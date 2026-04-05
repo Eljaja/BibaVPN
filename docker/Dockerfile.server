@@ -1,0 +1,14 @@
+# Build from repo root: biba-vpn/biba-vpn (contains Cargo.toml workspace)
+FROM rust:1.89-bookworm AS chef
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY bibavpn ./bibavpn
+RUN cargo build --release -p bibavpn --bin bibavpn-server
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=chef /app/target/release/bibavpn-server /usr/local/bin/bibavpn-server
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/bibavpn-server"]

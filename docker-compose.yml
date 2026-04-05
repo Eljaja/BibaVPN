@@ -1,0 +1,67 @@
+# Local lab: docker compose -f docker-compose.yml up --build
+# Client: SOCKS5 localhost:11080, HTTP CONNECT localhost:11880 → biba-server:8443 (PSK + decoy)
+services:
+  biba-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    command:
+      - --listen
+      - 0.0.0.0:8443
+      - --self-signed-san
+      - biba-server
+      - --token
+      - docker-compose-biba
+      - --psk
+      - ComposePSK_ChangeMe
+      - --decoy-max
+      - "24"
+      - --max-pad
+      - "64"
+      - --max-ws-binary
+      - "1400"
+      - --ws-ping-secs
+      - "25"
+    ports:
+      - "8443:8443"
+    networks:
+      - bibanet
+
+  biba-client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    depends_on:
+      - biba-server
+    command:
+      - --server
+      - biba-server:8443
+      - --sni
+      - biba-server
+      - --token
+      - docker-compose-biba
+      - --insecure
+      - --socks5
+      - 0.0.0.0:11080
+      - --http-proxy
+      - 0.0.0.0:18080
+      - --psk
+      - ComposePSK_ChangeMe
+      - --decoy-max
+      - "24"
+      - --max-pad
+      - "64"
+      - --max-ws-binary
+      - "1400"
+      - --ws-ping-secs
+      - "25"
+      - --early-ws-frames
+      - "1"
+    ports:
+      - "11080:11080"
+      - "11880:18080"
+    networks:
+      - bibanet
+
+networks:
+  bibanet:

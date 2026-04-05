@@ -1,0 +1,42 @@
+# Remote client only → your VPN entrypoint (e.g. abroad). SOCKS5 and HTTP CONNECT on the host.
+#
+# From repo root (directory with this compose file):
+#   export BIBA_REMOTE=vpn.example.com:8443
+#   export BIBA_SNI=vpn.example.com
+#   export BIBA_VPN_TOKEN=REDACTED_TOKEN
+#   export BIBA_VPN_PSK=REDACTED_PSK
+#   docker compose -f docker-compose.remote-client.yml up -d --build
+#
+# SOCKS5: BIBA_SOCKS_HOST_PORT (default 11090).
+# HTTP CONNECT: BIBA_HTTP_HOST_PORT maps to BIBA_HTTP_CONTAINER_PORT in the container (default 11880→18080).
+# If Windows cannot reach the proxy, use the WSL IP: wsl -e hostname -I
+
+name: biba-remote-client
+
+services:
+  biba-client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    command:
+      - --server
+      - ${BIBA_REMOTE:-vpn.example.com:8443}
+      - --sni
+      - ${BIBA_SNI:-vpn.example.com}
+      - --token
+      - ${BIBA_VPN_TOKEN:-REDACTED_TOKEN}
+      - --insecure
+      - --socks5
+      - 0.0.0.0:${BIBA_SOCKS_CONTAINER_PORT:-11090}
+      - --http-proxy
+      - 0.0.0.0:${BIBA_HTTP_CONTAINER_PORT:-18080}
+      - --psk
+      - ${BIBA_VPN_PSK:-REDACTED_PSK}
+      - --decoy-max
+      - ${BIBA_DECOY_MAX:-32}
+      - --max-pad
+      - ${BIBA_MAX_PAD:-64}
+    ports:
+      - "${BIBA_SOCKS_HOST_PORT:-11090}:${BIBA_SOCKS_CONTAINER_PORT:-11090}"
+      - "${BIBA_HTTP_HOST_PORT:-11880}:${BIBA_HTTP_CONTAINER_PORT:-18080}"
+    restart: unless-stopped
