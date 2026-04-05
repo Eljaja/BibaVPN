@@ -1,0 +1,12 @@
+/target/
+**/*.rs.bk
+.DS_Store
+Thumbs.db
+
+# Secrets and local overrides (do not commit)
+server.txt
+.env
+.env.*
+*.pem
+*.key
+docker-compose.override.yml
