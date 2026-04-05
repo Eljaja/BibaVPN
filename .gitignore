@@ -1,4 +1,5 @@
 /target/
+.speedtest-out.txt
 **/*.rs.bk
 .DS_Store
 Thumbs.db
