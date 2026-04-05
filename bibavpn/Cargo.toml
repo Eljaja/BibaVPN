@@ -1,0 +1,46 @@
+[package]
+name = "bibavpn"
+version.workspace = true
+edition.workspace = true
+description = "WSS tunnel with frame padding (Amnezia-inspired) and browser-like handshake (naive/v2ray-friendly)."
+
+[[bin]]
+name = "bibavpn-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "bibavpn-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.5"
+bytes = "1"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+http = "1"
+rand = "0.8"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+tokio = { version = "1.43", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "io-util",
+    "sync",
+    "time",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = [
+    "handshake",
+    "connect",
+    "rustls-native-certs",
+    "rustls-tls-webpki-roots",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
