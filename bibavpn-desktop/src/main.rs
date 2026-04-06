@@ -683,7 +683,17 @@ fn unix_ignore_shell_signals() {
     }
 }
 
-fn main() -> eframe::Result<()> {
+fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("BibaVPN panic: {info}");
+    }));
+    if let Err(e) = run_app() {
+        eprintln!("BibaVPN failed to start: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run_app() -> eframe::Result<()> {
     install_ring_crypto();
     #[cfg(unix)]
     unix_ignore_shell_signals();
@@ -702,6 +712,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([460.0, 620.0])
             .with_min_inner_size([420.0, 540.0])
             .with_title("BibaVPN"),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
