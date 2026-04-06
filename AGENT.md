@@ -15,27 +15,29 @@ Typical traffic path:
 
 ## Layout
 
-| Path | Role |
-| ---- | ---- |
-| `bibavpn/` | Crate: `lib` plus `bibavpn-server`, `bibavpn-client` binaries |
-| `bibavpn/src/crypto_layer.rs` | BibaV2: BLAKE3 derive, HELLO/ACK, MAC, `SessionCrypto`, decoy |
-| `bibavpn/src/bin/server.rs` | Server entry (TLS, WSS, token, PSK) |
-| `bibavpn/src/bin/client.rs` | Client entry (SOCKS5, HTTP CONNECT, WSS, PSK) |
-| `bibavpn/src/socks5.rs` | SOCKS5 frontend |
-| `bibavpn/src/tls_util.rs`, `frame.rs`, `protocol.rs`, `stealth.rs` | TLS, framing, OPEN, WS upgrade (incl. BibaV2.1 header knobs) |
-| `bibavpn/src/ws_bridge.rs` | Shared WS↔TCP bridge: BibaV2 seal/open, MTU cap, ping/pong |
-| `bibavpn/src/http_connect.rs` | HTTP `CONNECT` on a separate listen port |
-| `docker/` | `Dockerfile.server`, `Dockerfile.client` (multi-stage, Rust **≥ 1.89**) |
-| `docker-compose.yml` | Local lab: server + client on one Docker network |
-| `docker-compose.remote-client.yml` | Client only toward remote `host:8443`, proxies on the host |
-| `scripts/` | Smoke tests, deploy helpers, benchmarks |
+
+| Path                                                               | Role                                                                    |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `bibavpn/`                                                         | Crate: `lib` plus `bibavpn-server`, `bibavpn-client` binaries           |
+| `bibavpn/src/crypto_layer.rs`                                      | BibaV2: BLAKE3 derive, HELLO/ACK, MAC, `SessionCrypto`, decoy           |
+| `bibavpn/src/bin/server.rs`                                        | Server entry (TLS, WSS, token, PSK)                                     |
+| `bibavpn/src/bin/client.rs`                                        | Client entry (SOCKS5, HTTP CONNECT, WSS, PSK)                           |
+| `bibavpn/src/socks5.rs`                                            | SOCKS5 frontend                                                         |
+| `bibavpn/src/tls_util.rs`, `frame.rs`, `protocol.rs`, `stealth.rs` | TLS, framing, OPEN, WS upgrade (incl. BibaV2.1 header knobs)            |
+| `bibavpn/src/ws_bridge.rs`                                         | Shared WS↔TCP bridge: BibaV2 seal/open, MTU cap, ping/pong              |
+| `bibavpn/src/http_connect.rs`                                      | HTTP `CONNECT` on a separate listen port                                |
+| `docker/`                                                          | `Dockerfile.server`, `Dockerfile.client` (multi-stage, Rust **≥ 1.89**) |
+| `docker-compose.yml`                                               | Local lab: server + client on one Docker network                        |
+| `docker-compose.remote-client.yml`                                 | Client only toward remote `host:8443`, proxies on the host              |
+| `scripts/`                                                         | Smoke tests, deploy helpers, benchmarks                                 |
+
 
 ## BibaV2 (short)
 
-- Enabled with matching `**--psk**` and `**--decoy-max**` on client and server.
+- Enabled with matching `**--psk`** and `**--decoy-max`** on client and server.
 - HELLO: magic `BIBV2HL1` + 32-byte client random.
 - ACK: `BIBV2ACK1` + server random + 16-byte keyed MAC (BLAKE3 over PSK).
-- Directional keys: separate `derive` **`bibavpn.v2.c2s`** / **`bibavpn.v2.s2c`** (split directions like many v2ray-style designs).
+- Directional keys: separate `derive` `**bibavpn.v2.c2s`** / `**bibavpn.v2.s2c**` (split directions like many v2ray-style designs).
 - On the wire: 12-byte nonce + ciphertext; plaintext is optional decoy `0..N` bytes then payload.
 - Unit tests live in `crypto_layer` and `frame`; wire-format changes need matching client/server updates and tests.
 
@@ -43,12 +45,12 @@ Typical traffic path:
 
 Compatible with the **same** BibaV2 PSK/decoy when both ends use the same new flags.
 
-- **`--ws-ping-secs`**: periodic WebSocket **Ping** during tunneling (`0` = off). Incoming **Ping** gets **Pong** (including while waiting for HELLO/OPEN). Reduces idle/NAT drops.
-- **`--max-ws-binary`**: max size of one **outgoing** WS binary (and coarse inbound check). TCP is read in chunks; with BibaV2 account for nonce/tag/decoy (see `frame::max_tcp_payload_per_ws_message`). Default **1400** (MTU-oriented).
-- **`--ws-host`**, **`--ws-origin`**, **`--ws-user-agent`**, **`--ws-accept-language`**, repeatable **`--ws-header 'Name: value'`** customize the HTTP upgrade instead of a fixed header set.
-- **`--early-ws-frames`**: count of random binary frames **right after** the WS upgrade (before junk/HELLO) to vary startup pattern.
+- `**--ws-ping-secs`**: periodic WebSocket **Ping** during tunneling (`0` = off). Incoming **Ping** gets **Pong** (including while waiting for HELLO/OPEN). Reduces idle/NAT drops.
+- `**--max-ws-binary`**: max size of one **outgoing** WS binary (and coarse inbound check). TCP is read in chunks; with BibaV2 account for nonce/tag/decoy (see `frame::max_tcp_payload_per_ws_message`). Default **1400** (MTU-oriented).
+- `**--ws-host`**, `**--ws-origin`**, `**--ws-user-agent**`, `**--ws-accept-language**`, repeatable `**--ws-header 'Name: value'**` customize the HTTP upgrade instead of a fixed header set.
+- `**--early-ws-frames**`: count of random binary frames **right after** the WS upgrade (before junk/HELLO) to vary startup pattern.
 
-**`rust-toolchain.toml` pins 1.89.0**: on **rustc 1.93** building `bibavpn-server` hit an ICE in early lint; pinning 1.89 stabilizes `cargo build`. Docker images use Rust 1.89+.
+`**rust-toolchain.toml` pins 1.89.0**: on **rustc 1.93** building `bibavpn-server` hit an ICE in early lint; pinning 1.89 stabilizes `cargo build`. Docker images use Rust 1.89+.
 
 ## Build and run (local)
 
@@ -83,19 +85,21 @@ Server (demo self-signed):
 
 ## Docker / Compose gotcha
 
-`Dockerfile.*` sets **`ENTRYPOINT`** to the binary path. In `docker-compose.yml`, **`command`** must list **argument flags only** (do not repeat the binary path). Otherwise `clap` sees an extra token and the container exits with code 2.
+`Dockerfile.`* sets `**ENTRYPOINT`** to the binary path. In `docker-compose.yml`, `**command`** must list **argument flags only** (do not repeat the binary path). Otherwise `clap` sees an extra token and the container exits with code 2.
 
-Images use **`rust:1.89-bookworm`** (or newer): older `cargo` cannot build dependencies that use edition 2024.
+Images use `**rust:1.89-bookworm`** (or newer): older `cargo` cannot build dependencies that use edition 2024.
 
 ## Scripts
 
-| Script | Purpose |
-| ------ | ------- |
-| `scripts/docker-smoke.sh` | `docker compose up`, `curl` via SOCKS `127.0.0.1:11080` and HTTP proxy, `down` |
-| `scripts/wsl-test.sh` | Local smoke (plain/PSK) on WSL |
-| `scripts/remote-install-server.sh` | Build server image, `docker save` |
-| `scripts/speedtest-via-socks.py` | Speedtest via SOCKS (`pysocks`, `speedtest-cli`) |
-| `scripts/run-remote-speedtest.sh` | SSH to VPS, venv, `speedtest-cli --simple` on the server (reads password/port from `server.txt` — gitignored) |
+
+| Script                             | Purpose                                                                                                       |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `scripts/docker-smoke.sh`          | `docker compose up`, `curl` via SOCKS `127.0.0.1:11080` and HTTP proxy, `down`                                |
+| `scripts/wsl-test.sh`              | Local smoke (plain/PSK) on WSL                                                                                |
+| `scripts/remote-install-server.sh` | Build server image, `docker save`                                                                             |
+| `scripts/speedtest-via-socks.py`   | Speedtest via SOCKS (`pysocks`, `speedtest-cli`)                                                              |
+| `scripts/run-remote-speedtest.sh`  | SSH to VPS, venv, `speedtest-cli --simple` on the server (reads password/port from `server.txt` — gitignored) |
+
 
 Remote client with Docker:
 
@@ -105,7 +109,7 @@ export BIBA_REMOTE=vps:8443 BIBA_SNI=... BIBA_VPN_TOKEN=... BIBA_VPN_PSK=...
 docker compose -f docker-compose.remote-client.yml up -d --build
 ```
 
-Default SOCKS on host: **`127.0.0.1:11090`** (override with `BIBA_SOCKS_HOST_PORT` / `BIBA_SOCKS_CONTAINER_PORT`). HTTP CONNECT defaults to **`11880`** on the host.
+Default SOCKS on host: `**127.0.0.1:11090**` (override with `BIBA_SOCKS_HOST_PORT` / `BIBA_SOCKS_CONTAINER_PORT`). HTTP CONNECT defaults to `**11880**` on the host.
 
 ## Security
 
