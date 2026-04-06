@@ -111,6 +111,7 @@ impl ActiveVpn {
     }
 }
 
+#[derive(Clone)]
 struct TrayMenuIds {
     open: MenuId,
     on: MenuId,
@@ -210,7 +211,7 @@ impl BibaApp {
                 Self::show_window(ctx);
             }
         }
-        let Some(ids) = self.tray_ids.as_ref() else {
+        let Some(ids) = self.tray_ids.clone() else {
             return;
         };
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
