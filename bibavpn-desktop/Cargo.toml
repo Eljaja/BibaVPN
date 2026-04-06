@@ -21,3 +21,6 @@ tray-icon = "0.19"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 windows = { version = "0.58", features = ["Win32_Networking_WinInet"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

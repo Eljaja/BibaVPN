@@ -629,25 +629,32 @@ impl eframe::App for BibaApp {
 }
 
 fn build_tray_icon() -> tray_icon::Icon {
-    const S: u32 = 32;
+    const S: u32 = 64;
+    let center = S as f32 * 0.5;
+    let r_core = 15.0_f32;
+    let r_feather = 5.0_f32;
     let mut rgba = Vec::with_capacity((S * S * 4) as usize);
     for y in 0..S {
         for x in 0..S {
-            let cx = x as f32 - (S as f32) * 0.5 + 0.5;
-            let cy = y as f32 - (S as f32) * 0.5 + 0.5;
-            let r0 = 12.0_f32;
+            let cx = x as f32 + 0.5 - center;
+            let cy = y as f32 + 0.5 - center;
             let d = (cx * cx + cy * cy).sqrt();
-            let a = if d < r0 {
-                255
-            } else if d < r0 + 2.5 {
-                (((r0 + 2.5 - d) / 2.5) * 255.0) as u8
+            let a = if d <= r_core {
+                255u8
+            } else if d <= r_core + r_feather {
+                ((1.0 - (d - r_core) / r_feather).clamp(0.0, 1.0) * 255.0) as u8
             } else {
-                0
+                0u8
             };
-            let t = (x + y) as f32 * 0.04;
-            let r = (55.0_f32 + (t * 40.0).sin() * 30.0) as u8;
-            let g = (100.0_f32 + (t * 50.0).cos() * 35.0) as u8;
-            let b = (230_u8).saturating_sub((d * 4.0) as u8);
+            if a == 0 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            // Яркий розово-малиновый диск, заметный на тёмной полосе меню
+            let h = 1.0 - (d / (r_core + r_feather)).min(1.0);
+            let r = (255.0 - 10.0 * h) as u8;
+            let g = (35.0 + 70.0 * h) as u8;
+            let b = (140.0 + 90.0 * (1.0 - h)) as u8;
             rgba.extend_from_slice(&[r, g, b, a]);
         }
     }
@@ -656,6 +663,8 @@ fn build_tray_icon() -> tray_icon::Icon {
 
 fn main() -> eframe::Result<()> {
     install_ring_crypto();
+    #[cfg(target_os = "macos")]
+    proxy_mac::init_process_limits();
 
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()

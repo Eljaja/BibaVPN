@@ -1,34 +1,41 @@
 //! Системный прокси macOS через `networksetup` (как в «Системные настройки → Сеть → Прокси»).
 
 use std::io;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const NETSETUP: &str = "/usr/sbin/networksetup";
+/// Столько сетевых сервисов максимум трогаем (остальные — мосты, VPN, Thunderbolt и т.д.).
+const MAX_PROXY_SERVICES: usize = 8;
 
-#[derive(Debug, Clone)]
-struct ProxySlot {
-    enabled: bool,
-    server: String,
-    port: u16,
-}
+/// Поднять мягкий лимит дескрипторов (частая причина `Too many open files` при долгой работе + spawn).
+pub fn init_process_limits() {
+    use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE, RLIM_INFINITY};
 
-#[derive(Debug, Clone)]
-struct ServiceProxyBackup {
-    service: String,
-    web: ProxySlot,
-    secure: ProxySlot,
-    socks: ProxySlot,
-}
-
-/// Снимок настроек прокси по всем сервисам из `networksetup -listallnetworkservices`.
-#[derive(Debug, Clone)]
-pub struct ProxyBackup {
-    services: Vec<ServiceProxyBackup>,
+    const WANT: rlim_t = 50_000;
+    unsafe {
+        let mut lim: rlimit = std::mem::zeroed();
+        if getrlimit(RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let hard = if lim.rlim_max == RLIM_INFINITY {
+            WANT
+        } else {
+            lim.rlim_max
+        };
+        let target = WANT.min(hard).max(lim.rlim_cur);
+        if target > lim.rlim_cur {
+            lim.rlim_cur = target;
+            let _ = setrlimit(RLIMIT_NOFILE, &lim);
+        }
+    }
 }
 
 fn run_netsetup(args: &[&str]) -> Result<String, String> {
     let out = Command::new(NETSETUP)
         .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("networksetup: {e}"))?;
     if !out.status.success() {
@@ -39,12 +46,7 @@ fn run_netsetup(args: &[&str]) -> Result<String, String> {
         } else {
             stderr.trim()
         };
-        return Err(format!(
-            "{} {:?}: {}",
-            NETSETUP,
-            args,
-            msg
-        ));
+        return Err(format!("{} {:?}: {}", NETSETUP, args, msg));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -66,6 +68,95 @@ fn list_services() -> Result<Vec<String>, String> {
         }
     }
     Ok(v)
+}
+
+fn filter_proxy_services(services: Vec<String>) -> Vec<String> {
+    fn denied(lower: &str) -> bool {
+        if lower.contains("vpn") {
+            return true;
+        }
+        const DENY: &[&str] = &[
+            "bridge",
+            "thunderbolt",
+            "virtual",
+            "iphone usb",
+            "iphone",
+            "usb serial",
+            "modem",
+            "bluetooth pan",
+            "wireless hotspot",
+            "rndis",
+            "cdc ncm",
+            "huawei",
+            "android",
+            "clash",
+            "wireguard",
+            "utun",
+        ];
+        DENY.iter().any(|pat| lower.contains(pat))
+    }
+
+    let mut scored: Vec<(u8, String)> = services
+        .into_iter()
+        .filter(|s| !denied(&s.to_lowercase()))
+        .map(|s| {
+            let l = s.to_lowercase();
+            let pri = if l.contains("wi-fi") || l.contains("wifi") {
+                0u8
+            } else if l.contains("ethernet") {
+                1u8
+            } else {
+                2u8
+            };
+            (pri, s)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+    });
+
+    scored
+        .into_iter()
+        .take(MAX_PROXY_SERVICES)
+        .map(|(_, s)| s)
+        .collect()
+}
+
+fn services_for_proxy() -> Result<Vec<String>, String> {
+    let all = list_services()?;
+    if all.is_empty() {
+        return Err("networksetup: нет сетевых сервисов".into());
+    }
+    let mut picked = filter_proxy_services(all.clone());
+    if picked.is_empty() {
+        picked = all.into_iter().take(MAX_PROXY_SERVICES).collect();
+    }
+    if picked.is_empty() {
+        return Err("networksetup: нет подходящих сетевых сервисов".into());
+    }
+    Ok(picked)
+}
+
+#[derive(Debug, Clone)]
+struct ProxySlot {
+    enabled: bool,
+    server: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone)]
+struct ServiceProxyBackup {
+    service: String,
+    web: ProxySlot,
+    secure: ProxySlot,
+    socks: ProxySlot,
+}
+
+/// Снимок настроек прокси только по тем сервисам, которые мы реально меняем.
+#[derive(Debug, Clone)]
+pub struct ProxyBackup {
+    services: Vec<ServiceProxyBackup>,
 }
 
 fn parse_proxy_state(get_cmd: &str, service: &str) -> ProxySlot {
@@ -102,13 +193,7 @@ fn parse_proxy_state(get_cmd: &str, service: &str) -> ProxySlot {
 }
 
 pub fn read_backup() -> io::Result<ProxyBackup> {
-    let services = list_services().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    if services.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "networksetup: нет сетевых сервисов",
-        ));
-    }
+    let services = services_for_proxy().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let mut backups = Vec::with_capacity(services.len());
     for service in services {
         backups.push(ServiceProxyBackup {
@@ -134,10 +219,7 @@ fn split_host_port(hp: &str) -> Result<(String, String), String> {
 pub fn apply_proxy(http_host_port: &str, socks_host_port: &str) -> Result<(), String> {
     let (http_host, http_port) = split_host_port(http_host_port)?;
     let (socks_host, socks_port) = split_host_port(socks_host_port)?;
-    let services = list_services()?;
-    if services.is_empty() {
-        return Err("networksetup: нет сетевых сервисов".into());
-    }
+    let services = services_for_proxy()?;
     let mut ok_any = false;
     let mut last_err = String::new();
     for service in &services {

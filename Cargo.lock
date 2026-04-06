@@ -246,6 +246,7 @@ dependencies = [
  "dirs 5.0.1",
  "eframe",
  "egui",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

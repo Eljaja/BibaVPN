@@ -43,9 +43,56 @@ jobs:
       - name: Build bibavpn-desktop (release)
         run: cargo build -p bibavpn-desktop --release --locked
 
+      - name: Pack BibaVPN.app + DMG
+        run: |
+          set -euo pipefail
+          APP_DIR="packaging/BibaVPN.app"
+          BIN="$APP_DIR/Contents/MacOS/BibaVPN"
+          mkdir -p "$(dirname "$BIN")" "$APP_DIR/Contents/Resources"
+          cp target/release/bibavpn-desktop "$BIN"
+          chmod +x "$BIN"
+          cat > "$APP_DIR/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>BibaVPN</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.bibavpn.desktop</string>
+            <key>CFBundleName</key>
+            <string>BibaVPN</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          STAGE="packaging/dmg_root"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R "$APP_DIR" "$STAGE/"
+          ln -sf /Applications "$STAGE/Applications"
+          rm -f BibaVPN-macos-aarch64.dmg
+          hdiutil create -volname "BibaVPN" -srcfolder "$STAGE" -ov -format UDZO BibaVPN-macos-aarch64.dmg
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: bibavpn-desktop-macos-aarch64
           path: target/release/bibavpn-desktop
+          if-no-files-found: error
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: BibaVPN-macos-aarch64-dmg
+          path: BibaVPN-macos-aarch64.dmg
           if-no-files-found: error
