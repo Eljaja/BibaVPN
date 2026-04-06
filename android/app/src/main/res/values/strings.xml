@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BibaVPN</string>
+    <string name="channel_name">Прокси</string>
+    <string name="notification_title">BibaVPN активен</string>
+    <string name="notification_text">Локальный SOCKS5: %1$s</string>
+</resources>
