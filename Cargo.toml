@@ -1,5 +1,5 @@
 [workspace]
-members = ["bibavpn"]
+members = ["bibavpn", "bibavpn-jni", "bibavpn-desktop"]
 resolver = "2"
 
 [workspace.package]

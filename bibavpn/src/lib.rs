@@ -5,6 +5,7 @@
 pub mod crypto_layer;
 pub mod frame;
 pub mod http_connect;
+pub mod local_client;
 pub mod protocol;
 pub mod socks5;
 pub mod stealth;
