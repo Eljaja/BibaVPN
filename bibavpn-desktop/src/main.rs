@@ -15,7 +15,6 @@ use proxy_mac::{apply_proxy, read_backup, restore, ProxyBackup};
 use proxy_stub::{apply_proxy, read_backup, restore, ProxyBackup};
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,26 +24,10 @@ use bibavpn::local_client::{
 use bibavpn::tls_util::install_ring_crypto;
 use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke, Vec2, Visuals};
 use serde::{Deserialize, Serialize};
-use tao::event::Event;
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{MouseButton, TrayIconBuilder, TrayIconEvent};
-
-#[derive(Debug)]
-enum TraySignal {
-    ShowWindow,
-    ConnectVpn,
-    DisconnectVpn,
-    ExitApp,
-}
-
-#[derive(Debug)]
-enum UserEvent {
-    Tray(TrayIconEvent),
-    Menu(MenuEvent),
-}
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::{MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedConfig {
@@ -128,24 +111,28 @@ impl ActiveVpn {
     }
 }
 
+struct TrayMenuIds {
+    open: MenuId,
+    on: MenuId,
+    off: MenuId,
+    quit: MenuId,
+}
+
 struct BibaApp {
     cfg: SavedConfig,
     rt: Arc<tokio::runtime::Runtime>,
-    tray_rx: Receiver<TraySignal>,
     err: Option<String>,
     proxy_backup: Option<ProxyBackup>,
     vpn: Option<ActiveVpn>,
     /// Фактический `host:port` удалённого сервера для текущего туннеля (может отличаться от полей формы).
     tunnel_server: Option<String>,
     exiting: bool,
+    tray: Option<TrayIcon>,
+    tray_ids: Option<TrayMenuIds>,
 }
 
 impl BibaApp {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        rt: Arc<tokio::runtime::Runtime>,
-        tray_rx: Receiver<TraySignal>,
-    ) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, rt: Arc<tokio::runtime::Runtime>) -> Self {
         setup_style(&cc.egui_ctx);
         let mut cfg = load_config();
         if cfg.local_http_port == 0 {
@@ -157,12 +144,95 @@ impl BibaApp {
         Self {
             cfg,
             rt,
-            tray_rx,
             err: None,
             proxy_backup: None,
             vpn: None,
             tunnel_server: None,
             exiting: false,
+            tray: None,
+            tray_ids: None,
+        }
+    }
+
+    fn ensure_tray_icon(&mut self) {
+        if self.tray.is_some() {
+            return;
+        }
+        let tray_menu = Menu::new();
+        let open_i = MenuItem::new("Открыть окно", true, None);
+        let on_i = MenuItem::new("Включить VPN", true, None);
+        let off_i = MenuItem::new("Отключить VPN", true, None);
+        let quit_i = MenuItem::new("Выход", true, None);
+        let tray_ids = TrayMenuIds {
+            open: open_i.id().clone(),
+            on: on_i.id().clone(),
+            off: off_i.id().clone(),
+            quit: quit_i.id().clone(),
+        };
+        let _ = tray_menu.append_items(&[
+            &open_i,
+            &PredefinedMenuItem::separator(),
+            &on_i,
+            &off_i,
+            &PredefinedMenuItem::separator(),
+            &quit_i,
+        ]);
+        let icon = build_tray_icon();
+        match TrayIconBuilder::new()
+            .with_menu_on_left_click(false)
+            .with_tooltip("BibaVPN")
+            .with_menu(Box::new(tray_menu))
+            .with_icon(icon)
+            .build()
+        {
+            Ok(tray) => {
+                self.tray = Some(tray);
+                self.tray_ids = Some(tray_ids);
+            }
+            Err(e) => {
+                self.err = Some(format!("Трей: {e}"));
+            }
+        }
+    }
+
+    fn show_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                ..
+            } = ev
+            {
+                Self::show_window(ctx);
+            }
+        }
+        let Some(ids) = self.tray_ids.as_ref() else {
+            return;
+        };
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            if ev.id() == &ids.quit {
+                self.tray.take();
+                self.shutdown_app();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+            if ev.id() == &ids.open {
+                Self::show_window(ctx);
+            } else if ev.id() == &ids.on {
+                match self.connect() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.err = Some(e);
+                        Self::show_window(ctx);
+                    }
+                }
+            } else if ev.id() == &ids.off {
+                self.disconnect();
+            }
         }
     }
 
@@ -316,27 +386,8 @@ fn setup_style(ctx: &egui::Context) {
 
 impl eframe::App for BibaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(sig) = self.tray_rx.try_recv() {
-            match sig {
-                TraySignal::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                TraySignal::ConnectVpn => match self.connect() {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.err = Some(e);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                },
-                TraySignal::DisconnectVpn => self.disconnect(),
-                TraySignal::ExitApp => {
-                    self.shutdown_app();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
+        self.ensure_tray_icon();
+        self.poll_tray(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.exiting {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -602,91 +653,8 @@ fn build_tray_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, S, S).expect("tray icon")
 }
 
-fn run_tray_thread(tx: Sender<TraySignal>) {
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-
-    let proxy = event_loop.create_proxy();
-    TrayIconEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::Tray(event));
-    }));
-    let proxy = event_loop.create_proxy();
-    MenuEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::Menu(event));
-    }));
-
-    let tray_menu = Menu::new();
-    let open_i = MenuItem::new("Открыть окно", true, None);
-    let on_i = MenuItem::new("Включить VPN", true, None);
-    let off_i = MenuItem::new("Отключить VPN", true, None);
-    let quit_i = MenuItem::new("Выход", true, None);
-    let _ = tray_menu.append_items(&[
-        &open_i,
-        &PredefinedMenuItem::separator(),
-        &on_i,
-        &off_i,
-        &PredefinedMenuItem::separator(),
-        &quit_i,
-    ]);
-
-    let mut tray_holder: Option<tray_icon::TrayIcon> = None;
-    let tx_menu = tx.clone();
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-
-        match event {
-            Event::NewEvents(tao::event::StartCause::Init) => {
-                let icon = build_tray_icon();
-                tray_holder = Some(
-                    TrayIconBuilder::new()
-                        .with_menu_on_left_click(false)
-                        .with_tooltip("BibaVPN")
-                        .with_menu(Box::new(tray_menu.clone()))
-                        .with_icon(icon)
-                        .build()
-                        .expect("tray"),
-                );
-            }
-
-            Event::UserEvent(UserEvent::Tray(ev)) => {
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    ..
-                } = ev
-                {
-                    let _ = tx.send(TraySignal::ShowWindow);
-                }
-            }
-
-            Event::UserEvent(UserEvent::Menu(ev)) => {
-                if quit_i.id() == &ev.id {
-                    tray_holder.take();
-                    let _ = tx.send(TraySignal::ExitApp);
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-                if open_i.id() == &ev.id {
-                    let _ = tx_menu.send(TraySignal::ShowWindow);
-                } else if on_i.id() == &ev.id {
-                    let _ = tx_menu.send(TraySignal::ConnectVpn);
-                } else if off_i.id() == &ev.id {
-                    let _ = tx_menu.send(TraySignal::DisconnectVpn);
-                }
-            }
-
-            _ => {}
-        }
-    });
-}
-
 fn main() -> eframe::Result<()> {
     install_ring_crypto();
-
-    let (tray_tx, tray_rx) = mpsc::channel::<TraySignal>();
-    std::thread::spawn({
-        let tray_tx = tray_tx.clone();
-        move || run_tray_thread(tray_tx)
-    });
 
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -706,6 +674,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "BibaVPN",
         options,
-        Box::new(move |cc| Ok(Box::new(BibaApp::new(cc, rt, tray_rx)) as Box<dyn eframe::App>)),
+        Box::new(move |cc| Ok(Box::new(BibaApp::new(cc, rt)) as Box<dyn eframe::App>)),
     )
 }
