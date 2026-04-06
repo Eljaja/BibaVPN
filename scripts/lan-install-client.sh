@@ -8,6 +8,7 @@
 #
 # Optional (defaults match VPS lab):
 #   BIBA_REMOTE BIBA_SNI BIBA_VPN_TOKEN BIBA_VPN_PSK BIBA_SOCKS_HOST_PORT etc.
+#   BIBA_CLIENT_NO_CACHE=1 — force `docker build --no-cache` (avoids stale Rust binary in image).
 
 set -euo pipefail
 : "${BIBA_LAN_HOST:?set BIBA_LAN_HOST}"
@@ -35,7 +36,11 @@ if ! command -v sshpass >/dev/null; then
   exit 1
 fi
 
-docker build -t bibavpn-client:local -f "$ROOT/docker/Dockerfile.client" "$ROOT"
+BUILD=(docker build -t bibavpn-client:local -f "$ROOT/docker/Dockerfile.client" "$ROOT")
+if [[ "${BIBA_CLIENT_NO_CACHE:-}" == 1 ]]; then
+  BUILD=(docker build --no-cache -t bibavpn-client:local -f "$ROOT/docker/Dockerfile.client" "$ROOT")
+fi
+"${BUILD[@]}"
 docker save bibavpn-client:local | gzip > /tmp/bibavpn-client.tgz
 "${SCP[@]}" /tmp/bibavpn-client.tgz "${BIBA_LAN_USER}@${BIBA_LAN_HOST}:/tmp/bibavpn-client.tgz"
 
