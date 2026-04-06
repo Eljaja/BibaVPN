@@ -187,9 +187,9 @@ async fn connect_udp_mux_ws(
         .context("junk frames")?;
 
     let crypto: Option<SharedCrypto> = if let Some(ref secret) = cfg.psk {
-        Some(Arc::new(Mutex::new(
+        Some(Arc::new(
             v2_client_preamble(&mut ws, secret, cfg.decoy_max).await?,
-        )))
+        ))
     } else {
         None
     };
@@ -216,9 +216,8 @@ async fn pack_tunnel_out(
     write_padded_frame(&mut wire, body, max_pad).context("pack frame")?;
     let blob: Vec<u8> = match crypto {
         Some(c) => c
-            .lock()
-            .await
             .seal_client_to_server(&wire)
+            .await
             .context("v2 seal c2s (udp mux)")?,
         None => wire,
     };
@@ -235,9 +234,8 @@ async fn unpack_tunnel_in(
     let raw = match crypto {
         None => b.to_vec(),
         Some(c) => c
-            .lock()
-            .await
             .open_server_to_client(b)
+            .await
             .context("v2 open s2c (udp mux)")?,
     };
     read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))
@@ -403,9 +401,8 @@ where
                     }
                     let raw = match &crypto_up {
                         Some(c) => c
-                            .lock()
-                            .await
                             .open_client_to_server(b.as_ref())
+                            .await
                             .context("v2 open c2s (udp mux)")?,
                         None => b.to_vec(),
                     };
@@ -475,9 +472,8 @@ where
                         write_padded_frame(&mut wire, &rep_plain, max_pad)?;
                         let blob: Vec<u8> = match &crypto_dn {
                             Some(c) => c
-                                .lock()
-                                .await
                                 .seal_server_to_client(&wire)
+                                .await
                                 .context("v2 seal s2c (udp mux)")?,
                             None => wire,
                         };
@@ -506,9 +502,8 @@ where
                 write_padded_frame(&mut wire, &rep_plain, max_pad)?;
                 let blob: Vec<u8> = match &crypto_dn {
                     Some(c) => c
-                        .lock()
-                        .await
                         .seal_server_to_client(&wire)
+                        .await
                         .context("v2 seal s2c (udp mux)")?,
                     None => wire,
                 };

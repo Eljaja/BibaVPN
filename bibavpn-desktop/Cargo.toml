@@ -2,7 +2,7 @@
 name = "bibavpn-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "BibaVPN for Windows: local HTTP proxy, system proxy toggle, tray"
+description = "BibaVPN desktop: local proxy, system proxy toggle, tray icon"
 
 [dependencies]
 bibavpn = { path = "../bibavpn" }
@@ -18,5 +18,7 @@ serde_json = "1"
 tao = "0.30"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync"] }
 tray-icon = "0.19"
+
+[target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 windows = { version = "0.58", features = ["Win32_Networking_WinInet"] }

@@ -1,7 +1,7 @@
 //! BibaV2: PSK handshake + ChaCha20-Poly1305 outer framing (inspired by AmneziaWG2 session noise
 //! and v2ray-style distinct bidirectional keys). Not compatible with stock WireGuard/Xray.
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use blake3::derive_key;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -41,130 +41,113 @@ fn transport_keys(psk: &[u8], client_random: &[u8; 32], server_random: &[u8; 32]
     (k_up, k_dn)
 }
 
-#[derive(Clone)]
+struct ChaHalf {
+    cipher: ChaCha20Poly1305,
+    ctr: u64,
+}
+
+impl ChaHalf {
+    fn new(key: &[u8; 32]) -> Self {
+        Self {
+            cipher: ChaCha20Poly1305::new_from_slice(key).expect("32B key"),
+            ctr: 0,
+        }
+    }
+
+    fn next_nonce(&mut self) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[4..].copy_from_slice(&self.ctr.to_be_bytes());
+        self.ctr = self.ctr.wrapping_add(1);
+        n
+    }
+
+    fn seal(&mut self, decoy_max: u8, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut plain = Vec::with_capacity(1 + usize::from(decoy_max) + inner.len());
+        let dlen: u8 = if decoy_max == 0 {
+            0
+        } else {
+            rand::thread_rng().gen_range(0..=decoy_max)
+        };
+        plain.push(dlen);
+        if dlen > 0 {
+            let mut noise = vec![0u8; usize::from(dlen)];
+            OsRng.fill_bytes(&mut noise);
+            plain.extend_from_slice(&noise);
+        }
+        plain.extend_from_slice(inner);
+
+        let nonce = self.next_nonce();
+        let ct = self
+            .cipher
+            .encrypt(&nonce.into(), plain.as_slice())
+            .map_err(|e| anyhow::anyhow!("chacha encrypt: {e}"))?;
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn open(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if wire.len() < 12 + 16 {
+            bail!("short v2 packet");
+        }
+        let (n, ct) = wire.split_at(12);
+        let nonce: [u8; 12] = n.try_into().unwrap();
+        let pt = self
+            .cipher
+            .decrypt(&nonce.into(), ct)
+            .map_err(|_| anyhow::anyhow!("chacha decrypt"))?;
+        strip_decoy(&pt)
+    }
+}
+
+fn strip_decoy(pt: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
+    if pt.is_empty() {
+        bail!("empty plaintext");
+    }
+    let d = usize::from(pt[0]);
+    if pt.len() < 1 + d {
+        bail!("bad decoy length");
+    }
+    Ok(pt[1 + d..].to_vec())
+}
+
+/// Bidirectional session keys. Each direction has its own lock so seal/open on different halves
+/// can run concurrently (e.g. TCP uplink vs downlink on one tunnel).
 pub struct SessionCrypto {
-    c2s: ChaCha20Poly1305,
-    s2c: ChaCha20Poly1305,
-    ctr_c2s: u64,
-    ctr_s2c: u64,
+    c2s: tokio::sync::Mutex<ChaHalf>,
+    s2c: tokio::sync::Mutex<ChaHalf>,
     pub decoy_max: u8,
 }
 
 impl SessionCrypto {
     pub fn new(psk: &str, client_random: &[u8; 32], server_random: &[u8; 32], decoy_max: u8) -> Self {
         let (k_up, k_dn) = transport_keys(psk.as_bytes(), client_random, server_random);
-        let c2s = ChaCha20Poly1305::new_from_slice(&k_up).expect("32B key");
-        let s2c = ChaCha20Poly1305::new_from_slice(&k_dn).expect("32B key");
         Self {
-            c2s,
-            s2c,
-            ctr_c2s: 0,
-            ctr_s2c: 0,
+            c2s: tokio::sync::Mutex::new(ChaHalf::new(&k_up)),
+            s2c: tokio::sync::Mutex::new(ChaHalf::new(&k_dn)),
             decoy_max,
         }
     }
 
-    fn nonce_c2s(&mut self) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[4..].copy_from_slice(&self.ctr_c2s.to_be_bytes());
-        self.ctr_c2s = self.ctr_c2s.wrapping_add(1);
-        n
+    pub async fn seal_client_to_server(&self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut g = self.c2s.lock().await;
+        g.seal(self.decoy_max, inner)
     }
 
-    fn nonce_s2c(&mut self) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[4..].copy_from_slice(&self.ctr_s2c.to_be_bytes());
-        self.ctr_s2c = self.ctr_s2c.wrapping_add(1);
-        n
+    pub async fn open_client_to_server(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let g = self.c2s.lock().await;
+        g.open(wire).context("chacha decrypt (c2s)")
     }
 
-    pub fn seal_client_to_server(&mut self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut plain = Vec::with_capacity(1 + usize::from(self.decoy_max) + inner.len());
-        let dlen: u8 = if self.decoy_max == 0 {
-            0
-        } else {
-            rand::thread_rng().gen_range(0..=self.decoy_max)
-        };
-        plain.push(dlen);
-        if dlen > 0 {
-            let mut noise = vec![0u8; usize::from(dlen)];
-            OsRng.fill_bytes(&mut noise);
-            plain.extend_from_slice(&noise);
-        }
-        plain.extend_from_slice(inner);
-
-        let nonce = self.nonce_c2s();
-        let ct = self
-            .c2s
-            .encrypt(&nonce.into(), plain.as_slice())
-            .map_err(|e| anyhow::anyhow!("chacha encrypt: {e}"))?;
-        let mut out = Vec::with_capacity(12 + ct.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
-        Ok(out)
+    pub async fn seal_server_to_client(&self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut g = self.s2c.lock().await;
+        g.seal(self.decoy_max, inner)
     }
 
-    pub fn open_client_to_server(&mut self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if wire.len() < 12 + 16 {
-            bail!("short v2 packet");
-        }
-        let (n, ct) = wire.split_at(12);
-        let nonce: [u8; 12] = n.try_into().unwrap();
-        let pt = self
-            .c2s
-            .decrypt(&nonce.into(), ct)
-            .map_err(|_| anyhow::anyhow!("chacha decrypt (c2s)"))?;
-        Self::strip_decoy(&pt)
-    }
-
-    pub fn seal_server_to_client(&mut self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut plain = Vec::with_capacity(1 + usize::from(self.decoy_max) + inner.len());
-        let dlen: u8 = if self.decoy_max == 0 {
-            0
-        } else {
-            rand::thread_rng().gen_range(0..=self.decoy_max)
-        };
-        plain.push(dlen);
-        if dlen > 0 {
-            let mut noise = vec![0u8; usize::from(dlen)];
-            OsRng.fill_bytes(&mut noise);
-            plain.extend_from_slice(&noise);
-        }
-        plain.extend_from_slice(inner);
-
-        let nonce = self.nonce_s2c();
-        let ct = self
-            .s2c
-            .encrypt(&nonce.into(), plain.as_slice())
-            .map_err(|e| anyhow::anyhow!("chacha encrypt: {e}"))?;
-        let mut out = Vec::with_capacity(12 + ct.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
-        Ok(out)
-    }
-
-    pub fn open_server_to_client(&mut self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if wire.len() < 12 + 16 {
-            bail!("short v2 packet");
-        }
-        let (n, ct) = wire.split_at(12);
-        let nonce: [u8; 12] = n.try_into().unwrap();
-        let pt = self
-            .s2c
-            .decrypt(&nonce.into(), ct)
-            .map_err(|_| anyhow::anyhow!("chacha decrypt (s2c)"))?;
-        Self::strip_decoy(&pt)
-    }
-
-    fn strip_decoy(pt: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if pt.is_empty() {
-            bail!("empty plaintext");
-        }
-        let d = usize::from(pt[0]);
-        if pt.len() < 1 + d {
-            bail!("bad decoy length");
-        }
-        Ok(pt[1 + d..].to_vec())
+    pub async fn open_server_to_client(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let g = self.s2c.lock().await;
+        g.open(wire).context("chacha decrypt (s2c)")
     }
 }
 
@@ -216,21 +199,21 @@ pub fn parse_ack(psk: &str, buf: &[u8], client_random: &[u8; 32]) -> anyhow::Res
 mod tests {
     use super::*;
 
-    #[test]
-    fn seal_roundtrip_both_dirs() {
+    #[tokio::test]
+    async fn seal_roundtrip_both_dirs() {
         let psk = "unit-test-psk";
         let c = [1u8; 32];
         let s = [2u8; 32];
-        let mut enc = SessionCrypto::new(psk, &c, &s, 8);
-        let mut dec = SessionCrypto::new(psk, &c, &s, 8);
+        let enc = SessionCrypto::new(psk, &c, &s, 8);
+        let dec = SessionCrypto::new(psk, &c, &s, 8);
         let inner = b"padded-frame-blob".to_vec();
-        let wire = enc.seal_client_to_server(&inner).unwrap();
-        let out = dec.open_client_to_server(&wire).unwrap();
+        let wire = enc.seal_client_to_server(&inner).await.unwrap();
+        let out = dec.open_client_to_server(&wire).await.unwrap();
         assert_eq!(out, inner);
 
         let back = b"server-payload".to_vec();
-        let w2 = dec.seal_server_to_client(&back).unwrap();
-        let out2 = enc.open_server_to_client(&w2).unwrap();
+        let w2 = dec.seal_server_to_client(&back).await.unwrap();
+        let out2 = enc.open_server_to_client(&w2).await.unwrap();
         assert_eq!(out2, back);
     }
 }

@@ -3,6 +3,8 @@ FROM rust:1.89-bookworm AS chef
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY bibavpn ./bibavpn
+COPY bibavpn-jni ./bibavpn-jni
+COPY bibavpn-desktop ./bibavpn-desktop
 RUN cargo build --release -p bibavpn --bin bibavpn-server
 
 FROM debian:bookworm-slim

@@ -1,0 +1,51 @@
+# Manual: Actions → Desktop macOS → Run workflow. Also runs on push/PR when desktop paths change.
+name: Desktop macOS
+
+run-name: Desktop macOS · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "bibavpn-desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop-macos.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "bibavpn-desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop-macos.yml"
+
+concurrency:
+  group: desktop-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build bibavpn-desktop (release)
+        run: cargo build -p bibavpn-desktop --release --locked
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bibavpn-desktop-macos-aarch64
+          path: target/release/bibavpn-desktop
+          if-no-files-found: error

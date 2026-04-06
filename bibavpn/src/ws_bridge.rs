@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::crypto_layer::SessionCrypto;
 use crate::{read_padded_frame, write_padded_frame};
 
-pub type SharedCrypto = Arc<Mutex<SessionCrypto>>;
+pub type SharedCrypto = Arc<SessionCrypto>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum TunnelEnd {
@@ -113,14 +113,12 @@ where
                     }
                     let raw = match (&crypto_up, end) {
                         (Some(c), TunnelEnd::Client) => c
-                            .lock()
-                            .await
                             .open_server_to_client(b.as_ref())
+                            .await
                             .context("v2 open s2c")?,
                         (Some(c), TunnelEnd::Server) => c
-                            .lock()
-                            .await
                             .open_client_to_server(b.as_ref())
+                            .await
                             .context("v2 open c2s")?,
                         (None, _) => b.to_vec(),
                     };
@@ -152,8 +150,9 @@ where
     };
 
     let down = async move {
-        let mut buf = vec![0u8; max_chunk];
-        let mut wire = Vec::with_capacity(max_ws_binary.min(64 * 1024));
+        let read_cap = max_chunk.saturating_mul(8).min(512 * 1024).max(max_chunk);
+        let mut buf = vec![0u8; read_cap];
+        let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
         loop {
             if let Some(ref mut ticker) = ping_tok {
                 tokio::select! {
@@ -174,21 +173,19 @@ where
                             let blob = match (&crypto_dn, end) {
                                 (Some(c), TunnelEnd::Client) => {
                                     bytes::Bytes::from(
-                                        c.lock()
+                                        c.seal_client_to_server(&wire)
                                             .await
-                                            .seal_client_to_server(&wire)
                                             .context("v2 seal c2s")?,
                                     )
                                 }
                                 (Some(c), TunnelEnd::Server) => {
                                     bytes::Bytes::from(
-                                        c.lock()
+                                        c.seal_server_to_client(&wire)
                                             .await
-                                            .seal_server_to_client(&wire)
                                             .context("v2 seal s2c")?,
                                     )
                                 }
-                                (None, _) => bytes::Bytes::from(wire.clone()),
+                                (None, _) => bytes::Bytes::from(std::mem::take(&mut wire)),
                             };
                             if blob.len() > max_ws_binary {
                                 anyhow::bail!(
@@ -216,21 +213,19 @@ where
                     let blob = match (&crypto_dn, end) {
                         (Some(c), TunnelEnd::Client) => {
                             bytes::Bytes::from(
-                                c.lock()
+                                c.seal_client_to_server(&wire)
                                     .await
-                                    .seal_client_to_server(&wire)
                                     .context("v2 seal c2s")?,
                             )
                         }
                         (Some(c), TunnelEnd::Server) => {
                             bytes::Bytes::from(
-                                c.lock()
+                                c.seal_server_to_client(&wire)
                                     .await
-                                    .seal_server_to_client(&wire)
                                     .context("v2 seal s2c")?,
                             )
                         }
-                        (None, _) => bytes::Bytes::from(wire.clone()),
+                        (None, _) => bytes::Bytes::from(std::mem::take(&mut wire)),
                     };
                     if blob.len() > max_ws_binary {
                         anyhow::bail!(

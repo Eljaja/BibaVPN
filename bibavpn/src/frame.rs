@@ -3,8 +3,8 @@ use rand::Rng;
 const FRAME_VER: u8 = 1;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
-/// Default cap for one WebSocket binary message (TLS record / IP fragmentation safety). BibaV2.1.
-pub const DEFAULT_MAX_WS_BINARY: usize = 1400;
+/// Default cap for one WebSocket binary message (fewer frames = higher throughput; lower if middleboxes break).
+pub const DEFAULT_MAX_WS_BINARY: usize = 262_144;
 
 /// Worst-case plaintext (TCP chunk) per tunnel frame so sealed WS binary ≤ `max_ws_binary`.
 /// For plain mode: one WS binary = padded frame only. For BibaV2: includes ChaChaPoly nonce+tag and inner decoy prefix.
@@ -115,10 +115,14 @@ mod tests {
 
     #[test]
     fn mtu_cap_plaintext_budget() {
-        let n = max_tcp_payload_per_ws_message(false, 0, 64, 1400);
+        let small = 1400usize;
+        let n = max_tcp_payload_per_ws_message(false, 0, 64, small);
         assert!(n > 1300);
-        let v2 = max_tcp_payload_per_ws_message(true, 32, 64, 1400);
+        let v2 = max_tcp_payload_per_ws_message(true, 32, 64, small);
         assert!(v2 < n);
         assert!(v2 > 1000);
+
+        let n_large = max_tcp_payload_per_ws_message(true, 32, 64, DEFAULT_MAX_WS_BINARY);
+        assert!(n_large > 200_000);
     }
 }

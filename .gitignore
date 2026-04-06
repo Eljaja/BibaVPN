@@ -6,6 +6,7 @@ Thumbs.db
 
 # Local release build artifacts
 *.exe
+release-staging/
 
 # Secrets and local overrides (do not commit)
 server.txt

@@ -2,7 +2,7 @@
 
 Local **SOCKS5** and optional **HTTP CONNECT** over **TLS + WebSocket** to an entry server; the server opens outbound **TCP** to the target `host:port`. Optional **BibaV2**: shared PSK, HELLO/ACK, ChaCha20-Poly1305, and random decoy per frame. **BibaV2.1** adds a max WS binary size, periodic WS Ping, configurable upgrade headers, and early-session noise.
 
-Developer details: [AGENT.md](AGENT.md).
+Developer/agent details: [AGENTS.md](AGENTS.md) (legacy link: [AGENT.md](AGENT.md)).
 
 ---
 

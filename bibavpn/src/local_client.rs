@@ -95,7 +95,7 @@ impl ClientCfg {
     }
 }
 
-type SharedCrypto = Arc<Mutex<SessionCrypto>>;
+type SharedCrypto = Arc<SessionCrypto>;
 
 /// Build TLS config and run SOCKS5 (+ optional HTTP CONNECT) until `shutdown` becomes `true`.
 ///
@@ -155,21 +155,31 @@ pub async fn run_local_client(
             .with_context(|| format!("bind http proxy {http_bind}"))?;
         info!("HTTP CONNECT on {http_bind}");
         let cfg_http = cfg.clone();
+        let mut shutdown_http = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                let (sock, peer) = match http_listener.accept().await {
-                    Ok(x) => x,
-                    Err(e) => {
-                        error!("http accept: {e:#}");
-                        continue;
+                tokio::select! {
+                    _ = shutdown_http.changed() => {
+                        if *shutdown_http.borrow() {
+                            break;
+                        }
                     }
-                };
-                let c = cfg_http.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_http_peer(sock, c).await {
-                        error!("http {peer}: {e:#}");
+                    res = http_listener.accept() => {
+                        match res {
+                            Ok((sock, peer)) => {
+                                let c = cfg_http.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_http_peer(sock, c).await {
+                                        error!("http {peer}: {e:#}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("http accept: {e:#}");
+                            }
+                        }
                     }
-                });
+                }
             }
         });
     }
@@ -363,9 +373,9 @@ async fn tunnel_to_biba(
         .context("junk frames")?;
 
     let crypto: Option<SharedCrypto> = if let Some(ref secret) = cfg.psk {
-        Some(Arc::new(Mutex::new(
+        Some(Arc::new(
             v2_client_preamble(&mut ws, secret, cfg.decoy_max).await?,
-        )))
+        ))
     } else {
         None
     };

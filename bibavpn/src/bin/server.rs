@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
+use bibavpn::frame::DEFAULT_MAX_WS_BINARY;
 use bibavpn::protocol::{decode_open, is_udp_mux_open};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
@@ -12,7 +13,6 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -49,7 +49,7 @@ struct Args {
     decoy_max: u8,
 
     /// Max WebSocket binary bytes per message (send path; loose bound on receive).
-    #[arg(long, default_value = "1400")]
+    #[arg(long, default_value_t = DEFAULT_MAX_WS_BINARY)]
     max_ws_binary: usize,
 
     /// WebSocket ping interval seconds; 0 disables keepalive pings.
@@ -57,7 +57,7 @@ struct Args {
     ws_ping_secs: u64,
 }
 
-type SharedCrypto = Arc<Mutex<SessionCrypto>>;
+type SharedCrypto = Arc<SessionCrypto>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -154,9 +154,9 @@ async fn handle_one(
     let mut ws = ws;
     let crypto: Option<SharedCrypto> = if let Some(ref secret) = psk {
         info!("BibaV2 PSK mode, decoy_max={decoy_max}");
-        Some(Arc::new(Mutex::new(
+        Some(Arc::new(
             v2_server_preamble(&mut ws, secret, decoy_max).await?,
-        )))
+        ))
     } else {
         None
     };
