@@ -8,8 +8,8 @@ use rand::Rng;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -21,8 +21,9 @@ use crate::http_connect;
 use crate::protocol::encode_open;
 use crate::stealth::{WsHandshakeParams, build_websocket_request};
 use crate::tls_util::{client_config_insecure, client_config_system_roots};
+use crate::udp_mux::{UdpMuxConfig, UdpMuxHandle, spawn_udp_mux_driver};
 use crate::ws_bridge::{self, TunnelEnd};
-use crate::{socks5, socks5::socks5_handshake};
+use crate::{socks5, socks5::SocksCommand};
 use bytes::Bytes;
 
 /// User-facing options (CLI, JSON over JNI, etc.).
@@ -70,6 +71,30 @@ struct ClientCfg {
     ws_ping_secs: u64,
 }
 
+impl ClientCfg {
+    fn udp_mux_config(&self) -> UdpMuxConfig {
+        UdpMuxConfig {
+            server_host: self.server_host.clone(),
+            server_port: self.server_port,
+            sni: self.sni.clone(),
+            token: self.token.clone(),
+            tls: self.tls.clone(),
+            max_pad: self.max_pad,
+            junk_frames: self.junk_frames,
+            early_ws_frames: self.early_ws_frames,
+            psk: self.psk.clone(),
+            decoy_max: self.decoy_max,
+            ws_host: self.ws_host.clone(),
+            ws_origin: self.ws_origin.clone(),
+            ws_user_agent: self.ws_user_agent.clone(),
+            ws_accept_language: self.ws_accept_language.clone(),
+            ws_extra_headers: self.ws_extra_headers.clone(),
+            max_ws_binary: self.max_ws_binary,
+            ws_ping_secs: self.ws_ping_secs,
+        }
+    }
+}
+
 type SharedCrypto = Arc<Mutex<SessionCrypto>>;
 
 /// Build TLS config and run SOCKS5 (+ optional HTTP CONNECT) until `shutdown` becomes `true`.
@@ -113,6 +138,8 @@ pub async fn run_local_client(
         max_ws_binary: opts.max_ws_binary,
         ws_ping_secs: opts.ws_ping_secs,
     });
+
+    let udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>> = Arc::new(Mutex::new(None));
 
     let socks_listener = TcpListener::bind(&opts.socks_bind)
         .await
@@ -158,8 +185,9 @@ pub async fn run_local_client(
             res = socks_listener.accept() => {
                 let (sock, peer) = res.context("socks accept")?;
                 let c = cfg.clone();
+                let ums = udp_mux_slot.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_socks_peer(sock, c).await {
+                    if let Err(e) = handle_socks_peer(sock, c, ums).await {
                         error!("socks {peer}: {e:#}");
                     }
                 });
@@ -185,10 +213,69 @@ pub fn parse_ws_header(line: &str) -> anyhow::Result<(String, String)> {
     Ok((k.trim().to_string(), v.trim().to_string()))
 }
 
-async fn handle_socks_peer(mut local: TcpStream, cfg: Arc<ClientCfg>) -> anyhow::Result<()> {
-    let (host, port) = socks5_handshake(&mut local).await?;
-    socks5::socks5_reply_ok(&mut local).await?;
-    tunnel_to_biba(local, host, port, cfg, Vec::new()).await
+async fn handle_socks_peer(
+    mut local: TcpStream,
+    cfg: Arc<ClientCfg>,
+    udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
+) -> anyhow::Result<()> {
+    match socks5::socks5_read_command(&mut local).await? {
+        SocksCommand::Connect { host, port } => {
+            socks5::socks5_reply_ok(&mut local).await?;
+            tunnel_to_biba(local, host, port, cfg, Vec::new()).await
+        }
+        SocksCommand::UdpAssociate { .. } => {
+            let udp = UdpSocket::bind("0.0.0.0:0").await.context("bind udp relay")?;
+            let relay_port = udp.local_addr()?.port();
+            socks5::socks5_reply_udp_associate(&mut local, relay_port).await?;
+            run_socks_udp_assoc(local, udp, cfg, udp_mux_slot).await
+        }
+    }
+}
+
+/// SOCKS TCP control connection stays open per RFC; UDP relay shares one WSS UDP mux.
+async fn run_socks_udp_assoc(
+    mut ctrl: TcpStream,
+    udp: UdpSocket,
+    cfg: Arc<ClientCfg>,
+    mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
+) -> anyhow::Result<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64];
+        loop {
+            match ctrl.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    let handle = {
+        let mut g = mux_slot.lock().await;
+        if g.is_none() {
+            *g = Some(spawn_udp_mux_driver(cfg.udp_mux_config()));
+        }
+        g.as_ref()
+            .expect("udp mux just set")
+            .clone()
+    };
+
+    let mut mbuf = vec![0u8; 65535];
+    loop {
+        let (n, peer) = udp.recv_from(&mut mbuf).await?;
+        let (dst_host, dst_port, payload) =
+            crate::protocol::parse_socks5_udp_datagram(&mbuf[..n]).context("socks udp parse")?;
+        let xid: u64 = rand::random();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.forward(xid, dst_host, dst_port, payload, tx)?;
+        match rx.await {
+            Ok(Ok(socks_body)) => {
+                udp.send_to(&socks_body, peer).await?;
+            }
+            Ok(Err(e)) => error!("udp mux: {e:#}"),
+            Err(_) => error!("udp mux driver dropped channel"),
+        }
+    }
 }
 
 async fn handle_http_peer(mut local: TcpStream, cfg: Arc<ClientCfg>) -> anyhow::Result<()> {

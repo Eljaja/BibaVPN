@@ -54,12 +54,15 @@ fn notify_changed() -> Result<(), String> {
     Ok(())
 }
 
-/// `addr` like `127.0.0.1:17890` (HTTP CONNECT from `bibavpn` local client).
-pub fn apply_proxy(addr: &str) -> Result<(), String> {
+/// WinInet `ProxyServer`: HTTP/HTTPS → локальный CONNECT-прокси; `socks` → SOCKS5 (TCP + UDP ASSOCIATE).
+pub fn apply_proxy(http_host_port: &str, socks_host_port: &str) -> Result<(), String> {
+    let proxy_server = format!(
+        "http={http_host_port};https={http_host_port};socks={socks_host_port}"
+    );
     let key = internet_settings_key(true).map_err(|e| e.to_string())?;
     key.set_value("ProxyEnable", &1u32)
         .map_err(|e| format!("ProxyEnable: {e}"))?;
-    key.set_value("ProxyServer", &addr.to_string())
+    key.set_value("ProxyServer", &proxy_server)
         .map_err(|e| format!("ProxyServer: {e}"))?;
     notify_changed()
 }

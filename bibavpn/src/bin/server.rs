@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
-use bibavpn::protocol::decode_open;
+use bibavpn::protocol::{decode_open, is_udp_mux_open};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
 use bytes::Bytes;
@@ -161,24 +161,76 @@ async fn handle_one(
         None
     };
 
-    let (host, port, ws) = wait_open(ws).await?;
-    info!("OPEN {host}:{port}");
-    let remote = TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("connect {host}:{port}"))?;
-    bibavpn::ws_bridge::bridge_ws_tcp_padded(
-        ws,
-        remote,
-        Vec::new(),
-        max_pad,
-        decoy_max,
-        crypto,
-        max_ws_binary,
-        ws_ping_secs,
-        TunnelEnd::Server,
-    )
-    .await?;
+    match wait_first_channel(ws).await? {
+        FirstChannel::Tcp { host, port, ws } => {
+            info!("OPEN {host}:{port}");
+            let remote = TcpStream::connect((host.as_str(), port))
+                .await
+                .with_context(|| format!("connect {host}:{port}"))?;
+            bibavpn::ws_bridge::bridge_ws_tcp_padded(
+                ws,
+                remote,
+                Vec::new(),
+                max_pad,
+                decoy_max,
+                crypto,
+                max_ws_binary,
+                ws_ping_secs,
+                TunnelEnd::Server,
+            )
+            .await?;
+        }
+        FirstChannel::UdpMux { ws } => {
+            info!("UDP mux (same WSS/TLS envelope as TCP)");
+            bibavpn::udp_mux::bridge_ws_udp_mux_server(
+                ws,
+                max_pad,
+                decoy_max,
+                crypto,
+                max_ws_binary,
+                ws_ping_secs,
+            )
+            .await?;
+        }
+    }
     Ok(())
+}
+
+enum FirstChannel<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    Tcp {
+        host: String,
+        port: u16,
+        ws: WebSocketStream<S>,
+    },
+    UdpMux { ws: WebSocketStream<S> },
+}
+
+async fn wait_first_channel<S>(mut ws: WebSocketStream<S>) -> anyhow::Result<FirstChannel<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(m) = ws.next().await {
+        let m = m.context("ws read")?;
+        match m {
+            Message::Binary(b) => {
+                if let Ok((h, p)) = decode_open(b.as_ref()) {
+                    return Ok(FirstChannel::Tcp { host: h, port: p, ws });
+                }
+                if is_udp_mux_open(b.as_ref()) {
+                    return Ok(FirstChannel::UdpMux { ws });
+                }
+            }
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await.context("pong during OPEN wait")?;
+            }
+            Message::Close(_) => anyhow::bail!("closed before channel open"),
+            _ => {}
+        }
+    }
+    anyhow::bail!("eof before OPEN / UDP_MUX")
 }
 
 async fn v2_server_preamble<S>(
@@ -216,26 +268,3 @@ where
     }
 }
 
-async fn wait_open<S>(
-    mut ws: WebSocketStream<S>,
-) -> anyhow::Result<(String, u16, WebSocketStream<S>)>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    while let Some(m) = ws.next().await {
-        let m = m.context("ws read")?;
-        match m {
-            Message::Binary(b) => {
-                if let Ok((h, p)) = decode_open(b.as_ref()) {
-                    return Ok((h, p, ws));
-                }
-            }
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong during OPEN wait")?;
-            }
-            Message::Close(_) => anyhow::bail!("closed before OPEN"),
-            _ => {}
-        }
-    }
-    anyhow::bail!("eof before OPEN")
-}

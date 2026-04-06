@@ -10,6 +10,7 @@ pub mod protocol;
 pub mod socks5;
 pub mod stealth;
 pub mod tls_util;
+pub mod udp_mux;
 pub mod ws_bridge;
 
 pub use frame::{FrameError, read_padded_frame, write_padded_frame};

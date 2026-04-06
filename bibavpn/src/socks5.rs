@@ -1,4 +1,4 @@
-//! Minimal SOCKS5 (no auth, CONNECT only, IPv4 / domain / IPv6).
+//! Minimal SOCKS5 (no auth, CONNECT and UDP ASSOCIATE, IPv4 / domain / IPv6).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -6,7 +6,15 @@ use anyhow::{Context, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub async fn socks5_handshake(local: &mut TcpStream) -> anyhow::Result<(String, u16)> {
+/// SOCKS5 command after method negotiation.
+#[derive(Debug)]
+pub enum SocksCommand {
+    Connect { host: String, port: u16 },
+    /// BND in reply is where the client must send UDP datagrams.
+    UdpAssociate { host: String, port: u16 },
+}
+
+pub async fn socks5_read_command(local: &mut TcpStream) -> anyhow::Result<SocksCommand> {
     let mut buf = [0u8; 2];
     local.read_exact(&mut buf).await.context("socks version")?;
     if buf[0] != 5 {
@@ -22,9 +30,7 @@ pub async fn socks5_handshake(local: &mut TcpStream) -> anyhow::Result<(String, 
     if hdr[0] != 5 {
         bail!("bad socks rsv");
     }
-    if hdr[1] != 1 {
-        bail!("only CONNECT (cmd={}) is supported", hdr[1]);
-    }
+    let cmd = hdr[1];
     if hdr[2] != 0 {
         bail!("non-zero RSV");
     }
@@ -56,7 +62,19 @@ pub async fn socks5_handshake(local: &mut TcpStream) -> anyhow::Result<(String, 
     local.read_exact(&mut p).await?;
     let port = u16::from_be_bytes(p);
 
-    Ok((host, port))
+    match cmd {
+        1 => Ok(SocksCommand::Connect { host, port }),
+        3 => Ok(SocksCommand::UdpAssociate { host, port }),
+        _ => bail!("unsupported SOCKS cmd {cmd}"),
+    }
+}
+
+/// Backward-compatible: CONNECT only, same as before.
+pub async fn socks5_handshake(local: &mut TcpStream) -> anyhow::Result<(String, u16)> {
+    match socks5_read_command(local).await? {
+        SocksCommand::Connect { host, port } => Ok((host, port)),
+        SocksCommand::UdpAssociate { .. } => bail!("UDP ASSOCIATE requires socks5_read_command"),
+    }
 }
 
 /// SOCKS5 reply: success, bind 0.0.0.0:0
@@ -65,6 +83,14 @@ pub async fn socks5_reply_ok(local: &mut TcpStream) -> anyhow::Result<()> {
         5, 0, 0, 1, 0, 0, 0, 0, 0, 0,
     ];
     local.write_all(REPLY).await.context("socks reply")?;
+    Ok(())
+}
+
+/// Reply to UDP ASSOCIATE: `127.0.0.1:<udp_relay_port>`.
+pub async fn socks5_reply_udp_associate(local: &mut TcpStream, relay_port: u16) -> anyhow::Result<()> {
+    let mut reply = vec![5u8, 0, 0, 1, 127, 0, 0, 1];
+    reply.extend_from_slice(&relay_port.to_be_bytes());
+    local.write_all(&reply).await.context("socks udp associate reply")?;
     Ok(())
 }
 

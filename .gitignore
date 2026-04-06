@@ -4,6 +4,9 @@
 .DS_Store
 Thumbs.db
 
+# Local release build artifacts
+*.exe
+
 # Secrets and local overrides (do not commit)
 server.txt
 .env

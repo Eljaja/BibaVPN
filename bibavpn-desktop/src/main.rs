@@ -33,7 +33,7 @@ enum UserEvent {
     Menu(MenuEvent),
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 struct SavedConfig {
     server: String,
     token: String,
@@ -41,6 +41,23 @@ struct SavedConfig {
     sni: String,
     insecure: bool,
     local_http_port: u16,
+    /// 0 = автоматически `local_http_port + 1` (SOCKS5: TCP + UDP через системный прокси).
+    #[serde(default)]
+    local_socks_port: u16,
+}
+
+impl Default for SavedConfig {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            token: String::new(),
+            psk: String::new(),
+            sni: String::new(),
+            insecure: false,
+            local_http_port: 17_890,
+            local_socks_port: 0,
+        }
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -147,7 +164,17 @@ impl BibaApp {
         };
 
         let http_port = self.cfg.local_http_port;
-        let socks_port = http_port.saturating_add(1);
+        let socks_port = if self.cfg.local_socks_port == 0 {
+            http_port.saturating_add(1)
+        } else {
+            self.cfg.local_socks_port
+        };
+        if socks_port == http_port {
+            return Err(
+                "Порт SOCKS5 должен отличаться от HTTP (или оставьте SOCKS = 0 для HTTP+1)."
+                    .into(),
+            );
+        }
         let http_bind = format!("127.0.0.1:{http_port}");
         let socks_bind = format!("127.0.0.1:{socks_port}");
 
@@ -182,8 +209,9 @@ impl BibaApp {
 
         std::thread::sleep(Duration::from_millis(220));
 
-        let proxy_addr = format!("127.0.0.1:{http_port}");
-        if let Err(e) = apply_proxy(&proxy_addr) {
+        let http_hp = format!("127.0.0.1:{http_port}");
+        let socks_hp = format!("127.0.0.1:{socks_port}");
+        if let Err(e) = apply_proxy(&http_hp, &socks_hp) {
             let _ = shutdown_tx.send(true);
             let _ = self.rt.block_on(join);
             return Err(format!("Системный прокси: {e}"));
@@ -194,7 +222,9 @@ impl BibaApp {
             shutdown: shutdown_tx,
             join,
         });
-        self.status = format!("Подключено · локальный HTTP {http_bind}");
+        self.status = format!(
+            "Подключено · HTTP {http_bind} · SOCKS5 127.0.0.1:{socks_port} (TCP+UDP для WinInet)"
+        );
         save_config(&self.cfg);
         Ok(())
     }
@@ -264,9 +294,11 @@ impl eframe::App for BibaApp {
                         .color(Color32::from_rgb(200, 210, 245)),
                 );
                 ui.label(
-                    RichText::new("Подключение к вашему серверу и системный HTTP-прокси")
-                        .size(13.0)
-                        .color(Color32::from_rgb(160, 168, 190)),
+                    RichText::new(
+                        "Системный прокси WinInet: HTTP/HTTPS + SOCKS5 (включая UDP через UDP ASSOCIATE)",
+                    )
+                    .size(13.0)
+                    .color(Color32::from_rgb(160, 168, 190)),
                 );
                 ui.add_space(16.0);
 
@@ -298,11 +330,17 @@ impl eframe::App for BibaApp {
 
                         ui.checkbox(&mut self.cfg.insecure, "Insecure TLS (только для тестов)");
 
-                        ui.label("Локальный порт HTTP CONNECT");
+                        ui.label("Локальный порт HTTP CONNECT (TCP)");
                         ui.add(
                             egui::DragValue::new(&mut self.cfg.local_http_port)
-                                .range(1024..=65533)
-                                .suffix(" → SOCKS на +1"),
+                                .range(1024..=65533),
+                        );
+
+                        ui.label("Локальный порт SOCKS5 (0 = HTTP+1). Нужен WinInet для UDP.");
+                        ui.add(
+                            egui::DragValue::new(&mut self.cfg.local_socks_port)
+                                .range(0..=65535)
+                                .suffix(" (TCP+UDP mux)"),
                         );
                     });
 

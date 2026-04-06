@@ -131,7 +131,7 @@ private fun BibaRootScreen(
     var insecure by remember { mutableStateOf(last?.optBoolean("insecure") ?: false) }
     var advancedOpen by remember { mutableStateOf(false) }
     var maxPad by remember { mutableStateOf(last?.optInt("max_pad")?.toString() ?: "64") }
-    var decoyMax by remember { mutableStateOf(last?.optInt("decoy_max")?.toString() ?: "0") }
+    var decoyMax by remember { mutableStateOf(last?.optInt("decoy_max")?.toString() ?: "32") }
     var junkFrames by remember { mutableStateOf(last?.optInt("junk_frames")?.toString() ?: "0") }
     var earlyWs by remember { mutableStateOf(last?.optInt("early_ws_frames")?.toString() ?: "0") }
     var maxWsBin by remember { mutableStateOf(last?.optInt("max_ws_binary")?.toString() ?: "1400") }
@@ -166,7 +166,9 @@ private fun BibaRootScreen(
                 fontWeight = FontWeight.Bold,
             )
             Text(
-                text = "Сервер и ключи → системный VPN: весь трафик уходит в BibaVPN (как «ключ» Android).",
+                text = "Сервер и ключи → системный VPN: весь трафик уходит в BibaVPN (как «ключ» Android). " +
+                    "Обфускация в «Дополнительно» (max_pad, decoy_max, junk_frames, PSK) действует и для TCP, и для UDP " +
+                    "(DNS и прочий UDP через SOCKS5 UDP ASSOCIATE → отдельный WS mux).",
                 color = TextMuted,
                 fontSize = 14.sp,
                 modifier = Modifier.padding(top = 6.dp, bottom = 20.dp),
@@ -215,6 +217,12 @@ private fun BibaRootScreen(
                         visualTransformation = PasswordVisualTransformation(),
                         singleLine = true,
                         colors = fieldColors(),
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "С PSK тот же профиль, что и у TCP: задайте decoy_max под сервер (часто 32), иначе UDP mux не сойдётся.",
+                        color = TextMuted,
+                        fontSize = 12.sp,
                     )
                     Spacer(Modifier.height(8.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -286,7 +294,7 @@ private fun BibaRootScreen(
                             socksBind = socksBind.trim(),
                             insecure = insecure,
                             maxPad = maxPad.toIntOrNull() ?: 64,
-                            decoyMax = decoyMax.toIntOrNull() ?: 0,
+                            decoyMax = decoyMax.toIntOrNull() ?: 32,
                             junkFrames = junkFrames.toIntOrNull() ?: 0,
                             earlyWs = earlyWs.toIntOrNull() ?: 0,
                             maxWsBinary = maxWsBin.toIntOrNull() ?: 1400,
@@ -399,7 +407,7 @@ private fun buildJson(
     o.put("socks_bind", socksBind.trim().ifBlank { BibaVpnService.SOCKS_LOCAL })
     o.put("insecure", insecure)
     o.put("max_pad", maxPad)
-    o.put("decoy_max", decoyMax)
+    o.put("decoy_max", decoyMax.coerceIn(0, 255))
     o.put("junk_frames", junkFrames)
     o.put("early_ws_frames", earlyWs)
     o.put("max_ws_binary", maxWsBinary)

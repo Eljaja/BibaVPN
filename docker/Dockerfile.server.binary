@@ -1,0 +1,8 @@
+# Prebuilt Linux x86_64 binary in build context: ./bibavpn-server (see scripts/remote-deploy.sh)
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY bibavpn-server /usr/local/bin/bibavpn-server
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/bibavpn-server"]
