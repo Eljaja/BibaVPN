@@ -11,3 +11,10 @@ server.txt
 *.pem
 *.key
 docker-compose.override.yml
+
+# ADB / local debug log dumps (may contain device paths or stack traces)
+biba-*-capture.txt
+biba-listen*.txt
+
+# Prebuilt Android JNI libraries (build with scripts/wsl-build-all.sh or build-android-jni.ps1)
+android/app/src/main/jniLibs/**/*.so
