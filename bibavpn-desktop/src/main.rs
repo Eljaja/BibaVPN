@@ -130,6 +130,10 @@ struct BibaApp {
     exiting: bool,
     tray: Option<TrayIcon>,
     tray_ids: Option<TrayMenuIds>,
+    /// macOS: несколько кадров без трея, пока поднимется NSApplication / run loop (см. tray-icon + winit).
+    tray_frames_until_icon: u8,
+    /// Один раз после ожидания; при ошибке сборки трея не долбим build() каждый кадр.
+    tray_icon_attempted: bool,
 }
 
 impl BibaApp {
@@ -142,6 +146,7 @@ impl BibaApp {
         if cfg.max_ws_binary < 1024 {
             cfg.max_ws_binary = DEFAULT_CLIENT_MAX_WS_BINARY;
         }
+        let tray_frames_until_icon = if cfg!(target_os = "macos") { 6 } else { 0 };
         Self {
             cfg,
             rt,
@@ -152,6 +157,8 @@ impl BibaApp {
             exiting: false,
             tray: None,
             tray_ids: None,
+            tray_frames_until_icon,
+            tray_icon_attempted: false,
         }
     }
 
@@ -179,13 +186,14 @@ impl BibaApp {
             &quit_i,
         ]);
         let icon = build_tray_icon();
-        match TrayIconBuilder::new()
+        let tray_build = TrayIconBuilder::new()
             .with_menu_on_left_click(false)
             .with_tooltip("BibaVPN")
             .with_menu(Box::new(tray_menu))
-            .with_icon(icon)
-            .build()
-        {
+            .with_icon(icon);
+        #[cfg(target_os = "macos")]
+        let tray_build = tray_build.with_icon_as_template(false);
+        match tray_build.build() {
             Ok(tray) => {
                 self.tray = Some(tray);
                 self.tray_ids = Some(tray_ids);
@@ -387,7 +395,12 @@ fn setup_style(ctx: &egui::Context) {
 
 impl eframe::App for BibaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ensure_tray_icon();
+        if self.tray_frames_until_icon > 0 {
+            self.tray_frames_until_icon -= 1;
+        } else if self.tray.is_none() && !self.tray_icon_attempted {
+            self.tray_icon_attempted = true;
+            self.ensure_tray_icon();
+        }
         self.poll_tray(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.exiting {
@@ -661,8 +674,19 @@ fn build_tray_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, S, S).expect("tray icon")
 }
 
+/// Не завершаться при закрытии вкладки Terminal (SIGHUP), не ронять запись в сокеты (SIGPIPE).
+#[cfg(unix)]
+fn unix_ignore_shell_signals() {
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
 fn main() -> eframe::Result<()> {
     install_ring_crypto();
+    #[cfg(unix)]
+    unix_ignore_shell_signals();
     #[cfg(target_os = "macos")]
     proxy_mac::init_process_limits();
 

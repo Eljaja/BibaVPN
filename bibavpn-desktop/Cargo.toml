@@ -1,7 +1,7 @@
 [package]
 name = "bibavpn-desktop"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "BibaVPN desktop: local proxy, system proxy toggle, tray icon"
 
 [dependencies]
@@ -22,5 +22,5 @@ tray-icon = "0.19"
 winreg = "0.52"
 windows = { version = "0.58", features = ["Win32_Networking_WinInet"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
