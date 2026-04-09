@@ -28,7 +28,7 @@ pub async fn socks5_read_command(local: &mut TcpStream) -> anyhow::Result<SocksC
     let mut hdr = [0u8; 4];
     local.read_exact(&mut hdr).await.context("request hdr")?;
     if hdr[0] != 5 {
-        bail!("bad socks rsv");
+        bail!("bad SOCKS version in request (expected 5)");
     }
     let cmd = hdr[1];
     if hdr[2] != 0 {
@@ -86,9 +86,37 @@ pub async fn socks5_reply_ok(local: &mut TcpStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reply to UDP ASSOCIATE: `127.0.0.1:<udp_relay_port>`.
+/// Reply to UDP ASSOCIATE: relay is reachable at `local_addr` of this control connection
+/// (fallback `127.0.0.1` if the listener was bound to an unspecified address).
 pub async fn socks5_reply_udp_associate(local: &mut TcpStream, relay_port: u16) -> anyhow::Result<()> {
-    let mut reply = vec![5u8, 0, 0, 1, 127, 0, 0, 1];
+    let sock_ip = match local.local_addr().context("socks local_addr")? {
+        SocketAddr::V4(v4) => {
+            if v4.ip().is_unspecified() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(*v4.ip())
+            }
+        }
+        SocketAddr::V6(v6) => {
+            if v6.ip().is_unspecified() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(*v6.ip())
+            }
+        }
+    };
+
+    let mut reply = vec![5u8, 0, 0];
+    match sock_ip {
+        IpAddr::V4(ip) => {
+            reply.push(1);
+            reply.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            reply.push(4);
+            reply.extend_from_slice(&ip.octets());
+        }
+    }
     reply.extend_from_slice(&relay_port.to_be_bytes());
     local.write_all(&reply).await.context("socks udp associate reply")?;
     Ok(())
