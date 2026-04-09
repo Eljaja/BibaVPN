@@ -79,6 +79,7 @@ class BibaVpnService : VpnService() {
                         e.message ?: e.javaClass.simpleName
                     }
                     if (err != null) {
+                        isTunnelActive = false
                         mainHandler.post {
                             android.widget.Toast.makeText(
                                 applicationContext,
@@ -92,6 +93,7 @@ class BibaVpnService : VpnService() {
                     }
 
                     if (!startVpnTunnel(socks)) {
+                        isTunnelActive = false
                         BibaNative.nativeStop()
                         mainHandler.post {
                             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -100,6 +102,7 @@ class BibaVpnService : VpnService() {
                         return@Thread
                     }
                 } catch (e: Throwable) {
+                    isTunnelActive = false
                     Log.e(TAG, "vpn start thread", e)
                     mainHandler.post {
                         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -170,6 +173,7 @@ class BibaVpnService : VpnService() {
                         Engine.insert(key)
                         Engine.start()
                         synchronized(tunLock) { tunFdMustCloseInJava = false }
+                        isTunnelActive = true
                     } catch (e: Throwable) {
                         Log.e(TAG, "tun2socks", e)
                         abortVpnFromWorker(e.message)
@@ -194,6 +198,7 @@ class BibaVpnService : VpnService() {
     }
 
     private fun stopTun2socksOnly() {
+        isTunnelActive = false
         runCatching { Engine.stop() }
         tun2socksThread?.let { t ->
             try {
@@ -257,6 +262,11 @@ class BibaVpnService : VpnService() {
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_LAST_JSON, null)
 
     companion object {
+        /** true после успешного Engine.start() tun2socks; сбрасывается при остановке. */
+        @Volatile
+        var isTunnelActive: Boolean = false
+            private set
+
         private const val TAG = "BibaVpnService"
         private const val CHANNEL_ID = "bibavpn_proxy"
         private const val NOTIFICATION_ID = 42
