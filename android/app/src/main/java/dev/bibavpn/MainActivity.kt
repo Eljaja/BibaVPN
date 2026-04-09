@@ -8,8 +8,9 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,48 +21,62 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CheckboxDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import org.json.JSONArray
 import org.json.JSONObject
 
-private val Night = Color(0xFF0A0612)
-private val DeepPurple = Color(0xFF1A0F2E)
-private val Accent = Color(0xFF7C4DFF)
-private val AccentGlow = Color(0xFF00E5FF)
-private val TextMuted = Color(0xFFB39DDB)
-private val CardBg = Color(0xFF1E1530)
+private val BgRoot = Color(0xFF070B14)
+private val BgScreen = Color(0xFF0B0F1A)
+private val CardBg = Color(0xFF121826)
+private val LabelSky = Color(0xFF60A5FA)
+private val TextMuted = Color(0xFF94A3B8)
+private val TextSlate200 = Color(0xFFE2E8F0)
+private val Mint = Color(0xFF00FFA3)
+private val MintSoft = Color(0xFF34D399)
+private val BorderSubtle = Color.White.copy(alpha = 0.08f)
+private val MainButtonBrush = Brush.verticalGradient(
+    listOf(Color(0xFF1A2950), Color(0xFF14203C)),
+)
+private val MainButtonBorder = Color(0x3360A5FA)
 
 class MainActivity : ComponentActivity() {
 
@@ -92,7 +107,7 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             MaterialTheme {
-                Surface(color = Color.Transparent) {
+                Surface(color = BgRoot) {
                     BibaRootScreen(
                         onRequestVpnConnect = { json ->
                             val prep = VpnService.prepare(this@MainActivity)
@@ -110,26 +125,26 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun BibaRootScreen(
     onRequestVpnConnect: (String) -> Unit,
 ) {
     val context = LocalContext.current
-    val scroll = rememberScrollState()
+    var showSettings by remember { mutableStateOf(false) }
+    var tunnelUp by remember { mutableStateOf(BibaVpnService.isTunnelActive) }
+
     val last = remember {
         BibaVpnService.getLastConfigJson(context)?.let { runCatching { JSONObject(it) }.getOrNull() }
     }
 
     var server by remember { mutableStateOf(last?.optString("server") ?: "") }
     var token by remember { mutableStateOf(last?.optString("token") ?: "") }
+    var tokenVisible by remember { mutableStateOf(false) }
     var sni by remember { mutableStateOf(last?.optString("sni") ?: "") }
     var psk by remember { mutableStateOf(last?.optString("psk") ?: "") }
-    var socksBind by remember {
-        mutableStateOf(last?.optString("socks_bind") ?: "")
-    }
+    var pskVisible by remember { mutableStateOf(false) }
+    var socksBind by remember { mutableStateOf(last?.optString("socks_bind") ?: "") }
     var insecure by remember { mutableStateOf(last?.optBoolean("insecure") ?: false) }
-    var advancedOpen by remember { mutableStateOf(false) }
     var maxPad by remember { mutableStateOf(last?.optInt("max_pad")?.toString() ?: "64") }
     var decoyMax by remember { mutableStateOf(last?.optInt("decoy_max")?.toString() ?: "32") }
     var junkFrames by remember { mutableStateOf(last?.optInt("junk_frames")?.toString() ?: "0") }
@@ -144,245 +159,679 @@ private fun BibaRootScreen(
         )
     }
 
-    val gradient = Brush.verticalGradient(
-        listOf(Night, DeepPurple, Color(0xFF120A22)),
+    val activity = context as ComponentActivity
+    DisposableEffect(activity) {
+        val obs = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_RESUME) {
+                tunnelUp = BibaVpnService.isTunnelActive
+            }
+        }
+        activity.lifecycle.addObserver(obs)
+        onDispose { activity.lifecycle.removeObserver(obs) }
+    }
+
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            delay(400)
+            val t = BibaVpnService.isTunnelActive
+            if (t != tunnelUp) tunnelUp = t
+        }
+    }
+
+    fun buildConfigJson(): JSONObject = buildJson(
+        server = server.trim(),
+        token = token,
+        sni = sni.trim(),
+        psk = psk.trim(),
+        socksBind = socksBind.trim(),
+        insecure = insecure,
+        maxPad = maxPad.toIntOrNull() ?: 64,
+        decoyMax = decoyMax.toIntOrNull() ?: 32,
+        junkFrames = junkFrames.toIntOrNull() ?: 0,
+        earlyWs = earlyWs.toIntOrNull() ?: 0,
+        maxWsBinary = maxWsBin.toIntOrNull() ?: 1400,
+        wsPing = wsPing.toLongOrNull() ?: 25L,
+        wsHeaders = wsHeaders,
     )
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(gradient),
+            .background(
+                Brush.radialGradient(
+                    colors = listOf(Color(0xFF16203B), BgRoot, BgRoot),
+                    center = Offset(0.5f, 0f),
+                    radius = 1200f,
+                ),
+            ),
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(scroll)
-                .padding(horizontal = 20.dp, vertical = 28.dp),
-        ) {
-            Text(
-                text = "BibaVPN",
-                color = Color.White,
-                fontSize = 32.sp,
-                fontWeight = FontWeight.Bold,
+        if (showSettings) {
+            SettingsScreen(
+                server = server,
+                onServerChange = { server = it },
+                token = token,
+                onTokenChange = { token = it },
+                tokenVisible = tokenVisible,
+                onTokenVisibleChange = { tokenVisible = it },
+                sni = sni,
+                onSniChange = { sni = it },
+                psk = psk,
+                onPskChange = { psk = it },
+                pskVisible = pskVisible,
+                onPskVisibleChange = { pskVisible = it },
+                insecure = insecure,
+                onInsecureChange = { insecure = it },
+                socksBind = socksBind,
+                onSocksBindChange = { socksBind = it },
+                maxPad = maxPad,
+                onMaxPadChange = { maxPad = it },
+                decoyMax = decoyMax,
+                onDecoyMaxChange = { decoyMax = it },
+                junkFrames = junkFrames,
+                onJunkFramesChange = { junkFrames = it },
+                earlyWs = earlyWs,
+                onEarlyWsChange = { earlyWs = it },
+                maxWsBin = maxWsBin,
+                onMaxWsBinChange = { maxWsBin = it },
+                wsPing = wsPing,
+                onWsPingChange = { wsPing = it },
+                wsHeaders = wsHeaders,
+                onWsHeadersChange = { wsHeaders = it },
+                onBack = { showSettings = false },
             )
-            Text(
-                text = "Сервер и ключи → системный VPN: весь трафик уходит в BibaVPN (как «ключ» Android). " +
-                    "Обфускация в «Дополнительно» (max_pad, decoy_max, junk_frames, PSK) действует и для TCP, и для UDP " +
-                    "(DNS и прочий UDP через SOCKS5 UDP ASSOCIATE → отдельный WS mux).",
-                color = TextMuted,
-                fontSize = 14.sp,
-                modifier = Modifier.padding(top = 6.dp, bottom = 20.dp),
-            )
-
-            Card(
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = CardBg),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-            ) {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    FieldLabel("Сервер (host:port)")
-                    OutlinedTextField(
-                        value = server,
-                        onValueChange = { server = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("vpn.example.com:443", color = TextMuted) },
-                        singleLine = true,
-                        colors = fieldColors(),
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    FieldLabel("Токен (path /b/{token})")
-                    OutlinedTextField(
-                        value = token,
-                        onValueChange = { token = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
-                        colors = fieldColors(),
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    FieldLabel("SNI / TLS имя (пусто = host из сервера)")
-                    OutlinedTextField(
-                        value = sni,
-                        onValueChange = { sni = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        colors = fieldColors(),
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    FieldLabel("PSK (BibaV2, опционально)")
-                    OutlinedTextField(
-                        value = psk,
-                        onValueChange = { psk = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        visualTransformation = PasswordVisualTransformation(),
-                        singleLine = true,
-                        colors = fieldColors(),
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "С PSK тот же профиль, что и у TCP: задайте decoy_max под сервер (часто 32), иначе UDP mux не сойдётся.",
-                        color = TextMuted,
-                        fontSize = 12.sp,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(
-                            checked = insecure,
-                            onCheckedChange = { insecure = it },
-                            colors = CheckboxDefaults.colors(
-                                checkedColor = Accent,
-                                uncheckedColor = TextMuted,
-                            ),
-                        )
-                        Text("Пропускать проверку TLS (insecure)", color = Color.White)
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-                    TextButton(onClick = { advancedOpen = !advancedOpen }) {
-                        Text(
-                            if (advancedOpen) "▼ Дополнительно" else "▶ Дополнительно",
-                            color = AccentGlow,
-                            fontWeight = FontWeight.Medium,
-                        )
-                    }
-                    AnimatedVisibility(advancedOpen) {
-                        Column {
-                            FieldLabel("Локальный SOCKS (оставь пустым = ${BibaVpnService.SOCKS_LOCAL})")
-                            OutlinedTextField(
-                                value = socksBind,
-                                onValueChange = { socksBind = it },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true,
-                                placeholder = { Text(BibaVpnService.SOCKS_LOCAL, color = TextMuted) },
-                                colors = fieldColors(),
-                            )
-                            Spacer(Modifier.height(12.dp))
-                            SmallIntField("max_pad", maxPad) { maxPad = it }
-                            SmallIntField("decoy_max", decoyMax) { decoyMax = it }
-                            SmallIntField("junk_frames", junkFrames) { junkFrames = it }
-                            SmallIntField("early_ws_frames", earlyWs) { earlyWs = it }
-                            SmallIntField("max_ws_binary", maxWsBin) { maxWsBin = it }
-                            SmallIntField("ws_ping_secs", wsPing) { wsPing = it }
-                            Spacer(Modifier.height(8.dp))
-                            FieldLabel("ws_headers (строки «Name: value»)")
-                            OutlinedTextField(
-                                value = wsHeaders,
-                                onValueChange = { wsHeaders = it },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(120.dp),
-                                maxLines = 5,
-                                colors = fieldColors(),
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(24.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Button(
-                    onClick = {
-                        val json = buildJson(
-                            server = server.trim(),
-                            token = token,
-                            sni = sni.trim(),
-                            psk = psk.trim(),
-                            socksBind = socksBind.trim(),
-                            insecure = insecure,
-                            maxPad = maxPad.toIntOrNull() ?: 64,
-                            decoyMax = decoyMax.toIntOrNull() ?: 32,
-                            junkFrames = junkFrames.toIntOrNull() ?: 0,
-                            earlyWs = earlyWs.toIntOrNull() ?: 0,
-                            maxWsBinary = maxWsBin.toIntOrNull() ?: 1400,
-                            wsPing = wsPing.toLongOrNull() ?: 25L,
-                            wsHeaders = wsHeaders,
-                        )
+        } else {
+            HomeScreen(
+                tunnelUp = tunnelUp,
+                server = server.trim(),
+                sni = sni.trim(),
+                canConnect = server.isNotBlank() && token.isNotBlank(),
+                onOpenSettings = { showSettings = true },
+                onConnectToggle = {
+                    if (tunnelUp) {
+                        BibaVpnService.stop(context)
+                    } else {
+                        val json = buildConfigJson()
+                        BibaVpnService.saveConfig(context, json.toString())
                         onRequestVpnConnect(json.toString())
-                    },
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(52.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Accent,
-                        contentColor = Color.White,
-                    ),
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-                ) {
-                    Text("Подключить", fontWeight = FontWeight.SemiBold)
-                }
-                Button(
-                    onClick = { BibaVpnService.stop(context) },
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(52.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF3D2E5C),
-                        contentColor = Color.White,
-                    ),
-                ) {
-                    Text("Стоп", fontWeight = FontWeight.SemiBold)
-                }
-            }
-            Spacer(Modifier.height(16.dp))
-            Text(
-                text = "Нужно разрешение VPN. Остановка — кнопка «Стоп» или через уведомление.",
-                color = TextMuted,
-                fontSize = 12.sp,
+                    }
+                },
+                onServerCardTap = { showSettings = true },
             )
         }
     }
 }
 
 @Composable
-private fun FieldLabel(text: String) {
-    Text(
-        text = text,
-        color = AccentGlow,
-        fontSize = 12.sp,
-        fontWeight = FontWeight.Medium,
-        modifier = Modifier.padding(bottom = 4.dp),
-    )
+private fun HomeScreen(
+    tunnelUp: Boolean,
+    server: String,
+    sni: String,
+    canConnect: Boolean,
+    onOpenSettings: () -> Unit,
+    onConnectToggle: () -> Unit,
+    onServerCardTap: () -> Unit,
+) {
+    val displayHost = remember(server, sni) {
+        when {
+            sni.isNotBlank() -> sni
+            server.isNotBlank() -> server.substringBefore(':').ifBlank { server }
+            else -> "—"
+        }
+    }
+    val subtitle = server.ifBlank { "Не задан сервер" }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(20.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            RoundIconButton(onClick = onOpenSettings, symbol = "⚙")
+            Text(
+                "BibaVPN",
+                color = TextSlate200,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.8.sp,
+            )
+            Spacer(Modifier.width(40.dp))
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        // Status card
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(26.dp))
+                .border(1.dp, BorderSubtle, RoundedCornerShape(26.dp))
+                .background(CardBg)
+                .padding(20.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatusDot(active = tunnelUp)
+                Text(
+                    if (tunnelUp) "Подключено" else "Не подключено",
+                    color = Color.White,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                if (tunnelUp) "$displayHost · туннель активен" else "Нажмите, чтобы включить VPN",
+                color = TextSlate200.copy(alpha = 0.85f),
+                fontSize = 14.sp,
+            )
+        }
+
+        Spacer(Modifier.height(40.dp))
+
+        // Main action
+        val buttonEnabled = if (tunnelUp) true else canConnect
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(28.dp))
+                .border(1.dp, MainButtonBorder, RoundedCornerShape(28.dp))
+                .background(MainButtonBrush)
+                .clickable(enabled = buttonEnabled) { if (buttonEnabled) onConnectToggle() }
+                .padding(horizontal = 24.dp, vertical = 22.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        if (tunnelUp) "Отключить" else "Подключить",
+                        color = Color.White,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        if (tunnelUp) {
+                            "Защищено · отключить туннель"
+                        } else {
+                            "Трафик через System VPN + локальный SOCKS"
+                        },
+                        color = LabelSky.copy(alpha = 0.75f),
+                        fontSize = 14.sp,
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .border(1.dp, Mint.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                        .background(Mint.copy(alpha = 0.12f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .clip(CircleShape)
+                            .background(MintSoft),
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(32.dp))
+
+        // Server card
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(24.dp))
+                .border(1.dp, BorderSubtle, RoundedCornerShape(24.dp))
+                .background(CardBg)
+                .clickable { onServerCardTap() }
+                .padding(16.dp),
+        ) {
+            Text(
+                "SERVER",
+                color = TextMuted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 2.4.sp,
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        displayHost,
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        subtitle,
+                        color = TextMuted,
+                        fontSize = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Text("›", color = TextMuted.copy(alpha = 0.55f), fontSize = 22.sp)
+            }
+        }
+    }
 }
 
 @Composable
-private fun SmallIntField(
-    name: String,
-    value: String,
-    onChange: (String) -> Unit,
-) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(name, color = Color.White, modifier = Modifier.weight(0.45f))
-        OutlinedTextField(
-            value = value,
-            onValueChange = onChange,
-            modifier = Modifier.weight(0.55f),
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            colors = fieldColors(),
+private fun StatusDot(active: Boolean) {
+    val c = if (active) MintSoft else TextMuted
+    Box(contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .size(18.dp)
+                .clip(CircleShape)
+                .background(if (active) Mint.copy(alpha = 0.35f) else Color.Transparent),
+        )
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .clip(CircleShape)
+                .background(c),
         )
     }
 }
 
 @Composable
-private fun fieldColors() = OutlinedTextFieldDefaults.colors(
-    focusedTextColor = Color.White,
-    unfocusedTextColor = Color.White,
-    focusedBorderColor = Accent,
-    unfocusedBorderColor = Color(0xFF4A3F6B),
-    cursorColor = AccentGlow,
+private fun RoundIconButton(onClick: () -> Unit, symbol: String) {
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .border(1.dp, BorderSubtle, CircleShape)
+            .background(Color.White.copy(alpha = 0.03f))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(symbol, color = TextSlate200.copy(alpha = 0.88f), fontSize = 18.sp)
+    }
+}
+
+@Composable
+private fun SettingsScreen(
+    server: String,
+    onServerChange: (String) -> Unit,
+    token: String,
+    onTokenChange: (String) -> Unit,
+    tokenVisible: Boolean,
+    onTokenVisibleChange: (Boolean) -> Unit,
+    sni: String,
+    onSniChange: (String) -> Unit,
+    psk: String,
+    onPskChange: (String) -> Unit,
+    pskVisible: Boolean,
+    onPskVisibleChange: (Boolean) -> Unit,
+    insecure: Boolean,
+    onInsecureChange: (Boolean) -> Unit,
+    socksBind: String,
+    onSocksBindChange: (String) -> Unit,
+    maxPad: String,
+    onMaxPadChange: (String) -> Unit,
+    decoyMax: String,
+    onDecoyMaxChange: (String) -> Unit,
+    junkFrames: String,
+    onJunkFramesChange: (String) -> Unit,
+    earlyWs: String,
+    onEarlyWsChange: (String) -> Unit,
+    maxWsBin: String,
+    onMaxWsBinChange: (String) -> Unit,
+    wsPing: String,
+    onWsPingChange: (String) -> Unit,
+    wsHeaders: String,
+    onWsHeadersChange: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    val scroll = rememberScrollState()
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgScreen)
+            .verticalScroll(scroll)
+            .padding(20.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            RoundIconButton(onClick = onBack, symbol = "‹")
+            Text(
+                "Настройки",
+                color = TextSlate200,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.6.sp,
+            )
+            Spacer(Modifier.width(40.dp))
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        SettingsSection(
+            title = "Подключение",
+            subtitle = "Сервер и параметры рукопожатия",
+        ) {
+            SettingsTextField(
+                label = "Server",
+                value = server,
+                onChange = onServerChange,
+                placeholder = "host:443",
+            )
+            SettingsTextField(
+                label = "Token",
+                value = token,
+                onChange = onTokenChange,
+                placeholder = "токен",
+                isPassword = !tokenVisible,
+                trailing = {
+                    Text(
+                        if (tokenVisible) "🙈" else "👁",
+                        modifier = Modifier
+                            .clickable { onTokenVisibleChange(!tokenVisible) }
+                            .padding(4.dp),
+                        fontSize = 16.sp,
+                    )
+                },
+            )
+            SettingsTextField(
+                label = "SNI / TLS Name",
+                value = sni,
+                onChange = onSniChange,
+                placeholder = "Auto (пусто = host)",
+                hint = "Leave empty to use host",
+            )
+            SettingsTextField(
+                label = "PSK",
+                value = psk,
+                onChange = onPskChange,
+                isPassword = !pskVisible,
+                trailing = {
+                    Text(
+                        if (pskVisible) "🙈" else "👁",
+                        modifier = Modifier
+                            .clickable { onPskVisibleChange(!pskVisible) }
+                            .padding(4.dp),
+                        fontSize = 16.sp,
+                    )
+                },
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column {
+                    Text("Пропуск TLS (insecure)", color = Color.White, fontSize = 14.sp)
+                    Text("Только для лаборатории", color = TextMuted, fontSize = 12.sp)
+                }
+                Switch(
+                    checked = insecure,
+                    onCheckedChange = onInsecureChange,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Mint,
+                        checkedTrackColor = Mint.copy(alpha = 0.4f),
+                        uncheckedThumbColor = TextMuted,
+                        uncheckedTrackColor = TextMuted.copy(alpha = 0.3f),
+                    ),
+                )
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        SettingsSection(
+            title = "Сеть",
+            subtitle = "Маршрутизация",
+        ) {
+            SettingsStaticField(
+                label = "Routing Mode",
+                value = "System VPN",
+                hint = "Весь трафик через туннель",
+            )
+            SettingsTextField(
+                label = "Локальный SOCKS",
+                value = socksBind,
+                onChange = onSocksBindChange,
+                placeholder = BibaVpnService.SOCKS_LOCAL,
+                hint = "Пусто = ${BibaVpnService.SOCKS_LOCAL}",
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        SettingsSection(
+            title = "Транспорт",
+            subtitle = "Обфускация и WebSocket",
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "max_pad",
+                    value = maxPad,
+                    onChange = onMaxPadChange,
+                    hint = "Packet padding",
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "decoy_max",
+                    value = decoyMax,
+                    onChange = onDecoyMaxChange,
+                    hint = "Fake packets",
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "junk_frames",
+                    value = junkFrames,
+                    onChange = onJunkFramesChange,
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "early_ws_frames",
+                    value = earlyWs,
+                    onChange = onEarlyWsChange,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "max_ws_binary",
+                    value = maxWsBin,
+                    onChange = onMaxWsBinChange,
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "ws_ping_secs",
+                    value = wsPing,
+                    onChange = onWsPingChange,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            SettingsTextField(
+                label = "ws_headers",
+                value = wsHeaders,
+                onChange = onWsHeadersChange,
+                singleLine = false,
+                maxLines = 5,
+                placeholder = "Name: value",
+            )
+        }
+
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun SettingsSection(
+    title: String,
+    subtitle: String,
+    content: @Composable () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(28.dp))
+            .border(1.dp, BorderSubtle, RoundedCornerShape(28.dp))
+            .background(CardBg.copy(alpha = 0.92f))
+            .padding(20.dp),
+    ) {
+        Text(title, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Text(subtitle, color = TextMuted, fontSize = 14.sp)
+        Spacer(Modifier.height(16.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            content()
+        }
+    }
+}
+
+@Composable
+private fun SettingsStaticField(
+    label: String,
+    value: String,
+    hint: String? = null,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            label,
+            color = LabelSky.copy(alpha = 0.9f),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.3.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(16.dp))
+                .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
+                .background(Color(0xFF020617).copy(alpha = 0.55f))
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+        ) {
+            Text(value, color = Color(0xFFF8FAFC), fontSize = 14.sp)
+            if (hint != null) {
+                Spacer(Modifier.height(4.dp))
+                Text(hint, color = TextMuted, fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsTextField(
+    label: String,
+    value: String,
+    onChange: (String) -> Unit,
+    placeholder: String = "",
+    hint: String? = null,
+    isPassword: Boolean = false,
+    singleLine: Boolean = true,
+    maxLines: Int = if (singleLine) 1 else 5,
+    trailing: (@Composable () -> Unit)? = null,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            label,
+            color = LabelSky.copy(alpha = 0.9f),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.3.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = value,
+            onValueChange = onChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = singleLine,
+            maxLines = maxLines,
+            placeholder = {
+                Text(placeholder, color = TextMuted.copy(alpha = 0.65f), fontSize = 14.sp)
+            },
+            trailingIcon = trailing,
+            visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
+            keyboardOptions = KeyboardOptions.Default,
+            shape = RoundedCornerShape(16.dp),
+            colors = fieldInsetColors(),
+        )
+        if (hint != null) {
+            Spacer(Modifier.height(4.dp))
+            Text(hint, color = TextMuted, fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+private fun SettingsMiniField(
+    label: String,
+    value: String,
+    onChange: (String) -> Unit,
+    hint: String? = null,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier) {
+        Text(
+            label,
+            color = LabelSky.copy(alpha = 0.9f),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.3.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = value,
+            onValueChange = onChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            shape = RoundedCornerShape(16.dp),
+            colors = fieldInsetColors(),
+        )
+        if (hint != null) {
+            Spacer(Modifier.height(4.dp))
+            Text(hint, color = TextMuted, fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+private fun fieldInsetColors() = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = Color(0xFFF8FAFC),
+    unfocusedTextColor = Color(0xFFF8FAFC),
+    focusedContainerColor = Color(0xFF020617).copy(alpha = 0.55f),
+    unfocusedContainerColor = Color(0xFF020617).copy(alpha = 0.55f),
+    cursorColor = Mint,
+    focusedBorderColor = BorderSubtle,
+    unfocusedBorderColor = BorderSubtle,
     focusedPlaceholderColor = TextMuted,
+    unfocusedPlaceholderColor = TextMuted,
 )
 
 private fun buildJson(
