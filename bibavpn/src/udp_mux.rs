@@ -1,7 +1,6 @@
 //! UDP datagram relay inside the same TLS + WebSocket transport as TCP tunnels (DPI profile).
 
-use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -12,8 +11,8 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use rustls::pki_types::ServerName;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, Interval, MissedTickBehavior, interval};
+use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::time::{Duration, Interval, MissedTickBehavior, interval, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -24,6 +23,10 @@ use crate::protocol::{
 use crate::stealth::{WsHandshakeParams, build_websocket_request};
 use crate::ws_bridge::SharedCrypto;
 use crate::{read_padded_frame, write_padded_frame};
+
+/// One OS UDP socket per request so replies cannot be matched to the wrong `xid`.
+const UDP_MUX_SERVER_RECV_TIMEOUT: Duration = Duration::from_secs(30);
+const UDP_MUX_SERVER_MAX_INFLIGHT: usize = 512;
 
 /// Config snapshot for opening a UDP-mux WebSocket (mirrors `local_client::ClientCfg`).
 #[derive(Clone)]
@@ -366,7 +369,8 @@ async fn run_udp_mux_client_loop(
     Ok(())
 }
 
-/// Server side: one UDP socket, paired with this WebSocket after `UDP_MUX_OPEN`.
+/// Server side: UDP over WebSocket after `UDP_MUX_OPEN`. Each request uses a dedicated UDP socket
+/// so replies attach to the correct `xid` (parallel requests to the same host no longer collide).
 pub async fn bridge_ws_udp_mux_server<S>(
     ws: WebSocketStream<S>,
     max_pad: u8,
@@ -378,65 +382,10 @@ pub async fn bridge_ws_udp_mux_server<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.context("udp bind server mux")?);
-    sock.set_broadcast(true).ok();
+    let sem = Arc::new(Semaphore::new(UDP_MUX_SERVER_MAX_INFLIGHT));
+    let (ws_sink, mut ws_rx) = ws.split();
+    let ws_tx = Arc::new(Mutex::new(ws_sink));
 
-    let pending: Arc<Mutex<HashMap<SocketAddr, VecDeque<u64>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    let (ws_tx, mut ws_rx) = ws.split();
-    let ws_tx = Arc::new(Mutex::new(ws_tx));
-    let ws_tx_up = ws_tx.clone();
-    let crypto_up = crypto.clone();
-    let pending_up = pending.clone();
-    let sock_up = sock.clone();
-
-    let up = async move {
-        while let Some(m) = ws_rx.next().await {
-            let m = m.context("websocket read")?;
-            match m {
-                Message::Binary(b) => {
-                    if b.len() > max_ws_binary.saturating_mul(4) {
-                        anyhow::bail!("oversized WS binary");
-                    }
-                    let raw = match &crypto_up {
-                        Some(c) => c
-                            .open_client_to_server(b.as_ref())
-                            .await
-                            .context("v2 open c2s (udp mux)")?,
-                        None => b.to_vec(),
-                    };
-                    let plain = read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let (xid, host, port, payload) = decode_udp_req(&plain)?;
-                    let mut dest_iter = tokio::net::lookup_host((host.as_str(), port))
-                        .await
-                        .with_context(|| format!("lookup {host}:{port}"))?;
-                    let dest = dest_iter
-                        .next()
-                        .with_context(|| format!("no addr for {host}:{port}"))?;
-                    sock_up.send_to(&payload, dest).await?;
-                    pending_up
-                        .lock()
-                        .await
-                        .entry(dest)
-                        .or_default()
-                        .push_back(xid);
-                }
-                Message::Ping(p) => {
-                    let mut g = ws_tx_up.lock().await;
-                    g.send(Message::Pong(p)).await.context("ws pong")?;
-                }
-                Message::Pong(_) => {}
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    };
-
-    let crypto_dn = crypto.clone();
-    let ws_tx_dn = ws_tx.clone();
-    let pending_dn = pending.clone();
     let mut ping_tok: Option<Interval> = if ws_ping_secs > 0 {
         let mut i = interval(Duration::from_secs(ws_ping_secs));
         i.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -445,32 +394,77 @@ where
         None
     };
 
-    let mut buf = vec![0u8; 65535];
-    let down = async move {
-        loop {
-            if let Some(ref mut ticker) = ping_tok {
-                tokio::select! {
-                    biased;
-                    _ = ticker.tick() => {
-                        let mut g = ws_tx_dn.lock().await;
-                        g.send(Message::Ping(Bytes::new())).await.context("ws ping")?;
-                    }
-                    r = sock.as_ref().recv_from(&mut buf) => {
-                        let (n, src) = r.context("recv_from udp")?;
-                        let xid = {
-                            let mut g = pending_dn.lock().await;
-                            let q = g.entry(src).or_default();
-                            q.pop_front().context("stray udp reply")?
+    loop {
+        let m = if let Some(ref mut ticker) = ping_tok {
+            tokio::select! {
+                biased;
+                _ = ticker.tick() => {
+                    let mut g = ws_tx.lock().await;
+                    g.send(Message::Ping(Bytes::new())).await.context("ws ping")?;
+                    continue;
+                }
+                m = ws_rx.next() => m,
+            }
+        } else {
+            ws_rx.next().await
+        };
+
+        let Some(m) = m else {
+            break;
+        };
+        let m = m.context("websocket read")?;
+        match m {
+            Message::Binary(b) => {
+                if b.len() > max_ws_binary.saturating_mul(4) {
+                    anyhow::bail!("oversized WS binary");
+                }
+                let raw = match &crypto {
+                    Some(c) => c
+                        .open_client_to_server(b.as_ref())
+                        .await
+                        .context("v2 open c2s (udp mux)")?,
+                    None => b.to_vec(),
+                };
+                let plain = read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let (xid, host, port, payload) = decode_udp_req(&plain)?;
+
+                let permit = sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("udp mux sem closed"))?;
+                let ws_tx = ws_tx.clone();
+                let crypto = crypto.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = (async {
+                        let sock = UdpSocket::bind("0.0.0.0:0")
+                            .await
+                            .context("udp mux bind ephemeral")?;
+                        sock.set_broadcast(true).ok();
+                        let mut dest_iter = tokio::net::lookup_host((host.as_str(), port))
+                            .await
+                            .with_context(|| format!("lookup {host}:{port}"))?;
+                        let dest = dest_iter
+                            .next()
+                            .with_context(|| format!("no addr for {host}:{port}"))?;
+                        sock.send_to(&payload, dest).await.context("udp send")?;
+                        let mut rbuf = vec![0u8; 65535];
+                        let (n, src) = match timeout(UDP_MUX_SERVER_RECV_TIMEOUT, sock.recv_from(&mut rbuf)).await
+                        {
+                            Ok(Ok(v)) => v,
+                            Ok(Err(e)) => return Err(e.into()),
+                            Err(_) => return Ok(()),
                         };
                         let rep_plain = encode_udp_rep(
                             xid,
                             &src.ip().to_string(),
                             src.port(),
-                            &buf[..n],
+                            &rbuf[..n],
                         )?;
                         let mut wire = Vec::new();
-                        write_padded_frame(&mut wire, &rep_plain, max_pad)?;
-                        let blob: Vec<u8> = match &crypto_dn {
+                        write_padded_frame(&mut wire, &rep_plain, max_pad).context("pad rep")?;
+                        let blob: Vec<u8> = match &crypto {
                             Some(c) => c
                                 .seal_server_to_client(&wire)
                                 .await
@@ -480,44 +474,27 @@ where
                         if blob.len() > max_ws_binary {
                             anyhow::bail!("udp rep ws frame too large");
                         }
-                        let mut g = ws_tx_dn.lock().await;
+                        let mut g = ws_tx.lock().await;
                         g.send(Message::Binary(Bytes::from(blob)))
                             .await
                             .context("ws send udp rep")?;
-                    }
-                }
-            } else {
-                let (n, src) = sock
-                    .as_ref()
-                    .recv_from(&mut buf)
+                        Ok::<_, anyhow::Error>(())
+                    })
                     .await
-                    .context("recv_from udp")?;
-                let xid = {
-                    let mut g = pending_dn.lock().await;
-                    let q = g.entry(src).or_default();
-                    q.pop_front().context("stray udp reply")?
-                };
-                let rep_plain = encode_udp_rep(xid, &src.ip().to_string(), src.port(), &buf[..n])?;
-                let mut wire = Vec::new();
-                write_padded_frame(&mut wire, &rep_plain, max_pad)?;
-                let blob: Vec<u8> = match &crypto_dn {
-                    Some(c) => c
-                        .seal_server_to_client(&wire)
-                        .await
-                        .context("v2 seal s2c (udp mux)")?,
-                    None => wire,
-                };
-                if blob.len() > max_ws_binary {
-                    anyhow::bail!("udp rep ws frame too large");
-                }
-                let mut g = ws_tx_dn.lock().await;
-                g.send(Message::Binary(Bytes::from(blob))).await?;
+                    {
+                        tracing::error!("udp mux server outbound: {e:#}");
+                    }
+                });
             }
+            Message::Ping(p) => {
+                let mut g = ws_tx.lock().await;
+                g.send(Message::Pong(p)).await.context("ws pong")?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => break,
+            _ => {}
         }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
-    };
+    }
 
-    tokio::try_join!(up, down)?;
     Ok(())
 }
