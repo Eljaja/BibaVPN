@@ -41,7 +41,6 @@ Typical path (UDP via SOCKS):
 | `bibavpn/src/lib.rs`                                | Exports `udp_mux` and other modules                                                                              |
 | `docker/`                                           | `Dockerfile.server` (in-container Rust build), `Dockerfile.server.binary` (prebuilt binary), `Dockerfile.client` |
 | `docker-compose.yml`                                | Local lab: server + client on one Docker network                                                                 |
-| `docker-compose.remote-client.yml`                  | Client only toward remote `host:8443`, proxies on the host                                                       |
 | `scripts/`                                          | Smoke tests, deploy helpers, benchmarks                                                                          |
 
 
@@ -118,15 +117,7 @@ Images use `**rust:1.89-bookworm`** (or newer): older `cargo` cannot build depen
 | `scripts/run-remote-speedtest.sh`  | SSH to VPS, venv, `speedtest-cli --simple` on the server (reads password/port from `server.txt` — gitignored)                                                                            |
 
 
-Remote client with Docker:
-
-```bash
-cd biba-vpn   # directory containing this compose file
-export BIBA_REMOTE=vps:8443 BIBA_SNI=... BIBA_VPN_TOKEN=... BIBA_VPN_PSK=...
-docker compose -f docker-compose.remote-client.yml up -d --build
-```
-
-Default SOCKS on host: `**127.0.0.1:11090**` (override with `BIBA_SOCKS_HOST_PORT` / `BIBA_SOCKS_CONTAINER_PORT`). HTTP CONNECT defaults to `**11880**` on the host.
+**Remote entry, client in Docker (no compose file):** build `docker/Dockerfile.client`, then `docker run` with `-p` for SOCKS and HTTP proxy and the same flags as in the [example client](#build-and-run-local) above. Inside the container use matching `--socks5 0.0.0.0:<socks_port>` and `--http-proxy 0.0.0.0:<http_port>`; publish those ports on the host (e.g. `11090:11090`, `11880:18080`).
 
 ## UDP design note (agents)
 

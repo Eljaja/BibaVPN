@@ -1,8 +1,20 @@
 # BibaVPN
 
-Local **SOCKS5** and optional **HTTP CONNECT** over **TLS + WebSocket** to an entry server; the server opens outbound **TCP** to the target `host:port`. Optional **BibaV2**: shared PSK, HELLO/ACK, ChaCha20-Poly1305, and random decoy per frame. **BibaV2.1** adds a max WS binary size, periodic WS Ping, configurable upgrade headers, and early-session noise.
+Local **SOCKS5** and optional **HTTP CONNECT** over **TLS + WebSocket** to an entry server; the server opens outbound **TCP** (and **UDP** via a dedicated mux) to the target `host:port`. Optional **BibaV2**: shared PSK, HELLO/ACK, ChaCha20-Poly1305, and random decoy per frame. **BibaV2.1** adds a max WS binary size, periodic WebSocket Ping, configurable upgrade headers, and early-session noise.
 
-Developer/agent details: [AGENTS.md](AGENTS.md) (legacy link: [AGENT.md](AGENT.md)).
+| | |
+| --- | --- |
+| Developer / agent guide | [AGENTS.md](AGENTS.md) |
+| Local Docker lab | `docker compose -f docker-compose.yml up --build` |
+
+---
+
+## Contents
+
+- [End-to-end picture](#end-to-end-picture)
+- [Build](#build)
+- [Security](#security)
+- [Repository](#repository)
 
 ---
 
@@ -48,17 +60,25 @@ DPI on the outside sees ordinary **TLS** and **WebSocket**; **inside** Binary is
 
 ---
 
-## Build and run (short)
+## Build
 
 ```bash
 cargo build --release -p bibavpn --bin bibavpn-server
 cargo build --release -p bibavpn --bin bibavpn-client
 ```
 
-Flags, Docker, and the remote-only client are described in [AGENT.md](AGENT.md).
+CLI flags, remote-server examples, Docker notes, and deploy gotchas live in **[AGENTS.md](AGENTS.md)**. Legacy bookmark: [AGENT.md](AGENT.md).
 
 Workspace crates also include `bibavpn-jni` (Android JNI) and `bibavpn-desktop` (desktop helper); see `android/` for the Android app.
+
+---
 
 ## Security
 
 Treat PSK and path token as **secrets** — do not commit them. For production use proper certificates and avoid `--insecure` on the client.
+
+---
+
+## Repository
+
+Rust stack; protocol modules and layout are documented in [AGENTS.md](AGENTS.md) (BibaV2 / BibaV2.1, UDP mux, scripts).

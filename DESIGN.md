@@ -33,17 +33,19 @@ A concise, product-agnostic reference for visual design, interaction patterns, a
 
 ### Suggested token names (example)
 
-| Token            | Typical use                    |
-|------------------|--------------------------------|
-| `bg.app`         | Root screen background         |
-| `bg.surface`     | Cards, sheets                  |
-| `border.subtle`  | Dividers, card outlines        |
-| `text.primary`   | Headings, values               |
-| `text.secondary` | Captions, hints                |
-| `text.accent`    | Labels, links (non-destructive)|
-| `accent.primary` | Key CTAs, active indicators    |
-| `state.success`  | Connected, completed           |
-| `state.danger`   | Destructive / errors           |
+
+| Token            | Typical use                     |
+| ---------------- | ------------------------------- |
+| `bg.app`         | Root screen background          |
+| `bg.surface`     | Cards, sheets                   |
+| `border.subtle`  | Dividers, card outlines         |
+| `text.primary`   | Headings, values                |
+| `text.secondary` | Captions, hints                 |
+| `text.accent`    | Labels, links (non-destructive) |
+| `accent.primary` | Key CTAs, active indicators     |
+| `state.success`  | Connected, completed            |
+| `state.danger`   | Destructive / errors            |
+
 
 ---
 
@@ -76,7 +78,7 @@ A concise, product-agnostic reference for visual design, interaction patterns, a
 
 - **Primary action** — One clear primary per view; visual weight (color, size) matches importance.
 - **Destructive actions** — Require confirmation or an undo path when data loss or billing impact is possible.
-- **Loading & errors** — Show explicit progress for operations &gt; ~1 s. Errors: what failed, what the user can do next, no raw stack traces in UI.
+- **Loading & errors** — Show explicit progress for operations > ~1 s. Errors: what failed, what the user can do next, no raw stack traces in UI.
 - **Forms** — Label fields; group server/identity vs. advanced transport; mask secrets with optional reveal; persist drafts where appropriate.
 
 ---
@@ -108,14 +110,14 @@ A concise, product-agnostic reference for visual design, interaction patterns, a
 
 ## 11. Review checklist (before ship)
 
-- [ ] Primary task completable in minimal steps from cold start  
-- [ ] Typography and spacing match the agreed scale  
-- [ ] Colors map to tokens; contrast checked on real devices  
-- [ ] Touch targets and hit slop verified  
-- [ ] Settings / advanced options discoverable but not noisy  
-- [ ] Copy reviewed for clarity and localization headroom  
-- [ ] Motion respects reduced-motion settings  
-- [ ] Platform-specific entry points (TV launcher, notifications) covered  
+- Primary task completable in minimal steps from cold start  
+- Typography and spacing match the agreed scale  
+- Colors map to tokens; contrast checked on real devices  
+- Touch targets and hit slop verified  
+- Settings / advanced options discoverable but not noisy  
+- Copy reviewed for clarity and localization headroom  
+- Motion respects reduced-motion settings  
+- Platform-specific entry points (TV launcher, notifications) covered
 
 ---
 
