@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info};
@@ -249,6 +249,7 @@ async fn run_socks_udp_assoc(
     cfg: Arc<ClientCfg>,
     mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
 ) -> anyhow::Result<()> {
+    let (close_tx, mut close_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64];
         loop {
@@ -258,6 +259,7 @@ async fn run_socks_udp_assoc(
                 Err(_) => break,
             }
         }
+        let _ = close_tx.send(());
     });
 
     let handle = {
@@ -270,22 +272,44 @@ async fn run_socks_udp_assoc(
             .clone()
     };
 
+    let udp = Arc::new(udp);
     let mut mbuf = vec![0u8; 65535];
     loop {
-        let (n, peer) = udp.recv_from(&mut mbuf).await?;
-        let (dst_host, dst_port, payload) =
-            crate::protocol::parse_socks5_udp_datagram(&mbuf[..n]).context("socks udp parse")?;
-        let xid: u64 = rand::random();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        handle.forward(xid, dst_host, dst_port, payload, tx)?;
-        match rx.await {
-            Ok(Ok(socks_body)) => {
-                udp.send_to(&socks_body, peer).await?;
+        tokio::select! {
+            biased;
+            _ = close_rx.recv() => {
+                break;
             }
-            Ok(Err(e)) => error!("udp mux: {e:#}"),
-            Err(_) => error!("udp mux driver dropped channel"),
+            r = udp.recv_from(&mut mbuf) => {
+                let (n, peer) = r.context("socks udp recv")?;
+                let data = mbuf[..n].to_vec();
+                let udp = udp.clone();
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    let res: anyhow::Result<()> = async {
+                        let (dst_host, dst_port, payload) =
+                            crate::protocol::parse_socks5_udp_datagram(&data).context("socks udp parse")?;
+                        let xid: u64 = rand::random();
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        handle.forward(xid, dst_host, dst_port, payload, tx)?;
+                        match rx.await {
+                            Ok(Ok(socks_body)) => {
+                                udp.send_to(&socks_body, peer).await?;
+                            }
+                            Ok(Err(e)) => error!("udp mux: {e:#}"),
+                            Err(_) => error!("udp mux driver dropped channel"),
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(e) = res {
+                        error!("socks udp worker: {e:#}");
+                    }
+                });
+            }
         }
     }
+    Ok(())
 }
 
 async fn handle_http_peer(mut local: TcpStream, cfg: Arc<ClientCfg>) -> anyhow::Result<()> {
