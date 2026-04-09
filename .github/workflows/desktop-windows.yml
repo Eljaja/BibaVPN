@@ -1,0 +1,55 @@
+# Manual: Actions → Desktop Windows → Run workflow. Also runs on push/PR when desktop paths change.
+name: Desktop Windows
+
+run-name: Desktop Windows · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "bibavpn-desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop-windows.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "bibavpn-desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop-windows.yml"
+
+concurrency:
+  group: desktop-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build bibavpn-desktop (release)
+        run: cargo build -p bibavpn-desktop --release --locked
+
+      - name: Pack ZIP
+        shell: pwsh
+        run: Compress-Archive -Path target/release/bibavpn-desktop.exe -DestinationPath BibaVPN-windows-x64.zip -Force
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: BibaVPN-windows-x64
+          path: BibaVPN-windows-x64.zip
+          if-no-files-found: error
