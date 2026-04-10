@@ -6,21 +6,27 @@ run-name: Desktop Windows · ${{ github.event_name == 'workflow_dispatch' && 'ma
 on:
   workflow_dispatch:
 
+  workflow_call:
+
   push:
     branches: [main, master]
     paths:
       - "bibavpn/**"
+      - "!bibavpn/**/*.md"
       - "bibavpn-desktop/**"
+      - "!bibavpn-desktop/**/*.md"
       - "Cargo.toml"
-      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/desktop-windows.yml"
   pull_request:
     branches: [main, master]
     paths:
       - "bibavpn/**"
+      - "!bibavpn/**/*.md"
       - "bibavpn-desktop/**"
+      - "!bibavpn-desktop/**/*.md"
       - "Cargo.toml"
-      - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/desktop-windows.yml"
 
 concurrency:

@@ -6,23 +6,33 @@ run-name: Android · ${{ github.event_name == 'workflow_dispatch' && 'manual' ||
 on:
   workflow_dispatch:
 
+  workflow_call:
+
   push:
     branches: [main, master]
     paths:
       - "bibavpn/**"
+      - "!bibavpn/**/*.md"
       - "bibavpn-jni/**"
+      - "!bibavpn-jni/**/*.md"
       - "android/**"
+      - "!android/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/android.yml"
   pull_request:
     branches: [main, master]
     paths:
       - "bibavpn/**"
+      - "!bibavpn/**/*.md"
       - "bibavpn-jni/**"
+      - "!bibavpn-jni/**/*.md"
       - "android/**"
+      - "!android/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/android.yml"
 
 concurrency:

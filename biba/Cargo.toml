@@ -1,0 +1,16 @@
+[package]
+name = "biba"
+version = "0.1.0"
+edition = "2021"
+description = "uTLS-style TLS ClientHello specs, fingerprinting, and browser presets (Rust), with optional rustls hints"
+license = "BSD-3-Clause"
+
+[features]
+default = []
+rustls = ["dep:rustls"]
+
+[dependencies]
+rand = "0.8"
+thiserror = "1.0"
+
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }

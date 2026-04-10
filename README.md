@@ -2,10 +2,12 @@
 
 Local **SOCKS5** and optional **HTTP CONNECT** over **TLS + WebSocket** to an entry server; the server opens outbound **TCP** (and **UDP** via a dedicated mux) to the target `host:port`. Optional **BibaV2**: shared PSK, HELLO/ACK, ChaCha20-Poly1305, and random decoy per frame. **BibaV2.1** adds a max WS binary size, periodic WebSocket Ping, configurable upgrade headers, and early-session noise.
 
-| | |
-| --- | --- |
-| Developer / agent guide | [AGENTS.md](AGENTS.md) |
-| Local Docker lab | `docker compose -f docker-compose.yml up --build` |
+
+|                         |                                                   |
+| ----------------------- | ------------------------------------------------- |
+| Developer / agent guide | [AGENTS.md](AGENTS.md)                            |
+| Local Docker lab        | `docker compose -f docker-compose.yml up --build` |
+
 
 ---
 
@@ -55,6 +57,8 @@ flowchart TB
 
   SV --> DST[(Target host:port)]
 ```
+
+
 
 DPI on the outside sees ordinary **TLS** and **WebSocket**; **inside** Binary is either a **padded TCP** slice or **nonce + AEAD** over decoy + padded TCP. In parallel, BibaV2.1 may send **WebSocket Ping** to keep the session alive.
 
