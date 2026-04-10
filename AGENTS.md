@@ -97,7 +97,7 @@ Server (demo self-signed):
 
 ## Docker / Compose gotcha
 
-`Dockerfile.*` sets `**ENTRYPOINT`** to the binary path. In `docker-compose.yml`, `**command`** must list **argument flags only** (do not repeat the binary path). Otherwise `clap` sees an extra token and the container exits with code 2.
+`Dockerfile.`* sets `**ENTRYPOINT`** to the binary path. In `docker-compose.yml`, `**command`** must list **argument flags only** (do not repeat the binary path). Otherwise `clap` sees an extra token and the container exits with code 2.
 
 Images use `**rust:1.89-bookworm`** (or newer): older `cargo` cannot build dependencies that use edition 2024.
 

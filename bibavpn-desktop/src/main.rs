@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use bibavpn::local_client::{
     parse_host_port, LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY,
+    DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use bibavpn::tls_util::install_ring_crypto;
 use bibavpn::TlsClientProfile;
@@ -449,7 +450,13 @@ impl BibaApp {
             ws_extra_headers: Arc::new(Vec::new()),
             max_ws_binary: self.cfg.max_ws_binary,
             ws_ping_secs: 25,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            udp_max_pad: None,
+            udp_max_ws_binary: None,
+            udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
             tls_profile,
+            pinned_certs_pem: None,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

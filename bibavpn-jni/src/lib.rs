@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use bibavpn::local_client::{
-    LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, parse_host_port, parse_ws_header,
+    LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
+    parse_host_port, parse_ws_header,
 };
 use bibavpn::tls_util::install_ring_crypto;
 use bibavpn::TlsClientProfile;
@@ -80,6 +81,19 @@ struct StartJson {
     /// Overrides invite `tls_profile` when non-empty.
     #[serde(default)]
     tls_profile: Option<String>,
+    #[serde(default)]
+    ws_ping_jitter_percent: u8,
+    #[serde(default)]
+    ws_binary_send_jitter_ms: u8,
+    #[serde(default)]
+    udp_max_pad: Option<u8>,
+    #[serde(default)]
+    udp_max_ws_binary: Option<usize>,
+    #[serde(default = "default_udp_mux_reply_timeout")]
+    udp_mux_reply_timeout_secs: u64,
+    /// PEM string (`CERTIFICATE` blocks). Leaf must match; mutually exclusive with `insecure`.
+    #[serde(default)]
+    pin_cert_pem: Option<String>,
 }
 
 fn default_token() -> String {
@@ -100,6 +114,10 @@ fn default_max_ws_binary() -> usize {
 
 fn default_ws_ping() -> u64 {
     25
+}
+
+fn default_udp_mux_reply_timeout() -> u64 {
+    DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS
 }
 
 fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
@@ -124,6 +142,13 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         extra.push(parse_ws_header(line)?);
     }
 
+    let pinned_certs_pem = j
+        .pin_cert_pem
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_bytes().to_vec());
+
     let (
         server_host,
         server_port,
@@ -136,6 +161,11 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         decoy_max,
         max_ws_binary,
         ws_ping_secs,
+        ws_ping_jitter_percent,
+        ws_binary_send_jitter_ms,
+        udp_max_pad,
+        udp_max_ws_binary,
+        udp_mux_reply_timeout_secs,
         insecure_tls,
         tls_profile,
     ) = if let (Some(uri), Some(pass)) = (invite_uri, invite_pass) {
@@ -162,6 +192,11 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
             inv.decoy_max,
             inv.max_ws_binary,
             inv.ws_ping_secs,
+            inv.ws_ping_jitter_percent,
+            inv.ws_binary_send_jitter_ms,
+            inv.udp_max_pad,
+            inv.udp_max_ws_binary,
+            inv.udp_mux_reply_timeout_secs,
             j.insecure || inv.insecure,
             tls_profile,
         )
@@ -193,6 +228,11 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
             j.decoy_max,
             j.max_ws_binary,
             j.ws_ping_secs,
+            j.ws_ping_jitter_percent,
+            j.ws_binary_send_jitter_ms,
+            j.udp_max_pad,
+            j.udp_max_ws_binary,
+            j.udp_mux_reply_timeout_secs,
             j.insecure,
             tls_profile,
         )
@@ -218,7 +258,13 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         ws_extra_headers: Arc::new(extra),
         max_ws_binary,
         ws_ping_secs,
+        ws_ping_jitter_percent,
+        ws_binary_send_jitter_ms,
+        udp_max_pad,
+        udp_max_ws_binary,
+        udp_mux_reply_timeout_secs,
         tls_profile,
+        pinned_certs_pem,
     })
 }
 
