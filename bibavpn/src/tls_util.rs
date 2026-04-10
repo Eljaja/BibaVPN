@@ -11,6 +11,9 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, S
 use rustls::{SupportedCipherSuite, client::danger::ServerCertVerifier, crypto::CryptoProvider};
 
 /// TLS client preset: maps to [`biba::ClientHelloId`] and aligns rustls cipher order + ALPN (best-effort).
+///
+/// **Guarantee:** negotiated **cipher suite order** and **ALPN** only — not a wire-identical
+/// ClientHello (no full JA3/JA4 parity); rustls does not expose byte-level CH control.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsClientProfile {
     #[default]
@@ -196,6 +199,159 @@ pub fn client_config_for_profile(
     cfg.alpn_protocols = alpn;
 
     Ok(Arc::new(cfg))
+}
+
+/// TLS knobs for the SOCKS/HTTP client: verification mode, `biba` profile, optional leaf pin (PEM).
+#[derive(Clone, Debug, Default)]
+pub struct ClientTlsParams {
+    pub insecure: bool,
+    pub profile: TlsClientProfile,
+    /// PEM bytes containing one or more `CERTIFICATE` blocks; leaf must match one DER exactly.
+    pub pinned_certs_pem: Option<Vec<u8>>,
+}
+
+/// Build [`ClientConfig`] from [`ClientTlsParams`] (call [`install_ring_crypto`] first).
+pub fn client_tls_config(params: &ClientTlsParams) -> anyhow::Result<Arc<ClientConfig>> {
+    if params.insecure && params.pinned_certs_pem.is_some() {
+        anyhow::bail!("TLS: --insecure cannot be combined with certificate pinning");
+    }
+    if params.insecure {
+        return Ok(client_config_insecure());
+    }
+
+    let pins: Option<Vec<CertificateDer<'static>>> = match &params.pinned_certs_pem {
+        None => None,
+        Some(pem) => {
+            let v = read_certs(pem)?;
+            if v.is_empty() {
+                anyhow::bail!("pin-cert: no certificates in PEM");
+            }
+            Some(v)
+        }
+    };
+
+    match (&pins, params.profile.biba_id()) {
+        (None, None) => client_config_system_roots(),
+        (None, Some(_)) => client_config_for_profile(false, params.profile),
+        (Some(pins), None) => client_config_pinned_only(pins),
+        (Some(pins), Some(id)) => client_config_profile_with_pins(id, params.profile, pins),
+    }
+}
+
+fn client_config_pinned_only(pins: &[CertificateDer<'static>]) -> anyhow::Result<Arc<ClientConfig>> {
+    Ok(Arc::new(
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedCertsVerifier::new(pins.to_vec())))
+            .with_no_client_auth(),
+    ))
+}
+
+fn client_config_profile_with_pins(
+    id: ClientHelloId,
+    profile: TlsClientProfile,
+    pins: &[CertificateDer<'static>],
+) -> anyhow::Result<Arc<ClientConfig>> {
+    let spec = biba::utls_id_to_spec(id).map_err(|e| anyhow::anyhow!(e))?;
+    let hints = biba::rustls_compat::hints_from_spec(&spec);
+
+    let base_arc = CryptoProvider::get_default().ok_or_else(|| {
+        anyhow::anyhow!("no rustls CryptoProvider; call install_ring_crypto() before connecting")
+    })?;
+    let base = base_arc.as_ref();
+
+    let mut cipher_suites: Vec<SupportedCipherSuite> = Vec::new();
+    for &suite_ref in &hints.cipher_suites {
+        if base.cipher_suites.contains(suite_ref) {
+            cipher_suites.push(*suite_ref);
+        }
+    }
+    if cipher_suites.is_empty() {
+        anyhow::bail!("TLS profile {:?}: no cipher suites overlap rustls provider", profile);
+    }
+
+    let mut provider = base.clone();
+    provider.cipher_suites = cipher_suites;
+    let provider = Arc::new(provider);
+
+    let versions = rustls::DEFAULT_VERSIONS;
+    let mut cfg = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedCertsVerifier::new(pins.to_vec())))
+        .with_no_client_auth();
+
+    let mut alpn = hints.alpn;
+    if alpn.is_empty() {
+        alpn.push(b"http/1.1".to_vec());
+    }
+    cfg.alpn_protocols = alpn;
+
+    Ok(Arc::new(cfg))
+}
+
+#[derive(Debug)]
+struct PinnedCertsVerifier {
+    pins: Vec<CertificateDer<'static>>,
+}
+
+impl PinnedCertsVerifier {
+    fn new(pins: Vec<CertificateDer<'static>>) -> Self {
+        Self { pins }
+    }
+}
+
+impl ServerCertVerifier for PinnedCertsVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if self
+            .pins
+            .iter()
+            .any(|p| p.as_ref() == end_entity.as_ref())
+        {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let prov = CryptoProvider::get_default()
+            .ok_or_else(|| rustls::Error::General("no default crypto provider".to_string()))?;
+        verify_tls12_signature(message, cert, dss, &prov.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let prov = CryptoProvider::get_default()
+            .ok_or_else(|| rustls::Error::General("no default crypto provider".to_string()))?;
+        verify_tls13_signature(message, cert, dss, &prov.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        CryptoProvider::get_default()
+            .expect("default crypto")
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 #[derive(Debug)]
