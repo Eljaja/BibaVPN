@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
+use bibavpn::invite_uri::decode_invite_v1;
 use bibavpn::local_client::{
     LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, parse_host_port, parse_ws_header,
 };
@@ -18,10 +20,18 @@ use tracing::info;
     about = "SOCKS5 / HTTP CONNECT front for BibaVPN (v2.1: WS ping, MTU cap, custom WS headers)"
 )]
 struct Args {
-    #[arg(long)]
-    server: String,
+    /// Encrypted `biba://...` invite (use with `--invite-passphrase`; mutually exclusive with `--server`).
+    #[arg(long, conflicts_with = "server")]
+    from_invite: Option<String>,
 
-    #[arg(long, default_value = "change-me")]
+    /// Passphrase for `--from-invite`.
+    #[arg(long)]
+    invite_passphrase: Option<String>,
+
+    #[arg(long, conflicts_with = "from_invite", required_unless_present = "from_invite")]
+    server: Option<String>,
+
+    #[arg(long, default_value = "change-me", conflicts_with = "from_invite")]
     token: String,
 
     #[arg(long)]
@@ -89,35 +99,90 @@ async fn main() -> anyhow::Result<()> {
 
     install_ring_crypto();
     let args = Args::parse();
-
-    let (server_host, server_port) = parse_host_port(&args.server)?;
-    let sni_owned = args.sni.clone().unwrap_or_else(|| server_host.clone());
+    if args.from_invite.is_some() != args.invite_passphrase.is_some() {
+        anyhow::bail!("use --from-invite and --invite-passphrase together");
+    }
 
     let mut extra = Vec::new();
     for line in &args.ws_headers {
         extra.push(parse_ws_header(line)?);
     }
 
+    let (
+        server_host,
+        server_port,
+        sni_owned,
+        token,
+        max_pad,
+        junk_frames,
+        early_ws_frames,
+        psk,
+        decoy_max,
+        max_ws_binary,
+        ws_ping_secs,
+        insecure_tls,
+    ) = if let Some(uri) = args.from_invite.as_ref() {
+        let pass = args
+            .invite_passphrase
+            .as_deref()
+            .expect("clap requires --invite-passphrase with --from-invite");
+        let inv = decode_invite_v1(uri, pass).context("decode --from-invite")?;
+        let (h, p) = parse_host_port(inv.server.trim()).context("invite server")?;
+        let sni = args.sni.clone().unwrap_or_else(|| inv.sni.clone());
+        (
+            h,
+            p,
+            sni,
+            inv.token,
+            inv.max_pad,
+            args.junk_frames,
+            args.early_ws_frames,
+            inv.psk,
+            inv.decoy_max,
+            inv.max_ws_binary,
+            inv.ws_ping_secs,
+            args.insecure || inv.insecure,
+        )
+    } else {
+        let server = args.server.as_ref().expect("server or from-invite");
+        let (h, p) = parse_host_port(server.trim()).context("server")?;
+        let sni = args.sni.clone().unwrap_or_else(|| h.clone());
+        (
+            h,
+            p,
+            sni,
+            args.token.clone(),
+            args.max_pad,
+            args.junk_frames,
+            args.early_ws_frames,
+            args.psk.clone(),
+            args.decoy_max,
+            args.max_ws_binary,
+            args.ws_ping_secs,
+            args.insecure,
+        )
+    };
+
     let opts = LocalClientOptions {
         server_host,
         server_port,
         sni: sni_owned,
-        token: args.token,
+        token,
         socks_bind: args.socks5,
         http_proxy_bind: args.http_proxy,
-        insecure_tls: args.insecure,
-        max_pad: args.max_pad,
-        junk_frames: args.junk_frames,
-        early_ws_frames: args.early_ws_frames,
-        psk: args.psk,
-        decoy_max: args.decoy_max,
+        insecure_tls,
+        max_pad,
+        junk_frames,
+        early_ws_frames,
+        psk,
+        decoy_max,
         ws_host: args.ws_host,
         ws_origin: args.ws_origin,
         ws_user_agent: args.ws_user_agent,
         ws_accept_language: args.ws_accept_language,
         ws_extra_headers: Arc::new(extra),
-        max_ws_binary: args.max_ws_binary,
-        ws_ping_secs: args.ws_ping_secs,
+        max_ws_binary,
+        ws_ping_secs,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

@@ -14,4 +14,8 @@ object BibaNative {
 
     @JvmStatic
     external fun nativeStop(): String?
+
+    /** JSON: `{ "ok": true, "server", "token", … }` or `{ "ok": false, "error": "…" }`. */
+    @JvmStatic
+    external fun nativeDecodeInvite(uri: String, passphrase: String): String
 }

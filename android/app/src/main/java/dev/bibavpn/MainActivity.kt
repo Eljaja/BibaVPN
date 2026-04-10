@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -28,6 +29,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -57,6 +60,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import dev.bibavpn.core.BibaNative
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.delay
@@ -158,6 +162,9 @@ private fun BibaRootScreen(
             } ?: "",
         )
     }
+    var bibaInvite by remember { mutableStateOf(last?.optString("from_invite") ?: "") }
+    var invitePassphrase by remember { mutableStateOf(last?.optString("invite_passphrase") ?: "") }
+    var tlsProfile by remember { mutableStateOf(last?.optString("tls_profile") ?: "") }
 
     val activity = context as ComponentActivity
     DisposableEffect(activity) {
@@ -178,13 +185,46 @@ private fun BibaRootScreen(
         }
     }
 
+    fun applyInviteToForm() {
+        val uri = bibaInvite.trim()
+        val pass = invitePassphrase
+        if (uri.isBlank() || pass.isBlank()) {
+            Toast.makeText(context, "Нужны ключ biba:// и passphrase", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            val raw = BibaNative.nativeDecodeInvite(uri, pass)
+            val j = JSONObject(raw)
+            if (!j.optBoolean("ok")) {
+                Toast.makeText(context, j.optString("error", "Ошибка ключа"), Toast.LENGTH_LONG).show()
+                return
+            }
+            server = j.optString("server", "")
+            sni = j.optString("sni", "")
+            token = j.optString("token", "")
+            psk = j.optString("psk", "")
+            maxPad = j.optInt("max_pad", 64).toString()
+            decoyMax = j.optInt("decoy_max", 32).toString()
+            maxWsBin = j.optInt("max_ws_binary", 1400).toString()
+            wsPing = j.optLong("ws_ping_secs", 25).toString()
+            insecure = j.optBoolean("insecure", false)
+            tlsProfile = j.optString("tls_profile", "default")
+            Toast.makeText(context, "Поля подключения обновлены", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(context, e.message ?: "decode", Toast.LENGTH_LONG).show()
+        }
+    }
+
     fun buildConfigJson(): JSONObject = buildJson(
+        fromInvite = bibaInvite.trim(),
+        invitePassphrase = invitePassphrase,
         server = server.trim(),
         token = token,
         sni = sni.trim(),
         psk = psk.trim(),
         socksBind = socksBind.trim(),
         insecure = insecure,
+        tlsProfile = tlsProfile.trim(),
         maxPad = maxPad.toIntOrNull() ?: 64,
         decoyMax = decoyMax.toIntOrNull() ?: 32,
         junkFrames = junkFrames.toIntOrNull() ?: 0,
@@ -207,6 +247,13 @@ private fun BibaRootScreen(
     ) {
         if (showSettings) {
             SettingsScreen(
+                bibaInvite = bibaInvite,
+                onBibaInviteChange = { bibaInvite = it },
+                invitePassphrase = invitePassphrase,
+                onInvitePassphraseChange = { invitePassphrase = it },
+                onApplyInvite = { applyInviteToForm() },
+                tlsProfile = tlsProfile,
+                onTlsProfileChange = { tlsProfile = it },
                 server = server,
                 onServerChange = { server = it },
                 token = token,
@@ -244,7 +291,10 @@ private fun BibaRootScreen(
                 tunnelUp = tunnelUp,
                 server = server.trim(),
                 sni = sni.trim(),
-                canConnect = server.isNotBlank() && token.isNotBlank(),
+                bibaInvite = bibaInvite.trim(),
+                canConnect =
+                    (bibaInvite.isNotBlank() && invitePassphrase.isNotBlank()) ||
+                        (server.isNotBlank() && token.isNotBlank()),
                 onOpenSettings = { showSettings = true },
                 onConnectToggle = {
                     if (tunnelUp) {
@@ -266,19 +316,26 @@ private fun HomeScreen(
     tunnelUp: Boolean,
     server: String,
     sni: String,
+    bibaInvite: String,
     canConnect: Boolean,
     onOpenSettings: () -> Unit,
     onConnectToggle: () -> Unit,
     onServerCardTap: () -> Unit,
 ) {
-    val displayHost = remember(server, sni) {
+    val displayHost = remember(server, sni, bibaInvite) {
         when {
-            sni.isNotBlank() -> sni
+            server.isNotBlank() && sni.isNotBlank() -> sni
             server.isNotBlank() -> server.substringBefore(':').ifBlank { server }
+            bibaInvite.isNotBlank() -> "Ключ Biba"
             else -> "—"
         }
     }
-    val subtitle = server.ifBlank { "Не задан сервер" }
+    val subtitle = when {
+        server.isNotBlank() -> server
+        bibaInvite.isNotBlank() ->
+            bibaInvite.take(36).let { if (bibaInvite.length > 36) "$it…" else it }
+        else -> "Не задан сервер"
+    }
 
     Column(
         modifier = Modifier
@@ -468,6 +525,13 @@ private fun RoundIconButton(onClick: () -> Unit, symbol: String) {
 
 @Composable
 private fun SettingsScreen(
+    bibaInvite: String,
+    onBibaInviteChange: (String) -> Unit,
+    invitePassphrase: String,
+    onInvitePassphraseChange: (String) -> Unit,
+    onApplyInvite: () -> Unit,
+    tlsProfile: String,
+    onTlsProfileChange: (String) -> Unit,
     server: String,
     onServerChange: (String) -> Unit,
     token: String,
@@ -525,6 +589,46 @@ private fun SettingsScreen(
         }
 
         Spacer(Modifier.height(24.dp))
+
+        SettingsSection(
+            title = "Ключ Biba",
+            subtitle = "Зашифрованный biba://… и passphrase (как --from-invite у desktop-клиента)",
+        ) {
+            SettingsTextField(
+                label = "Biba key",
+                value = bibaInvite,
+                onChange = onBibaInviteChange,
+                placeholder = "biba://…",
+                singleLine = false,
+                maxLines = 4,
+            )
+            SettingsTextField(
+                label = "Passphrase",
+                value = invitePassphrase,
+                onChange = onInvitePassphraseChange,
+                placeholder = "секрет out-of-band",
+                isPassword = true,
+            )
+            Text(
+                "Параметры туннеля берутся из ключа; junk_frames, ws_headers и SNI ниже можно переопределить.",
+                color = TextMuted,
+                fontSize = 11.sp,
+            )
+            Button(
+                onClick = onApplyInvite,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Mint.copy(alpha = 0.2f),
+                    contentColor = Mint,
+                ),
+                contentPadding = PaddingValues(vertical = 14.dp),
+            ) {
+                Text("Применить к полям подключения", fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
 
         SettingsSection(
             title = "Подключение",
@@ -622,6 +726,13 @@ private fun SettingsScreen(
             title = "Транспорт",
             subtitle = "Обфускация и WebSocket",
         ) {
+            SettingsTextField(
+                label = "tls_profile",
+                value = tlsProfile,
+                onChange = onTlsProfileChange,
+                placeholder = "default",
+                hint = "Справочно после расшифровки ключа; этот билд клиента профиль TLS не переключает",
+            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -835,12 +946,15 @@ private fun fieldInsetColors() = OutlinedTextFieldDefaults.colors(
 )
 
 private fun buildJson(
+    fromInvite: String,
+    invitePassphrase: String,
     server: String,
     token: String,
     sni: String,
     psk: String,
     socksBind: String,
     insecure: Boolean,
+    tlsProfile: String,
     maxPad: Int,
     decoyMax: Int,
     junkFrames: Int,
@@ -850,8 +964,17 @@ private fun buildJson(
     wsHeaders: String,
 ): JSONObject {
     val o = JSONObject()
-    o.put("server", server)
-    o.put("token", token)
+    val useInvite = fromInvite.isNotBlank() && invitePassphrase.isNotBlank()
+    if (useInvite) {
+        o.put("from_invite", fromInvite.trim())
+        o.put("invite_passphrase", invitePassphrase)
+        o.put("server", "")
+        o.put("token", "change-me")
+    } else {
+        o.put("server", server)
+        o.put("token", token)
+        if (tlsProfile.isNotBlank()) o.put("tls_profile", tlsProfile.trim())
+    }
     if (sni.isNotBlank()) o.put("sni", sni)
     o.put("socks_bind", socksBind.trim().ifBlank { BibaVpnService.SOCKS_LOCAL })
     o.put("insecure", insecure)

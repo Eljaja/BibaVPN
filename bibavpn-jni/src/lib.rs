@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use anyhow::Context;
 use bibavpn::local_client::{
     LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, parse_host_port, parse_ws_header,
 };
@@ -10,6 +11,7 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::watch;
 
 struct NativeState {
@@ -41,6 +43,7 @@ fn ensure_tracing() {
 
 #[derive(Deserialize)]
 struct StartJson {
+    #[serde(default)]
     server: String,
     #[serde(default = "default_token")]
     token: String,
@@ -69,6 +72,10 @@ struct StartJson {
     max_ws_binary: usize,
     #[serde(default = "default_ws_ping")]
     ws_ping_secs: u64,
+    #[serde(default)]
+    from_invite: Option<String>,
+    #[serde(default)]
+    invite_passphrase: Option<String>,
 }
 
 fn default_token() -> String {
@@ -93,39 +100,161 @@ fn default_ws_ping() -> u64 {
 
 fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
     let j: StartJson = serde_json::from_str(s)?;
-    let (server_host, server_port) = parse_host_port(&j.server)?;
-    let sni = j.sni.unwrap_or_else(|| server_host.clone());
+    let invite_uri = j
+        .from_invite
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let invite_pass = j
+        .invite_passphrase
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    if invite_uri.is_some() != invite_pass.is_some() {
+        anyhow::bail!("invite: set both from_invite and invite_passphrase, or neither");
+    }
 
     let mut extra = Vec::new();
     for line in &j.ws_headers {
         extra.push(parse_ws_header(line)?);
     }
 
+    let (
+        server_host,
+        server_port,
+        sni,
+        token,
+        max_pad,
+        junk_frames,
+        early_ws_frames,
+        psk,
+        decoy_max,
+        max_ws_binary,
+        ws_ping_secs,
+        insecure_tls,
+    ) = if let (Some(uri), Some(pass)) = (invite_uri, invite_pass) {
+        let inv = bibavpn::decode_invite_v1(uri, pass).context("decode invite")?;
+        let (h, p) = parse_host_port(inv.server.trim()).context("invite server")?;
+        let sni = j.sni.clone().unwrap_or_else(|| inv.sni.clone());
+        (
+            h,
+            p,
+            sni,
+            inv.token,
+            inv.max_pad,
+            j.junk_frames,
+            j.early_ws_frames,
+            inv.psk,
+            inv.decoy_max,
+            inv.max_ws_binary,
+            inv.ws_ping_secs,
+            j.insecure || inv.insecure,
+        )
+    } else {
+        if j.server.trim().is_empty() {
+            anyhow::bail!("server is required when not using invite");
+        }
+        let (h, p) = parse_host_port(j.server.trim()).context("server")?;
+        let sni = j.sni.clone().unwrap_or_else(|| h.clone());
+        (
+            h,
+            p,
+            sni,
+            j.token,
+            j.max_pad,
+            j.junk_frames,
+            j.early_ws_frames,
+            j.psk.clone(),
+            j.decoy_max,
+            j.max_ws_binary,
+            j.ws_ping_secs,
+            j.insecure,
+        )
+    };
+
     Ok(LocalClientOptions {
         server_host,
         server_port,
         sni,
-        token: j.token,
+        token,
         socks_bind: j.socks_bind,
         http_proxy_bind: j.http_proxy,
-        insecure_tls: j.insecure,
-        max_pad: j.max_pad,
-        junk_frames: j.junk_frames,
-        early_ws_frames: j.early_ws_frames,
-        psk: j.psk,
-        decoy_max: j.decoy_max,
+        insecure_tls,
+        max_pad,
+        junk_frames,
+        early_ws_frames,
+        psk,
+        decoy_max,
         ws_host: j.ws_host,
         ws_origin: j.ws_origin,
         ws_user_agent: j.ws_user_agent,
         ws_accept_language: j.ws_accept_language,
         ws_extra_headers: Arc::new(extra),
-        max_ws_binary: j.max_ws_binary,
-        ws_ping_secs: j.ws_ping_secs,
+        max_ws_binary,
+        ws_ping_secs,
     })
 }
 
 fn jni_err(env: &mut JNIEnv, msg: impl AsRef<str>) -> jstring {
     env.new_string(msg.as_ref()).expect("jstring").into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeDecodeInvite(
+    mut env: JNIEnv,
+    _class: JClass,
+    uri: JString,
+    passphrase: JString,
+) -> jstring {
+    ensure_ring();
+    let uri_s: String = match env.get_string(&uri) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            return env
+                .new_string(json!({"ok": false, "error": format!("uri: {e}")}).to_string())
+                .expect("jstring")
+                .into_raw();
+        }
+    };
+    let pass_s: String = match env.get_string(&passphrase) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            return env
+                .new_string(json!({"ok": false, "error": format!("passphrase: {e}")}).to_string())
+                .expect("jstring")
+                .into_raw();
+        }
+    };
+
+    let payload = match bibavpn::decode_invite_v1(&uri_s, &pass_s) {
+        Ok(inv) => json!({
+            "ok": true,
+            "server": inv.server,
+            "sni": inv.sni,
+            "token": inv.token,
+            "psk": inv.psk,
+            "decoy_max": inv.decoy_max,
+            "max_pad": inv.max_pad,
+            "max_ws_binary": inv.max_ws_binary,
+            "ws_ping_secs": inv.ws_ping_secs,
+            "ws_ping_jitter_percent": inv.ws_ping_jitter_percent,
+            "ws_binary_send_jitter_ms": inv.ws_binary_send_jitter_ms,
+            "udp_max_pad": inv.udp_max_pad,
+            "udp_max_ws_binary": inv.udp_max_ws_binary,
+            "udp_mux_reply_timeout_secs": inv.udp_mux_reply_timeout_secs,
+            "insecure": inv.insecure,
+            "tls_profile": inv.tls_profile,
+        })
+        .to_string(),
+        Err(e) => json!({
+            "ok": false,
+            "error": format!("{e:#}"),
+        })
+        .to_string(),
+    };
+
+    env.new_string(payload).expect("jstring").into_raw()
 }
 
 #[no_mangle]
@@ -184,7 +313,6 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
     });
     drop(guard);
 
-    // Ждём bind SOCKS (иначе tun2socks подключается к закрывающейся TCP-пробе или рано — Go может os.Exit и убить процесс).
     match ready_rx.recv_timeout(std::time::Duration::from_secs(20)) {
         Ok(()) => std::ptr::null_mut(),
         Err(e) => {

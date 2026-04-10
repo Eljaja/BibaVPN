@@ -245,6 +245,7 @@ name = "bibavpn"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "blake3",
  "bytes",
  "chacha20poly1305",
@@ -256,6 +257,8 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
