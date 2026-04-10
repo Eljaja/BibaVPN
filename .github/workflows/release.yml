@@ -1,0 +1,63 @@
+# Builds macOS DMG, Windows ZIP, and Android APK (via reusable workflows), then uploads them to a GitHub Release.
+#
+# Triggers:
+#   • Push a tag matching v* (e.g. git tag v0.2.1 && git push origin v0.2.1)
+#   • Actions → Release → Run workflow: enter tag (e.g. v0.2.1); release is created at the current commit if the tag does not exist yet.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0). Created on this commit if missing."
+        required: true
+        type: string
+
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    uses: ./.github/workflows/desktop-macos.yml
+    secrets: inherit
+
+  windows:
+    uses: ./.github/workflows/desktop-windows.yml
+    secrets: inherit
+
+  android:
+    uses: ./.github/workflows/android.yml
+    secrets: inherit
+
+  publish:
+    needs: [macos, windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: BibaVPN-*
+          path: dist
+          merge-multiple: true
+
+      - name: Normalize APK filename
+        run: mv dist/app-debug.apk dist/BibaVPN-android-debug.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/BibaVPN-macos-aarch64.dmg
+            dist/BibaVPN-windows-x64.zip
+            dist/BibaVPN-android-debug.apk
