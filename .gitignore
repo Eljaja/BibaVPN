@@ -22,3 +22,4 @@ biba-listen*.txt
 
 # Prebuilt Android JNI libraries (build with scripts/wsl-build-all.sh or build-android-jni.ps1)
 android/app/src/main/jniLibs/**/*.so
+TODO_TOTHINK.txt

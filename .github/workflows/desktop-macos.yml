@@ -47,7 +47,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build bibavpn-desktop (release)
-        run: cargo build -p bibavpn-desktop --release --locked
+        run: cargo build -p bibavpn-desktop --release
 
       - name: Pack BibaVPN.app + DMG
         run: |

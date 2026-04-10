@@ -84,7 +84,7 @@ jobs:
         run: |
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
             -o android/app/src/main/jniLibs \
-            build -p bibavpn-jni --release --locked
+            build -p bibavpn-jni --release
 
       - name: Assemble debug APK
         working-directory: android
