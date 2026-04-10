@@ -12,23 +12,28 @@ use rand::rngs::OsRng;
 use rustls::pki_types::ServerName;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Semaphore, mpsc};
-use tokio::time::{Duration, Interval, MissedTickBehavior, interval, timeout};
+use tokio::time::{Duration, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, trace, warn};
 
 use crate::crypto_layer::{self, SessionCrypto};
 use crate::protocol::{
     decode_udp_rep, decode_udp_req, encode_udp_mux_open, encode_udp_rep, encode_udp_req,
 };
+use crate::retry::{maybe_ws_binary_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period};
 use crate::stealth::{WsHandshakeParams, build_websocket_request};
+use crate::tls_util::TlsClientProfile;
 use crate::ws_bridge::SharedCrypto;
 use crate::{read_padded_frame, write_padded_frame};
 
-/// One OS UDP socket per request so replies cannot be matched to the wrong `xid`.
-const UDP_MUX_SERVER_RECV_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max concurrent server-side UDP request tasks per mux session.
 const UDP_MUX_SERVER_MAX_INFLIGHT: usize = 512;
 
-/// Config snapshot for opening a UDP-mux WebSocket (mirrors `local_client::ClientCfg`).
+/// Max outstanding client replies per mux session (bounded map growth).
+const UDP_MUX_CLIENT_PENDING_CAP: usize = 2048;
+
+/// Config snapshot for opening a UDP-mux WebSocket (mirrors `local_client::ClientCfg` mux fields).
 #[derive(Clone)]
 pub struct UdpMuxConfig {
     pub server_host: String,
@@ -48,6 +53,9 @@ pub struct UdpMuxConfig {
     pub ws_extra_headers: Arc<Vec<(String, String)>>,
     pub max_ws_binary: usize,
     pub ws_ping_secs: u64,
+    pub ws_ping_jitter_percent: u8,
+    pub ws_binary_send_jitter_ms: u8,
+    pub tls_profile: TlsClientProfile,
 }
 
 pub enum ClientUdpCmd {
@@ -91,11 +99,43 @@ impl UdpMuxHandle {
 pub fn spawn_udp_mux_driver(cfg: UdpMuxConfig) -> UdpMuxHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(e) = run_udp_mux_client_loop(cfg, rx).await {
-            tracing::error!("udp mux client: {e:#}");
+        if let Err(e) = run_udp_mux_driver_forever(cfg, rx).await {
+            error!("udp mux client: {e:#}");
         }
     });
     UdpMuxHandle { tx }
+}
+
+async fn run_udp_mux_driver_forever(
+    cfg: UdpMuxConfig,
+    mut cmd_rx: mpsc::UnboundedReceiver<ClientUdpCmd>,
+) -> anyhow::Result<()> {
+    loop {
+        let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg).await?;
+        let shutdown = run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await?;
+        if shutdown {
+            return Ok(());
+        }
+    }
+}
+
+async fn connect_udp_mux_ws_resilient(
+    cfg: &UdpMuxConfig,
+) -> anyhow::Result<(
+    WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    Option<SharedCrypto>,
+)> {
+    let mut streak = 0u32;
+    loop {
+        match connect_udp_mux_ws(cfg).await {
+            Ok(x) => return Ok(x),
+            Err(e) => {
+                warn!("udp mux connect failed (streak {streak}): {e:#}");
+                sleep_outbound_backoff(streak.min(10)).await;
+                streak = streak.saturating_add(1);
+            }
+        }
+    }
 }
 
 fn junk_upper_bound(max_ws_binary: usize) -> usize {
@@ -155,11 +195,14 @@ where
 
 async fn connect_udp_mux_ws(
     cfg: &UdpMuxConfig,
-) -> anyhow::Result<(WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, Option<SharedCrypto>)>
-{
+) -> anyhow::Result<(
+    WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    Option<SharedCrypto>,
+)> {
     let tcp = tokio::net::TcpStream::connect((cfg.server_host.as_str(), cfg.server_port))
         .await
         .context("connect server")?;
+    let _ = tcp.set_nodelay(true);
     let domain = ServerName::try_from(cfg.sni.clone())?;
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
     let tls = connector.connect(domain, tcp).await.context("tls")?;
@@ -179,6 +222,7 @@ async fn connect_udp_mux_ws(
         user_agent: ws_ua,
         accept_language: ws_al,
         extra_headers: &extra,
+        tls_profile: cfg.tls_profile,
     });
     let (mut ws, _) = tokio_tungstenite::client_async(req, tls)
         .await
@@ -230,10 +274,7 @@ async fn pack_tunnel_out(
     Ok(blob)
 }
 
-async fn unpack_tunnel_in(
-    crypto: &Option<SharedCrypto>,
-    b: &[u8],
-) -> anyhow::Result<Vec<u8>> {
+async fn unpack_tunnel_in(crypto: &Option<SharedCrypto>, b: &[u8]) -> anyhow::Result<Vec<u8>> {
     let raw = match crypto {
         None => b.to_vec(),
         Some(c) => c
@@ -244,129 +285,134 @@ async fn unpack_tunnel_in(
     read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-async fn run_udp_mux_client_loop(
-    cfg: UdpMuxConfig,
-    mut cmd_rx: mpsc::UnboundedReceiver<ClientUdpCmd>,
-) -> anyhow::Result<()> {
-    let (ws, crypto) = connect_udp_mux_ws(&cfg).await?;
+/// One WSS session. Returns `Ok(true)` if the command channel closed (shutdown). `Ok(false)` = reconnect.
+async fn run_udp_mux_one_session(
+    ws: WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    crypto: Option<SharedCrypto>,
+    cfg: &UdpMuxConfig,
+    cmd_rx: &mut mpsc::UnboundedReceiver<ClientUdpCmd>,
+) -> anyhow::Result<bool> {
     let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>> =
         HashMap::new();
     let (ws_tx, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_tx));
-    let ws_ping_secs = cfg.ws_ping_secs;
 
-    let mut ping_tok: Option<Interval> = if ws_ping_secs > 0 {
-        let mut i = interval(Duration::from_secs(ws_ping_secs));
-        i.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        Some(i)
+    let _ping = if cfg.ws_ping_secs > 0 {
+        let w = ws_tx.clone();
+        let secs = cfg.ws_ping_secs;
+        let jit = cfg.ws_ping_jitter_percent;
+        Some(tokio::spawn(async move {
+            loop {
+                sleep_ws_ping_period(secs, jit).await;
+                let mut g = w.lock().await;
+                if g.send(Message::Ping(Bytes::new())).await.is_err() {
+                    break;
+                }
+            }
+        }))
     } else {
         None
     };
 
+    let mut shutdown = false;
     loop {
-        if ping_tok.is_some() {
-            tokio::select! {
-                biased;
-                _ = async {
-                    match &mut ping_tok {
-                        Some(t) => t.tick().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    let mut g = ws_tx.lock().await;
-                    g.send(Message::Ping(Bytes::new())).await.context("ws ping udp mux")?;
-                }
-                cmd = cmd_rx.recv() => {
-                    let Some(cmd) = cmd else { break };
-                    match cmd {
-                        ClientUdpCmd::Forward { xid, dst_host, dst_port, payload, reply } => {
-                            pending.insert(xid, reply);
-                            let req = encode_udp_req(xid, &dst_host, dst_port, &payload)?;
-                            let blob = pack_tunnel_out(
-                                &crypto,
-                                cfg.max_pad,
-                                cfg.decoy_max,
-                                cfg.max_ws_binary,
-                                &req,
-                            )
-                            .await?;
-                            let mut g = ws_tx.lock().await;
-                            g.send(Message::Binary(Bytes::from(blob)))
-                                .await
-                                .context("ws send udp req")?;
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    shutdown = true;
+                    break;
+                };
+                match cmd {
+                    ClientUdpCmd::Forward { xid, dst_host, dst_port, payload, reply } => {
+                        if pending.len() >= UDP_MUX_CLIENT_PENDING_CAP {
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "udp mux: too many pending replies (cap {})",
+                                UDP_MUX_CLIENT_PENDING_CAP
+                            )));
+                            continue;
                         }
-                    }
-                }
-                msg = ws_rx.next() => {
-                    let Some(msg) = msg else { break };
-                    match msg.context("ws read")? {
-                        Message::Binary(b) => {
-                            let inner = unpack_tunnel_in(&crypto, b.as_ref()).await?;
-                            let (xid, sh, sp, pl) = decode_udp_rep(&inner)?;
-                            if let Some(tx) = pending.remove(&xid) {
-                                let rep = crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl)?;
-                                let _ = tx.send(Ok(rep));
+                        pending.insert(xid, reply);
+                        let req = match encode_udp_req(xid, &dst_host, dst_port, &payload) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                if let Some(tx) = pending.remove(&xid) {
+                                    let _ = tx.send(Err(e));
+                                }
+                                continue;
                             }
+                        };
+                        let blob = match pack_tunnel_out(
+                            &crypto,
+                            cfg.max_pad,
+                            cfg.decoy_max,
+                            cfg.max_ws_binary,
+                            &req,
+                        )
+                        .await
+                        {
+                            Ok(b) => b,
+                            Err(e) => {
+                                if let Some(tx) = pending.remove(&xid) {
+                                    let _ = tx.send(Err(e));
+                                }
+                                continue;
+                            }
+                        };
+                        maybe_ws_binary_send_jitter(cfg.ws_binary_send_jitter_ms).await;
+                        let mut g = ws_tx.lock().await;
+                        if let Err(e) = g.send(Message::Binary(Bytes::from(blob))).await {
+                            if let Some(tx) = pending.remove(&xid) {
+                                let _ = tx.send(Err(anyhow::anyhow!(e)));
+                            }
+                            break;
                         }
-                        Message::Ping(p) => {
-                            let mut g = ws_tx.lock().await;
-                            g.send(Message::Pong(p)).await?;
-                        }
-                        Message::Pong(_) => {}
-                        Message::Close(_) => break,
-                        _ => {}
                     }
                 }
             }
-        } else {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    let Some(cmd) = cmd else { break };
-                    match cmd {
-                        ClientUdpCmd::Forward { xid, dst_host, dst_port, payload, reply } => {
-                            pending.insert(xid, reply);
-                            let req = encode_udp_req(xid, &dst_host, dst_port, &payload)?;
-                            let blob = pack_tunnel_out(
-                                &crypto,
-                                cfg.max_pad,
-                                cfg.decoy_max,
-                                cfg.max_ws_binary,
-                                &req,
-                            )
-                            .await?;
-                            let mut g = ws_tx.lock().await;
-                            g.send(Message::Binary(Bytes::from(blob))).await?;
-                        }
-                    }
-                }
-                msg = ws_rx.next() => {
-                    let Some(msg) = msg else { break };
-                    match msg.context("ws read")? {
-                        Message::Binary(b) => {
-                            let inner = unpack_tunnel_in(&crypto, b.as_ref()).await?;
-                            let (xid, sh, sp, pl) = decode_udp_rep(&inner)?;
-                            if let Some(tx) = pending.remove(&xid) {
-                                let rep = crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl)?;
-                                let _ = tx.send(Ok(rep));
+            msg = ws_rx.next() => {
+                let Some(msg) = msg else { break };
+                match msg.context("ws read")? {
+                    Message::Binary(b) => {
+                        let inner = match unpack_tunnel_in(&crypto, b.as_ref()).await {
+                            Ok(x) => x,
+                            Err(e) => {
+                                warn!("udp mux: drop bad frame: {e:#}");
+                                continue;
                             }
+                        };
+                        let rep = match decode_udp_rep(&inner) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                warn!("udp mux: bad UDP_REP: {e:#}");
+                                continue;
+                            }
+                        };
+                        let (xid, sh, sp, pl) = rep;
+                        if let Some(tx) = pending.remove(&xid) {
+                            match crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl) {
+                                Ok(body) => { let _ = tx.send(Ok(body)); }
+                                Err(e) => { let _ = tx.send(Err(e)); }
+                            }
+                        } else {
+                            trace!("udp mux: reply for unknown xid {xid} (likely timed out client-side)");
                         }
-                        Message::Ping(p) => {
-                            let mut g = ws_tx.lock().await;
-                            g.send(Message::Pong(p)).await?;
-                        }
-                        Message::Pong(_) => {}
-                        Message::Close(_) => break,
-                        _ => {}
                     }
+                    Message::Ping(p) => {
+                        let mut g = ws_tx.lock().await;
+                        let _ = g.send(Message::Pong(p)).await;
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
         }
     }
 
     for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(anyhow::anyhow!("udp mux closed")));
+        let _ = tx.send(Err(anyhow::anyhow!("udp mux session ended")));
     }
-    Ok(())
+    Ok(shutdown)
 }
 
 /// Server side: UDP over WebSocket after `UDP_MUX_OPEN`. Each request uses a dedicated UDP socket
@@ -378,6 +424,9 @@ pub async fn bridge_ws_udp_mux_server<S>(
     crypto: Option<SharedCrypto>,
     max_ws_binary: usize,
     ws_ping_secs: u64,
+    ws_ping_jitter_percent: u8,
+    ws_binary_send_jitter_ms: u8,
+    recv_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -386,29 +435,23 @@ where
     let (ws_sink, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_sink));
 
-    let mut ping_tok: Option<Interval> = if ws_ping_secs > 0 {
-        let mut i = interval(Duration::from_secs(ws_ping_secs));
-        i.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        Some(i)
+    let _ping = if ws_ping_secs > 0 {
+        let w = ws_tx.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                sleep_ws_ping_period(ws_ping_secs, ws_ping_jitter_percent).await;
+                let mut g = w.lock().await;
+                if g.send(Message::Ping(Bytes::new())).await.is_err() {
+                    break;
+                }
+            }
+        }))
     } else {
         None
     };
 
     loop {
-        let m = if let Some(ref mut ticker) = ping_tok {
-            tokio::select! {
-                biased;
-                _ = ticker.tick() => {
-                    let mut g = ws_tx.lock().await;
-                    g.send(Message::Ping(Bytes::new())).await.context("ws ping")?;
-                    continue;
-                }
-                m = ws_rx.next() => m,
-            }
-        } else {
-            ws_rx.next().await
-        };
-
+        let m = ws_rx.next().await;
         let Some(m) = m else {
             break;
         };
@@ -425,8 +468,20 @@ where
                         .context("v2 open c2s (udp mux)")?,
                     None => b.to_vec(),
                 };
-                let plain = read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
-                let (xid, host, port, payload) = decode_udp_req(&plain)?;
+                let plain = match read_padded_frame(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("udp mux server: skip bad padded frame: {e}");
+                        continue;
+                    }
+                };
+                let (xid, host, port, payload) = match decode_udp_req(&plain) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        warn!("udp mux server: bad UDP_REQ: {e:#}");
+                        continue;
+                    }
+                };
 
                 let permit = sem
                     .clone()
@@ -450,8 +505,7 @@ where
                             .with_context(|| format!("no addr for {host}:{port}"))?;
                         sock.send_to(&payload, dest).await.context("udp send")?;
                         let mut rbuf = vec![0u8; 65535];
-                        let (n, src) = match timeout(UDP_MUX_SERVER_RECV_TIMEOUT, sock.recv_from(&mut rbuf)).await
-                        {
+                        let (n, src) = match timeout(recv_timeout, sock.recv_from(&mut rbuf)).await {
                             Ok(Ok(v)) => v,
                             Ok(Err(e)) => return Err(e.into()),
                             Err(_) => return Ok(()),
@@ -474,6 +528,7 @@ where
                         if blob.len() > max_ws_binary {
                             anyhow::bail!("udp rep ws frame too large");
                         }
+                        maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
                         let mut g = ws_tx.lock().await;
                         g.send(Message::Binary(Bytes::from(blob)))
                             .await
@@ -482,7 +537,7 @@ where
                     })
                     .await
                     {
-                        tracing::error!("udp mux server outbound: {e:#}");
+                        error!("udp mux server outbound: {e:#}");
                     }
                 });
             }
