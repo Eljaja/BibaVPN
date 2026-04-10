@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -93,6 +94,10 @@ struct Args {
     /// TLS SNI / trust name in the invite (default: host from `--invite-public`).
     #[arg(long, requires = "print_invite_uri")]
     invite_sni: Option<String>,
+
+    /// Per-request UDP `recv_from` timeout on the server for UDP mux (seconds, 1–600).
+    #[arg(long, default_value_t = 120)]
+    udp_mux_recv_timeout_secs: u64,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -180,6 +185,11 @@ async fn main() -> anyhow::Result<()> {
     let decoy_max = args.decoy_max;
     let max_ws_binary = args.max_ws_binary;
     let ws_ping_secs = args.ws_ping_secs;
+    let ws_ping_jitter_percent = args.ws_ping_jitter_percent;
+    let ws_binary_send_jitter_ms = args.ws_binary_send_jitter_ms;
+    let udp_mux_pad = args.udp_max_pad.unwrap_or(max_pad);
+    let udp_mux_ws = args.udp_max_ws_binary.unwrap_or(max_ws_binary);
+    let udp_mux_recv = Duration::from_secs(args.udp_mux_recv_timeout_secs.clamp(1, 600));
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -196,6 +206,11 @@ async fn main() -> anyhow::Result<()> {
                 decoy_max,
                 max_ws_binary,
                 ws_ping_secs,
+                ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms,
+                udp_mux_pad,
+                udp_mux_ws,
+                udp_mux_recv,
             )
             .await
             {
@@ -214,6 +229,11 @@ async fn handle_one(
     decoy_max: u8,
     max_ws_binary: usize,
     ws_ping_secs: u64,
+    ws_ping_jitter_percent: u8,
+    ws_binary_send_jitter_ms: u8,
+    udp_mux_max_pad: u8,
+    udp_mux_max_ws_binary: usize,
+    udp_mux_recv_timeout: Duration,
 ) -> anyhow::Result<()> {
     let tls = acceptor.accept(tcp).await.context("tls accept")?;
     let path_ok = format!("/b/{token}");
@@ -246,6 +266,7 @@ async fn handle_one(
             let remote = TcpStream::connect((host.as_str(), port))
                 .await
                 .with_context(|| format!("connect {host}:{port}"))?;
+            let _ = remote.set_nodelay(true);
             bibavpn::ws_bridge::bridge_ws_tcp_padded(
                 ws,
                 remote,
@@ -255,6 +276,8 @@ async fn handle_one(
                 crypto,
                 max_ws_binary,
                 ws_ping_secs,
+                ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms,
                 TunnelEnd::Server,
             )
             .await?;
@@ -263,11 +286,14 @@ async fn handle_one(
             info!("UDP mux (same WSS/TLS envelope as TCP)");
             bibavpn::udp_mux::bridge_ws_udp_mux_server(
                 ws,
-                max_pad,
+                udp_mux_max_pad,
                 decoy_max,
                 crypto,
-                max_ws_binary,
+                udp_mux_max_ws_binary,
                 ws_ping_secs,
+                ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms,
+                udp_mux_recv_timeout,
             )
             .await?;
         }
