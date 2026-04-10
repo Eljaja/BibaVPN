@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::{Rng, RngCore};
 
 const FRAME_VER: u8 = 1;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
@@ -60,8 +60,11 @@ pub fn write_padded_frame(buf: &mut Vec<u8>, payload: &[u8], max_pad: u8) -> Res
     buf.push(((len >> 8) & 0xFF) as u8);
     buf.push((len & 0xFF) as u8);
     buf.push(pad_len);
-    for _ in 0..pad_len {
-        buf.push(rng.gen());
+    if pad_len > 0 {
+        let pl = usize::from(pad_len);
+        let start = buf.len();
+        buf.resize(start + pl, 0);
+        rng.fill_bytes(&mut buf[start..]);
     }
     buf.extend_from_slice(payload);
     Ok(())
