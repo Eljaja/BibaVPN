@@ -14,6 +14,7 @@ Local **SOCKS5** and optional **HTTP CONNECT** over **TLS + WebSocket** to an en
 ## Contents
 
 - [End-to-end picture](#end-to-end-picture)
+- [Encrypted invite `biba://](#encrypted-invite-biba)`
 - [Build](#build)
 - [Security](#security)
 - [Repository](#repository)
@@ -64,6 +65,35 @@ DPI on the outside sees ordinary **TLS** and **WebSocket**; **inside** Binary is
 
 ---
 
+## Encrypted invite `biba://`
+
+The server can print a **single-line encrypted config** after it binds: JSON (`InviteV1`) sealed with **ChaCha20-Poly1305** and a key derived from a **passphrase** (BLAKE3 KDF). Clients and Android JNI can consume the same blob instead of spelling out `--server`, `--token`, and matching tunnel options by hand.
+
+**Server** (stdout = only the URI; passphrase must stay secret — share out-of-band):
+
+```bash
+./target/release/bibavpn-server \
+  --listen 0.0.0.0:8443 --self-signed-san vpn.example \
+  --token YOUR_TOKEN --psk YOUR_PSK --decoy-max 32 --max-pad 64 \
+  --print-invite-uri \
+  --invite-passphrase 'shared-out-of-band-secret' \
+  --invite-public 'YOUR_VPS_PUBLIC_IP:8443' \
+  --invite-sni 'vpn.example'
+```
+
+**Client** (mutually exclusive with `--server` / `--token`):
+
+```bash
+./target/release/bibavpn-client \
+  --from-invite 'biba://...' \
+  --invite-passphrase 'shared-out-of-band-secret' \
+  --socks5 127.0.0.1:1080
+```
+
+The invite carries tunnel parameters (token, PSK, pad/decoy, WS limits, optional UDP profile hints, `insecure` for demo self-signed, etc.). **Do not** paste real invites or passphrases into tickets or public logs.
+
+---
+
 ## Build
 
 ```bash
@@ -79,7 +109,7 @@ Workspace crates also include `bibavpn-jni` (Android JNI) and `bibavpn-desktop` 
 
 ## Security
 
-Treat PSK and path token as **secrets** — do not commit them. For production use proper certificates and avoid `--insecure` on the client.
+Treat PSK, path token, and **invite passphrase** as **secrets** — do not commit them. For production use proper certificates and avoid `--insecure` on the client.
 
 ---
 

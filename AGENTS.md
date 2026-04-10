@@ -49,7 +49,7 @@ Typical path (UDP via SOCKS):
 - Enabled with matching `**--psk`** and `**--decoy-max`** on client and server.
 - HELLO: magic `BIBV2HL1` + 32-byte client random.
 - ACK: `BIBV2ACK1` + server random + 16-byte keyed MAC (BLAKE3 over PSK).
-- Directional keys: separate `derive` `**bibavpn.v2.c2s`** / `**bibavpn.v2.s2c**` (split directions like many v2ray-style designs).
+- Directional keys: separate `derive` `**bibavpn.v2.c2s`** / `**bibavpn.v2.s2c`** (split directions like many v2ray-style designs).
 - On the wire: 12-byte nonce + ciphertext; plaintext is optional decoy `0..N` bytes then payload.
 - Unit tests live in `crypto_layer` and `frame`; wire-format changes need matching client/server updates and tests.
 
@@ -101,7 +101,7 @@ Server (demo self-signed):
 
 Images use `**rust:1.89-bookworm`** (or newer): older `cargo` cannot build dependencies that use edition 2024.
 
-**Small VPS / low disk:** full `Dockerfile.server` pulls the Rust toolchain inside Docker and can exceed available space. Use **local Linux build** (e.g. WSL) + `**docker/Dockerfile.server.binary`** (copy prebuilt `bibavpn-server`) — see `**scripts/remote-deploy.sh**`.
+**Small VPS / low disk:** full `Dockerfile.server` pulls the Rust toolchain inside Docker and can exceed available space. Use **local Linux build** (e.g. WSL) + `**docker/Dockerfile.server.binary`** (copy prebuilt `bibavpn-server`) — see `**scripts/remote-deploy.sh`**.
 
 ## Scripts
 
@@ -111,7 +111,7 @@ Images use `**rust:1.89-bookworm`** (or newer): older `cargo` cannot build depen
 | `scripts/docker-smoke.sh`          | `docker compose up`, `curl` via SOCKS `127.0.0.1:11080` and HTTP proxy, `down`                                                                                                           |
 | `scripts/udp-socks-smoke.sh`       | Ephemeral ports: TCP via SOCKS + **UDP DNS** (8.8.8.8:53) over SOCKS; fails if server/client dies at start                                                                               |
 | `scripts/wsl-test.sh`              | Local smoke (plain/PSK) on WSL                                                                                                                                                           |
-| `scripts/remote-deploy.sh`         | Reads parent `**server.txt`** (lines: IP, user, pass, SSH port): `tar` sync → local `cargo build` → `scp` binary → `**Dockerfile.server.binary**` on host → recreate `bibavpn` container |
+| `scripts/remote-deploy.sh`         | Reads parent `**server.txt`** (lines: IP, user, pass, SSH port): `tar` sync → local `cargo build` → `scp` binary → `**Dockerfile.server.binary`** on host → recreate `bibavpn` container |
 | `scripts/remote-install-server.sh` | Build server image, `docker save`                                                                                                                                                        |
 | `scripts/speedtest-via-socks.py`   | Speedtest via SOCKS (`pysocks`, `speedtest-cli`)                                                                                                                                         |
 | `scripts/run-remote-speedtest.sh`  | SSH to VPS, venv, `speedtest-cli --simple` on the server (reads password/port from `server.txt` — gitignored)                                                                            |

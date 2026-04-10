@@ -246,6 +246,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
+ "biba",
  "blake3",
  "bytes",
  "chacha20poly1305",

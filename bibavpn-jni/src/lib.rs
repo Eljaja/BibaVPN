@@ -7,6 +7,7 @@ use bibavpn::local_client::{
     LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, parse_host_port, parse_ws_header,
 };
 use bibavpn::tls_util::install_ring_crypto;
+use bibavpn::TlsClientProfile;
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
@@ -76,6 +77,9 @@ struct StartJson {
     from_invite: Option<String>,
     #[serde(default)]
     invite_passphrase: Option<String>,
+    /// Overrides invite `tls_profile` when non-empty.
+    #[serde(default)]
+    tls_profile: Option<String>,
 }
 
 fn default_token() -> String {
@@ -133,10 +137,19 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         max_ws_binary,
         ws_ping_secs,
         insecure_tls,
+        tls_profile,
     ) = if let (Some(uri), Some(pass)) = (invite_uri, invite_pass) {
         let inv = bibavpn::decode_invite_v1(uri, pass).context("decode invite")?;
         let (h, p) = parse_host_port(inv.server.trim()).context("invite server")?;
         let sni = j.sni.clone().unwrap_or_else(|| inv.sni.clone());
+        let tls_s = j
+            .tls_profile
+            .as_ref()
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or(inv.tls_profile.clone());
+        let tls_profile = tls_s.parse::<TlsClientProfile>().context("tls_profile")?;
         (
             h,
             p,
@@ -150,6 +163,7 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
             inv.max_ws_binary,
             inv.ws_ping_secs,
             j.insecure || inv.insecure,
+            tls_profile,
         )
     } else {
         if j.server.trim().is_empty() {
@@ -157,6 +171,16 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         }
         let (h, p) = parse_host_port(j.server.trim()).context("server")?;
         let sni = j.sni.clone().unwrap_or_else(|| h.clone());
+        let tls_s = j
+            .tls_profile
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let tls_s = if tls_s.trim().is_empty() {
+            "default".to_string()
+        } else {
+            tls_s
+        };
+        let tls_profile = tls_s.parse::<TlsClientProfile>().context("tls_profile")?;
         (
             h,
             p,
@@ -170,6 +194,7 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
             j.max_ws_binary,
             j.ws_ping_secs,
             j.insecure,
+            tls_profile,
         )
     };
 
@@ -193,6 +218,7 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         ws_extra_headers: Arc::new(extra),
         max_ws_binary,
         ws_ping_secs,
+        tls_profile,
     })
 }
 

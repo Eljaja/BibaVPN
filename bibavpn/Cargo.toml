@@ -15,6 +15,7 @@ path = "src/bin/client.rs"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+biba = { path = "../biba", features = ["rustls"] }
 blake3 = "1.5"
 bytes = "1"
 chacha20poly1305 = { version = "0.10", features = ["std"] }

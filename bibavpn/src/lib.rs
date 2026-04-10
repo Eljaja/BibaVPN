@@ -17,3 +17,4 @@ pub mod ws_bridge;
 pub use frame::{FrameError, read_padded_frame, write_padded_frame};
 pub use invite_uri::{InviteV1, decode_invite_v1, encode_invite_v1};
 pub use stealth::browser_websocket_request;
+pub use tls_util::TlsClientProfile;

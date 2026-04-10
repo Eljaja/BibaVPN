@@ -20,7 +20,7 @@ use crate::frame::DEFAULT_MAX_WS_BINARY;
 use crate::http_connect;
 use crate::protocol::encode_open;
 use crate::stealth::{WsHandshakeParams, build_websocket_request};
-use crate::tls_util::{client_config_insecure, client_config_system_roots};
+use crate::tls_util::{TlsClientProfile, client_config_for_profile};
 use crate::udp_mux::{UdpMuxConfig, UdpMuxHandle, spawn_udp_mux_driver};
 use crate::ws_bridge::{self, TunnelEnd};
 use crate::{socks5, socks5::SocksCommand};
@@ -48,6 +48,8 @@ pub struct LocalClientOptions {
     pub ws_extra_headers: Arc<Vec<(String, String)>>,
     pub max_ws_binary: usize,
     pub ws_ping_secs: u64,
+    /// `biba` / uTLS-style rustls hints (cipher order + ALPN). Also set from `biba://` invite.
+    pub tls_profile: TlsClientProfile,
 }
 
 #[derive(Clone)]
@@ -105,12 +107,13 @@ pub async fn run_local_client(
     mut shutdown: watch::Receiver<bool>,
     socks_ready: Option<std::sync::mpsc::Sender<()>>,
 ) -> anyhow::Result<()> {
-    let tls = if opts.insecure_tls {
+    if opts.insecure_tls {
         info!("TLS: certificate verification disabled (lab only)");
-        client_config_insecure()
-    } else {
-        client_config_system_roots()?
-    };
+    }
+    if opts.tls_profile != TlsClientProfile::default() {
+        info!("TLS client profile: {:?}", opts.tls_profile);
+    }
+    let tls = client_config_for_profile(opts.insecure_tls, opts.tls_profile)?;
 
     if opts.psk.is_some() {
         info!(

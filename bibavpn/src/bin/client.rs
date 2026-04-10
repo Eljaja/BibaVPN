@@ -8,7 +8,7 @@ use bibavpn::invite_uri::decode_invite_v1;
 use bibavpn::local_client::{
     LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, parse_host_port, parse_ws_header,
 };
-use bibavpn::tls_util::install_ring_crypto;
+use bibavpn::tls_util::{TlsClientProfile, install_ring_crypto};
 use clap::Parser;
 use tokio::signal;
 use tokio::sync::watch;
@@ -86,6 +86,11 @@ struct Args {
     /// WebSocket ping interval seconds (0 = off). Keeps NAT / middleboxes warm.
     #[arg(long, default_value_t = 25)]
     ws_ping_secs: u64,
+
+    /// TLS ClientHello profile (`biba` → rustls): default, chrome70, firefox65, firefox63,
+    /// randomized, randomized-alpn, randomized-no-alpn. If omitted with `--from-invite`, uses invite field.
+    #[arg(long)]
+    tls_profile: Option<String>,
 }
 
 #[tokio::main]
@@ -108,6 +113,16 @@ async fn main() -> anyhow::Result<()> {
         extra.push(parse_ws_header(line)?);
     }
 
+    let inv_opt = if let Some(uri) = args.from_invite.as_ref() {
+        let pass = args
+            .invite_passphrase
+            .as_deref()
+            .expect("clap requires --invite-passphrase with --from-invite");
+        Some(decode_invite_v1(uri, pass).context("decode --from-invite")?)
+    } else {
+        None
+    };
+
     let (
         server_host,
         server_port,
@@ -121,23 +136,18 @@ async fn main() -> anyhow::Result<()> {
         max_ws_binary,
         ws_ping_secs,
         insecure_tls,
-    ) = if let Some(uri) = args.from_invite.as_ref() {
-        let pass = args
-            .invite_passphrase
-            .as_deref()
-            .expect("clap requires --invite-passphrase with --from-invite");
-        let inv = decode_invite_v1(uri, pass).context("decode --from-invite")?;
+    ) = if let Some(ref inv) = inv_opt {
         let (h, p) = parse_host_port(inv.server.trim()).context("invite server")?;
         let sni = args.sni.clone().unwrap_or_else(|| inv.sni.clone());
         (
             h,
             p,
             sni,
-            inv.token,
+            inv.token.clone(),
             inv.max_pad,
             args.junk_frames,
             args.early_ws_frames,
-            inv.psk,
+            inv.psk.clone(),
             inv.decoy_max,
             inv.max_ws_binary,
             inv.ws_ping_secs,
@@ -163,6 +173,15 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
+    let tls_profile: TlsClientProfile =
+        if let Some(s) = args.tls_profile.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            s.parse().context("tls-profile")?
+        } else if let Some(ref inv) = inv_opt {
+            inv.tls_profile.parse().context("invite tls_profile")?
+        } else {
+            TlsClientProfile::default()
+        };
+
     let opts = LocalClientOptions {
         server_host,
         server_port,
@@ -183,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
         ws_extra_headers: Arc::new(extra),
         max_ws_binary,
         ws_ping_secs,
+        tls_profile,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

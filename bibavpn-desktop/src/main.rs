@@ -22,6 +22,7 @@ use bibavpn::local_client::{
     parse_host_port, LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY,
 };
 use bibavpn::tls_util::install_ring_crypto;
+use bibavpn::TlsClientProfile;
 use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke, Vec2, Visuals};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -50,6 +51,9 @@ struct SavedConfig {
     /// Как `--max-ws-binary`, верхняя граница размера WS binary.
     #[serde(default = "default_max_ws_binary_cfg")]
     max_ws_binary: usize,
+    /// Как `--tls-profile` у bibavpn-client.
+    #[serde(default = "default_tls_profile_cfg")]
+    tls_profile: String,
 }
 
 impl Default for SavedConfig {
@@ -65,6 +69,7 @@ impl Default for SavedConfig {
             max_pad: default_max_pad_cfg(),
             decoy_max: 0,
             max_ws_binary: default_max_ws_binary_cfg(),
+            tls_profile: default_tls_profile_cfg(),
         }
     }
 }
@@ -97,6 +102,10 @@ fn default_max_pad_cfg() -> u8 {
 
 fn default_max_ws_binary_cfg() -> usize {
     DEFAULT_CLIENT_MAX_WS_BINARY
+}
+
+fn default_tls_profile_cfg() -> String {
+    "default".to_string()
 }
 
 /// Токены из `DESIGN.md` §3–4 (тёмная тема, один акцент).
@@ -414,6 +423,12 @@ impl BibaApp {
         let backup = read_backup().map_err(|e| e.to_string())?;
         let remote_label = format!("{host}:{port}");
 
+        let tls_profile: TlsClientProfile = self
+            .cfg
+            .tls_profile
+            .parse()
+            .map_err(|e| e.to_string())?;
+
         let opts = LocalClientOptions {
             server_host: host,
             server_port: port,
@@ -434,6 +449,7 @@ impl BibaApp {
             ws_extra_headers: Arc::new(Vec::new()),
             max_ws_binary: self.cfg.max_ws_binary,
             ws_ping_secs: 25,
+            tls_profile,
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -655,6 +671,42 @@ impl eframe::App for BibaApp {
                                             .speed(1024),
                                     );
                                 });
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("tls-profile — шифры и ALPN (biba)")
+                                        .size(12.0)
+                                        .color(t.text_secondary),
+                                );
+                                ui.add_space(6.0);
+                                egui::ComboBox::from_id_salt("tls_profile")
+                                    .width(320.0)
+                                    .selected_text(match self.cfg.tls_profile.as_str() {
+                                        "default" => "По умолчанию (rustls)",
+                                        "chrome70" => "Chrome 70",
+                                        "firefox65" => "Firefox 65",
+                                        "firefox63" => "Firefox 63",
+                                        "randomized" => "Randomized",
+                                        "randomized-alpn" => "Randomized + ALPN",
+                                        "randomized-no-alpn" => "Randomized без ALPN",
+                                        other => other,
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for (val, label) in [
+                                            ("default", "По умолчанию (rustls)"),
+                                            ("chrome70", "Chrome 70"),
+                                            ("firefox65", "Firefox 65"),
+                                            ("firefox63", "Firefox 63"),
+                                            ("randomized", "Randomized"),
+                                            ("randomized-alpn", "Randomized + ALPN"),
+                                            ("randomized-no-alpn", "Randomized без ALPN"),
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.cfg.tls_profile,
+                                                val.to_string(),
+                                                label,
+                                            );
+                                        }
+                                    });
                             });
                     });
 
