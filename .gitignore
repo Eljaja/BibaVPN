@@ -16,6 +16,10 @@ server.txt
 *.key
 docker-compose.override.yml
 
+# Local deploy helpers (host / secrets); keep out of git
+scripts/deploy-biba-docker-alt-port.sh
+scripts/.deploy-run-once.sh
+
 # ADB / local debug log dumps (may contain device paths or stack traces)
 biba-*-capture.txt
 biba-listen*.txt

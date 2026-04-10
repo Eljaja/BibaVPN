@@ -4,6 +4,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
 use bibavpn::frame::DEFAULT_MAX_WS_BINARY;
+use bibavpn::invite_uri::{InviteV1, encode_invite_v1};
+use bibavpn::local_client::{DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS, parse_host_port};
 use bibavpn::protocol::{decode_open, is_udp_mux_open};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
@@ -55,6 +57,42 @@ struct Args {
     /// WebSocket ping interval seconds; 0 disables keepalive pings.
     #[arg(long, default_value = "25")]
     ws_ping_secs: u64,
+
+    /// Vary WS ping interval ±N percent (0–50). Same meaning as on the client.
+    #[arg(long, default_value = "0")]
+    ws_ping_jitter_percent: u8,
+
+    /// Random 0..=N ms delay before each outbound WS binary frame (server → client).
+    #[arg(long, default_value = "0")]
+    ws_binary_send_jitter_ms: u8,
+
+    /// Padding cap for UDP mux replies only (default: same as `--max-pad`).
+    #[arg(long)]
+    udp_max_pad: Option<u8>,
+
+    /// MTU cap for UDP mux only (default: same as `--max-ws-binary`).
+    #[arg(long)]
+    udp_max_ws_binary: Option<usize>,
+
+    /// After bind, print one `biba://...` line to **stdout** (encrypted invite for clients).
+    #[arg(
+        long,
+        default_value_t = false,
+        requires_all = ["invite_passphrase", "invite_public"]
+    )]
+    print_invite_uri: bool,
+
+    /// Passphrase for the invite blob; **keep secret** and share out-of-band with clients.
+    #[arg(long, requires = "print_invite_uri")]
+    invite_passphrase: Option<String>,
+
+    /// Public `host:port` for clients (e.g. VPS when `--listen` is `0.0.0.0:8443`).
+    #[arg(long, requires = "print_invite_uri")]
+    invite_public: Option<String>,
+
+    /// TLS SNI / trust name in the invite (default: host from `--invite-public`).
+    #[arg(long, requires = "print_invite_uri")]
+    invite_sni: Option<String>,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -94,6 +132,47 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {}", args.listen))?;
     info!("listening on {}", args.listen);
+
+    if args.print_invite_uri {
+        let public = args
+            .invite_public
+            .as_ref()
+            .expect("clap requires invite_public with print_invite_uri");
+        let (host_for_sni, _) = parse_host_port(public).context("invite-public host:port")?;
+        let sni = args
+            .invite_sni
+            .clone()
+            .unwrap_or_else(|| host_for_sni.clone());
+        let lab_insecure = matches!(
+            (&args.cert, &args.key, &args.self_signed_san),
+            (None, None, Some(_))
+        );
+        let passphrase = args
+            .invite_passphrase
+            .as_deref()
+            .expect("clap requires invite_passphrase");
+        let invite = InviteV1 {
+            v: 1,
+            server: public.clone(),
+            sni,
+            token: args.token.clone(),
+            psk: args.psk.clone(),
+            decoy_max: args.decoy_max,
+            max_pad: args.max_pad,
+            max_ws_binary: args.max_ws_binary,
+            ws_ping_secs: args.ws_ping_secs,
+            ws_ping_jitter_percent: args.ws_ping_jitter_percent,
+            ws_binary_send_jitter_ms: args.ws_binary_send_jitter_ms,
+            udp_max_pad: args.udp_max_pad,
+            udp_max_ws_binary: args.udp_max_ws_binary,
+            udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
+            insecure: lab_insecure,
+            tls_profile: "default".into(),
+        };
+        let uri = encode_invite_v1(&invite, passphrase).context("build invite URI")?;
+        println!("{}", uri);
+        eprintln!("bibavpn-server: invite URI on stdout; keep --invite-passphrase secret (not in log aggregation).");
+    }
 
     let token = args.token.clone();
     let max_pad = args.max_pad;

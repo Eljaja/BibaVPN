@@ -30,12 +30,15 @@ pub struct InviteV1 {
     pub max_pad: u8,
     pub max_ws_binary: usize,
     pub ws_ping_secs: u64,
+    #[serde(default)]
     pub ws_ping_jitter_percent: u8,
+    #[serde(default)]
     pub ws_binary_send_jitter_ms: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_max_pad: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_max_ws_binary: Option<usize>,
+    #[serde(default = "default_udp_mux_reply_timeout_secs")]
     pub udp_mux_reply_timeout_secs: u64,
     /// Set when the server uses demo self-signed TLS; client should use `--insecure` or pin.
     pub insecure: bool,
@@ -45,6 +48,10 @@ pub struct InviteV1 {
 
 fn default_tls_profile() -> String {
     "default".to_string()
+}
+
+fn default_udp_mux_reply_timeout_secs() -> u64 {
+    130
 }
 
 fn cipher_from_passphrase(passphrase: &[u8]) -> ChaCha20Poly1305 {

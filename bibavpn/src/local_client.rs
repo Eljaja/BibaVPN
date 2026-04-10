@@ -459,3 +459,6 @@ where
 
 /// Default `max_ws_binary` for clients (BibaV2.1 MTU cap).
 pub const DEFAULT_CLIENT_MAX_WS_BINARY: usize = DEFAULT_MAX_WS_BINARY;
+
+/// Default SOCKS UDP-mux reply wait (seconds). Server embeds this in `biba://` invites for clients.
+pub const DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS: u64 = 130;
