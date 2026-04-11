@@ -1,0 +1,1296 @@
+﻿--------- beginning of system
+04-11 14:29:36.464  1660  2664 D BackgroundInstallControlService: Package event received: 0
+--------- beginning of main
+04-11 14:29:36.470  3403  3403 I NearbyDiscovery: (REDACTED) FastPairDisplayObserver: %s -> %s
+04-11 14:29:36.472  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:150 Scan: in shim layer stopped
+04-11 14:29:36.472  3403 21362 I NearbySharing: Screen is locked
+04-11 14:29:36.472  3403 21362 I NearbySharing: Stopping scanning because the screen is locked.
+04-11 14:29:36.472  3403 21362 I NearbySharing: [NS_PROVIDER_API]: stopDiscovery called.
+04-11 14:29:36.478  3060  3250 I bluetooth: system/gd/hci/le_address_manager.cc:277 unregister_client: Client unregistered
+04-11 14:29:36.484  3060  3283 W BtScan.ScanRadioStats: recordScanRadioStop(caller=configureRegularScanParams): No scan radio to stop
+04-11 14:29:36.484  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:319 SetScanParameters: in shim layer, scannerId1m=1, scannerIdCoded=0
+04-11 14:29:36.484  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:150 Scan: in shim layer started
+04-11 14:29:36.485  3403  7033 I NearbyDiscovery: (REDACTED) ApFastPairScanner: isScreenOn=%s, isLocationEnabled=%s, disableLocationRequirement=%s, isDiscoveryScanningEnabled=%s, during24GhzWifiWarmingUpPeriod=%s
+04-11 14:29:36.486  3403  7033 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:36.486  3403  7033 I NearbyDiscovery: (REDACTED) ApFastPairScanner: eventType=%s, intReq=%s, scanning=%s, scanAllowed=%s, bleEnabled=%s, lockScanRate=%s, startScanningByLowPowerMode=%s
+04-11 14:29:36.492  3403  7033 I NearbyDiscovery: (REDACTED) ApFastPairScanner: Stopping scan, %s
+04-11 14:29:36.492  3060  3250 I bluetooth: system/gd/hci/le_scanning_manager_impl.cc:622 stop_scan: Scanning already stopped, return!
+04-11 14:29:36.494  3060  3250 I bluetooth: system/gd/hci/le_scanning_manager_impl.cc:473 configure_scan: Support RPA offload, set own address type RESOLVABLE_OR_RANDOM_ADDRESS
+04-11 14:29:36.495  3060  3250 I bluetooth: system/gd/hci/le_address_manager.cc:262 register_client: Client registered
+04-11 14:29:36.498  3403  7033 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:36.499  2889  2889 D GRIL-S  : [0467]> UPDATE_DEVICE_STATE DeviceState: Usb:1, Wifi: 1, Wifi AP: 0, Earpiece: 0, Bluetooth: 1, Wireless charging: 0, Screen: 0, Camera: 0, 0, -, -, Motion: 1, Bluetooth tethering: 0, Voice: 0, Wifi 2.4G: 0, Radio: 1, Bluetooth connected: 0, Bluetooth media: 0, Wifi Band: 2, Wifi AP Band: 0, Wifi call: 0, mmWave: 0, mCellBackhaul: 0, mHallSensor: 0, mDozeStatus: 1, mAppClassInfo: 0, mWifiCapSensorStatus: 0, mCellCapSensorStatus: 0, mBesideHeadHandStatus: 0, mSpeakerStatus: 0, mProtectiveCaseStatus: 0, mWifiSettingStatus: 0, mGpsStatus: 0
+04-11 14:29:36.502  3403 21362 I NearbySharing: NearbySharing Internal event SendManagerEnd
+04-11 14:29:36.508  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:187 ScanFilterParamSetup: in shim layer, clientIf=1
+04-11 14:29:36.508  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:187 ScanFilterParamSetup: in shim layer, clientIf=1
+04-11 14:29:36.508  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:144 Unregister: in shim layer, scannerId=1
+04-11 14:29:36.517  3403 21361 I NearbySharing: [NS_DEBUG] DiscoveryController stopped.
+04-11 14:29:36.534  3403  3772 I NearbyConnections: Client 197205907 requested discovery to stop.
+04-11 14:29:36.547  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 3026: USF: TMD3743: [ALS] SyncDelay_adjustment (us): 1300
+04-11 14:29:36.551  7199  8219 I Mosey.A : Mosey invoking StopDiscovery
+04-11 14:29:36.556  7199  8219 I Mosey.A : API: stop() called.
+04-11 14:29:36.564  3403 19542 I NearbyMediums: Stopped BLE scanning, service-id=NearbySharing
+04-11 14:29:36.565  2889  3707 D GRIL-S  : [0467]< UPDATE_DEVICE_STATE 
+04-11 14:29:36.566  7199 21426 I Mosey.A : Ignoring Stop: already IDLE.
+04-11 14:29:36.568  3403 19542 I NearbyMediums: [WifiAwareManagerHelper] Can't stop WiFi Aware subscribing because it was never started.
+04-11 14:29:36.572  3403 19542 I NearbyMediums: NFC discovery successfully stopped.
+04-11 14:29:36.573  3403 21362 I NearbySharing: External sharing provider has received status 0 for stopDiscovery
+04-11 14:29:36.574  3403 21362 I NearbySharing: External sharing provider has stopped discovery
+04-11 14:29:36.576  3403 21362 I NearbySharing: Scanning has stopped.
+04-11 14:29:36.577  3403 19542 I NearbyConnections: No longer listening to visibility changes for client 197205907
+04-11 14:29:36.579  3403 21362 I NearbySharing: Stopping Fast Init advertisement because we're not scanning in the foreground.
+04-11 14:29:36.583  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.584  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.584  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.584  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.586   882   922 I CHRE    : @ 3124.094: [WallabyPD] 	Device (0x21)  >>> stationary faceup - not-in-pocket <<< Config: Optical-Only FCN 
+04-11 14:29:36.586   882   922 I CHRE    : @ 3124.094: [Wallaby] PocketEvent Pos: 0x21 -> 0x21, IsHostAwake: 1
+04-11 14:29:36.586   882   922 I CHRE    : @ 3124.094: [WallabyPD] 	Device (0x21)  >>> stationary faceup - not-in-pocket <<< Config: Optical-Only FCN 
+04-11 14:29:36.586   882   922 I CHRE    : @ 3124.094: [Wallaby] PocketEvent Pos: 0x21 -> 0x21, IsHostAwake: 1
+04-11 14:29:36.594  3403 21362 I NearbySharing: Start advertising with mode SCREEN_OFF certificate visibility SELF_SHARE data usage preference ONLINE, and bt advertising false with vendorId 0
+04-11 14:29:36.594  1660  3391 D TelephonyManager: requestModemActivityInfo: Sending result to app: ModemActivityInfo{ mTimestamp=3121314 mSleepTimeMs=2268366 mIdleTimeMs=267341 mActivityStatsTechSpecificInfo=[{mRat=GERAN,mFrequencyRange=UNKNOWN,mTxTimeMs[]=[0, 0, 0, 0, 0],mRxTimeMs=795}, {mRat=UTRAN,mFrequencyRange=UNKNOWN,mTxTimeMs[]=[0, 0, 0, 0, 0],mRxTimeMs=31}, {mRat=EUTRAN,mFrequencyRange=UNKNOWN,mTxTimeMs[]=[66663, 12829, 23013, 8870, 8086],mRxTimeMs=570739}, {mRat=NGRAN,mFrequencyRange=HIGH,mTxTimeMs[]=[0, 0, 0, 0, 0],mRxTimeMs=0}, {mRat=NGRAN,mFrequencyRange=MMWAVE,mTxTimeMs[]=[0, 0, 0, 0, 0],mRxTimeMs=0}, {mRat=UNKNOWN,mFrequencyRange=UNKNOWN,mTxTimeMs[]=[0, 0, 0, 0, 0],mRxTimeMs=0}]}
+04-11 14:29:36.595  3403 21362 I NearbySharing: Uwb feature is off.
+04-11 14:29:36.596  3403 21362 I NearbySharing: Updating advertising options for [duea@279ae30, duap@b3e0f81] providers
+04-11 14:29:36.596  3403 21362 I NearbySharing: Updating advertising options: AdvertisingOptions{mode=SCREEN_OFF, dataUsage=2, flowId=0, uwbSenderInfo=[], deviceType=1, bluetoothClassicEnabled=false, useStableIdentifiers=false, allowGattConnections=false, allowBleL2capConnections=false, vendorId=0, advertisePlaintextDeviceName=false}
+04-11 14:29:36.596  3403 21362 I NearbySharing: [RECEIVE_PROVIDER] update called.
+04-11 14:29:36.596  3403 21362 I NearbySharing: Updating advertising options: AdvertisingOptions{mode=SCREEN_OFF, dataUsage=2, flowId=0, uwbSenderInfo=[], deviceType=1, bluetoothClassicEnabled=false, useStableIdentifiers=false, allowGattConnections=false, allowBleL2capConnections=false, vendorId=0, advertisePlaintextDeviceName=false}
+04-11 14:29:36.598  7199  8219 I Mosey.A : Mosey invoking UpdateAdvertising
+04-11 14:29:36.599  7199  8219 I Mosey.A : update called.
+04-11 14:29:36.600  7199 21426 I Mosey.A : execUpdate() called with options: AdvertisingOptions(mode=3, localDeviceName=)
+04-11 14:29:36.600  3403 21362 I NearbySharing: External sharing provider has received status 0 for updateAdvertisingOptions
+04-11 14:29:36.600  3403 21362 I NearbySharing: External sharing provider has updated advertising options
+04-11 14:29:36.601  7199 21426 I Mosey.A : stopNsdAdvertising() called.
+04-11 14:29:36.602   952  1064 I WifiHAL : Creating message to get link statistics; iface = 47
+04-11 14:29:36.604  7199  7199 I Mosey.A : Event received: STOP_RECEIVE(immediate=false, completer=dgo{Active}@1afe6ac)
+04-11 14:29:36.605  7199  7199 I Mosey.A : Next state: bqo@775baa0
+04-11 14:29:36.606  7199  7199 I Mosey.A : State updated to: bqo@775baa0
+04-11 14:29:36.615  3403 21362 I NearbySharing: Advertising has started with mode SCREEN_OFF, Bt enabled : false
+04-11 14:29:36.615  3403 21362 I NearbySharing: Stopping FastInitiation scanning because the screen is locked.
+04-11 14:29:36.615  3403 21362 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:36.619  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:187 ScanFilterParamSetup: in shim layer, clientIf=3
+04-11 14:29:36.620  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:187 ScanFilterParamSetup: in shim layer, clientIf=3
+04-11 14:29:36.621  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:144 Unregister: in shim layer, scannerId=3
+04-11 14:29:36.625  3403 21362 I NearbySharing: Stopped scanning for FastInitiation
+04-11 14:29:36.633  3403 21362 I NearbySharing: Fast Initiation Scanning has stopped
+04-11 14:29:36.633  3403 21362 I NearbySharing: Dismissing HUN as there's no device nearby.
+04-11 14:29:36.635  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6100 matrix =
+04-11 14:29:36.635  1660  2074 D ColorDisplayService:        0.997120 0.000027-0.001423 0.000000 0.000305 0.997122-0.005836 0.000000 0.002575 0.001426 0.931704 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:36.636   952   952 I WifiHAL : Getting cached scan results, iface handle = 0xb400007c98ecf050
+04-11 14:29:36.636   952   952 E WifiHAL : Creating message to get cached scan results
+04-11 14:29:36.640   952   952 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+04-11 14:29:36.645   491   491 I hwc-pixel-display-DSI-1: SetPowerMode PixelPowerMode ON -> OFF
+04-11 14:29:36.650   490   490 D SurfaceFlinger: Finished setting power mode 0 on physical display 4619827256186712064
+04-11 14:29:36.651  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 2643: USF: TMD3743: dbv:0 rr:0 pwm:-1 te2:0 status:0[1] C/R/G/B/W=0.0/0.0/0.0/0.0/0.0
+04-11 14:29:36.651  1207  1207 D AOC     : A3:MSG: usf_vsc_log.cc, 69: VSC: [BINNED_BRIGHTNESS] Display[0] state changed to 0 (lux:354.083240)
+04-11 14:29:36.651  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 3026: USF: TMD3743: [ALS] SyncDelay_adjustment (us): 4700
+04-11 14:29:36.653   898  2444 I suez-nanoapp-clients: Disabling ip_health nanoapp.
+04-11 14:29:36.653  1660  2686 D SurfaceControl: Excessive delay in setPowerMode()
+04-11 14:29:36.653  1660  2686 I LocalDisplayAdapter: SF.setDisplayPowerMode took 254ms
+04-11 14:29:36.654   858   899 W statsd  : StatsPullerManager: Unknown tagId 150023
+04-11 14:29:36.654   858   899 E statsd  : Stats puller failed for tag: 150023 at 3121071573809
+04-11 14:29:36.655  1660  2294 I PowerGroup: dreamManagerAttemptedDozing status changed to true for group 0
+04-11 14:29:36.655  1660  2294 I DreamManagerService: Entering dreamland.
+04-11 14:29:36.656  1660  2294 I PowerManagerService: Dozing...
+04-11 14:29:36.661   882   922 D CHRE    : @ 3124.170: Parsed nanoapp message from host: app ID 0x476f6f676c001022 endpoint 0x8042 msgType 2 payload size 0
+04-11 14:29:36.663   898  2445 I suez-nanoapp-clients: Vendor atom [id = 100046] reported.
+04-11 14:29:36.670  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.670  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.670  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1881: USF: Received stop sampling request for SPL07003 Barometer (active:1).
+04-11 14:29:36.670  1207  1207 D AOC     : A3:MSG: spxyz00n_sensor.cc, 102: USF: Spxyz00nSensor: Start 0, period: 1000000000, latency: 0.
+04-11 14:29:36.670  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.670  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.670  1207  1207 D AOC     : A3:MSG: spxyz00n_sensor.cc, 114: USF: Spxyz00nSensor: Supported sampling period: 640000000 ns.
+04-11 14:29:36.670  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.670  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.671  1207  1207 D AOC     : A3:MSG: usf_tbn_server.cc, 263: gti: Receive TBN event id: 56, op: 1
+04-11 14:29:36.671   882   922 I CHRE    : @ 3124.170: [ip] Received message from host endpoint 0x8042 of type 2 and size 0.
+04-11 14:29:36.671   882   922 I CHRE    : @ 3124.170: [ip] App disabled by host.
+04-11 14:29:36.672   882   922 D CHRE    : @ 3124.179: Parsed nanoapp message from host: app ID 0x476f6f676c00103b endpoint 0x8005 msgType 3 payload size 0
+04-11 14:29:36.672   882   922 I CHRE    : @ 3124.180: [Wallaby] Unsubscribe protobuf request from host: 0x8005
+04-11 14:29:36.673   882   922 I CHRE    : @ 3124.180: [Wallaby] Handling unsubscribe request: one_shot=0, client_id 32773
+04-11 14:29:36.673   882   922 I CHRE    : @ 3124.180: [WallabyPD] Removing config, model=1, on_demand=0, #configs=2
+04-11 14:29:36.673   882   922 I CHRE    : @ 3124.180: [WallabyPD] Config exists=1. decrementing num_clients=1
+04-11 14:29:36.673   882   922 I CHRE    : @ 3124.180: [WallabyPD] REMOVED inference config refcount, #configs=1
+04-11 14:29:36.673   882   922 I CHRE    : @ 3124.180: [Wallaby] updated merged flags: 0x1
+04-11 14:29:36.674  3544  3922 I CHRE    : Got message from nanoapp 0x476f6f676c00103b to endpoint 0x8005 with type 0x4 and length 2
+04-11 14:29:36.674  3544  3922 I CHRE    : Wallaby Ack : 0x00000001 : Subscription : 0
+04-11 14:29:36.676   882   922 D CHRE    : @ 3124.189: Parsed nanoapp message from host: app ID 0x476f6f676c00103b endpoint 0x8005 msgType 1 payload size 4
+04-11 14:29:36.686  1207  1207 D AOC     : A3:MSG: usf_tbn_server.cc, 57: gti: Change bus owner to AOC.
+04-11 14:29:36.686  1207  1207 D AOC     : A3:MSG: usf_touch_device.cc, 801: gtd: On tbn event, state: 2.
+04-11 14:29:36.686  1207  1207 D AOC     : A3:MSG: usf_touch_device.cc, 593: gtd: Bus: 1, Host: 0; Enabled: 0.
+04-11 14:29:36.686  1207  1207 D AOC     : A3:MSG: usf_tbn_server.cc, 236: gti: Send TBN event response id: 56, op: 1
+04-11 14:29:36.686  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.686  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.686  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.687  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.687  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.687  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.687  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1881: USF: Received stop sampling request for ICM45631 Accelerometer (active:2).
+04-11 14:29:36.687  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.687  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.688   881  2400 I Lyric   : spectral_driver.cc:204: Ambient light sampling has been disabled for session ID: 59
+04-11 14:29:36.690  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 476: USF: TMD3743: [0]Stop sampling (Client count L/C/S/P = 1/0/0/0, err = 0)
+04-11 14:29:36.690   881  2400 I Lyric   : spectral_driver.cc:204: Ambient light sampling has been disabled for session ID: 60
+04-11 14:29:36.694  1660  2070 I DreamController: Starting dream: name=ComponentInfo{com.android.systemui/com.android.systemui.doze.DozeService}, isPreviewMode=false, canDoze=true, userId=0, reason='power manager request'
+04-11 14:29:36.697  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:36.716  2723  2723 D DLObserver: add listener: com.android.systemui.doze.DozeTriggers$DockEventListener@165c212
+04-11 14:29:36.716  2723  2723 D SbStateController: setState: requested state KEYGUARD!= upcomingState: SHADE. This usually means the status bar state transition was interrupted before the upcoming state could be applied.
+04-11 14:29:36.718  2723  3048 D KeyguardViewMediator: updateActivityLockScreenState(false, true, setDozing)
+04-11 14:29:36.719  1660  3189 D WindowManager: Add SleepToken: tag=keyguard, displayId=0
+04-11 14:29:36.719  2723  2723 E NotifRow: Magnetic state changed from IDLE to IDLE on a null swiped listener, or the logging key of the listener is null
+04-11 14:29:36.720  3403 21362 I NearbyMediums: Found Fast Ble Advertisements :
+04-11 14:29:36.720  3403 21362 I NearbyMediums: BleAdvertisement { version=2, socketVersion=2, isFast=true, serviceIdHash=null, data=[ 0x23 0x31 0x57 0x55 0x4c 0x11 0x32 0x02 0x33 0x32 0x96 0x42 0xa5 0x55 0x0c 0xe8 0x16 0x4a 0xbd 0xed 0x9e 0x9d 0xd3 ], deviceToken=[ 0xdb 0xe7 ], rxAdvertisement=[ 0xa0 0x17 0x4d 0xbd 0x25 0xeb 0xe3 0x38 0xb3 0x89 0xea 0x95 0xe4 0xca 0xa0 0xf9 0xb8 0x39 0x32 0x53 0x5b 0x61 0x01 0xa8 0x9b 0x91 0x10 0x37 0xca 0xd2 0x90 0x0f 0xe7 0x2d 0x84 0x15 0x05 0x73 0x00 0x00 0x84 0x15 0x06 0x61 0x00 0x00 0x84 0x15 0x04 0x73 0x00 0x00 0x83 0x15 0x01 0x09 0x76 ] } : 2 times.
+04-11 14:29:36.720  3403 21362 I NearbyMediums: BleAdvertisement { version=2, socketVersion=2, isFast=true, serviceIdHash=null, data=[ 0x23 0x5a 0x48 0x4c 0x4c 0x11 0x34 0x37 0xd3 0x98 0x49 0x7b 0x30 0xc5 0x09 0xb7 0xc7 0xdb 0xb8 0x3e 0xcc 0x0f 0x98 ], deviceToken=[ 0x8e 0x63 ], rxAdvertisement=null } : 1 times.
+04-11 14:29:36.720  3403 21362 I NearbyMediums: Total 3 fast advertisements from 2 unique advertisers.
+04-11 14:29:36.722  2723  2723 D InsetsController: Setting requestedVisibleTypes to 501 (was 503)
+04-11 14:29:36.723  2723  2723 D DLIndicator: onDozingChanged(true)
+04-11 14:29:36.723  2723  2723 D DLIndicator: updateVisibility(), mDozing=true, mDocking=false, mTopIconShowing=false, mViewAttached=true
+04-11 14:29:36.724  2723  2723 D DLIndicator: onStateChanged(1)
+04-11 14:29:36.724  2723  2723 D DLIndicator: updateVisibility(), mDozing=true, mDocking=false, mTopIconShowing=false, mViewAttached=true
+04-11 14:29:36.729  3403 21362 I NearbyMediums: Current Tracked Scanning Clients are : {NearbyConnections.EnvironmentMonitor, NearbyConnections.TxAdvertisement}
+04-11 14:29:36.732  5112 20841 I AiAiEcho: (REDACTED) Settings changed for uri: %s
+04-11 14:29:36.736  2723  2723 D DLObserver: add listener: com.android.systemui.doze.DozeDockHandler$DockEventListener@f27a510
+04-11 14:29:36.736  3403 21361 I NearbySharing: Loading certificates with visibility SELF_SHARE
+04-11 14:29:36.737  2723  2723 V DreamService[DozeService]: UpdateDoze mDozeScreenState=1 mDozeScreenBrightness=NaN
+04-11 14:29:36.737  1660  2258 D DreamManagerService: Dream requested to start dozing: android.os.Binder@e785284, screenState=OFF, reason=UNKNOWN, screenBrightness=NaN, useNormalBrightnessForDoze=false
+04-11 14:29:36.737  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.738  5112  5457 I AiAiEcho: (REDACTED) Predicting[%d]: %s
+04-11 14:29:36.739  1137 14016 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.739  1137 14016 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.739  1137 14016 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.739  1137 14016 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.739  1137 14016 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.739  5112  5457 I AiAiEcho: (REDACTED) EchoTargets: %s
+04-11 14:29:36.739  5112  5457 I AiAiEcho: Filtered by AiAi flag check: %s
+04-11 14:29:36.742  3403 21361 I NearbySharing: Saving the private certificate to file nearby_sharing_private_certificate_file_for_self.
+04-11 14:29:36.744  2723  3048 V DreamService[DozeService]: UpdateDoze mDozeScreenState=1 mDozeScreenBrightness=0.0
+04-11 14:29:36.746   898  1840 D usf_sensor_hal: device pickup: Enter Batch. Period = 1000000, latency = 0.
+04-11 14:29:36.746   898  2277 I sensor-suez: Vendor atom [id = 100243] reported.
+04-11 14:29:36.746   898  1840 D usf_sensor_hal: device pickup: Enter Activate. Enable = 1.
+04-11 14:29:36.747  1660  2258 D DreamManagerService: Dream requested to start dozing: android.os.Binder@e785284, screenState=OFF, reason=UNKNOWN, screenBrightness=0.0, useNormalBrightnessForDoze=false
+04-11 14:29:36.748  1660  2294 I DisplayPowerController[0]: BrightnessEvent: brt=0.0(0.0%), nits=1.0, lux=-1.0, reason=screen_off, strat=ScreenOffBrightnessStrategy, state=OFF, stateReason=UNKNOWN, policy=DOZE, flags=, initBrt=0.0, rcmdBrt=NaN, preBrt=NaN, preLux=0.0, wasShortTermModelActive=false, autoBrightness=true (default), unclampedBrt=-1.0, hbmMax=0.7, hbmMode=off, thrmMax=1.0, rbcStrength=0, powerFactor=1.0, physDisp=Built-in Screen(local:4619827256186712064), logicalId=0, slowChange=false, rampSpeed=0.0
+04-11 14:29:36.749  1207  1207 D AOC     : A3:MSG: vsc_sensor.cc, 37: VSC: [Lift to Wake Sensor] enable: period 1, latency = 0
+04-11 14:29:36.751  2723  2723 W View    : requestLayout() improperly called by com.android.keyguard.CarrierText{6c7d14b V.ED..... ......ID 70,0-485,173 #7f0a0466 app:id/keyguard_carrier_text} during layout: running second layout pass
+04-11 14:29:36.751  2723  2723 W View    : requestLayout() improperly called by com.android.systemui.util.AutoMarqueeTextView{94ca9f5 V.ED..... ..S...ID 0,0-115,58 #7f0a057a app:id/mobile_carrier_text} during layout: running second layout pass
+04-11 14:29:36.755  5112  5457 I AiAiEcho: #remoteViewsTwiddler: feature disabled.
+04-11 14:29:36.755   898   982 I usf_sensor_hal: Received REPORT_SENSOR_ACTIVE_STATE_CHANGES event from 'TMD3743 Proximity' with state:kActive and desired fps:30!
+04-11 14:29:36.759  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for TMD3743 Proximity (active:1).
+04-11 14:29:36.759  1207  1207 D AOC     : A3:MSG: tmd3743_sensor.cc, 296: USF: TMD3743: Report new active state:1 min_fps:30
+04-11 14:29:36.760  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 367: USF: TMD3743: [0]Start sampling (Client count L/C/S/P = 1/0/0/1, err = 0)
+04-11 14:29:36.760  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1881: USF: Received stop sampling request for TMD3743 Proximity (active:0).
+04-11 14:29:36.760  1207  1207 D AOC     : A3:MSG: tmd3743_sensor.cc, 296: USF: TMD3743: Report new active state:0 min_fps:0
+04-11 14:29:36.760  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 476: USF: TMD3743: [0]Stop sampling (Client count L/C/S/P = 1/0/0/0, err = 0)
+04-11 14:29:36.760  1207  1207 D AOC     : A3:MSG: usf_vsc_log.cc, 69: VSC: [Lift_to_Wake] Enable Lift to Wake gesture : 1
+04-11 14:29:36.760  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.760   491   491 I hwc-pixel-display-DSI-1: SetSensorRefreshRateThrottle: writes min_vrefresh(30) to the sysfs node
+04-11 14:29:36.761  2723  2723 I KeyguardTransitionRepository: FINISHED transition: TransitionStep(from=GONE, to=DOZING, value=1.0, transitionState=FINISHED, ownerName=FromGoneTransitionInteractor(Sleep transition triggered))
+04-11 14:29:36.761   491   519 I hwc-pixel-display-DSI-1: SetSensorRefreshRateThrottle: writes idle_delay_ms(1000) to the sysfs node
+04-11 14:29:36.761   898   982 I usf_sensor_hal: Received REPORT_SENSOR_ACTIVE_STATE_CHANGES event from 'TMD3743 Proximity' with state:kInactive and desired fps:0!
+04-11 14:29:36.761   491   832 I hwc-pixel-display-DSI-1: SetSensorRefreshRateThrottle: writes min_vrefresh(0) to the sysfs node
+04-11 14:29:36.762  5112  5457 I AiAiEcho: (REDACTED) Predicting[%d]: %s
+04-11 14:29:36.764   491  3925 I hwc-pixel-display-DSI-1: SetSensorRefreshRateThrottle: writes idle_delay_ms(0) to the sysfs node
+04-11 14:29:36.765  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Accelerometer (active:3).
+04-11 14:29:36.765  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 0, p/l: 20000000 ns/ 0 ns, O/WM/I: 50/10/5
+04-11 14:29:36.765  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Gyroscope (active:1).
+04-11 14:29:36.766  2723  2803 D StatusBar##isHomeStatusBarAllowed: newValue: false
+04-11 14:29:36.766  5112  5457 I AiAiEcho: (REDACTED) EchoTargets: %s
+04-11 14:29:36.766  5112  5457 I AiAiEcho: Filtered by AiAi flag check: %s
+04-11 14:29:36.766  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 1, p/l: 20000000 ns/ 0 ns, O/WM/I: 50/1/50
+04-11 14:29:36.766  2723  2803 D StatusBar##chips: newValue: Chips[allowed=false numChips=0]
+04-11 14:29:36.767  5112  5457 I AiAiEcho: (REDACTED) #weatherSubItemsTwiddler: Weather removes SubtitleSupplementalItem in surface: %s
+04-11 14:29:36.767  5112  5457 I AiAiEcho: #remoteViewsTwiddler: feature disabled.
+04-11 14:29:36.768  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Stationary Detect (active:1).
+04-11 14:29:36.768  5112  5457 I AiAiEcho: (REDACTED) Predicting[%d]: %s
+04-11 14:29:36.769  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 4, p/l: 640000000 ns/ 0 ns, O/WM/I: 50/1/50
+04-11 14:29:36.770  5112  5457 I AiAiEcho: (REDACTED) EchoTargets: %s
+04-11 14:29:36.770  5112  5457 I AiAiEcho: Filtered by AiAi flag check: %s
+04-11 14:29:36.770  5112  5457 I AiAiEcho: (REDACTED) #weatherSubItemsTwiddler: Weather removes SubtitleSupplementalItem in surface: %s
+04-11 14:29:36.771  5112  5457 I AiAiEcho: #remoteViewsTwiddler: feature disabled.
+04-11 14:29:36.771   898  2277 I sensor-suez: Vendor atom [id = 100242] reported.
+04-11 14:29:36.771   898  2277 I sensor-suez: Vendor atom [id = 100243] reported.
+04-11 14:29:36.772   898  1840 D usf_sensor_hal: proximity gated single tap: Enter Batch. Period = 1000000, latency = 0.
+04-11 14:29:36.772   898  1840 D usf_sensor_hal: proximity gated single tap: Enter Activate. Enable = 1.
+04-11 14:29:36.772  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Accelerometer (active:4).
+04-11 14:29:36.772   898  2277 I sensor-suez: Vendor atom [id = 100243] reported.
+04-11 14:29:36.774  1207  1207 D AOC     : A3:MSG: vsc_sensor.cc, 37: VSC: [Proximity Gated Single Tap Gesture] enable: period 1, latency = 0
+04-11 14:29:36.776  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for TMD3743 Proximity (active:1).
+04-11 14:29:36.778  2864  2864 D ContextualAwarenessService: Before dispatching ACTION_SCREEN_OFF onReceive work to background
+04-11 14:29:36.779  1660  1660 I PowerManagerService: onFlip(): Face up.
+04-11 14:29:36.780  1207  1207 D AOC     : A3:MSG: tmd3743_sensor.cc, 296: USF: TMD3743: Report new active state:1 min_fps:30
+04-11 14:29:36.780  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 367: USF: TMD3743: [0]Start sampling (Client count L/C/S/P = 1/0/0/1, err = 0)
+04-11 14:29:36.781   898   982 I usf_sensor_hal: Received REPORT_SENSOR_ACTIVE_STATE_CHANGES event from 'TMD3743 Proximity' with state:kActive and desired fps:30!
+04-11 14:29:36.781   491  3925 I hwc-pixel-display-DSI-1: SetSensorRefreshRateThrottle: writes min_vrefresh(30) to the sysfs node
+04-11 14:29:36.781   491   519 I hwc-pixel-display-DSI-1: SetSensorRefreshRateThrottle: writes idle_delay_ms(1000) to the sysfs node
+04-11 14:29:36.782  5112  5457 I AiAiEcho: (REDACTED) #postPredictionTargets: Sending updates to UISurface %s with targets# %s (types=[%s])
+04-11 14:29:36.782  2864 13435 D ContextualAwarenessService: Before ACTION_SCREEN_OFF onReceive work
+04-11 14:29:36.782  2864 13435 D ContextualAwarenessService: After ACTION_SCREEN_OFF onReceive work
+04-11 14:29:36.783  2864  2864 D ContextualAwarenessService: After dispatching ACTION_SCREEN_OFF onReceive work to background
+04-11 14:29:36.783  2723  2723 D DeviceEntryIconViewBinder: Initializing device entry fgIconView
+04-11 14:29:36.785  2723  2723 W TypefaceCache: MISS: CacheKey(res=kotlin.Unit, fvar='wght' 200, 'wdth' 85, 'ROND' 100, 'slnt' 0); Total: 32
+04-11 14:29:36.785  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 4, p/l: 0 ns/ 9223372036854775807 ns, O/WM/I: 50/1/50
+04-11 14:29:36.785  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Gyroscope (active:2).
+04-11 14:29:36.785  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for Touch Single Tap Sensor (active:1).
+04-11 14:29:36.787  2864  2864 I AppSlicerService: Received Screen Off intent 
+04-11 14:29:36.788  2723  2723 W TypefaceCache: MISS: CacheKey(res=kotlin.Unit, fvar='ROND' 100.0,'slnt' 0.0,'wdth' 85.0,'wght' 200.0); Total: 33
+04-11 14:29:36.788  2723  2799 I AmbientCueRepository: Receiving SmartSpace targets # 0
+04-11 14:29:36.789  5112  5457 I AiAiEcho: (REDACTED) #postPredictionTargets: Sending updates to UISurface %s with targets# %s (types=[%s])
+04-11 14:29:36.789  1207  1207 D AOC     : A3:MSG: usf_touch_device.cc, 199: gtd: Host enables sensor, type: 1.
+04-11 14:29:36.789  1207  1207 D AOC     : A3:MSG: usf_touch_device.cc, 593: gtd: Bus: 1, Host: 1; Enabled: 0.
+04-11 14:29:36.789  1207  1207 D AOC     : A3:MSG: ft3683u_task.cc, 44: UTD: Enter gesture mode
+04-11 14:29:36.790  2723  2723 D KeyguardViewMediator: KeyguardViewMediator queue processing message: NOTIFY_FINISHED_GOING_TO_SLEEP
+04-11 14:29:36.792  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Temperature (active:5).
+04-11 14:29:36.792   898  2277 I sensor-suez: Vendor atom [id = 100242] reported.
+04-11 14:29:36.792   898  2277 I sensor-suez: Vendor atom [id = 100243] reported.
+04-11 14:29:36.793  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 2, p/l: 80000000 ns/ 0 ns, O/WM/I: 50/1/50
+04-11 14:29:36.793   898  1840 D usf_sensor_hal: accelerometer: Enter Batch. Period = 20000000, latency = 200000000.
+04-11 14:29:36.793   898  1840 D usf_sensor_hal: IMU temperature: Enter Batch. Period = 666667000, latency = 200000000.
+04-11 14:29:36.793  1660  2258 D BiometricService: canAuthenticate: User=0, Caller=0, Authenticators=255
+04-11 14:29:36.793   898  2277 I sensor-suez: Vendor atom [id = 100243] reported.
+04-11 14:29:36.793  2953  4034 I SHANNON_IMS: 4243 [PROX] onReceive: intent= [Intent { act=android.intent.action.SCREEN_OFF flg=0x50200010 }] (ConnectivityBroadcastReceiver%onReceive:91)
+04-11 14:29:36.793  1660  2258 D BiometricService/PreAuthInfo: Package: com.android.systemui Sensor ID: 1 Modality: 8 User id: 0 Status: 7
+04-11 14:29:36.794  1660  2258 D BiometricService/PreAuthInfo: Package: com.android.systemui Sensor ID: 37748992 Modality: 2 User id: 0 Status: 1
+04-11 14:29:36.794  1660  2258 D BiometricService/PreAuthInfo: getCanAuthenticateInternal Modality: 2 AuthenticatorStatus: 1
+04-11 14:29:36.794  1660  2258 D AuthService: canAuthenticate, userId: 0, callingUserId: 0, authenticators: 255, result: 0
+04-11 14:29:36.794  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for MMC5616 Magnetometer (active:2).
+04-11 14:29:36.794  1207  1207 D AOC     : A3:MSG: mmc5616_device.cc, 448: USF: MMC56160: mmc5616_enable_measure odr = 10.
+04-11 14:29:36.795  5112  5457 I AiAiEcho: (REDACTED) #postPredictionTargets: Sending updates to UISurface %s with targets# %s (types=[%s])
+04-11 14:29:36.798  2723  2723 D SystemEventDataSource: onReceive: intentAction
+04-11 14:29:36.798  2723  2723 I WeatherSmartspaceView: setFormattedContentDescription: text=9┬░C, iconDescription=Clear day, contentDescription=Clear day, 9┬░C
+04-11 14:29:36.798  2723  2723 I WeatherSmartspaceView: setFormattedContentDescription: text=9┬░C, iconDescription=Clear day, contentDescription=Clear day, 9┬░C
+04-11 14:29:36.798  2723  2723 I WeatherData: Weather data parsed SUNNY ("Clear day") 9┬░C from Bundle[{description=Clear day, feedback_intent=null, explanation_intent=Supplier{VAL_PARCELABLE@144+1920}, is_gaia_linked_data=true, use_celsius=true, state=1, temperature=9}]
+04-11 14:29:36.799  3403 21361 I NearbySharing: Network state changed: NetworkState(isRestricted=false, isOnline=true, isCongested=false, isMetered=true, isWifiConnected=true)
+04-11 14:29:36.799  2723  2723 I Columbus/Service: Switching action from UserSelectedAction [currentAction -> LaunchOverview] to null
+04-11 14:29:36.799  2723  2723 I Columbus/Service: No available actions
+04-11 14:29:36.800  3403 21361 I NearbySharing: Network state changed: NetworkState(isRestricted=false, isOnline=true, isCongested=false, isMetered=true, isWifiConnected=true)
+04-11 14:29:36.801  2723  2723 D InputMonitorCompat: Input event receiver for monitor (Quick Tap-disp0) disposed
+04-11 14:29:36.801  2723  2723 D InputMonitorCompat: Input monitor (Quick Tap-disp0) disposed
+04-11 14:29:36.801  1660  2563 W InputDispatcher: channel '[Gesture Monitor] Quick Tap' ~ Consumer closed input channel or an error occurred.  events=0x9
+04-11 14:29:36.801  1660  2563 E InputDispatcher: channel '[Gesture Monitor] Quick Tap' ~ Channel is unrecoverably broken and will be disposed!
+04-11 14:29:36.802  1660  3189 D SystemServerTiming: getUserSwitchability-0
+04-11 14:29:36.802  1660  3189 D SystemServerTiming: TM.isInCall
+04-11 14:29:36.803  1660  3189 D SystemServerTiming: hasUserRestriction-DISALLOW_USER_SWITCH
+04-11 14:29:36.803  2723  2723 I Columbus/GestureSensor: CHREGestureSensorDelegator stopListening, gestureSensor = com.google.android.systemui.columbus.legacy.sensors.CHREGestureSensor@7dc8cba
+04-11 14:29:36.803  1660  3189 D SystemServerTiming: getInt-ALLOW_USER_SWITCHING_WHEN_SYSTEM_USER_LOCKED
+04-11 14:29:36.803  1660  3189 D SystemServerTiming: isUserUnlocked-USER_SYSTEM
+04-11 14:29:36.803  1660  2258 D SystemServerTiming: getUserSwitchability-0
+04-11 14:29:36.803  1660  2258 D SystemServerTiming: TM.isInCall
+04-11 14:29:36.804  3403  3772 I NearbyConnections: ClientProxy(0p:com.google.android.gms.nearby.sharing) allow WebRtc to use mobile data.
+04-11 14:29:36.804  1660  2258 D SystemServerTiming: hasUserRestriction-DISALLOW_USER_SWITCH
+04-11 14:29:36.805   490   522 I libbinder.BpBinder: onLastStrongRef automatically unlinking death recipients for binder (0xb400006fc4b04b70) with descriptor: '(not cached)'
+04-11 14:29:36.805  1660  2258 D SystemServerTiming: getInt-ALLOW_USER_SWITCHING_WHEN_SYSTEM_USER_LOCKED
+04-11 14:29:36.805  1660  2258 D SystemServerTiming: isUserUnlocked-USER_SYSTEM
+04-11 14:29:36.805  2723  2723 D UdfpsTouchOverlayBinder: [com.android.systemui.biometrics.ui.view.UdfpsTouchOverlay{89bb149 V.E...... ........ 0,0-1080,2424 #7f0a0992 app:id/udfps_touch_overlay}]: update isVisible=true
+04-11 14:29:36.806  2723  2798 D SystemEventDataSource: updatedEventData: SystemEventData(intentAction=android.intent.action.SCREEN_OFF, plugged=EventData(value=2), batteryScale=EventData(value=100), batteryLevel=EventData(value=7), chargingStatus=EventData(value=1), maxChargingCurrent=EventData(value=500000), maxChargingVoltage=EventData(value=5000000), batteryStatus=EventData(value=2), halEventData=HalEventData(dockDefendStatus=EventData(value=-3), tempDefendEventData=EventData(value=false), dwellDefendEventData=EventData(value=false)), settingsEventData=SettingsEventData(dockDefenderBypass=EventData(value=0), chargingLimitSettings=EventData(value=0), dndState=EventData(value=false), airplaneState=EventData(value=false)), frameworkApiEventData=FrameworkApiEventData(batterySaverState=EventData(value=false), extremeBatterySaverState=EventData(value=false)))
+04-11 14:29:36.806  2723  2798 D ChargingLimitEventModule: validate()=false, chargingStatus=1
+04-11 14:29:36.806  2723  2798 D DwellDefendBatteryModule: validate: false -> false
+04-11 14:29:36.806  2723  2798 D TempDefendBatteryModule: validate: false -> false
+04-11 14:29:36.806  2723  2798 D BatteryEventService: collect BatteryEvents: BatteryEvents(eventTypes=[SLOW_CHARGING], batteryLevel=7, pluggedType=2)
+04-11 14:29:36.806  2723  2723 D DLObserver: add listener: com.android.systemui.dock.DockManagerExtensionsKt$retrieveIsDocked$1$callback$1@1c4ea4e
+04-11 14:29:36.806  2723  2798 D BatteryEventService: notifyForBatteryEventsUpdate: BatteryEvents(eventTypes=[SLOW_CHARGING], batteryLevel=7, pluggedType=2)
+04-11 14:29:36.806  2723  2799 I Columbus/GestureSensor: Legacy CHREGestureSensor stopListening
+04-11 14:29:36.806  3403  3772 I NearbyConnections: Client 197205907 requested to update advertising options.
+04-11 14:29:36.806  2723  2723 D DLObserver: add listener: com.android.systemui.dock.DockManagerExtensionsKt$retrieveIsDocked$1$callback$1@68fb76f
+04-11 14:29:36.806  2723  2723 D DLObserver: add listener: com.android.systemui.dock.DockManagerExtensionsKt$retrieveIsDocked$1$callback$1@3ef1c7c
+04-11 14:29:36.806  1660  1660 D NearbyService: [ChreDiscoveryProvider] update nanoapp screen status: FALSE
+04-11 14:29:36.806  2723  2723 D DLObserver: add listener: com.android.systemui.dock.DockManagerExtensionsKt$retrieveIsDocked$1$callback$1@6895d5a
+04-11 14:29:36.806  2723  2723 D DLObserver: add listener: com.android.systemui.dock.DockManagerExtensionsKt$retrieveIsDocked$1$callback$1@8a5b8b
+04-11 14:29:36.807  2723  2723 D DLObserver: add listener: com.android.systemui.dock.DockManagerExtensionsKt$retrieveIsDocked$1$callback$1@b4f8468
+04-11 14:29:36.807  2723  2798 D BatteryEventService: AIDL callback listeners count: 1
+04-11 14:29:36.807  2723  2798 D BatteryEventService: notify AIDL callback to null, cost: 0 ms
+04-11 14:29:36.807  2723  2798 I BatteryEventService: notify all AIDL callbacks, cost: 1 ms
+04-11 14:29:36.807  2723  2798 D BatteryEventService: BatteryEventsListener (broadcast) count: 1
+04-11 14:29:36.807  2723  2798 D BatteryEventService: broadcastIntent(uid:0): Intent { act=com.google.android.battery_event.BATTERY_EVENTS_UPDATE cmp=com.google.android.apps.turbo/.batteryevent.BatteryEventUpdateReceiver (has extras) }, events:[]
+04-11 14:29:36.807  3403 21362 I Nearby  : (REDACTED) Note nearby client %s for operation %s
+04-11 14:29:36.807  2723  2798 I BatteryEventService: notify all broadcast intent, cost: 0 ms
+04-11 14:29:36.810  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.810  2923  2923 D NfcService: applyScreenState: screenState = OFF_UNLOCKED
+04-11 14:29:36.810  2923  2923 D NfcService: applyScreenState: screenState != mScreenState=8
+04-11 14:29:36.811  3403 21362 I NearbyMediums: In ScanningCancellationFlag, service-id=NearbyConnections.TxAdvertisement is the last scanner to stop scanning. The flag has been cancelled.
+04-11 14:29:36.811  1207  1207 D AOC     : A3:MSG: ft3683u_task.cc, 90: UTD: Enable IRQ Report
+04-11 14:29:36.811  1207  1207 D AOC     : A3:MSG: usf_touch_device.cc, 345: gtd: Device is enabled.
+04-11 14:29:36.811  3403 19542 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:36.811  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.811  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.812  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.812   882   922 D CHRE    : @ 3124.322: Parsed nanoapp message from host: app ID 0x476f6f676c001019 endpoint 0x4 msgType 101 payload size 0
+04-11 14:29:36.812   882   922 D CHRE.HAL: Received a nanoapp message from 0x476f6f676c001019 endpoint 0x4: Type 0x1f4 size 11 
+04-11 14:29:36.814  5112  5457 I AiAiEcho: (REDACTED) Predicting[%d]: %s
+04-11 14:29:36.816  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 3183: USF: TMD3743: Prox State: Unknown -> FAR
+04-11 14:29:36.816  1207  1207 D AOC     : A3:MSG: usf_vsc_log.cc, 69: VSC: gti: [STTW] prox state far
+04-11 14:29:36.817   882   922 I CHRE    : @ 3124.325: [COLUMBUS] Disable
+04-11 14:29:36.817   882   922 I CHRE    : @ 3124.325: [COLUMBUS_LITE] Disable
+04-11 14:29:36.818  5112  5457 I AiAiEcho: (REDACTED) EchoTargets: %s
+04-11 14:29:36.818  5112  5457 I AiAiEcho: Filtered by AiAi flag check: %s
+04-11 14:29:36.819  2923  2923 D NfcService: handleMessage: MSG_APPLY_SCREEN_STATE OFF_UNLOCKED
+04-11 14:29:36.823   882   922 D CHRE    : @ 3124.334: Nanoapp list request from client ID 2
+04-11 14:29:36.823   882   922 D CHRE.HAL: Received a nanoapp list response for client 2
+04-11 14:29:36.823  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.823  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.823  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.823  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.823  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.823  2723  2723 D DLObserver: onDockEvent mDockState = 0
+04-11 14:29:36.823  1459  1459 I pixel-thermal: VIRTUAL-SKIN:34.438 raw data: VIRTUAL-SKIN:34438 
+04-11 14:29:36.825  5112  5457 I AiAiEcho: (REDACTED) #weatherSubItemsTwiddler: Weather removes SubtitleSupplementalItem in surface: %s
+04-11 14:29:36.825  5112  5457 I AiAiEcho: #remoteViewsTwiddler: feature disabled.
+04-11 14:29:36.826  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.826  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.829  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:36.829  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:36.829  2723  2799 D ControlsListingControllerImpl: Subscribing callback, service count: 2
+04-11 14:29:36.830  1660  1660 V NearbyService: Successfully sent config to CHRE.
+04-11 14:29:36.830   882   922 D CHRE    : @ 3124.341: Parsed nanoapp message from host: app ID 0x476f6f676c001031 endpoint 0x3 msgType 5 payload size 2
+04-11 14:29:36.831  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:150 Scan: in shim layer stopped
+04-11 14:29:36.832  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:187 ScanFilterParamSetup: in shim layer, clientIf=2
+04-11 14:29:36.832  3060  3250 I bluetooth: system/gd/hci/le_address_manager.cc:277 unregister_client: Client unregistered
+04-11 14:29:36.832  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:187 ScanFilterParamSetup: in shim layer, clientIf=2
+04-11 14:29:36.832  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:187 ScanFilterParamSetup: in shim layer, clientIf=2
+04-11 14:29:36.832  3060  3283 I bt_shim_scanner: system/main/shim/le_scanning_manager.cc:144 Unregister: in shim layer, scannerId=2
+04-11 14:29:36.834  3403 21362 I NearbyMediums: Stopped BLE scanning, service-id=NearbyConnections.TxAdvertisement
+04-11 14:29:36.834  3403 21362 I NearbyConnections: [InstantConnectionPcpMgr] In invalidateTxAdvertisementScanning(by pre_updateAdvertising) tx advertisement scanning skipped or stopped for endpointId:SVMC serviceId:NearbySharing isScreenUnlocked:false isAdvertising:true powerLevel:BALANCED isTxScanning:true
+04-11 14:29:36.834  3403 21362 I NearbyConnections: [PcpManager] In updateAdvertisingOptions() advertisingMediums:[BLE] upgradeMediums:[USB, WIFI_LAN, WIFI_DIRECT, WIFI_AWARE, WIFI_HOTSPOT, WEB_RTC, BLE_L2CAP, BLUETOOTH, BLE, NFC] requireRegisterWifiStatusChangedCallback:true
+04-11 14:29:36.835  2723  2799 D ControlsListingControllerImpl: Subscribing callback, service count: 2
+04-11 14:29:36.839  2723  2723 W KeyguardRootViewBinder: Skipping onNotificationContainerBoundsChanged during transition
+04-11 14:29:36.840  2723  2799 D ControlsListingControllerImpl: Subscribing callback, service count: 2
+04-11 14:29:36.841  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1881: USF: Received stop sampling request for ICM45631 Accelerometer (active:3).
+04-11 14:29:36.841  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 0, p/l: 20000000 ns/ 200000000 ns, O/WM/I: 50/1/50
+04-11 14:29:36.841  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1881: USF: Received stop sampling request for ICM45631 Gyroscope (active:0).
+04-11 14:29:36.841  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 1, p/l: 0 ns/ 9223372036854775807 ns, O/WM/I: 50/1/50
+04-11 14:29:36.842  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Accelerometer (active:4).
+04-11 14:29:36.842  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Gyroscope (active:1).
+04-11 14:29:36.842  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for ICM45631 Temperature (active:4).
+04-11 14:29:36.842  1207  1207 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 2, p/l: 80000000 ns/ 666667000 ns, O/WM/I: 50/4/13
+04-11 14:29:36.844  1207  1207 D AOC     : A3:MSG: usf_sensor.cc, 1866: USF: Received start sampling request for MMC5616 Magnetometer (active:2).
+04-11 14:29:36.844  1207  1207 D AOC     : A3:MSG: mmc5616_device.cc, 448: USF: MMC56160: mmc5616_enable_measure odr = 10.
+04-11 14:29:36.846  3403  6271 I ActivityScheduler: nextTriggerTime: 3351935, in 230364ms, detectorType: 0,  alarmWindowMillis: 80000
+04-11 14:29:36.848  2723  2799 E QuickAccessWalletKeyguardQuickAffordanceConfig: Wallet card retrieval error, message: "null"
+04-11 14:29:36.848  2723  2799 E QuickAccessWalletKeyguardQuickAffordanceConfig: Wallet card retrieval error, message: "null"
+04-11 14:29:36.848  2723  2799 E QuickAccessWalletKeyguardQuickAffordanceConfig: Wallet card retrieval error, message: "null"
+04-11 14:29:36.849  1660  2654 I MR2ServiceImpl: Updating composite discovery preference | preference: RouteDiscoveryRequest{ preferredFeatures={}, activeScan=false }, active routers: []
+04-11 14:29:36.849  1660  2654 I MR2ServiceImpl: Updating composite discovery preference | preference: RouteDiscoveryRequest{ preferredFeatures={}, activeScan=false }, active routers: []
+04-11 14:29:36.850   880  2304 I bluetooth_hal.hci_router: command queued: (7)[01 57 fd 03 01 01 1d]
+04-11 14:29:36.851  5112  5457 I AiAiEcho: (REDACTED) #postPredictionTargets: Sending updates to UISurface %s with targets# %s (types=[%s])
+04-11 14:29:36.853  2923  2923 D libnfc_nci: nfcManager_doSetScreenState: state = 1 sPrevScreenStateMask= 24, screen_state_mask= 1
+04-11 14:29:36.853  2923  2923 D libnfc_nci: nfcManager_doSetScreenState: discovry_param = 0x00
+04-11 14:29:36.857  2723  2723 W KeyguardRootViewBinder: Skipping onNotificationContainerBoundsChanged during transition
+04-11 14:29:36.858  2723  2723 I WeatherSmartspaceView: setFormattedContentDescription: text=9┬░C, iconDescription=Clear day, contentDescription=Clear day, 9┬░C
+04-11 14:29:36.859  2723  2723 I WeatherSmartspaceView: setFormattedContentDescription: text=9┬░C, iconDescription=Clear day, contentDescription=Clear day, 9┬░C
+04-11 14:29:36.859  2723  2723 I WeatherData: Weather data parsed SUNNY ("Clear day") 9┬░C from Bundle[{description=Clear day, feedback_intent=null, explanation_intent=Supplier{VAL_PARCELABLE@144+1920}, is_gaia_linked_data=true, use_celsius=true, state=1, temperature=9}]
+04-11 14:29:36.859  3073  3073 D LauncherStateManager: StateManager.goToState: fromState: Normal, toState: Normal, partial trace:
+04-11 14:29:36.859  3073  3073 D LauncherStateManager: 	at com.android.launcher3.Launcher$$ExternalSyntheticLambda22.onScreenOnChanged(go/retraceme 3d8e65277b6baf6dc4f876a17308e9f399078f929d9fcb99cc94034c93e6ae80:22)
+04-11 14:29:36.859  3073  3073 D LauncherStateManager: 	at com.android.launcher3.util.ScreenOnTracker$$ExternalSyntheticLambda2.accept(go/retraceme 3d8e65277b6baf6dc4f876a17308e9f399078f929d9fcb99cc94034c93e6ae80:18)
+04-11 14:29:36.859  3073  3073 D LauncherStateManager: 	at java.util.concurrent.CopyOnWriteArrayList.forEach(CopyOnWriteArrayList.java:895)
+04-11 14:29:36.859  3073  3073 D LauncherStateManager: StateManager.onRepeatStateSetAborted: state: Normal
+04-11 14:29:36.860   880  2304 I bluetooth_hal.hci_router: command queued: (7)[01 57 fd 03 01 01 22]
+04-11 14:29:36.871  2723  2723 W KeyguardRootViewBinder: Skipping onNotificationContainerBoundsChanged during transition
+04-11 14:29:36.871  5070 19826 I DeviceStatusMonitor: DeviceStatusMonitor.handleBroadcast():138 onReceive() : Action = android.intent.action.SCREEN_OFF
+04-11 14:29:36.873  5070 19826 I DeviceStatusMonitor: DeviceStatusMonitor.updateCountryInfo():154 updateCountryInfo(), notifyAnyway = false
+04-11 14:29:36.874  5070  5070 I InputBundle: InputBundle.consumeEvent():1037 Skip consuming an event as imeStatus is INACTIVE
+04-11 14:29:36.876   952   952 I WifiHAL : Successfully set firmware roam state - 1
+04-11 14:29:36.877  5070  5070 I Module  : DeviceLockedStatusModuleProvider$Module.updateDeviceLockedStatus():103 repeatCheckTimes = 0, locked = false
+04-11 14:29:36.877  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: enter; event=0x2
+04-11 14:29:36.877  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: NFA_DM_SET_CONFIG_EVT
+04-11 14:29:36.878   913  3322 D NfcNciHalWrapper: nfc_set_state 5->11
+04-11 14:29:36.878   952   952 I WifiHAL : Creating message to get link statistics; iface = 47
+04-11 14:29:36.879  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: enter; event=0xB
+04-11 14:29:36.879  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: NFA_DM_SET_POWER_SUB_STATE_EVT; status=0x0
+04-11 14:29:36.879  2923  2923 D libnfc_nci: nativeNfcTag_doDisconnect: enter
+04-11 14:29:36.879  2923  2923 W libnfc_nci: nativeNfcTag_doDisconnect: tag already deactivated
+04-11 14:29:36.879  2923  2923 D libnfc_nci: nativeNfcTag_doDisconnect: exit
+04-11 14:29:36.879  3399  3399 D QnsTimer: onReceive action=android.intent.action.SCREEN_OFF
+04-11 14:29:36.883  3403  3403 I Dtdi    : [RouteScanController] stopScan: stopping route scanning [CONTEXT service_id=312 ]
+04-11 14:29:36.883  3399  3697 D QnsTimer: No timers are pending to run
+04-11 14:29:36.885  3403  3403 I Dtdi    : [RouteScanController] stopScan: no active scanning sessions exist [CONTEXT service_id=312 ]
+04-11 14:29:36.890  3403  7033 I NearbyDiscovery: (REDACTED) FastPairHandler: Received action %s
+04-11 14:29:36.891  3403  7033 I NearbyDiscovery: (REDACTED) ApFastPairScanner: isScreenOn=%s, isLocationEnabled=%s, disableLocationRequirement=%s, isDiscoveryScanningEnabled=%s, during24GhzWifiWarmingUpPeriod=%s
+04-11 14:29:36.891  3403  7033 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:36.891  3403  7033 I NearbyDiscovery: (REDACTED) ApFastPairScanner: eventType=%s, intReq=%s, scanning=%s, scanAllowed=%s, bleEnabled=%s, lockScanRate=%s, startScanningByLowPowerMode=%s
+04-11 14:29:36.891  3403  7033 I NearbyDiscovery: FastPairController: onSystemStateChanged: skip due to flag disabled [CONTEXT service_id=265 ]
+04-11 14:29:36.893  4093  4093 I Dtdi    : [RouteScanController] stopScan: stopping route scanning [CONTEXT service_id=312 ]
+04-11 14:29:36.894  4093  4093 I Dtdi    : [RouteScanController] stopScan: no active scanning sessions exist [CONTEXT service_id=312 ]
+04-11 14:29:36.895  3343  3639 W ConnectivityEventWriter: Failed to add tag: ConnectivityMonitorEventMetadata{eventTimestampMs=1775906976871, subscriptionId=Optional.empty, slotId=Optional.empty}
+04-11 14:29:36.897  4093  6615 I ActivityScheduler: nextTriggerTime: 3130903, in 9282ms, detectorType: 39, FULL_TYPE alarmWindowMillis: 7500
+04-11 14:29:36.899 32630 32630 D SensorReceiverBase: Received intent: android.intent.action.SCREEN_OFF
+04-11 14:29:36.901 32630 15209 D SensorReceiverBase$onReceive: Sensor(s) [is_interactive] corresponding to received event android.intent.action.SCREEN_OFF are disabled, skipping sensors update
+04-11 14:29:36.902   952   952 I WifiHAL : Getting cached scan results, iface handle = 0xb400007c98ecf050
+04-11 14:29:36.902   952   952 E WifiHAL : Creating message to get cached scan results
+04-11 14:29:36.905   952   952 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+04-11 14:29:36.905  2723  2723 D DeviceEntryIconViewBinder: Updating device entry icon image state ForegroundIconViewModel(type=FINGERPRINT, useAodVariant=true, tint=-1, padding=50)
+04-11 14:29:36.908  3403 21362 I NearbyConnections: Instant Connection Security key rotated.
+04-11 14:29:36.909  3403 21362 I NearbyConnections: Scheduled invalidation of the HPKE key alarm (delayMillis:8000) for client 197205907
+04-11 14:29:36.909 32630 32630 V BaseGlanceEntityWidgetReceiver: Received intent action = android.intent.action.SCREEN_OFF for widget = 0 (io.homeassistant.companion.android.widgets.todo.TodoGlanceAppWidget) io.homeassistant.companion.android.widgets.todo.TodoWidget@126f26
+04-11 14:29:36.909  3403 21362 I NearbyConnections: Get local endpoint id from random generation F6P2 (last:SVMC) for client 197205907
+04-11 14:29:36.914 32630 32630 D ButtonWidget: Broadcast received: 
+04-11 14:29:36.914 32630 32630 D ButtonWidget: Broadcast action: android.intent.action.SCREEN_OFF
+04-11 14:29:36.914 32630 32630 D ButtonWidget: AppWidgetId: -1
+04-11 14:29:36.913  3343  3343 D SconeAwareness: Awareness received [android.intent.action.SCREEN_OFF] action and try to relay info
+04-11 14:29:36.915  3343  3343 W JobInfo : Job 'com.google.android.apps.scone/.awareness.AwarenessJobIntentService#188052156' has a deadline with no functional constraints. The deadline won't improve job execution latency. Consider removing the deadline.
+04-11 14:29:36.916  1660  2891 W JobInfo : Job 'com.google.android.apps.scone/.awareness.AwarenessJobIntentService#188052156' has a deadline with no functional constraints. The deadline won't improve job execution latency. Consider removing the deadline.
+04-11 14:29:36.918 32630 32630 D MediaPlayerControlsWidget: Broadcast received: 
+04-11 14:29:36.918 32630 32630 D MediaPlayerControlsWidget: Broadcast action: android.intent.action.SCREEN_OFF
+04-11 14:29:36.918 32630 32630 D MediaPlayerControlsWidget: AppWidgetId: -1
+04-11 14:29:36.919  3403 21362 I NearbyConnections: generateRxInstantConnectionAdvBytes() returns null because in advertisingMediums: [BLE], there is no instant connection supported medium available for advertising.
+04-11 14:29:36.927 32630 32665 D WM-Processor: Processor cancelling b99ef526-0340-47f1-a51e-136288060c12
+04-11 14:29:36.928 32630 32665 D WM-Processor: WorkerWrapper could not be found for b99ef526-0340-47f1-a51e-136288060c12
+04-11 14:29:36.928  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.928  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.928  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.928  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.928  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.932  3343  3605 D SconeAwareness: handleIntent android.intent.action.SCREEN_OFF
+04-11 14:29:36.932  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:36.933  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:36.934  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.934  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.934  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.934  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.934  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.937  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:36.941 32630 32665 D WM-GreedyScheduler: Cancelling work ID b99ef526-0340-47f1-a51e-136288060c12
+04-11 14:29:36.943  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:80 Unregister: in shim layer
+04-11 14:29:36.944  1660  2541 V GrammaticalInflectionUtils: AttributionSource: android.content.AttributionSource@4b8efd76 does not have READ_SYSTEM_GRAMMATICAL_GENDER permission.
+04-11 14:29:36.944  1660  2541 D CompatChangeReporter: Compat change id reported: 441041342; UID 10205; state: ENABLED
+04-11 14:29:36.947  3060  3310 I bluetooth: bluetooth_core::gatt::server::isolation_manager: removing server (if any) associated with advertiser AdvertiserId(3)
+04-11 14:29:36.948  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:80 Unregister: in shim layer
+04-11 14:29:36.951  3060  3310 I bluetooth: bluetooth_core::gatt::server::isolation_manager: removing server (if any) associated with advertiser AdvertiserId(2)
+04-11 14:29:36.960   859   859 D Zygote  : Forked child process 21431
+04-11 14:29:36.961  3403 19542 I TapAndPay: (REDACTED) Processing event: %s, startState = %s
+04-11 14:29:36.962  1660  2541 D ActivityManager: sync unfroze 16994 com.Slack for 6
+04-11 14:29:36.963  1660  2541 D ActivityManager: sync unfroze 23365 com.android.chrome for 6
+04-11 14:29:36.963  1660  2541 D ActivityManager: sync unfroze 20641 com.android.chrome:sandboxed_process0:org.chromium.content.app.SandboxedProcessService0:0 for 6
+04-11 14:29:36.963  1660  2541 D ActivityManager: sync unfroze 20577 com.android.chrome:privileged_process0 for 6
+04-11 14:29:36.964  3403 21362 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:36.964  1660  2541 D ActivityManager: sync unfroze 29074 com.google.android.adservices.api for 6
+04-11 14:29:36.966  1660  2264 I ActivityManager: Start proc 21431:com.google.android.apps.tachyon/u0a205 for service {com.google.android.apps.tachyon/com.google.android.libraries.notifications.entrypoints.scheduled.ScheduledTaskService}
+04-11 14:29:36.978 21431 21431 I Zygote  : Process 21431 created for com.google.android.apps.tachyon
+04-11 14:29:36.978 21431 21431 I id.apps.tachyon: Using CollectorTypeCMC GC.
+04-11 14:29:36.979  1660  2541 W JobServiceContext: Sending onNetworkChanged for a job that isn't started. JobStatus{62c7e0d androidx.work.systemjobscheduler:u10a319/8899 #EmojiUseGetWork#@androidx.work.systemjobscheduler@com.Slack/androidx.work.impl.background.systemjob.SystemJobService u=10 s=1010319 TIME=-6s459ms:none NET READY}
+04-11 14:29:36.981 20641 20675 W ocessService0:0: userfaultfd: MOVE ioctl seems unsupported: Connection timed out
+04-11 14:29:36.982  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.982  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.982  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.982  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.984 16994 16994 D WM-DelayedWorkTracker: Scheduling work 68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76
+04-11 14:29:36.984 16994 16994 D WM-GreedyScheduler: Starting tracking for 68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76
+04-11 14:29:36.984  2723  2723 W KeyguardRootViewBinder: Skipping onNotificationContainerBoundsChanged during transition
+04-11 14:29:36.987  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.987  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.987  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.987  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:36.987   880  2304 I bluetooth_hal.hci_router: command queued: (10)[01 39 20 06 00 01 02 00 00 00]
+04-11 14:29:36.988 20577 20593 W ileged_process0: userfaultfd: MOVE ioctl seems unsupported: Connection timed out
+04-11 14:29:36.990 16994 17428 D WM-ConstraintTracker: NetworkStateTracker24: initial state = NetworkState(isConnected=true, isValidated=true, isMetered=false, isNotRoaming=true, isBlocked=false)
+04-11 14:29:36.990 16994 17428 D WM-NetworkStateTracker: Registering network callback
+04-11 14:29:36.990  1660  2891 D ConnectivityService: requestNetwork for uid/pid:1010319/16994 activeRequest: null callbackRequest: 1989 [NetworkRequest [ REQUEST id=1990, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 1010319 RequestorUid: 1010319 RequestorPkg: com.Slack UnderlyingNetworks: Null] ]] callback flags: 0 order: 2147483647 isUidTracked: false declaredMethods: AVAIL|LOST|NC|BLK
+04-11 14:29:36.993  1660  2603 D WifiNetworkFactory: got request NetworkRequest [ REQUEST id=1990, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 1010319 RequestorUid: 1010319 RequestorPkg: com.Slack UnderlyingNetworks: Null] ]
+04-11 14:29:36.993  1660  2603 D UntrustedWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1990, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 1010319 RequestorUid: 1010319 RequestorPkg: com.Slack UnderlyingNetworks: Null] ]
+04-11 14:29:36.993  1660  2603 D OemPaidWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1990, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 1010319 RequestorUid: 1010319 RequestorPkg: com.Slack UnderlyingNetworks: Null] ]
+04-11 14:29:36.993  1660  2603 D MultiInternetWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1990, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 1010319 RequestorUid: 1010319 RequestorPkg: com.Slack UnderlyingNetworks: Null] ]
+04-11 14:29:36.993  1660  2610 D ConnectivityService: NetReassign [1990 : null тЖТ 104] [c 0] [a 1] [i 1]
+04-11 14:29:36.994 20577 20595 W System  : A resource failed to call close. 
+04-11 14:29:36.995  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:161 StartAdvertisingSet: in shim layer
+04-11 14:29:36.997 16994 17428 D WM-GreedyScheduler: Constraints met: Scheduling work ID WorkGenerationalId(workSpecId=68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76, generation=0)
+04-11 14:29:36.998 16994 17428 D WM-Processor: Processor: processing WorkGenerationalId(workSpecId=68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76, generation=0)
+04-11 14:29:36.999  2923 19561 D NfcCardEmulationManager: setShouldDefaultToObserveModeForService: (ComponentInfo{com.google.android.gms/com.google.android.gms.tapandpay.hce.service.TpHceService}) to true
+04-11 14:29:37.000  2723  2723 W KeyguardRootViewBinder: Skipping onNotificationContainerBoundsChanged during transition
+04-11 14:29:37.003 23365 28957 W chromium: [WARNING:components/sync/engine/syncer_proto_util.cc:430] Error posting from syncer: Response Code (bogus on error): -1 Content-Length (bogus on error): -1 Server Status: CONNECTION_UNAVAILABLE
+04-11 14:29:37.003 23365 28957 E chromium: [ERROR:components/sync/engine/get_updates_processor.cc:270] PostClientToServerMessage() failed during GetUpdates with error Network error (ERR_INTERNET_DISCONNECTED)
+04-11 14:29:37.006  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:188 StartAdvertisingSet: create advertising set, client_id:255, reg_id:-110
+04-11 14:29:37.006  3060  3250 I bluetooth: system/gd/hci/le_advertising_manager_impl.cc:421 allocate_advertiser: Removing advertiser id 1 from removed advertisers.
+04-11 14:29:37.006  2923 19561 D NfcRegisteredServicesCache: setShouldDefaultToObserveModeForService: componentName=com.google.android.gms/com.google.android.gms.tapandpay.hce.service.TpHceService enable=true
+04-11 14:29:37.007  2923 19561 D NfcHostEmulationManager: updateForShouldDefaultToObserveMode: enabled=false
+04-11 14:29:37.007 16994 17534 D WM-NetworkStateTracker: Network capabilities changed: [ Transports: WIFI Capabilities: NOT_METERED&INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VPN&VALIDATED&NOT_ROAMING&FOREGROUND&NOT_CONGESTED&NOT_SUSPENDED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED LinkUpBandwidth>=11303Kbps LinkDnBandwidth>=29889Kbps TransportInfo: <SSID: <unknown ssid>, BSSID: 02:00:00:00:00:00, MAC: 02:00:00:00:00:00, IP: /192.168.88.13, Security type: 2, Supplicant state: COMPLETED, Wi-Fi standard: 11ax, RSSI: -52, Link speed: 408Mbps, Tx Link speed: 408Mbps, Max Supported Tx Link speed: 1200Mbps, Rx Link speed: 864Mbps, Max Supported Rx Link speed: 1200Mbps, Frequency: 5220MHz, Net ID: -1, Metered hint: false, score: 100, isUsable: true, CarrierMerged: false, SubscriptionId: -1, IsPrimary: -1, Trusted: true, Restricted: false, Ephemeral: false, OEM paid: false, OEM private: false, OSU AP: false, FQDN: <none>, Provider friendly name: <none>, Requesting package name: <none><none>MLO Information: , Is TID-To-Link negotiation supported by the AP: false, AP MLD Address: <none>, AP MLO Link Id: <none>, AP MLO Affiliated links: <none>, Vendor Data: <none>> SignalStrength: -52 UnderlyingNetworks: Null]
+04-11 14:29:37.008  2923 19561 D NfcService: setObserveMode: package com.google.android.nfc with UID (1027) setting observe mode to false
+04-11 14:29:37.008 16994 16994 D WM-SystemJobService: onStartJob for WorkGenerationalId(workSpecId=68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76, generation=0)
+04-11 14:29:37.008 21431 21431 D nativeloader: Load libframework-connectivity-tiramisu-jni.so using APEX ns com_android_tethering for caller /apex/com.android.tethering/javalib/framework-connectivity-t.jar: ok
+04-11 14:29:37.012 16994 17534 D WM-NetworkStateTracker: Network blocked status changed: false
+04-11 14:29:37.013  2889  2889 D GRIL-S  : [0468]> UPDATE_SCONE_INFO Mobility:3 Battery:2 Thermal:2 Screen:2
+04-11 14:29:37.015  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6140 matrix =
+04-11 14:29:37.015  1660  2074 D ColorDisplayService:        0.996722 0.000124-0.001278 0.000000-0.001720 0.998560-0.005325 0.000000 0.002253 0.001315 0.938384 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:37.016  2864  8711 D UidImportanceSource: onUidImportanceBlock: uid=10205 importance=400
+04-11 14:29:37.018  2864  8711 D UidImportanceSource: onUidImportanceBlock: packages=[com.google.android.apps.tachyon] importance=400
+04-11 14:29:37.018  2864  8711 D UidImportanceSource: onUidImportanceBlock: packageName=com.google.android.apps.tachyon importance=400
+04-11 14:29:37.018  2864  8711 D BusinessScope: Enqueuing the block
+04-11 14:29:37.018  2864  4488 D BusinessScope: Start running the #2144 block
+04-11 14:29:37.018  2864  4488 D BusinessScope: Enqueuing the block
+04-11 14:29:37.018  2864  4488 D ImpulseStateSource: Notify clients: 1070
+04-11 14:29:37.018  2864  4488 D BusinessScope: Finish running the #2144 block
+04-11 14:29:37.018  2864  4488 D BusinessScope: Start running the #2145 block
+04-11 14:29:37.018  2864  4488 D BusinessScope: Finish running the #2145 block
+04-11 14:29:37.019 20641 20677 W System  : A resource failed to call close. 
+04-11 14:29:37.022  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:37.022  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:37.023 21431 21431 D ApplicationLoaders: Returning zygote-cached class loader: /system_ext/framework/androidx.window.extensions.jar
+04-11 14:29:37.023 21431 21431 D ApplicationLoaders: Returning zygote-cached class loader: /system_ext/framework/androidx.window.sidecar.jar
+04-11 14:29:37.023  2923  3287 I libnfc_nci: nfaVSCallback: Query Observe mode state is FALSE
+04-11 14:29:37.023  2923  3287 I libnfc_nci: nfaVSCallback: RSP status: 0 to Android proprietary cmd 4
+04-11 14:29:37.023  2923 19561 D libnfc_nci: nfcManager_isObserveModeEnabled: returning FALSE
+04-11 14:29:37.023  3060  3250 I bluetooth: system/gd/hci/le_advertising_manager_impl.cc:907 set_parameters: Support RPA offload, set own address type RESOLVABLE_OR_RANDOM_ADDRESS
+04-11 14:29:37.023  2923 19561 D libnfc_nci: nfcManager_setObserveMode: called with FALSE but it is already FALSE, returning early
+04-11 14:29:37.024  3403  3403 I TapAndPay: (REDACTED) %s set default observe mode to %s
+04-11 14:29:37.025  2923 19561 I NfcRegisteredAidCache: isPreferredServicePackageNameForUser: NfcService:com.google.android.gms(0)  is not equal to the default wallet service ru.sberbankmobile(0)
+04-11 14:29:37.025  2923 19561 E NfcService: setObserveMode: Caller not preferred NFC service.
+04-11 14:29:37.025  3403  3403 I TapAndPay: (REDACTED) screen off, enabling observe mode successfully: %s
+04-11 14:29:37.025  1459  1480 I pixel-thermal: VIRTUAL-USB-UI:0 raw data: USB-MINUS-CHARGING:-4865 VIRTUAL-USB-UI:0 charging_therm:37393 usb_pwr_therm:32528 
+04-11 14:29:37.026  1459  1480 I pixel-thermal: VIRTUAL-USB-THROTTLING:0 raw data: USB-MINUS-CHARGING:-4865 VIRTUAL-USB-THROTTLING:0 usb_pwr_therm:32528 
+04-11 14:29:37.026  1459  1480 I pixel-thermal: usb_pwr_therm:32.528 raw data: usb_pwr_therm:32528 
+04-11 14:29:37.033  3060  3250 I bluetooth: system/gd/hci/le_advertising_manager_impl.cc:1735 on_set_advertising_set_random_address_complete: update random address for advertising set 1 : xx:xx:xx:xx:82:0e
+04-11 14:29:37.041  3403  3403 I RCNService: updateRcnState to isNetworkAvailable: true, isRcnSettingsEnabled: true, isScreenOn: false
+04-11 14:29:37.051  1245  1310 I adbd    : jdwp connection from 21431
+04-11 14:29:37.053  2723  2723 W KeyguardRootViewBinder: Skipping onNotificationContainerBoundsChanged during transition
+04-11 14:29:37.058 32630 32665 W JobInfo : Requested important-while-foreground flag for job36312 is ignored and takes no effect
+04-11 14:29:37.058 32630 32665 D WM-SystemJobScheduler: Scheduling work ID 26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2Job ID 36312
+04-11 14:29:37.058 16994 16994 D WM-WorkerWrapper: Starting work for slack.emoji.impl.work.EmojiUseGetWork
+04-11 14:29:37.060 16994 17428 D WM-Processor: Work WorkGenerationalId(workSpecId=68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76, generation=0) is already enqueued for processing
+04-11 14:29:37.079  3403 19542 I NearbySharing: Stopping scanning because the screen is locked.
+04-11 14:29:37.080 32630 32665 D WM-GreedyScheduler: Starting work for 26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2
+04-11 14:29:37.088  3403  3403 W ChimeraUtils: Module com.google.android.gms.cast missing resource cast_module_display_name(0)
+04-11 14:29:37.089  3403 19542 I NearbySharing: Stopping Fast Init advertisement because we're not scanning in the foreground.
+04-11 14:29:37.089  3403  3403 I NearbyMediums: [InstantOnLostManager] Start instant onLost extended advertising, hashes = [ 0x35 0x6f 0x65 0x4f ].
+04-11 14:29:37.090  3403 21362 I NearbyMediums: Successfully stopped BLE advertising for service NearbySharing
+04-11 14:29:37.092 32630 32665 D WM-Processor: Processor: processing WorkGenerationalId(workSpecId=26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2, generation=0)
+04-11 14:29:37.093  2889  3707 D GRIL-S  : [0468]< UPDATE_SCONE_INFO 
+04-11 14:29:37.093  1660  2613 I serviceDiscovery: [MdnsAdvertiser] Removing service with ID 60
+04-11 14:29:37.094  3403  3403 W AxMediaRouter: Ignoring null provider descriptor from ComponentInfo{com.google.android.gms/com.google.android.gms.cast.media.CastMediaRoute2ProviderService_Persistent}
+04-11 14:29:37.098  3403 19542 I NearbySharing: Failed to advertise because we're already advertising with mode SCREEN_OFF, certificate visibility SELF_SHARE data usage preference ONLINE, and bt advertising false with vendorId 0
+04-11 14:29:37.098  3403 19542 I NearbySharing: Stopping FastInitiation scanning because the screen is locked.
+04-11 14:29:37.100 32630 32630 D WM-SystemJobService: onStartJob for WorkGenerationalId(workSpecId=26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2, generation=0)
+04-11 14:29:37.100  3403 21362 I NearbyMediums: Stopped Wifi LAN advertising.
+04-11 14:29:37.104  3403 21362 I NearbyMediums: Stopped listening for incoming Wifi Lan connections.
+04-11 14:29:37.107 21431 21431 W id.apps.tachyon: Failed to find entry 'classes.dex': Entry not found
+04-11 14:29:37.111 32630 32630 D WM-WorkerWrapper: Starting work for io.homeassistant.companion.android.websocket.WebsocketManager
+04-11 14:29:37.111 21431 21431 W id.apps.tachyon: Failed to find entry 'classes.dex': Entry not found
+04-11 14:29:37.112 32630 32665 D WM-Processor: Work WorkGenerationalId(workSpecId=26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2, generation=0) is already enqueued for processing
+04-11 14:29:37.113 21431 21431 W id.apps.tachyon: Failed to find entry 'classes.dex': Entry not found
+04-11 14:29:37.114  3403 21341 I DiscoveryManager: Discovery state (DiscoveryState{filterCriteria=null, categoryToCriteria={}, activeScan=false, activeScanWithScreenOff=false, discoveryRequestSupportsDynamicSession=false})
+04-11 14:29:37.114 21431 21431 W id.apps.tachyon: Failed to find entry 'classes.dex': Entry not found
+04-11 14:29:37.114  3403 19542 I NearbySharing: Fast Initiation Scanning has stopped
+04-11 14:29:37.115  3403 19542 I NearbySharing: Dismissing HUN as there's no device nearby.
+04-11 14:29:37.116 21431 21431 D nativeloader: Configuring clns-9 for other apk /data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/base.apk:/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/split_config.arm64_v8a.apk:/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/split_config.en.apk:/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/split_config.ru.apk:/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/split_config.xxhdpi.apk. target_sdk_version=36, uses_libraries=libOpenCL.so:libOpenCL-pixel.so:libedgetpu_util.so:libedgetpu_client.google.so:libgxp.so, library_path=/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/lib/arm64:/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/base.apk!/lib/arm64-v8a:/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.
+04-11 14:29:37.119  3403 19753 E NearbyMediums: MEDIUM_ERROR [SYSTEM][WIFI_LAN][START_LISTENING_INCOMING_CONNECTION][ACCEPT_CONNECTION_FAILED][SOCKET_CLOSED], service-id=NearbySharing
+04-11 14:29:37.119  3403 19753 E NearbyMediums: Extra Sensitive/PII message : Socket closed
+04-11 14:29:37.119  1660  2613 I serviceDiscovery: [MdnsDiscoveryManager] Unregistering listener for serviceType:_googlecast._tcp.local
+04-11 14:29:37.120  1660  2613 I serviceDiscovery: [MdnsDiscoveryManager] Unregistering listener for serviceType:_googlecast._tcp.local
+04-11 14:29:37.121  3403 21362 I NearbyMediums: BLE extended advertising not started.
+04-11 14:29:37.122  1660  2613 I serviceDiscovery: [MdnsDiscoveryManager] Unregistering listener for serviceType:_googlecast._tcp.local
+04-11 14:29:37.122 32630 32665 I WM-WorkerWrapper: Worker result SUCCESS for Work [ id=26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2, tags={ io.homeassistant.companion.android.websocket.WebsocketManager } ]
+04-11 14:29:37.124  3403 21362 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:37.124  1660  5646 I WifiService: releaseMulticastLock uid=10187 lockTag=MdnsServiceBrowserImpl
+04-11 14:29:37.133 32630 32630 D WM-Processor: Processor 26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2 executed; reschedule = false
+04-11 14:29:37.133 32630 32630 D WM-SystemJobService: 26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2 executed on JobScheduler
+04-11 14:29:37.138  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:161 StartAdvertisingSet: in shim layer
+04-11 14:29:37.138  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:188 StartAdvertisingSet: create advertising set, client_id:255, reg_id:-111
+04-11 14:29:37.138  3060  3250 I bluetooth: system/gd/hci/le_advertising_manager_impl.cc:421 allocate_advertiser: Removing advertiser id 2 from removed advertisers.
+04-11 14:29:37.140  2851  2409 D IpClient.wlan0: set max DTIM multiplier to 9
+04-11 14:29:37.143   952   952 E WifiHAL : Setting APF program, halHandle = 0xb400007c98ecf050
+04-11 14:29:37.143   952   952 E WifiHAL : Set apf filter for iface = wlan0
+04-11 14:29:37.143   952   952 I WifiHAL : createRequest: APF set program request
+04-11 14:29:37.143   952   952 I WifiHAL : mProgramLen : 1400
+04-11 14:29:37.144  3060  3250 I bluetooth: system/gd/hci/le_advertising_manager_impl.cc:1735 on_set_advertising_set_random_address_complete: update random address for advertising set 2 : xx:xx:xx:xx:3d:12
+04-11 14:29:37.148 21431 21431 V GraphicsEnvironment: Currently set values for:
+04-11 14:29:37.149 21431 21431 V GraphicsEnvironment:   angle_gl_driver_selection_pkgs=[com.android.angle]
+04-11 14:29:37.149 21431 21431 V GraphicsEnvironment:   angle_gl_driver_selection_values=[angle]
+04-11 14:29:37.149 21431 21431 V GraphicsEnvironment: com.google.android.apps.tachyon is not listed in per-application setting
+04-11 14:29:37.149 21431 21431 V GraphicsEnvironment: No special selections for ANGLE, returning default driver choice
+04-11 14:29:37.149 21431 21431 V GraphicsEnvironment: Neither updatable production driver nor prerelease driver is supported.
+04-11 14:29:37.150  3403 21362 I NearbyMediums: Started BLE Legacy advertising. Regular Header Advertised : false, Fast Advertised : true, AdvertisingSettings : BleAdvertisingSetting{powerLevel= LOW_POWER, isConnectable= false, isPrivateGatt= true}, isAcceptingConnection : false
+04-11 14:29:37.150  3403 21362 I NearbyMediums: Successfully started BLE advertising of size 23 for service NearbySharing, deviceToken : [ 0x94 0xd9 ].
+04-11 14:29:37.151   952   952 D WifiHAL : Setting DTIM config , halHandle = 0xb400007c98ecf050 Multiplier = 9
+04-11 14:29:37.151   952   952 I WifiHAL : Successfully configured dtim multiplier 9
+04-11 14:29:37.152  3403 21362 I NearbyMediums: [WifiNetworkV2] WifiStatusChangedCallback unregistered for NearbySharing (wifiStatusChangedCallbacks.size:0)
+04-11 14:29:37.153 32630 32665 D WM-GreedyScheduler: Cancelling work ID 26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2
+04-11 14:29:37.153  3403 21362 I NearbyConnections: [InstantConnectionPcpMgr] In invalidateTxAdvertisementScanning(by final_updateAdvertising) tx advertisement scanning skipped or stopped for endpointId: serviceId:NearbySharing isScreenUnlocked:false isAdvertising:true powerLevel:LOW isTxScanning:false
+04-11 14:29:37.155  3403 21362 I NearbySharing: [broadcast provider] advertising options updated (BroadcastProviderOptions(powerLevel=1, flowId=6915827332747431471, uwbSenderInfo=[], deviceType=1, advertisingMediums=[4], upgradeMediums=[11, 5, 8, 6, 3, 9, 10, 2, 4, 7], useStableIdentifiers=false, allowBluetoothRadioToggling=false, allowWifiRadioToggling=false, enableBleL2capListening=false, allowGattConnections=false, enableFastAdvertisement=true)).
+04-11 14:29:37.155  3403 21362 I NearbySharing: NearbySharing Internal event ReceiveManagerUpdate(mode=1, isEveryoneMode=false, dataUsage=2, useQrCode=false, success=true)
+04-11 14:29:37.157  3403 19542 I NearbySharing: [ClearcutLog] ADVERTISE_DEVICE_PRESENCE_START sessionId=0 flowId=6915827332747431471 sessionStatus: 1, visibility: 4
+04-11 14:29:37.157 32630 32665 D WM-SystemJobScheduler: Scheduling work ID 26b9ec90-99d4-4be4-94c1-7f86ebb4c2d2Job ID 36313
+04-11 14:29:37.312 21431 21465 I org.webrtc.Logging: CrashStartupListener: Checking conference crashes for 2 account(s).
+04-11 14:29:37.319  3403  5760 I FontLog : (REDACTED) Received query %s, URI %s
+04-11 14:29:37.320  3403  5760 I FontLog : (REDACTED) Query [%s] resolved to %s
+04-11 14:29:37.322  3403  5760 I FontLog : (REDACTED) Fetch %s end status %s
+04-11 14:29:37.323 21431 21431 W id.apps.tachyon: Method void agwy.c(android.app.Activity) failed lock verification and will run slower.
+04-11 14:29:37.323 21431 21431 W id.apps.tachyon: Common causes for lock verification issues are non-optimized dex code
+04-11 14:29:37.323 21431 21431 W id.apps.tachyon: and incorrect proguard optimizations.
+04-11 14:29:37.323 21431 21431 I org.webrtc.Logging: vclib: NativeLibraryLoader: loading jingle_peerconnection_so from mcv
+04-11 14:29:37.323 21431 21431 I org.webrtc.Logging: vclib: Beginning load of jingle_peerconnection_so...
+04-11 14:29:37.325  3403  5743 I FontLog : (REDACTED) Pulling font file for id = %d, cache size = %d
+04-11 14:29:37.327 21431 21470 I HWUI    : Using FreeType backend (prop=Auto)
+04-11 14:29:37.329  3403  5760 I FontLog : (REDACTED) Pulling font file for id = %d, cache size = %d
+04-11 14:29:37.330  2723  2755 V WindowManagerShell: Transition requested (#159): android.os.BinderProxy@3dd6a98 TransitionRequestInfo { type = SLEEP, triggerTask = null, pipChange = null, remoteTransitionInfo = null, displayChange = null, requestedLocation = null, userChange = null, windowingLayerChange = null, fullscreenRequestChange = null, flags = 0, debugId = 159 }
+04-11 14:29:37.332  1660  5646 W Transition: Transition already started id=159 state=2
+04-11 14:29:37.332  1660  2070 V WindowManager: Sent Transition (#159) createdAt=04-11 14:29:37.330 via request=TransitionRequestInfo { type = SLEEP, triggerTask = null, pipChange = null, remoteTransitionInfo = null, displayChange = null, requestedLocation = null, userChange = null, windowingLayerChange = null, fullscreenRequestChange = null, flags = 0, debugId = 159 }
+04-11 14:29:37.332  1660  2070 V WindowManager:     startWCT=WindowContainerTransaction { changes= {} hops= [] flags= 0 errorCallbackToken=null taskFragmentOrganizer=null }
+04-11 14:29:37.332  1660  2070 V WindowManager:     info={id=159 t=SLEEP f=0x0 trk=0 r=[] c=[]}
+04-11 14:29:37.332  2723  4896 V WindowManagerShell: onTransitionReady(transaction=7129645732902)
+04-11 14:29:37.333  2723  2755 V WindowManagerShell: onTransitionReady (#159) android.os.BinderProxy@3dd6a98: {id=159 t=SLEEP f=0x0 trk=0 r=[] c=[]}
+04-11 14:29:37.333  2723  2755 V WindowManagerShell: No transition roots in (#159) android.os.BinderProxy@3dd6a98@0 so abort
+04-11 14:29:37.335  2723  2755 V WindowManagerShell: Transition animation finished (aborted=true), notifying core (#159) android.os.BinderProxy@3dd6a98@0
+04-11 14:29:37.336  2723  2755 V WindowManagerShell: Track 0 became idle
+04-11 14:29:37.336  2723  2755 V WindowManagerShell: All active transition animations finished
+04-11 14:29:37.336  1660  2070 V WindowManager: Finish Transition (#159): created at 04-11 14:29:37.330 collect-started=0.065ms request-sent=0.114ms started=1.547ms ready=1.536ms sent=1.729ms finished=5.226ms
+04-11 14:29:37.380  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6180 matrix =
+04-11 14:29:37.380  1660  2074 D ColorDisplayService:        0.994937 0.000219-0.001132 0.000000-0.003709 0.998577-0.004810 0.000000 0.001931 0.001204 0.943696 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:37.393  1660  2552 D HintManagerService: Starts cleaning for 10303
+04-11 14:29:37.442 16994 17511 I WM-WorkerWrapper: Worker result SUCCESS for Work [ id=68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76, tags={ slack.emoji.impl.work.EmojiUseGetWork,team_id_T08TSRF6RBK,cancel_on_logout } ]
+04-11 14:29:37.447 16994 16994 D WM-Processor: Processor 68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76 executed; reschedule = false
+04-11 14:29:37.447 16994 16994 D WM-GreedyScheduler: Stopping tracking for WorkGenerationalId(workSpecId=68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76, generation=0)
+04-11 14:29:37.447 16994 16994 D WM-SystemJobService: 68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76 executed on JobScheduler
+04-11 14:29:37.452 16994 17511 D WM-GreedyScheduler: Cancelling work ID 68f0a7ef-0a8d-48ed-b8a4-6ccdb6d00e76
+04-11 14:29:37.458 16994 17511 D WM-GreedyScheduler: Ignoring {WorkSpec: c2b324d4-c10e-4cbe-8225-434c77cc9716}. Requires device idle.
+04-11 14:29:37.459 16994 17511 D WM-GreedyScheduler: Ignoring {WorkSpec: 39ca5a25-5da1-4966-a765-6b37f53852dc}. Requires device idle.
+04-11 14:29:37.459 16994 17511 D WM-GreedyScheduler: Starting tracking for c55fd4a8-3ff1-4155-bd07-4311b77fd56e
+04-11 14:29:37.459 16994 17511 D WM-NetworkStateTracker: Unregistering network callback
+04-11 14:29:37.485 21431 21431 D nativeloader: Load /data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/lib/arm64/libjingle_peerconnection_so.so using class loader ns clns-9 (caller=/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/base.apk): ok
+04-11 14:29:37.492 21431 21431 I org.webrtc.Logging: vclib: jingle_peerconnection_so (null) was loaded normally!
+04-11 14:29:37.492 21431 21431 I org.webrtc.Logging: vclib: NativeLibraryLoader: loading jingle_peerconnection_so complete.
+04-11 14:29:37.505 21431 21475 D nativeloader: Load /data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/lib/arm64/libnative_crash_handler_jni.so using class loader ns clns-9 (caller=/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/base.apk!classes4.dex): ok
+04-11 14:29:37.552 21431 21479 D HttpFlagsLoader: Found application exporting HTTP flags: com.google.android.gms
+04-11 14:29:37.553 21431 21479 D HttpFlagsLoader: HTTP flags file path: /data/user_de/0/com.google.android.gms/app_httpflags/flags.binarypb
+04-11 14:29:37.563 21431 21482 D DesktopExperienceFlags: Toggle override initialized to: false
+04-11 14:29:37.563 21431 21479 I HttpFlagsLoader: HTTP flags log line (Impl): Using live production flag values from Google
+04-11 14:29:37.566  1660  2891 D ConnectivityService: Returning BLOCKED NetworkInfo to uid=10205
+04-11 14:29:37.567 21431 21431 I cn_CronetLibraryLoader: Cronet version: 144.0.7500.8, arch: aarch64
+04-11 14:29:37.568  1660  2891 D ConnectivityService: requestNetwork for uid/pid:10205/21431 activeRequest: null callbackRequest: 1991 [NetworkRequest [ REQUEST id=1992, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]] callback flags: 0 order: 2147483647 isUidTracked: false declaredMethods: AVAIL|LOST|NC|LP
+04-11 14:29:37.575  1660  2603 D UntrustedWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1992, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]
+04-11 14:29:37.575  1660  2603 D OemPaidWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1992, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]
+04-11 14:29:37.575  1660  2603 D MultiInternetWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1992, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]
+04-11 14:29:37.578  1660  2610 D ConnectivityService: NetReassign [1992 : null тЖТ 111] [c 0] [a 2] [i 4]
+04-11 14:29:37.578  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:37.578  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:37.583   882   922 I CHRE    : @ 3125.091: [Wallaby] OnInferredProx: prox_state=kFar
+04-11 14:29:37.585  1660  2610 D ConnectivityService: NetReassign [no changes] [c 0] [a 1] [i 4]
+04-11 14:29:37.618 21431 21459 W DynamiteModule: Local module descriptor class for com.google.android.gms.googlecertificates not found.
+04-11 14:29:37.657  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:37.657  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:37.658  1660  2541 W JobServiceContext: Sending onNetworkChanged for a job that isn't started. JobStatus{7e5202d #u0a205/11007999 com.google.android.apps.tachyon/com.google.android.libraries.notifications.entrypoints.scheduled.ScheduledTaskService u=0 s=10205 TIME=-43s107ms:+23h59m16s893ms NET PERIODIC PERSISTED READY}
+04-11 14:29:37.690  1660  5297 D ConnectivityService: Returning UNBLOCKED NetworkInfo to uid=10205
+04-11 14:29:37.733  1660  3189 D ActivityManager: sync unfroze 17352 com.google.android.projection.gearhead:provider for 7
+04-11 14:29:37.742  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:37.743  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:37.746 17352 17352 D ActivityThread: Package [dev.bibavpn] reported as REPLACED, but missing application info. Assuming REMOVED.
+04-11 14:29:37.749 17352 17352 D ActivityThread: Package [dev.bibavpn] reported as REPLACED, but missing application info. Assuming REMOVED.
+04-11 14:29:37.774  2864  8711 D UidImportanceSource: onUidImportanceBlock: uid=10247 importance=125
+04-11 14:29:37.775  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6220 matrix =
+04-11 14:29:37.775  1660  2074 D ColorDisplayService:        0.993185 0.000312-0.000988 0.000000-0.005662 0.998595-0.004299 0.000000 0.001612 0.001093 0.948969 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:37.776  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:37.777  2864  8711 D UidImportanceSource: onUidImportanceBlock: packages=[com.android.systemui] importance=125
+04-11 14:29:37.777  2864  8711 D UidImportanceSource: onUidImportanceBlock: packageName=com.android.systemui importance=125
+04-11 14:29:37.777  2864  8711 D BusinessScope: Enqueuing the block
+04-11 14:29:37.778  2864  4488 D BusinessScope: Start running the #2146 block
+04-11 14:29:37.778  2864  4488 D BusinessScope: Enqueuing the block
+04-11 14:29:37.778  2864  4488 D ImpulseStateSource: Notify clients: 1071
+04-11 14:29:37.778  2864  4488 D BusinessScope: Finish running the #2146 block
+04-11 14:29:37.778  2864  4488 D BusinessScope: Start running the #2147 block
+04-11 14:29:37.778  2864  4488 D BusinessScope: Finish running the #2147 block
+04-11 14:29:37.786  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:37.786  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:37.786  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:37.786  1137  8595 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:37.789 21431 21459 W id.apps.tachyon: ClassLoaderContext classpath size mismatch. expected=1, found=0 (DLC[];PCL[base.apk*3395480911]{PCL[/system/framework/org.apache.http.legacy.jar*3558135066]#PCL[/system/framework/com.android.location.provider.jar*275730956]#PCL[/system/framework/com.android.media.remotedisplay.jar*1374153400]#PCL[/system_ext/framework/com.android.extensions.appfunctions.jar*694088577]#PCL[/system_ext/framework/androidx.window.extensions.jar*2031876145]#PCL[/system_ext/framework/androidx.window.sidecar.jar*772602948]} | DLC[];PCL[])
+04-11 14:29:37.790  1660  2654 I MR2ServiceImpl: Updating composite discovery preference | preference: RouteDiscoveryRequest{ preferredFeatures={}, activeScan=false }, active routers: []
+04-11 14:29:37.813 17352 17979 V GH.ProjStateSvc: No binder to the car, notifying not projecting
+04-11 14:29:37.828  1459  1480 I pixel-thermal: soc_therm:36.745 raw data: soc_therm:36745 
+04-11 14:29:37.828  1459  1480 I pixel-thermal: north_therm:35.575 raw data: north_therm:35575 
+04-11 14:29:37.828  1459  1480 I pixel-thermal: rfpa_therm:35.878 raw data: rfpa_therm:35878 
+04-11 14:29:37.828  1459  1480 I pixel-thermal: quiet_therm:35.965 raw data: quiet_therm:35965 
+04-11 14:29:37.829  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: model_input: [35575.00 33668.00 36745.00 35878.00 37393.00 32856.00 32528.00 35965.00 34437.98 ]
+04-11 14:29:37.829  1459  1480 I native  : I0000 00:00:1775906977.829154    1480 thermal_tflite_wrapper.cc:261] ThermalTfliteInvoke
+04-11 14:29:37.831  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: model_output: [34291.6 34301.7 34306.8 34320.8 34339 34359.3 34385.5 34407 34429.6 34455.2 ]
+04-11 14:29:37.831  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: predicted_value: [34291.6 34301.7 34306.8 34320.8 34339 34359.3 34385.5 34407 34429.6 34455.2 ]
+04-11 14:29:37.835  1459  1480 I pixel-thermal: EARLY-WARNING-SENSOR:0 raw data: EARLY-EMERGENCY-WARNING-SENSOR:0 EARLY-SHUTDOWN-WARNING-SENSOR:0 EARLY-WARNING-SENSOR:0 VIRTUAL-SKIN:34438 VIRTUAL-SKIN-PREDICTION-MODEL:34291.6 VT-FORECAST-30SEC:34344.8 VT-FORECAST-60SEC:34444.3 charging_therm:37393 disp0_therm:32856 flash_therm:33668 north_therm:35575 quiet_therm:35965 rfpa_therm:35878 soc_therm:36745 usb_pwr_therm:32528 
+04-11 14:29:37.900   881   881 W TracingMuxer: type=1400 audit(0.0:1929): avc:  denied  { write } for  name="traced_producer" dev="tmpfs" ino=1362 scontext=u:r:hal_camera_default:s0 tcontext=u:object_r:traced_producer_socket:s0 tclass=sock_file permissive=0
+04-11 14:29:37.915 21431 21459 W System  : ClassLoader referenced unknown path: 
+04-11 14:29:37.921 21431 21459 D nativeloader: Configuring clns-10 for other apk . target_sdk_version=37, uses_libraries=, library_path=/data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/lib/arm64:/data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/base.apk!/lib/arm64-v8a, permitted_path=/data:/mnt/expand:/data/user/0/com.google.android.gms
+04-11 14:29:37.924  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:37.932 17352 17368 W arhead:provider: userfaultfd: MOVE ioctl seems unsupported: Connection timed out
+04-11 14:29:37.941  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:37.941  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:37.981  3812  5975 I MdiSyncModule: (REDACTED) Receiving API connection from package '%s'...
+04-11 14:29:37.991  3812  5975 I MdiSyncModule: API connection successful!
+04-11 14:29:37.994 21431 21459 W id.apps.tachyon: ClassLoaderContext classpath element checksum mismatch. expected=3395480911, found=4207150877 (DLC[];PCL[base.apk*3395480911]{PCL[/system/framework/org.apache.http.legacy.jar*3558135066]#PCL[/system/framework/com.android.location.provider.jar*275730956]#PCL[/system/framework/com.android.media.remotedisplay.jar*1374153400]#PCL[/system_ext/framework/com.android.extensions.appfunctions.jar*694088577]#PCL[/system_ext/framework/androidx.window.extensions.jar*2031876145]#PCL[/system_ext/framework/androidx.window.sidecar.jar*772602948]} | DLC[];PCL[/data/app/~~kqsXJpWe7cIDyv0omVeNnQ==/com.google.android.apps.tachyon-neqUFa8TFuYQenG5fflgCg==/base.apk*4207150877]{PCL[/system_ext/framework/androidx.window.extensions.jar*2031876145]#PCL[/system_ext/framework/androidx.window.sidecar.jar*772602948]})
+04-11 14:29:38.128  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6260 matrix =
+04-11 14:29:38.128  1660  2074 D ColorDisplayService:        0.991466 0.000404-0.000845 0.000000-0.007580 0.998613-0.003793 0.000000 0.001297 0.000983 0.954203 0.000000 0.000000 0.000000 0.000000 1.000000
+--------- beginning of kernel
+04-11 14:29:38.267     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:38.285     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:38.304     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:38.434     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:38.446     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:38.452     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:38.495  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6300 matrix =
+04-11 14:29:38.495  1660  2074 D ColorDisplayService:        0.989780 0.000494-0.000703 0.000000-0.009463 0.998632-0.003291 0.000000 0.000986 0.000874 0.959399 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:38.579  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:38.580  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:38.580   882   922 I CHRE    : @ 3126.092: [Wallaby] OnInferredProx: prox_state=kFar
+04-11 14:29:38.637 21431 21465 W JobInfo : Requested important-while-foreground flag for job1983 is ignored and takes no effect
+04-11 14:29:38.794  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 1 -> 2 d_lux:304.55 w_lux: 503.48 C:9.01 G:3.21
+04-11 14:29:38.828  1660  2891 D ConnectivityService: requestNetwork for uid/pid:10205/21431 activeRequest: null callbackRequest: 1994 [NetworkRequest [ REQUEST id=1995, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]] callback flags: 0 order: 2147483647 isUidTracked: false declaredMethods: AVAIL|LOST|NC|BLK
+04-11 14:29:38.845  1660  2603 D UntrustedWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1995, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]
+04-11 14:29:38.847  1660  2603 D OemPaidWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1995, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]
+04-11 14:29:38.849  1660  2603 D MultiInternetWifiNetworkFactory: got request NetworkRequest [ REQUEST id=1995, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10205 RequestorUid: 10205 RequestorPkg: com.google.android.apps.tachyon UnderlyingNetworks: Null] ]
+04-11 14:29:38.850  1660  2610 D ConnectivityService: NetReassign [1995 : null тЖТ 111] [c 0] [a 6] [i 12]
+04-11 14:29:38.864  1660  2696 I IsolatedStorageServiceM: Isolated storage service VM status: 1
+04-11 14:29:38.866  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6340 matrix =
+04-11 14:29:38.866  1660  2074 D ColorDisplayService:        0.988125 0.000582-0.000563 0.000000-0.011313 0.998653-0.002793 0.000000 0.000678 0.000766 0.964558 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:38.980  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:38.997  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 2 -> 1 d_lux:324.68 w_lux: 528.31 C:9.46 G:3.40
+04-11 14:29:39.026  1660  2551 D ActivityManager: freezing 18459 com.whatsapp
+04-11 14:29:39.057  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:39.062  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:39.063  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10304} in 23ms
+04-11 14:29:39.102  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:80 Unregister: in shim layer
+04-11 14:29:39.103  3060  3310 I bluetooth: bluetooth_core::gatt::server::isolation_manager: removing server (if any) associated with advertiser AdvertiserId(1)
+04-11 14:29:39.114  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x46, rc: 0
+04-11 14:29:39.115  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x47, rc: 0
+04-11 14:29:39.167  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:39.167  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:39.178  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:39.178  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:39.237  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6380 matrix =
+04-11 14:29:39.237  1660  2074 D ColorDisplayService:        0.986499 0.000668-0.000424 0.000000-0.013131 0.998673-0.002299 0.000000 0.000373 0.000658 0.969678 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:39.377  8252 17885 I VkpnsPushProvider:CheckServiceAlive: Service PushService is active
+04-11 14:29:39.389  1459  1480 I pixel-thermal: flash_therm:33.702 raw data: flash_therm:33702 
+04-11 14:29:39.420  1660  2074 D ColorDisplayService: DisplayWhiteBalanceTintController animation ended: wasCancelled=false toCct=6400 fromCct=6077
+04-11 14:29:39.422  1660  2074 D ColorDisplayService: computeDisplayWhiteBalanceMatrix: cct =6400 matrix =
+04-11 14:29:39.422  1660  2074 D ColorDisplayService:        0.985699 0.000711-0.000356 0.000000-0.014027 0.998684-0.002054 0.000000 0.000222 0.000605 0.972225 0.000000 0.000000 0.000000 0.000000 1.000000
+04-11 14:29:39.580  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:39.580  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:39.581   882   922 I CHRE    : @ 3127.092: [Wallaby] OnInferredProx: prox_state=kFar
+04-11 14:29:40.049  2864  3163 D TemperatureStateSource: sequence=152 actualDelay=10005
+04-11 14:29:40.055  2864  3163 D TemperatureStateSource: Reading temperature: sequence=153
+04-11 14:29:40.072  1459  1459 I pixel-thermal: VIRTUAL-SKIN:34.4277 raw data: VIRTUAL-SKIN:34427.7 VIRTUAL-SKIN-EQ:34427.7 VIRTUAL-SKIN-LEGACY:34962.7 VIRTUAL-SKIN-LEGACY-MODEL-DIFF:550.457 VIRTUAL-SKIN-LEGACY-SHUTDOWN:0 VIRTUAL-SKIN-MODEL:34412.2 VIRTUAL-SKIN-MODEL-CLAMPED:34412.2 VIRTUAL-SKIN-MODEL-LEGACY-DIFF:-550.457 VIRTUAL-SKIN-MODEL-UPDATED:34427.7 VIRTUAL-SKIN-MODEL-UPPER-CLAMPED:34412.2 VIRTUAL-SKIN-SUB-0:34859.3 VIRTUAL-SKIN-SUB-1:34962.7 VIRTUAL-SKIN-SUB-2:34465.3 VIRTUAL-SKIN-SUB-3:34624.3 VIRTUAL-SKIN-SUB-4:34366.5 VT_LEGACY_WEIGHT:0 VT_MODEL_WEIGHT:1 charging_therm:37382 disp0_therm:32870 flash_therm:33702 north_therm:35609 quiet_therm:35945 rfpa_therm:35863 soc_therm:36800 usb_pwr_therm:32553 
+04-11 14:29:40.074  2864  3163 D TemperatureStateSource: getDeviceTemperatures: sequence=153 deviceTemperatureType=3 temperatureSource=0 temperatures=[34.427677]
+04-11 14:29:40.074  2864  3163 D BusinessScope: Enqueuing the block
+04-11 14:29:40.074  2864  3163 D TemperatureStateSource: sequence=153 waitTime=10000
+04-11 14:29:40.075  2864  2951 D BusinessScope: Start running the #2148 block
+04-11 14:29:40.076  2864  2951 D BusinessScope: Enqueuing the block
+04-11 14:29:40.077  2864  2951 D ImpulseStateSource: Notify clients: 1072
+04-11 14:29:40.077  2864  2951 D BusinessScope: Finish running the #2148 block
+04-11 14:29:40.077  2864  2951 D BusinessScope: Start running the #2149 block
+04-11 14:29:40.078  2864  2951 D BusinessScope: Finish running the #2149 block
+04-11 14:29:40.286  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 1 -> 2 d_lux:317.80 w_lux: 521.34 C:9.39 G:3.35
+04-11 14:29:40.383  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 2 -> 1 d_lux:325.09 w_lux: 524.58 C:9.45 G:3.40
+04-11 14:29:40.489 19840 19900 I GoLog   : time="2026-04-11T11:29:40Z" level=warning msg="[TCP] read tcp 95.213.56.3:443: connection reset by peer"
+04-11 14:29:40.490 19840 19913 E GoLog   : W0411 11:29:40.484356   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:40.580   882   922 I CHRE    : @ 3128.092: [Wallaby] OnInferredProx: prox_state=kFar
+04-11 14:29:40.581  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:40.581  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:40.734  1660  2263 D ActivityManager: sync unfroze 18459 com.whatsapp for 3
+04-11 14:29:40.756  1660  5646 D ConnectivityService: Returning UNBLOCKED NetworkInfo to uid=10304
+04-11 14:29:40.771 19840 19900 E GoLog   : W0411 11:29:40.771053   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:40.773 19840 19954 I GoLog   : time="2026-04-11T11:29:40Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:40.785 19840 19891 I GoLog   : time="2026-04-11T11:29:40Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:40.785 19840 19891 I GoLog   : time="2026-04-11T11:29:40Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:40.785 19840 19891 I GoLog   : time="2026-04-11T11:29:40Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:40.785 19840 19891 E GoLog   : W0411 11:29:40.781298   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:40.785 19840 19891 E GoLog   : W0411 11:29:40.782133   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:40.785 19840 19891 E GoLog   : W0411 11:29:40.782471   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:40.791 19840 19955 E GoLog   : W0411 11:29:40.782863   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:40.799  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:40.799  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:40.802 19840 19891 I GoLog   : time="2026-04-11T11:29:40Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:40.813 19840 19955 E GoLog   : W0411 11:29:40.812600   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:40.813 19840 19955 I GoLog   : time="2026-04-11T11:29:40Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:40.839  1660  2263 D ActivityManager: sync unfroze 10328 com.android.systemui:screenshot for 10
+04-11 14:29:40.842  1660  2551 D ActivityManager: freezing 22284 android.process.acore
+04-11 14:29:40.857  2723  3048 D KeyguardViewMediator: updateActivityLockScreenState(true, true, handleShowInner)
+04-11 14:29:40.862  2723  2723 E NotifRow: Magnetic state changed from IDLE to IDLE on a null swiped listener, or the logging key of the listener is null
+04-11 14:29:40.868  1660  1660 D BiometricService: Sensor ID(1), oemStrength: 15, updatedStrength: 15, modality 8, state: 0, cookie: 0, sensorId 1, hasEnrollments: false cannot participate in Keystore operations
+04-11 14:29:40.875  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:40.875  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:40.876  2723  2803 E FromGoneTransitionInteractor: Ignoring startTransition: This interactor asked to transition from GONE -> LOCKSCREEN, but we last transitioned to DOZING, not GONE. This should never happen - check currentTransitionInfoInternal or use filterRelevantKeyguardState before starting transitions.
+04-11 14:29:40.876   478 18215 I keystore2: system/security/keystore2/src/authorization.rs:151 - on_device_locked(AndroidUserId(0), unlocking_sids=[SecureUserId(-1099702334)], weak_unlock_enabled=false)
+04-11 14:29:40.878  2923  2923 D NfcService: onKeyguardLockedStateChanged: isKeyguardLocked =true
+04-11 14:29:40.878  2923  2923 D NfcService: handleMessage: MSG_APPLY_SCREEN_STATE OFF_LOCKED
+04-11 14:29:40.878  2723  2723 I KeyguardDisplayManager: Secondary Keyguard presentation not shown on display 0 because shade window is on it (with the primary keyguard)
+04-11 14:29:40.879  3073  3073 D b/417220811: invalidateLoadedTasks - previous requestLoadId: -1
+04-11 14:29:40.882  2723  2723 D KeyguardViewMediator: KeyguardViewMediator queue processing message: SHOW
+04-11 14:29:40.883  2923  2923 D libnfc_nci: nfcManager_doSetScreenState: state = 2 sPrevScreenStateMask= 1, screen_state_mask= 2
+04-11 14:29:40.887  1660  5646 D SystemServerTiming: getUserSwitchability-0
+04-11 14:29:40.887  1660  5646 D SystemServerTiming: TM.isInCall
+04-11 14:29:40.888  1660  5646 D SystemServerTiming: hasUserRestriction-DISALLOW_USER_SWITCH
+04-11 14:29:40.888  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:40.888  3403  3403 I ActiveUnlock: onDeviceLocked [CONTEXT service_id=327 ]
+04-11 14:29:40.891  1660  5646 D SystemServerTiming: getInt-ALLOW_USER_SWITCHING_WHEN_SYSTEM_USER_LOCKED
+04-11 14:29:40.891  1660  5646 D SystemServerTiming: isUserUnlocked-USER_SYSTEM
+04-11 14:29:40.892  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:40.892  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10084} in 10ms
+04-11 14:29:40.895   913  3322 D NfcNciHalWrapper: nfc_set_state 5->11
+04-11 14:29:40.900     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:40.905  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: enter; event=0xB
+04-11 14:29:40.905  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: NFA_DM_SET_POWER_SUB_STATE_EVT; status=0x0
+04-11 14:29:40.905  2923  2923 D libnfc_nci: nfcManager_doSetScreenState: discovry_param = 0x00
+04-11 14:29:40.906   478 18215 I keystore2: system/security/keystore2/src/super_key.rs:996 - UnlockedDeviceRequired super keys for AndroidUserId(0) are biometric-encrypted
+04-11 14:29:40.907  1660  1660 D BiometricService: Sensor ID(1), oemStrength: 15, updatedStrength: 15, modality 8, state: 0, cookie: 0, sensorId 1, hasEnrollments: false cannot participate in Keystore operations
+04-11 14:29:40.908  2864  2864 I cdas-KeyguardService: onDeviceLockedStateChanged: true
+04-11 14:29:40.908   478 18215 I keystore2: system/security/keystore2/src/authorization.rs:151 - on_device_locked(AndroidUserId(10), unlocking_sids=[SecureUserId(-1099702334)], weak_unlock_enabled=false)
+04-11 14:29:40.910     0     0 I trusty  : gsp_crypto_proxy_srv: 97: Coercing legacy key derivation response
+04-11 14:29:40.914  1660  2263 D ActivityManager: sync unfroze 27430 com.google.android.crossdeviceaccessservice for 3
+04-11 14:29:40.915  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: enter; event=0x2
+04-11 14:29:40.915  2923  3287 D libnfc_nci: nfaDeviceManagementCallback: NFA_DM_SET_CONFIG_EVT
+04-11 14:29:40.919  2923  2923 D NfcService: applyScreenState: screenState = OFF_LOCKED
+04-11 14:29:40.925   857 21305 W resolv  : handshake timeout: Try again
+04-11 14:29:40.933   857 21305 W resolv  : TLS Handshake failed
+04-11 14:29:40.933   478 18215 I keystore2: system/security/keystore2/src/super_key.rs:996 - UnlockedDeviceRequired super keys for AndroidUserId(10) are biometric-encrypted
+04-11 14:29:40.936  1660  1660 W AlarmManager: Unrecognized alarm listener com.android.server.locksettings.LockSettingsStrongAuth$NonStrongBiometricIdleTimeoutAlarmListener@c03085d
+04-11 14:29:40.940  2723  3048 D Bubbles : handleKeyguardOrDreamChange isUnlockedShade=false keyguardShowing=true dreamingOrInPreview=true
+04-11 14:29:40.941  2723  2755 D Bubbles : BubbleController.onStatusBarStateChanged() isShade=false didChange=true mNotifEntryToExpandOnShadeUnlock=null
+04-11 14:29:40.944 19840 19895 I GoLog   : time="2026-04-11T11:29:40Z" level=info msg="[UDP] 10.69.0.2:46210 <-> 8.8.8.8:53"
+04-11 14:29:40.947 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:40.947 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:40.947 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.245.33
+04-11 14:29:40.948  2723  2806 D ShadeStatusBarComponentsInteractor#disableFlagsInteractor: newValue: DisableFlagsModel(disable1=16777216, disable2=0, animate=true)
+04-11 14:29:40.955 19840 19955 I GoLog   : time="2026-04-11T11:29:40Z" level=info msg="[UDP] 10.69.0.2:2069 <-> 8.8.8.8:53"
+04-11 14:29:40.957 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:40.957 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:40.964 27430 27430 I CDAS-CrossDeviceAccessService: UserBroadcastReceiver onReceive: com.google.android.pixelsystemservice.crossdeviceaccessservice.intent.action.ACTION_DEVICE_LOCKED_STATE_CHANGED
+04-11 14:29:40.969 27430 27446 I CDAS-CrossDeviceAccessService: UserBroadcastReceiver: isDeviceLocked: true
+04-11 14:29:40.980 27430 27446 I CDAS-CrossDeviceAccessService: LockStateRepositoryImpl: getDeviceLockState: LOCK_STATE_UNLOCKED
+04-11 14:29:40.980 27430 27446 I CDAS-CrossDeviceAccessService: UpdateLockStateUseCase: Updating lock state to isLocked: true
+04-11 14:29:41.010 27430 27446 I CDAS-CrossDeviceAccessService: LockStateRepositoryImpl: updateLockState: lockState=LOCK_STATE_LOCKED with timestamp 2026-04-11T11:29:40.980900Z
+04-11 14:29:41.013 21431 21512 W DynamiteModule: Local module descriptor class for com.google.android.gms.providerinstaller.dynamite not found.
+04-11 14:29:41.018 19840 19954 I GoLog   : time="2026-04-11T11:29:41Z" level=info msg="[TCP] 10.69.0.2:41830 <-> 172.217.20.170:443"
+04-11 14:29:41.019 27430 27446 D CDAS-LockOnDisconnect: Device is locked, ignore post lock notification
+04-11 14:29:41.024  3403  4852 W ProviderHelper: Unknown dynamite feature providerinstaller.dynamite
+04-11 14:29:41.032 19840 19955 I GoLog   : time="2026-04-11T11:29:41Z" level=info msg="[TCP] 10.69.0.2:59028 <-> 172.217.19.234:443"
+04-11 14:29:41.032 21431 21512 W ProviderInstaller: Failed to load providerinstaller module: No acceptable module com.google.android.gms.providerinstaller.dynamite found. Local version is 0 and remote version is 0.
+04-11 14:29:41.033  3403 21361 W Auth    : [TokenResponseCallback] TokenResponse failed with exception [CONTEXT service_id=343 ]
+04-11 14:29:41.033  3403 21361 W Auth    : cycd: Failed to process request
+04-11 14:29:41.033  3403 21361 W Auth    : 	at cyck.a(:com.google.android.gms@261332035@26.13.32 (260400-895912391):23)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at cygh.b(:com.google.android.gms@261332035@26.13.32 (260400-895912391):15)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at cygy.onFailed(:com.google.android.gms@261332035@26.13.32 (260400-895912391):15)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at m1.nr.onFailed(:com.google.android.gms.dynamite_cronetdynamite@261332035@26.13.32 (260400-0):3)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at m1.mn.run(:com.google.android.gms.dynamite_cronetdynamite@261332035@26.13.32 (260400-0):16)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at bjlx.c(:com.google.android.gms@261332035@26.13.32 (260400-895912391):50)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at bjlx.run(:com.google.android.gms@261332035@26.13.32 (260400-895912391):73)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1154)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:652)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at bjro.run(:com.google.android.gms@261332035@26.13.32 (260400-895912391):8)
+04-11 14:29:41.033  3403 21361 W Auth    : 	at java.lang.Thread.run(Thread.java:1564)
+04-11 14:29:41.033  3403 21361 W Auth    : Caused by: m1.na: Exception in CronetUrlRequest: net::ERR_TIMED_OUT, ErrorCode=4, InternalErrorCode=-7, Retryable=true
+04-11 14:29:41.033  3403 21361 W Auth    : 	at org.chromium.net.impl.CronetUrlRequest.onError(:com.google.android.gms.dynamite_cronetdynamite@261332035@26.13.32 (260400-0):3)
+04-11 14:29:41.036 21431 21512 D ApplicationLoaders: Returning zygote-cached class loader: /system/framework/org.apache.http.legacy.jar
+04-11 14:29:41.037 21431 21512 D ApplicationLoaders: Returning zygote-cached class loader: /system/framework/com.android.location.provider.jar
+04-11 14:29:41.037 21431 21512 D ApplicationLoaders: Returning zygote-cached class loader: /system/framework/com.android.media.remotedisplay.jar
+04-11 14:29:41.046     0     0 I trusty  : INFO: system/keymint/ta/src/lib.rs:1001 add 64 bytes of entropy
+04-11 14:29:41.051 21431 21512 D nativeloader: Configuring clns-11 for other apk /system_ext/framework/com.android.extensions.appfunctions.jar. target_sdk_version=37, uses_libraries=ALL, library_path=/data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/lib/arm64:/data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/base.apk!/lib/arm64-v8a, permitted_path=/data:/mnt/expand:/data/user/0/com.google.android.gms
+04-11 14:29:41.059 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:41.059 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:41.059 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:41.059 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.245.33
+04-11 14:29:41.062 21431 21512 D ApplicationLoaders: Returning zygote-cached class loader: /system_ext/framework/androidx.window.extensions.jar
+04-11 14:29:41.062 21431 21512 D ApplicationLoaders: Returning zygote-cached class loader: /system_ext/framework/androidx.window.sidecar.jar
+04-11 14:29:41.064 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:41.064 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:41.120 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:41.120 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:41.121 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:41.121 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.223.33
+04-11 14:29:41.129 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:41.129 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:41.192 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:41.192 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:41.192 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:41.192 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.223.33
+04-11 14:29:41.196 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:41.197 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:41.254 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:41.290 21431 21512 D nativeloader: Configuring clns-12 for other apk /data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/base.apk. target_sdk_version=37, uses_libraries=, library_path=/data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/lib/arm64:/data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/base.apk!/lib/arm64-v8a, permitted_path=/data:/mnt/expand:/data/user/0/com.google.android.gms
+04-11 14:29:41.356  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:41.356  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:41.398 21431 21512 D nativeloader: Load /data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/base.apk!/lib/arm64-v8a/libconscrypt_gmscore_jni.so using class loader ns clns-12 (caller=/data/app/~~eanjCT46Ygs-2I25X3j2NA==/com.google.android.gms-yKQJQeNwoeKFhU4-rm9DzA==/base.apk): ok
+04-11 14:29:41.403 21431 21512 V NativeCrypto: Registering com/google/android/gms/org/conscrypt/NativeCrypto's 336 native methods...
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: Failed to get service from broker. 
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: java.lang.SecurityException: Unknown calling package name 'com.google.android.gms'.
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Parcel.createExceptionOrNull(Parcel.java:3370)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Parcel.createException(Parcel.java:3354)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Parcel.readException(Parcel.java:3337)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Parcel.readException(Parcel.java:3279)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at bisg.a(:com.google.android.gms@261332035@26.13.32 (260400-895912391):36)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at biqh.z(:com.google.android.gms@261332035@26.13.32 (260400-895912391):143)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at bhwi.run(:com.google.android.gms@261332035@26.13.32 (260400-895912391):42)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Handler.handleCallback(Handler.java:1095)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Handler.dispatchMessageImpl(Handler.java:135)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Handler.dispatchMessage(Handler.java:125)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at cyil.mp(:com.google.android.gms@261332035@26.13.32 (260400-895912391):1)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at cyil.dispatchMessage(:com.google.android.gms@261332035@26.13.32 (260400-895912391):5)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Looper.loopOnce(Looper.java:269)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.Looper.loop(Looper.java:367)
+04-11 14:29:41.416 21431 21602 E GoogleApiManager: 	at android.os.HandlerThread.run(HandlerThread.java:139)
+04-11 14:29:41.429 21431 21602 W GoogleApiManager: Not showing notification since connectionResult is not user-facing: ConnectionResult{statusCode=DEVELOPER_ERROR, resolution=null, message=null, clientMethodKey=null}
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: Failed to register com.google.android.gms.providerinstaller#com.google.android.apps.tachyon
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: giyd: 17: 17: API: Phenotype.API is not available on this device. Connection failed with: ConnectionResult{statusCode=DEVELOPER_ERROR, resolution=null, message=null, clientMethodKey=null}
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at giyf.a(:com.google.android.gms@261332035@26.13.32 (260400-895912391):13)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at hiov.d(:com.google.android.gms@261332035@26.13.32 (260400-895912391):3)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at hiox.run(:com.google.android.gms@261332035@26.13.32 (260400-895912391):130)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at hirg.execute(:com.google.android.gms@261332035@26.13.32 (260400-895912391):1)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at hipf.f(:com.google.android.gms@261332035@26.13.32 (260400-895912391):1)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at hipf.m(:com.google.android.gms@261332035@26.13.32 (260400-895912391):99)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at hipf.r(:com.google.android.gms@261332035@26.13.32 (260400-895912391):17)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at gaqm.hA(:com.google.android.gms@261332035@26.13.32 (260400-895912391):35)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at fnei.run(:com.google.android.gms@261332035@26.13.32 (260400-895912391):12)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at hirg.execute(:com.google.android.gms@261332035@26.13.32 (260400-895912391):1)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at fnej.b(:com.google.android.gms@261332035@26.13.32 (260400-895912391):18)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at fney.b(:com.google.android.gms@261332035@26.13.32 (260400-895912391):34)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at fnfa.d(:com.google.android.gms@261332035@26.13.32 (260400-895912391):25)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhtr.c(:com.google.android.gms@261332035@26.13.32 (260400-895912391):9)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhwg.q(:com.google.android.gms@261332035@26.13.32 (260400-895912391):48)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhwg.d(:com.google.android.gms@261332035@26.13.32 (260400-895912391):10)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhwg.g(:com.google.android.gms@261332035@26.13.32 (260400-895912391):191)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhwg.onConnectionFailed(:com.google.android.gms@261332035@26.13.32 (260400-895912391):2)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhwi.run(:com.google.android.gms@261332035@26.13.32 (260400-895912391):70)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at android.os.Handler.handleCallback(Handler.java:1095)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at android.os.Handler.dispatchMessageImpl(Handler.java:135)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at android.os.Handler.dispatchMessage(Handler.java:125)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at cyil.mp(:com.google.android.gms@261332035@26.13.32 (260400-895912391):1)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at cyil.dispatchMessage(:com.google.android.gms@261332035@26.13.32 (260400-895912391):5)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at android.os.Looper.loopOnce(Looper.java:269)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at android.os.Looper.loop(Looper.java:367)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at android.os.HandlerThread.run(HandlerThread.java:139)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: Caused by: bhry: 17: API: Phenotype.API is not available on this device. Connection failed with: ConnectionResult{statusCode=DEVELOPER_ERROR, resolution=null, message=null, clientMethodKey=null}
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bipt.a(:com.google.android.gms@261332035@26.13.32 (260400-895912391):15)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhtu.a(:com.google.android.gms@261332035@26.13.32 (260400-895912391):1)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	at bhtr.c(:com.google.android.gms@261332035@26.13.32 (260400-895912391):5)
+04-11 14:29:41.440 21431 21590 W FlagRegistrar: 	... 13 more
+04-11 14:29:41.491 21431 21512 I ProviderInstaller: Installed default security provider GmsCore_OpenSSL
+04-11 14:29:41.888  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:41.889  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:41.946  1660  2610 D InetDiagMessage: Destroyed 1 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:41.950  1660  2610 D InetDiagMessage: Destroyed 2 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:41.950  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10303} in 9ms
+04-11 14:29:41.953  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:41.955  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:41.956  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={20303} in 5ms
+04-11 14:29:41.980   911   911 W TracingMuxer: type=1400 audit(0.0:1930): avc:  denied  { write } for  name="traced_producer" dev="tmpfs" ino=1362 scontext=u:r:mediacodec_google:s0 tcontext=u:object_r:traced_producer_socket:s0 tclass=sock_file permissive=0
+04-11 14:29:42.006  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:42.012  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:42.013  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1010289} in 22ms
+04-11 14:29:42.019  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:42.024  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:42.025  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1020289} in 11ms
+04-11 14:29:42.393  1660  1845 I system_server: Background young concurrent mark compact GC freed 91MB AllocSpace bytes, 29(1528KB) LOS objects, 49% free, 96MB/191MB, paused 1.965ms,6.367ms total 441.461ms
+04-11 14:29:42.435  1660  1846 I libbinder.BpBinder: onLastStrongRef automatically unlinking death recipients for binder (0xb400007b5b555b30) with descriptor: '(not cached)'
+04-11 14:29:42.437  1660  1846 I libbinder.BpBinder: onLastStrongRef automatically unlinking death recipients for binder (0xb400007b5b54a030) with descriptor: '(not cached)'
+04-11 14:29:42.443  1660  1847 W System  : A resource failed to call HardwareBuffer.close. 
+04-11 14:29:42.491  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:42.496  1660  2610 D InetDiagMessage: Destroyed 1 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:42.496  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1010319} in 9ms
+04-11 14:29:42.500  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:42.503  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:42.503  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1020319} in 7ms
+04-11 14:29:42.565 19840 19955 I GoLog   : time="2026-04-11T11:29:42Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:42.565 19840 19955 E GoLog   : W0411 11:29:42.564002   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:42.868 19840 19955 E GoLog   : W0411 11:29:42.864031   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:42.869 19840 19954 I GoLog   : time="2026-04-11T11:29:42Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:42.950 19840 19891 I GoLog   : time="2026-04-11T11:29:42Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:42.950 19840 19891 E GoLog   : W0411 11:29:42.949591   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:42.967 19840 19891 I GoLog   : time="2026-04-11T11:29:42Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:42.967 19840 19891 E GoLog   : W0411 11:29:42.965911   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:42.972 19840 19891 E GoLog   : W0411 11:29:42.972210   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:42.972 19840 19891 I GoLog   : time="2026-04-11T11:29:42Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:42.983  1660  5263 D ConnectivityService: Returning BLOCKED NetworkInfo to uid=10303
+04-11 14:29:43.190  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:43.197  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:43.197  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10289} in 14ms
+04-11 14:29:43.205  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:43.213  1459  1480 I pixel-thermal: VIRTUAL-SKIN-MODEL: model_input: [37370.00 32853.00 33736.00 35703.00 35948.00 35868.00 36835.00 32570.00 ]
+04-11 14:29:43.213  1459  1480 I native  : I0000 00:00:1775906983.213522    1480 thermal_tflite_wrapper.cc:261] ThermalTfliteInvoke
+04-11 14:29:43.213  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:43.214  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={20289} in 16ms
+04-11 14:29:43.214  1459  1480 I pixel-thermal: VIRTUAL-SKIN-MODEL: model_output: [34518.6 ]
+04-11 14:29:43.214  1459  1480 I pixel-thermal: VIRTUAL-SKIN-MODEL: predicted_value: [34518.6 ]
+04-11 14:29:43.214  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-HIGH:34.4641 raw data: VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-CPU-HIGH:34464.1 VIRTUAL-SKIN-EQ:34464.1 VIRTUAL-SKIN-LEGACY:35005.5 VIRTUAL-SKIN-LEGACY-MODEL-DIFF:486.891 VIRTUAL-SKIN-LEGACY-SHUTDOWN:0 VIRTUAL-SKIN-MODEL:34518.6 VIRTUAL-SKIN-MODEL-CLAMPED:34518.6 VIRTUAL-SKIN-MODEL-LEGACY-DIFF:-486.891 VIRTUAL-SKIN-MODEL-UPDATED:34464.1 VIRTUAL-SKIN-MODEL-UPPER-CLAMPED:34518.6 VIRTUAL-SKIN-SUB-0:34861.9 VIRTUAL-SKIN-SUB-1:35005.5 VIRTUAL-SKIN-SUB-2:34488.9 VIRTUAL-SKIN-SUB-3:34643.4 VIRTUAL-SKIN-SUB-4:34389.8 VT_LEGACY_WEIGHT:0 VT_MODEL_WEIGHT:1 charging_therm:37370 disp0_therm:32853 flash_therm:33736 north_therm:35703 quiet_therm:35948 rfpa_therm:35868 soc_therm:36835 usb_pwr_therm:32570 
+04-11 14:29:43.214  1459  1480 I pixel-thermal: VIRTUAL-SKIN:34.4641 raw data: VIRTUAL-SKIN:34464.1 
+04-11 14:29:43.215  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER-MODEL: model_input: [37370.00 32853.00 33736.00 35703.00 35948.00 35868.00 36835.00 32570.00 ]
+04-11 14:29:43.215  1459  1480 I native  : I0000 00:00:1775906983.215405    1480 thermal_tflite_wrapper.cc:261] ThermalTfliteInvoke
+04-11 14:29:43.215  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER-MODEL: model_output: [33417.2 ]
+04-11 14:29:43.215  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER-MODEL: predicted_value: [33417.2 ]
+04-11 14:29:43.215  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER:33.3163 raw data: VIRTUAL-SKIN-SPEAKER:33316.3 VIRTUAL-SKIN-SPEAKER-LEGACY:34237.8 VIRTUAL-SKIN-SPEAKER-LEGACY-MODEL-DIFF:820.664 VIRTUAL-SKIN-SPEAKER-MODEL:33417.2 VIRTUAL-SKIN-SPEAKER-MODEL-CLAMPED:33417.2 VIRTUAL-SKIN-SPEAKER-MODEL-LEGACY-DIFF:-820.664 VIRTUAL-SKIN-SPEAKER-MODEL-UPPER-CLAMPED:33417.2 VIRTUAL-SKIN-SPEAKER-SUB-0:34237.8 VIRTUAL-SKIN-SPEAKER-SUB-1:34087.1 VT_SPEAKER_LEGACY_WEIGHT:0 VT_SPEAKER_MODEL_WEIGHT:1 charging_therm:37370 disp0_therm:32853 flash_therm:33736 north_therm:35703 quiet_therm:35948 rfpa_therm:35868 soc_therm:36835 usb_pwr_therm:32570 
+04-11 14:29:43.216  1459  1480 I pixel-thermal: disp0_therm:32.853 raw data: disp0_therm:32853 
+04-11 14:29:43.216  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-LIGHT-ODPM:34.4641 raw data: VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-CPU-LIGHT-ODPM:34464.1 
+04-11 14:29:43.216  1459  1480 I pixel-thermal: cellular-emergency:34.4641 raw data: VIRTUAL-SKIN:34464.1 cellular-emergency:34464.1 
+04-11 14:29:43.217  1459  1480 I pixel-thermal: BG-TASKS-THROTTLING-HINT:0 raw data: BG-TASKS-THROTTLING-EXP-PROPERTY:0 BG-TASKS-THROTTLING-HINT:0 BG_TASKS_THROTTLING_COUNT:1 IS_BG_TASKS_THROTTLING_ACTIVE:0 IS_CHARGING:1 VIRTUAL-SKIN:34464.1 thb_hda:51 
+04-11 14:29:43.217  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-MID:34.4641 raw data: VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-CPU-MID:34464.1 
+04-11 14:29:43.217  1459  1480 I pixel-thermal: VIRTUAL-SKIN-HINT:34.4641 raw data: VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-HINT:34464.1 
+04-11 14:29:43.217  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SOC:34.4641 raw data: VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-SOC:34464.1 
+04-11 14:29:43.217  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-ODPM:34.4641 raw data: VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-CPU-ODPM:34464.1 
+04-11 14:29:43.218  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED:34.4641 raw data: NO_WLC:1 VIRTUAL-SKIN-CHARGE:34464.1 VIRTUAL-SKIN-CHARGE-WIRED:34464.1 VIRTUAL-SKIN-EQ:34464.1 WLC_CHECK:1 thb_hda:51 
+04-11 14:29:43.218  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=3710 err=3.53595 s_power=2493 time_elapsed_ms=7032 p=1074.93 i=567.991 d=-0 dt_per_min=-0.00838063 compensation=0 budget transient=0 control target=2 excluded power budget=105.818 (PARTIAL_SYSTEM_POWER: 881.81 mW, cdev_weight: 0.120000)
+04-11 14:29:43.218  1459  1480 I pixel-thermal: STATS-UPDATOR:0 raw data: EXTREME-CONDITION-POWER-MONITOR-44C:0 EXTREME-CONDITION-POWER-MONITOR-45C:0 EXTREME-CONDITION-POWER-MONITOR-46C:0 EXTREME_WORKLOAD_ODPM:881.813 STATS-UPDATOR:0 VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-44C:0 VIRTUAL-SKIN-45C:0 VIRTUAL-SKIN-46C:0 VIRTUAL-SKIN-PREDICTION-MODEL:34291.6 VT-FORECAST-30SEC-BACK:34438.9 VT-FORECAST-60SEC-BACK:34799.3 VT-FORECAST-ERROR-30SEC:-25.1562 VT-FORECAST-ERROR-60SEC:335.277 VT-FORECAST-ERROR-NOW:-164.703 VT-FORECAST-NOW:34299.3 
+04-11 14:29:43.218  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:34.4641 raw data: VIRTUAL-SKIN-CHARGE:34464.1 VIRTUAL-SKIN-CHARGE-PERSIST:34464.1 
+04-11 14:29:43.219  1459  1480 I pixel-thermal: Power rails total power: 1565.77 mW for 63238 ms
+04-11 14:29:43.219  1459  1480 I pixel-thermal: Power rails [VSYS_PWR_DISP_G1: 108.66 mW] [VSYS_PWR_MODEM: 27.24 mW] [S11S_UFS_VCC: 29.84 mW] [S10S_VDD_INFRA_MM_GPU_M: 26.31 mW] [S9S_VDD_INFRA: 9.96 mW] [S5S_VDDQ_MEM: 3.76 mW] 
+04-11 14:29:43.219  1459  1480 I pixel-thermal: Power rails [S8M_LLDO2: 115.49 mW] [S6S_LLDO2: 79.17 mW] [S11M_VDD_CPU_M: 45.85 mW] [S4S_VDD2H_MEM: 62.13 mW] [VSYS_PWR_DISP_G2: 20.39 mW] [VSYS_PWR_CAM_G1: 4.31 mW] 
+04-11 14:29:43.219  1459  1480 I pixel-thermal: Power rails [VSYS_PWR_RFFE: 4.89 mW] [VSYS_PWR_WLAN_BT: 99.21 mW] [S9M_VDD_TPU_M: 0.00 mW] [S7M_VDD_TPU: 0.00 mW] [S3S_LLDO1: 57.34 mW] [S2M_VDD_CPU2: 145.98 mW] 
+04-11 14:29:43.219  1459  1480 I pixel-thermal: Power rails [S6M_LLDO1: 21.48 mW] [S1S_VDD_MM: 11.31 mW] [S10M_VDD_AOC: 10.42 mW] [S7S_MLDO: 27.48 mW] [S8S_VDD_GMC: 106.63 mW] [VSYS_PWR_CAM_G2: 4.18 mW] 
+04-11 14:29:43.219  1459  1480 I pixel-thermal: Power rails [S12S: 142.10 mW] [S5M_VDD_AUR: 0.00 mW] [S3M_VDD_CPU1: 161.03 mW] [S4M_VDD_CPU: 145.46 mW] [S2S_VDD_GPU: 17.67 mW] [VSYS_PWR_VBATT: 544.94 mW] [S12M_VDD_CPU1_M: 10.55 mW] 
+04-11 14:29:43.219  1459  1480 I pixel-thermal: Power rails [S1M_VDD_AMB: 66.95 mW] 
+04-11 14:29:43.223  1459  1480 I pixel-thermal: CDEV log chg_mdis state:0 aurora state:0,budget:299000 usbc-port state:0 tpu state:0,budget:7964000 thermal-uclamp-7 state:0 cpufreq-cpu0 state:0,budget:999000 thermal-uclamp-5 state:0 thermal-uclamp-2 state:0 gpu state:0,budget:4798000 thermal-uclamp-0 state:0 cpufreq-cpu5 state:0,budget:1853000 cpufreq-cpu2 state:0,budget:1853000 cpufreq-cpu7 state:0,budget:3618000 
+04-11 14:29:43.225  1660  2610 D InetDiagMessage: Destroyed 1 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:43.226 19840 19895 E GoLog   : W0411 11:29:43.226119   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:43.227 19840 19895 I GoLog   : time="2026-04-11T11:29:43Z" level=warning msg="[TCP] read tcp 172.217.19.234:443: connection reset by peer"
+04-11 14:29:43.230  1660  2610 D InetDiagMessage: Destroyed 1 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:43.231 21431 21512 V NativeCrypto: SSL handshake aborted: ssl=0xb400007aeb361e58: I/O error during system call, Software caused connection abort
+04-11 14:29:43.231  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10205} in 13ms
+04-11 14:29:43.231 19840 19895 E GoLog   : W0411 11:29:43.231175   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:43.239 19840 19895 I GoLog   : time="2026-04-11T11:29:43Z" level=warning msg="[TCP] read tcp 172.217.20.170:443: connection reset by peer"
+04-11 14:29:43.240  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:43.240  1660  2613 I serviceDiscovery: [MdnsSocketProvider] Stop monitoring sockets.
+04-11 14:29:43.241  1660  2613 I TetheringManager: unregisterTetheringEventCallback caller:android
+04-11 14:29:43.243  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:43.243  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={20205} in 11ms
+04-11 14:29:43.245 21431 21484 E chromium: [0411/142943.228110:ERROR:external/cronet/stable/net/socket/ssl_client_socket_impl.cc:916] handshake failed; returned -1, SSL error code 1, net_error -103
+04-11 14:29:43.247  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:43.247 21431 21484 I cn_CronetUrlRequestContext: destroyNativeStreamLocked android.net.http.internal.org.chromium.net.impl.CronetBidirectionalStream@8f055e7
+04-11 14:29:43.250  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:43.250  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10173} in 6ms
+04-11 14:29:43.254  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:43.256  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:43.256  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={20173} in 6ms
+04-11 14:29:43.261  1660  5263 D ConnectivityService: Returning BLOCKED NetworkInfo to uid=10205
+04-11 14:29:43.274 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:43.274 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:43.274 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 3.33.221.48
+04-11 14:29:43.287 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:43.287   952   952 E WifiHAL : Setting APF program, halHandle = 0xb400007c98ecf050
+04-11 14:29:43.287   952   952 E WifiHAL : Set apf filter for iface = wlan0
+04-11 14:29:43.287 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:43.287   952   952 I WifiHAL : createRequest: APF set program request
+04-11 14:29:43.287   952   952 I WifiHAL : mProgramLen : 1109
+04-11 14:29:43.287 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 3.33.221.48
+04-11 14:29:43.290 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:43.290 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:43.370 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:43.370 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:43.423 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:43.424 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:43.424 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:43.424 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:43.424 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.245.33
+04-11 14:29:43.430 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:43.430 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:43.489 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:43.489 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:43.490 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:43.490 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.245.33
+04-11 14:29:43.492 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:43.493 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:43.584 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:43.584 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:43.584 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:43.584 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.223.33
+04-11 14:29:43.588 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:43.588 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:43.653 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:43.654 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:43.654 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:43.654 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 57.144.223.33
+04-11 14:29:43.659 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:43.659 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:43.735 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:44.045  1459  1480 I pixel-thermal: VIRTUAL-USB-UI:0 raw data: USB-MINUS-CHARGING:-4800 VIRTUAL-USB-UI:0 charging_therm:37370 usb_pwr_therm:32570 
+04-11 14:29:44.045  1459  1480 I pixel-thermal: VIRTUAL-USB-THROTTLING:0 raw data: USB-MINUS-CHARGING:-4800 VIRTUAL-USB-THROTTLING:0 usb_pwr_therm:32570 
+04-11 14:29:44.046  1459  1480 I pixel-thermal: usb_pwr_therm:32.57 raw data: usb_pwr_therm:32570 
+04-11 14:29:44.842  1459  1480 I pixel-thermal: soc_therm:36.835 raw data: soc_therm:36835 
+04-11 14:29:44.842  1459  1480 I pixel-thermal: north_therm:35.703 raw data: north_therm:35703 
+04-11 14:29:44.842  1459  1480 I pixel-thermal: rfpa_therm:35.868 raw data: rfpa_therm:35868 
+04-11 14:29:44.842  1459  1480 I pixel-thermal: quiet_therm:35.948 raw data: quiet_therm:35948 
+04-11 14:29:44.842  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: model_input: [35703.00 33736.00 36835.00 35868.00 37370.00 32853.00 32570.00 35948.00 34464.05 ]
+04-11 14:29:44.842  1459  1480 I native  : I0000 00:00:1775906984.842818    1480 thermal_tflite_wrapper.cc:261] ThermalTfliteInvoke
+04-11 14:29:44.843  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: model_output: [34356.1 34383.7 34406.1 34436.5 34470.2 34505 34544 34577.5 34611.5 34647.1 ]
+04-11 14:29:44.843  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: predicted_value: [34356.1 34383.7 34406.1 34436.5 34470.2 34505 34544 34577.5 34611.5 34647.1 ]
+04-11 14:29:44.843  1459  1480 I pixel-thermal: EARLY-WARNING-SENSOR:0 raw data: EARLY-EMERGENCY-WARNING-SENSOR:0 EARLY-SHUTDOWN-WARNING-SENSOR:0 EARLY-WARNING-SENSOR:0 VIRTUAL-SKIN:34464.1 VIRTUAL-SKIN-PREDICTION-MODEL:34356.1 VT-FORECAST-30SEC:34480.2 VT-FORECAST-60SEC:34631.9 charging_therm:37370 disp0_therm:32853 flash_therm:33736 north_therm:35703 quiet_therm:35948 rfpa_therm:35868 soc_therm:36835 usb_pwr_therm:32570 
+04-11 14:29:44.911  3403 21361 I NearbyConnections: Invalidate cached hpkeKey for client 197205907
+04-11 14:29:45.735 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:45.735 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:45.735 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 3.33.221.48
+04-11 14:29:45.741 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:45.741 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:45.853 19840 19891 I GoLog   : time="2026-04-11T11:29:45Z" level=warning msg="[TCP] read tcp 87.240.129.140:443: connection reset by peer"
+04-11 14:29:45.853 19840 19891 E GoLog   : W0411 11:29:45.850638   19840 gonet.go:457] ep.GetRemoteAddress() failed: endpoint not connected
+04-11 14:29:45.866 18459 19330 E msys    : E[N mns]_OnDiskCacheGetData(1102)=>Start post callback cache refresh DNS resolution
+04-11 14:29:45.866 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:45.866 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(35)=>[LogLevel:I] DNS Resolution Successful with 1 IPs, Persistent Cache Hit: 1, secondary resolver used: 0
+04-11 14:29:45.866 18459 19330 E msys    : E[ADNSUCTIMH WAJMNSDNSResolver]_MNSDNSResolutionSuccess(55)=>[LogLevel:I] Resolved IP Address: 15.197.206.217
+04-11 14:29:45.871 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using system DNS resolver, getaddrinfo(): No address associated with hostname
+04-11 14:29:45.872 18459 19330 E msys    : E[N mns]_TryFallbackToSecondary(704)=>Falling back to secondary DNS resolver
+04-11 14:29:45.889  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:45.892  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:45.893  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10304} in 8ms
+04-11 14:29:45.896  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:45.899  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:45.899  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={20304} in 6ms
+04-11 14:29:45.950 18459 19330 E msys    : E[N mns]_LogError(285)=>Failed to resolve using secondary DNS resolver, ares error: Could not contact DNS servers, timeouts: 0
+04-11 14:29:45.989  1660  2891 D ConnectivityService: Returning BLOCKED NetworkInfo to uid=10304
+04-11 14:29:46.417  1459  1480 I pixel-thermal: flash_therm:33.765 raw data: flash_therm:33765 
+04-11 14:29:46.418  3403 21342 I AlarmManager: setExactAndAllowWhileIdle [name: GCM_HB_ALARM type: 2 triggerAtMillis: 3611143]
+04-11 14:29:46.485  3403 21332 I AlarmManager: setExactAndAllowWhileIdle [name: FcmRetry type: 2 triggerAtMillis: 3251194]
+04-11 14:29:46.513  3403 21342 I AlarmManager: setExactAndAllowWhileIdle [name: GCM_HB_ALARM type: 2 triggerAtMillis: 3611238]
+04-11 14:29:46.559  3403 21342 I AlarmManager: setExactAndAllowWhileIdle [name: GCM_HB_ALARM type: 2 triggerAtMillis: 3611284]
+04-11 14:29:46.568  1660  2263 W ProcessStats: Tracking association SourceState{7d77cfc org.telegram.messenger/10303 Top #24842} whose proc state 1 is better than process ProcessState{5cc5db2 com.android.vending/10159 pkg=com.android.vending} proc state 8 (23 skipped)
+04-11 14:29:46.581  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:46.581  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:46.582  5094  5110 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:46.582  5094  5110 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:46.615  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:46.615  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:46.626  1137  1137 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:46.628  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:46.630   952   952 I WifiHAL : Creating message to get link statistics; iface = 47
+04-11 14:29:46.667  3403 21332 I AlarmManager: setExactAndAllowWhileIdle [name: FcmRetry type: 2 triggerAtMillis: 3251194]
+04-11 14:29:46.709  3403 21361 I AlarmManager: setExactAndAllowWhileIdle [name: FcmRetry type: 2 triggerAtMillis: 3251388]
+04-11 14:29:46.736   952  1064 I WifiHAL : Getting cached scan results, iface handle = 0xb400007c98ecf050
+04-11 14:29:46.736   952  1064 E WifiHAL : Creating message to get cached scan results
+04-11 14:29:46.744   952  1064 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+04-11 14:29:46.747   952  1064 E libbinder.IPCThreadState: binder thread pool (1 threads) starved for 118 ms
+04-11 14:29:46.915  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:46.920  3403 21361 I NearbyPresence: (REDACTED) %s verified [==] new request %s equals to the old request
+04-11 14:29:46.921  3403 21361 I NearbyPresence: (REDACTED) %s verified [!=] new request %s does not equal to the old request %s
+04-11 14:29:46.921  3403 21361 I NearbyPresence: (REDACTED) BleAdvertiseProviderController: request.isRequested() %s
+04-11 14:29:46.921  3403 21361 I NearbyPresence: (REDACTED) %s: stopping existing advertisement(s) %s,
+04-11 14:29:46.935  4093  4291 I NearbyPresence: (REDACTED) %s verified [==] new request %s equals to the old request
+04-11 14:29:46.941  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:46.944  5094  5106 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:46.945  5094  5106 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:46.945  5094  5106 I enwz    : (REDACTED) appOpsListener %s %s
+04-11 14:29:46.945  5094  5106 I enwz    : (REDACTED) Ignoring irrelevant audio permission changes for package %s
+04-11 14:29:47.018  1137  2559 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:47.018  1137  2559 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:47.018  1137  2559 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:47.107  1660  2263 W ActivityManager: Stopping service due to app idle: u0a305 -1m5s503ms com.vkontakte.android/.sync.online.VkOnlineService
+04-11 14:29:47.108  1660  2263 W libbinder.IPCThreadState: Sending oneway calls to frozen process.
+04-11 14:29:47.126 19840 19900 I GoLog   : time="2026-04-11T11:29:47Z" level=info msg="[TCP] 10.69.0.2:59496 <-> 1.1.1.1:853"
+04-11 14:29:47.144  1660  2664 D BackgroundInstallControlService: Package event received: 0
+04-11 14:29:47.166  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:80 Unregister: in shim layer
+04-11 14:29:47.168  3060  3310 I bluetooth: bluetooth_core::gatt::server::isolation_manager: removing server (if any) associated with advertiser AdvertiserId(0)
+04-11 14:29:47.171  1660  1660 W JobScheduler: Job didn't exist in JobStore: 80b0aa1 {SyncManager} #1000/47 @SyncManager@gmail-ls/com.google:android
+04-11 14:29:47.172  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 3587: USF: TMD3743: Baseline-cal complete. Baseline=6468.850374, amb_ir=1071
+04-11 14:29:47.182  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x48, rc: 0
+04-11 14:29:47.184  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x49, rc: 0
+04-11 14:29:47.184  3403 21361 I NearbyPresence: (REDACTED) %s: successfully stopped advertising
+04-11 14:29:47.198  3403 19753 I NearbyPresence: (REDACTED) %s: Nearby Presence stops mac rotation scheduler.
+04-11 14:29:47.335  3403 21361 I fpp     : device=FRANKEL, txOffset=0
+04-11 14:29:47.336  3403 21361 I NearbyPresence: (REDACTED) %s: Creating Java V0 advertisement
+04-11 14:29:47.341  3403 21361 I NearbyPresence: (REDACTED) %s: Broadcast with parameter %s
+04-11 14:29:47.342  3403 21361 D BluetoothAdapter: isLeEnabled(): ON
+04-11 14:29:47.348  3403 21361 I NearbyPresence: (REDACTED) %s successfully started advertising %s
+04-11 14:29:47.351  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:161 StartAdvertisingSet: in shim layer
+04-11 14:29:47.352  3060  3311 I bt_shim_advertiser: system/main/shim/le_advertising_manager.cc:188 StartAdvertisingSet: create advertising set, client_id:255, reg_id:-112
+04-11 14:29:47.352  3060  3250 I bluetooth: system/gd/hci/le_advertising_manager_impl.cc:421 allocate_advertiser: Removing advertiser id 0 from removed advertisers.
+04-11 14:29:47.364  3403 19753 I AlarmManager: setExactAndAllowWhileIdle [name: NearbyBleWakeup type: 0 triggerAtMillis: 1775907626363]
+04-11 14:29:47.376  3060  3250 I bluetooth: system/gd/hci/le_advertising_manager_impl.cc:1735 on_set_advertising_set_random_address_complete: update random address for advertising set 0 : xx:xx:xx:xx:cb:c6
+04-11 14:29:47.504  1660  2551 D ActivityManager: freezing 16994 com.Slack
+04-11 14:29:47.515  1660  2551 D ActivityManager: freezing 23365 com.android.chrome
+04-11 14:29:47.518  1660  2551 D ActivityManager: freezing 20641 com.android.chrome:sandboxed_process0:org.chromium.content.app.SandboxedProcessService0:0
+04-11 14:29:47.520  1660  2551 D ActivityManager: freezing 20577 com.android.chrome:privileged_process0
+04-11 14:29:47.521  1660  2551 D ActivityManager: freezing 29074 com.google.android.adservices.api
+04-11 14:29:47.537  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:47.544  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:47.544  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1010319} in 19ms
+04-11 14:29:47.552  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:47.558  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:47.559  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1090100} in 14ms
+04-11 14:29:47.566  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:47.570  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:47.571  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1010221} in 12ms
+04-11 14:29:47.577  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:47.582  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:47.582  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1010289} in 11ms
+04-11 14:29:48.174  1660  2551 D ActivityManager: freezing 21431 com.google.android.apps.tachyon
+04-11 14:29:48.191  1660  2551 D ActivityManager: freezing 17352 com.google.android.projection.gearhead:provider
+04-11 14:29:48.212  1660  2610 D InetDiagMessage: Destroyed 2 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:48.219  1660  2610 D InetDiagMessage: Destroyed 1 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:48.220  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10205} in 21ms
+04-11 14:29:48.248  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:48.260  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:48.260  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10173} in 35ms
+04-11 14:29:48.473 21687 21687 W libbinder.BackendUnifiedServiceManager: Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be implemented. serviceName: activity
+04-11 14:29:48.944 21708 21708 W libbinder.BackendUnifiedServiceManager: Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be implemented. serviceName: netstats
+04-11 14:29:48.991   882   922 D CHRE.HAL: Received a nanoapp message from 0x476f6f676c001016 endpoint 0x5: Type 0x8003 size 1 
+04-11 14:29:49.060   952  1064 I vendor.google.wifi_ext-service-vendor: Wifi: Resetting SAR Scenario to default
+04-11 14:29:49.067   952  1064 E WifiHAL : wifi_reset_tx_power_scenario
+04-11 14:29:49.126  2889  2889 D GRIL-S  : [0469]> UPDATE_DEVICE_STATE DeviceState: Usb:1, Wifi: 1, Wifi AP: 0, Earpiece: 0, Bluetooth: 1, Wireless charging: 0, Screen: 0, Camera: 0, 0, -, -, Motion: 0, Bluetooth tethering: 0, Voice: 0, Wifi 2.4G: 0, Radio: 1, Bluetooth connected: 0, Bluetooth media: 0, Wifi Band: 2, Wifi AP Band: 0, Wifi call: 0, mmWave: 0, mCellBackhaul: 0, mHallSensor: 0, mDozeStatus: 1, mAppClassInfo: 0, mWifiCapSensorStatus: 0, mCellCapSensorStatus: 0, mBesideHeadHandStatus: 0, mSpeakerStatus: 0, mProtectiveCaseStatus: 0, mWifiSettingStatus: 0, mGpsStatus: 0
+04-11 14:29:49.221  2889  3707 D GRIL-S  : [0469]< UPDATE_DEVICE_STATE 
+04-11 14:29:49.229  2889  2889 D GRIL-BluetoothSar: setBluetoothModeBasedTxPowerCap invoked with parameters: chain0Cap:[68, 68, 34, 74] chain1Cap:[68, 68, 34, 74] beamformingCap:[56, 56, 18, 18, 56, 56, 18, 18]
+04-11 14:29:49.235   880   880 I bluetooth_hal.extensions.sar: SetBluetoothModeBasedTxPowerCapPlusHR: Chain 0 Power Cap:<br=68, edr=68, ble=34, hr=74>, Chain 1 Power Cap:<br=68, edr=68, ble=34, hr=74>, Beamforming Power Cap Chain 0: <br=56, edr=56, ble=18, hr=18>, Chain 1:<br=56, edr=56, ble=18, hr=18>
+04-11 14:29:49.246  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x4a, rc: 0
+04-11 14:29:49.247  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x4b, rc: 0
+04-11 14:29:49.253   880  2309 I bluetooth_hal.extensions.sar: OnCommandCallback: Recv VSE <(9)[04 0e 06 01 69 fe 00 0f 01]> [Success]
+04-11 14:29:50.048  2864  3163 D ImpulseConnection: timeout happen: com.google.android.apps.turbo
+04-11 14:29:50.052  2864  3163 D ImpulseConnection: unbindService for releasing a CONNECTED connection com.google.android.apps.turbo
+04-11 14:29:50.082  2864  3163 D TemperatureStateSource: sequence=153 actualDelay=10008
+04-11 14:29:50.083  2864  3163 D TemperatureStateSource: Reading temperature: sequence=154
+04-11 14:29:50.110  1459  1459 I pixel-thermal: VIRTUAL-SKIN:34.4859 raw data: VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-EQ:34485.9 VIRTUAL-SKIN-LEGACY:34979.8 VIRTUAL-SKIN-LEGACY-MODEL-DIFF:461.207 VIRTUAL-SKIN-LEGACY-SHUTDOWN:0 VIRTUAL-SKIN-MODEL:34518.6 VIRTUAL-SKIN-MODEL-CLAMPED:34518.6 VIRTUAL-SKIN-MODEL-LEGACY-DIFF:-461.207 VIRTUAL-SKIN-MODEL-UPDATED:34485.9 VIRTUAL-SKIN-MODEL-UPPER-CLAMPED:34518.6 VIRTUAL-SKIN-SUB-0:34818.3 VIRTUAL-SKIN-SUB-1:34979.8 VIRTUAL-SKIN-SUB-2:34480.4 VIRTUAL-SKIN-SUB-3:34618 VIRTUAL-SKIN-SUB-4:34390.8 VT_LEGACY_WEIGHT:0 VT_MODEL_WEIGHT:1 charging_therm:37269 disp0_therm:32778 flash_therm:33788 north_therm:35692 quiet_therm:35915 rfpa_therm:35832 soc_therm:36660 usb_pwr_therm:32598 
+04-11 14:29:50.112  2864  3163 D TemperatureStateSource: getDeviceTemperatures: sequence=154 deviceTemperatureType=3 temperatureSource=0 temperatures=[34.485878]
+04-11 14:29:50.112  2864  3163 D BusinessScope: Enqueuing the block
+04-11 14:29:50.113  2864  4488 D BusinessScope: Start running the #2150 block
+04-11 14:29:50.117  2864  4488 D BusinessScope: Enqueuing the block
+04-11 14:29:50.117  2864  4488 D ImpulseStateSource: Notify clients: 1073
+04-11 14:29:50.117  2864  4488 D BusinessScope: Finish running the #2150 block
+04-11 14:29:50.118  2864  4488 D BusinessScope: Start running the #2151 block
+04-11 14:29:50.118  2864  4488 D BusinessScope: Finish running the #2151 block
+04-11 14:29:50.121  2864  3163 D TemperatureStateSource: sequence=154 waitTime=10000
+04-11 14:29:50.258  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-HIGH:34.4859 raw data: VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-CPU-HIGH:34485.9 
+04-11 14:29:50.259  1459  1480 I pixel-thermal: VIRTUAL-SKIN:34.4859 raw data: VIRTUAL-SKIN:34485.9 
+04-11 14:29:50.260  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER-MODEL: model_input: [37269.00 32778.00 33788.00 35692.00 35915.00 35832.00 36660.00 32598.00 ]
+04-11 14:29:50.261  1459  1480 I native  : I0000 00:00:1775906990.260576    1480 thermal_tflite_wrapper.cc:261] ThermalTfliteInvoke
+04-11 14:29:50.261  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER-MODEL: model_output: [33384.3 ]
+04-11 14:29:50.261  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER-MODEL: predicted_value: [33384.3 ]
+04-11 14:29:50.262  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SPEAKER:33.3435 raw data: VIRTUAL-SKIN-SPEAKER:33343.5 VIRTUAL-SKIN-SPEAKER-LEGACY:34236.4 VIRTUAL-SKIN-SPEAKER-LEGACY-MODEL-DIFF:852.148 VIRTUAL-SKIN-SPEAKER-MODEL:33384.3 VIRTUAL-SKIN-SPEAKER-MODEL-CLAMPED:33384.3 VIRTUAL-SKIN-SPEAKER-MODEL-LEGACY-DIFF:-852.148 VIRTUAL-SKIN-SPEAKER-MODEL-UPPER-CLAMPED:33384.3 VIRTUAL-SKIN-SPEAKER-SUB-0:34236.4 VIRTUAL-SKIN-SPEAKER-SUB-1:34065.1 VT_SPEAKER_LEGACY_WEIGHT:0 VT_SPEAKER_MODEL_WEIGHT:1 charging_therm:37269 disp0_therm:32778 flash_therm:33788 north_therm:35692 quiet_therm:35915 rfpa_therm:35832 soc_therm:36660 usb_pwr_therm:32598 
+04-11 14:29:50.262  1459  1480 I pixel-thermal: disp0_therm:32.778 raw data: disp0_therm:32778 
+04-11 14:29:50.262  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-LIGHT-ODPM:34.4859 raw data: VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-CPU-LIGHT-ODPM:34485.9 
+04-11 14:29:50.263  1459  1480 I pixel-thermal: cellular-emergency:34.4859 raw data: VIRTUAL-SKIN:34485.9 cellular-emergency:34485.9 
+04-11 14:29:50.263  1459  1480 I pixel-thermal: BG-TASKS-THROTTLING-HINT:0 raw data: BG-TASKS-THROTTLING-EXP-PROPERTY:0 BG-TASKS-THROTTLING-HINT:0 BG_TASKS_THROTTLING_COUNT:1 IS_BG_TASKS_THROTTLING_ACTIVE:0 IS_CHARGING:1 VIRTUAL-SKIN:34485.9 thb_hda:51 
+04-11 14:29:50.264  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-MID:34.4859 raw data: VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-CPU-MID:34485.9 
+04-11 14:29:50.264  1459  1480 I pixel-thermal: VIRTUAL-SKIN-HINT:34.4859 raw data: VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-HINT:34485.9 
+04-11 14:29:50.264  1459  1480 I pixel-thermal: VIRTUAL-SKIN-SOC:34.4859 raw data: VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-SOC:34485.9 
+04-11 14:29:50.264  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CPU-ODPM:34.4859 raw data: VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-CPU-ODPM:34485.9 
+04-11 14:29:50.265  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED:34.4859 raw data: NO_WLC:1 VIRTUAL-SKIN-CHARGE:34485.9 VIRTUAL-SKIN-CHARGE-WIRED:34485.9 VIRTUAL-SKIN-EQ:34485.9 WLC_CHECK:1 thb_hda:51 
+04-11 14:29:50.265  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED power_budget=3710 err=3.51412 s_power=2493 time_elapsed_ms=7032 p=1068.29 i=567.991 d=-0 dt_per_min=0.00642792 compensation=0 budget transient=0 control target=2 excluded power budget=89.0463 (PARTIAL_SYSTEM_POWER: 742.05 mW, cdev_weight: 0.120000)
+04-11 14:29:50.266  1459  1480 I pixel-thermal: STATS-UPDATOR:0 raw data: EXTREME-CONDITION-POWER-MONITOR-44C:0 EXTREME-CONDITION-POWER-MONITOR-45C:0 EXTREME-CONDITION-POWER-MONITOR-46C:0 EXTREME_WORKLOAD_ODPM:742.052 STATS-UPDATOR:0 VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-44C:0 VIRTUAL-SKIN-45C:0 VIRTUAL-SKIN-46C:0 VIRTUAL-SKIN-PREDICTION-MODEL:34356.1 VT-FORECAST-30SEC-BACK:34385.9 VT-FORECAST-60SEC-BACK:34977.8 VT-FORECAST-ERROR-30SEC:-99.9805 VT-FORECAST-ERROR-60SEC:491.883 VT-FORECAST-ERROR-NOW:-108.406 VT-FORECAST-NOW:34377.5 
+04-11 14:29:50.266  1459  1480 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:34.4859 raw data: VIRTUAL-SKIN-CHARGE:34485.9 VIRTUAL-SKIN-CHARGE-PERSIST:34485.9 
+04-11 14:29:50.885  1660  2551 D ActivityManager: freezing 18459 com.whatsapp
+04-11 14:29:50.918  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:50.925  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:50.926  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1010247} in 23ms
+04-11 14:29:50.932  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:50.939  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:50.939  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={1020247} in 14ms
+04-11 14:29:50.946  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:50.950  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:50.951  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10304} in 11ms
+04-11 14:29:51.024  1660  2551 D ActivityManager: freezing 27430 com.google.android.crossdeviceaccessservice
+04-11 14:29:51.045  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+04-11 14:29:51.051  1660  2610 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+04-11 14:29:51.052  1660  2610 D InetDiagMessage: Destroyed live tcp sockets for uids={10441} in 14ms
+04-11 14:29:51.105  1459  1480 I pixel-thermal: VIRTUAL-USB-UI:0 raw data: USB-MINUS-CHARGING:-4671 VIRTUAL-USB-UI:0 charging_therm:37269 usb_pwr_therm:32598 
+04-11 14:29:51.106  1459  1480 I pixel-thermal: VIRTUAL-USB-THROTTLING:0 raw data: USB-MINUS-CHARGING:-4671 VIRTUAL-USB-THROTTLING:0 usb_pwr_therm:32598 
+04-11 14:29:51.106  1459  1480 I pixel-thermal: usb_pwr_therm:32.598 raw data: usb_pwr_therm:32598 
+04-11 14:29:51.879  1459  1480 I pixel-thermal: soc_therm:36.66 raw data: soc_therm:36660 
+04-11 14:29:51.879  1459  1480 I pixel-thermal: north_therm:35.692 raw data: north_therm:35692 
+04-11 14:29:51.880  1459  1480 I pixel-thermal: rfpa_therm:35.832 raw data: rfpa_therm:35832 
+04-11 14:29:51.880  1459  1480 I pixel-thermal: quiet_therm:35.915 raw data: quiet_therm:35915 
+04-11 14:29:51.881  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: model_input: [35692.00 33788.00 36660.00 35832.00 37269.00 32778.00 32598.00 35915.00 34485.88 ]
+04-11 14:29:51.881  1459  1480 I native  : I0000 00:00:1775906991.881630    1480 thermal_tflite_wrapper.cc:261] ThermalTfliteInvoke
+04-11 14:29:51.885  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: model_output: [34387.6 34399.1 34405.2 34420.6 34439.2 34460 34485.5 34507.2 34529.8 34555.6 ]
+04-11 14:29:51.885  1459  1480 I pixel-thermal: VIRTUAL-SKIN-PREDICTION-MODEL: predicted_value: [34387.6 34399.1 34405.2 34420.6 34439.2 34460 34485.5 34507.2 34529.8 34555.6 ]
+04-11 14:29:51.886  1459  1480 I pixel-thermal: EARLY-WARNING-SENSOR:0 raw data: EARLY-EMERGENCY-WARNING-SENSOR:0 EARLY-SHUTDOWN-WARNING-SENSOR:0 EARLY-WARNING-SENSOR:0 VIRTUAL-SKIN:34485.9 VIRTUAL-SKIN-PREDICTION-MODEL:34387.6 VT-FORECAST-30SEC:34445.1 VT-FORECAST-60SEC:34544.6 charging_therm:37269 disp0_therm:32778 flash_therm:33788 north_therm:35692 quiet_therm:35915 rfpa_therm:35832 soc_therm:36660 usb_pwr_therm:32598 
+04-11 14:29:52.682  3403  3403 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.libs.gmscorelogger.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentDirectBootAwareApiService }
+04-11 14:29:53.121  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 1 -> 2 d_lux:312.29 w_lux: 505.21 C:9.29 G:3.29
+04-11 14:29:53.319  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 2 -> 1 d_lux:336.89 w_lux: 539.46 C:9.90 G:3.54
+04-11 14:29:53.460  1459  1480 I pixel-thermal: flash_therm:33.819 raw data: flash_therm:33819 
+04-11 14:29:53.580  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:53.581  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms
+04-11 14:29:53.582   882   922 I CHRE    : @ 3141.092: [Wallaby] OnInferredProx: prox_state=kFar
+04-11 14:29:53.598  3812  3812 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.common.BIND_SHARED_PREFS xflg=0x4 pkg=com.google.android.gms }
+04-11 14:29:53.746   898  1840 D usf_sensor_hal: accelerometer: Enter Flush
+04-11 14:29:53.753  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x4c, rc: 0
+04-11 14:29:53.754  1207  1207 D AOC     : A3:MSG: controller.cc, 933: SysMem: ipc: C-F1-Ar, cmd ID: 0x00c8, tag: 0x4d, rc: 0
+04-11 14:29:53.755   898  2277 I sensor-suez: Vendor atom [id = 100243] reported.
+04-11 14:29:53.813  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 1 -> 2 d_lux:334.10 w_lux: 536.79 C:9.85 G:3.51
+04-11 14:29:53.912  1207  1207 D AOC     : A3:MSG: tmd3743_device.cc, 997: USF: TMD3743: C/G switch 2 -> 1 d_lux:330.59 w_lux: 528.40 C:9.69 G:3.46
+04-11 14:29:53.996  1660  5263 W AppOps  : Noting op not finished: uid 1010187 pkg com.google.android.gms code 113 startTime of in progress event=1775904290482
+04-11 14:29:54.020  1660  5263 W AppOps  : Noting op not finished: uid 1010187 pkg com.google.android.gms code 113 startTime of in progress event=1775904288578
+04-11 14:29:54.067  4093  6615 I ActivityScheduler: nextTriggerTime: 3198791, in 59999ms, detectorType: 39, FULL_TYPE alarmWindowMillis: 7500
+04-11 14:29:54.580   882   922 I CHRE    : @ 3142.092: [Wallaby] OnInferredProx: prox_state=kFar
+04-11 14:29:54.580  1207  1207 D AOC     : CHRE: DRAM vote count begins
+04-11 14:29:54.580  1207  1207 D AOC     : CHRE: DRAM vote count ends: 0 ms

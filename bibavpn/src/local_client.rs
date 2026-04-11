@@ -25,7 +25,7 @@ use crate::protocol::{encode_auth, encode_open};
 use crate::retry::{OUTBOUND_CONNECT_ATTEMPTS, sleep_outbound_backoff};
 use crate::stealth::{WsHandshakeParams, build_websocket_request, default_user_agent_for_profile};
 use crate::tls_util::{ClientTlsParams, TlsClientProfile, client_tls_config};
-use crate::tcp_mux::{self, MuxClientConfig, TcpMuxClientHandle};
+use crate::tcp_mux::{self, MuxClientConfig, MuxOpenStreamDropped, TcpMuxClientHandle};
 use crate::udp_mux::{UdpMuxConfig, UdpMuxHandle, spawn_udp_mux_driver};
 use crate::ws_bridge::{self, TunnelEnd};
 use crate::{socks5, socks5::SocksCommand};
@@ -33,6 +33,57 @@ use bytes::Bytes;
 
 /// SOCKS UDP: limit concurrent in-flight mux requests per datagram worker pool.
 const SOCKS_UDP_WORKERS: usize = 256;
+
+/// After the shared mux WSS dies, reopen quickly without the full outbound backoff ladder.
+const TCP_MUX_SLOT_RETRIES: u32 = 8;
+
+async fn sleep_mux_slot_retry(attempt: u32) {
+    let ms = (50u64 * (attempt as u64 + 1)).min(800);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+fn tcp_mux_writer_gone(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("tcp mux writer stopped")
+}
+
+async fn tcp_mux_open_stream_with_retry(
+    mut local: TcpStream,
+    host: String,
+    port: u16,
+    tcp_uplink_prefix: Vec<u8>,
+    cfg: Arc<ClientCfg>,
+    tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>>,
+) -> anyhow::Result<()> {
+    for attempt in 0..TCP_MUX_SLOT_RETRIES {
+        let h = {
+            let mut slot = tcp_mux_slot.lock().await;
+            if slot.is_none() {
+                *slot = Some(connect_tcp_mux_handle(&cfg).await?);
+            }
+            slot.as_ref().expect("mux set").clone()
+        };
+        match h
+            .open_stream(local, host.clone(), port, tcp_uplink_prefix.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(MuxOpenStreamDropped { local: l, err }) => {
+                if tcp_mux_writer_gone(&err) {
+                    let mut slot = tcp_mux_slot.lock().await;
+                    *slot = None;
+                    local = l;
+                    if attempt + 1 >= TCP_MUX_SLOT_RETRIES {
+                        return Err(err);
+                    }
+                    sleep_mux_slot_retry(attempt).await;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    unreachable!()
+}
 
 /// User-facing options (CLI, JSON over JNI, etc.).
 #[derive(Clone, Debug)]
@@ -452,14 +503,7 @@ async fn handle_socks_peer(
         SocksCommand::Connect { host, port } => {
             socks5::socks5_reply_ok(&mut local).await?;
             if cfg.use_tcp_mux {
-                let h = {
-                    let mut slot = tcp_mux_slot.lock().await;
-                    if slot.is_none() {
-                        *slot = Some(connect_tcp_mux_handle(&cfg).await?);
-                    }
-                    slot.as_ref().expect("mux set").clone()
-                };
-                h.open_stream(local, host, port, Vec::new()).await
+                tcp_mux_open_stream_with_retry(local, host, port, Vec::new(), cfg, tcp_mux_slot).await
             } else {
                 tunnel_to_biba(local, host, port, cfg, Vec::new()).await
             }
@@ -579,14 +623,7 @@ async fn handle_http_peer(
     };
     http_connect::reply_connect_ok(&mut local).await?;
     if cfg.use_tcp_mux {
-        let h = {
-            let mut slot = tcp_mux_slot.lock().await;
-            if slot.is_none() {
-                *slot = Some(connect_tcp_mux_handle(&cfg).await?);
-            }
-            slot.as_ref().expect("mux set").clone()
-        };
-        h.open_stream(local, host, port, prefetch).await
+        tcp_mux_open_stream_with_retry(local, host, port, prefetch, cfg, tcp_mux_slot).await
     } else {
         tunnel_to_biba(local, host, port, cfg, prefetch).await
     }

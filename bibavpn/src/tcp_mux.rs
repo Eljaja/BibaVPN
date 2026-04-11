@@ -373,6 +373,12 @@ enum MuxWriteCmd {
     RawBinary(Bytes),
 }
 
+/// `open_stream` failed before the bridge task was spawned; `local` is returned so the caller can retry.
+pub struct MuxOpenStreamDropped {
+    pub local: TcpStream,
+    pub err: anyhow::Error,
+}
+
 /// Handle to enqueue mux records on the shared WSS (one per SOCKS connection / stream).
 #[derive(Clone)]
 pub struct TcpMuxClientHandle {
@@ -400,12 +406,21 @@ impl TcpMuxClientHandle {
         host: String,
         port: u16,
         tcp_uplink_prefix: Vec<u8>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), MuxOpenStreamDropped> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (down_tx, down_rx) = mpsc::channel::<Vec<u8>>(256);
         self.down.lock().await.insert(stream_id, down_tx);
-        let open_pl = encode_mux_open_target(&host, port)?;
-        self.send_record(stream_id, MUX_FLAG_OPEN, open_pl).await?;
+        let open_pl = match encode_mux_open_target(&host, port) {
+            Ok(p) => p,
+            Err(e) => {
+                self.down.lock().await.remove(&stream_id);
+                return Err(MuxOpenStreamDropped { local, err: e });
+            }
+        };
+        if let Err(e) = self.send_record(stream_id, MUX_FLAG_OPEN, open_pl).await {
+            self.down.lock().await.remove(&stream_id);
+            return Err(MuxOpenStreamDropped { local, err: e });
+        }
         let h = self.clone();
         tokio::spawn(async move {
             if let Err(e) = mux_client_stream_bridge(local, stream_id, tcp_uplink_prefix, h, down_rx).await

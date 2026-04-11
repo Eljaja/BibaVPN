@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
+import android.os.PowerManager
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -30,6 +31,8 @@ class BibaVpnService : VpnService() {
     @Volatile
     private var tunFdMustCloseInJava = false
     private var tunParcelOrphan: ParcelFileDescriptor? = null
+    private var tunnelWakeLock: PowerManager.WakeLock? = null
+
     override fun onBind(intent: Intent?) = null
 
     override fun onCreate() {
@@ -173,6 +176,7 @@ class BibaVpnService : VpnService() {
                         Engine.insert(key)
                         Engine.start()
                         synchronized(tunLock) { tunFdMustCloseInJava = false }
+                        acquireTunnelWakeLock()
                         isTunnelActive = true
                     } catch (e: Throwable) {
                         Log.e(TAG, "tun2socks", e)
@@ -197,8 +201,31 @@ class BibaVpnService : VpnService() {
         }
     }
 
+    private fun acquireTunnelWakeLock() {
+        releaseTunnelWakeLock()
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        tunnelWakeLock = pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "$packageName:biba-tunnel",
+        ).apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        Log.i(TAG, "PARTIAL_WAKE_LOCK acquired for VPN tunnel")
+    }
+
+    private fun releaseTunnelWakeLock() {
+        runCatching {
+            tunnelWakeLock?.let { wl ->
+                if (wl.isHeld) wl.release()
+            }
+        }
+        tunnelWakeLock = null
+    }
+
     private fun stopTun2socksOnly() {
         isTunnelActive = false
+        releaseTunnelWakeLock()
         runCatching { Engine.stop() }
         tun2socksThread?.let { t ->
             try {
