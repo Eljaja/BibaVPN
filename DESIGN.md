@@ -1,131 +1,181 @@
-# Design System & UI Guidelines
+# BibaVPN — design system for cross-platform ports
 
-A concise, product-agnostic reference for visual design, interaction patterns, and how design decisions should be documented and implemented across applications. Use this as a shared baseline for mobile, TV, and desktop clients unless a platform explicitly overrides it.
-
----
-
-## 1. Principles
-
-1. **Clarity over decoration** — Users should perceive primary actions and current state within one glance. Ornament must not compete with content.
-2. **Consistent affordances** — Same visual language for the same behavior everywhere (e.g., one primary-action treatment, one card pattern).
-3. **Progressive disclosure** — Show the minimal surface needed for the current task; move power-user or risky options behind an explicit “Advanced” or settings path.
-4. **Respectful of context** — Input constraints (remote, touch, keyboard), privacy (sensitive fields), and system integrations (VPN, notifications) shape layout and copy, not the other way around.
-5. **Accessible by default** — Contrast, touch targets, and semantic structure are requirements, not stretch goals.
+This document describes the visual language of the Android app (Jetpack Compose + Material 3), brand assets, and tokens needed to reproduce the same look on iOS, desktop, web, and other platforms.
 
 ---
 
-## 2. Layout & structure
+## 1. Brand identity
 
-- **Spacing scale** — Use a small fixed set (e.g., 4 / 8 / 12 / 16 / 20 / 24 / 32) and apply it consistently. Avoid arbitrary one-off gaps.
-- **Reading order** — Top to bottom: orientation (where am I?) → primary state → primary action → secondary actions and metadata.
-- **Touch targets** — Minimum ~48×48 dp (or platform equivalent) for interactive elements; increase spacing between dense controls on small screens.
-- **Cards & grouping** — Group related controls in rounded containers with subtle borders or elevation. One primary card per screen for the main task when possible.
-- **Safe areas** — Respect system insets (notches, gesture bars, TV overscan). Do not place critical actions in unsafe regions.
+### 1.1 Meaning and metaphor
 
----
+- **VPN / privacy** — the brand uses a **ghost** (stealth, “invisibility” on the network).
+- **UI mood** — dark “night” interface, **neon mint** accent on **cool blue** (slate / sky).
 
-## 3. Color
+### 1.2 Two graphic types
 
-- **Semantic roles** — Define tokens for: background (base, elevated), surface (card), border (subtle, focus Primary text, secondary/muted, accent, success, warning, danger. Avoid hard-coding one-off hex values in components; map them to tokens.
-- **Contrast** — Aim for **WCAG 2.1 AA** for body text (4.5:1) and large text (3:1). Test primary actions against both light-on-dark and dark-on-light if both exist.
-- **Accent discipline** — Use one primary accent for “go / active / connected.” Secondary accents only for distinct semantic states (e.g., warning).
-- **Dark UIs** — Prefer slightly **off-black** backgrounds and **elevated** surfaces that step up in lightness; avoid pure black next to harsh white text for long reading sessions.
+| Role | Description | File in the repo |
+|------|-------------|------------------|
+| **Horizontal wordmark** | **BIBA** lettering + **VPN** block with ghost; dark background baked into the asset. Used in the **main screen header** and as the basis for the **TV banner**. | `branding/biba-vpn-logo.png` → in Android also `android/app/src/main/res/drawable/img_biba_wordmark.png` |
+| **App icon** | Square composition: **white ghost** on a **teal-green** rounded rectangle, overall dark background. Phone launcher / Android TV. | `branding/biba-vpn-app-icon.png` → `android/app/src/main/res/drawable/ic_launcher.png` |
 
-### Suggested token names (example)
+When porting, **keep the same PNGs** (or export from source with the same aspect ratio and padding).
 
+### 1.3 Status-bar mini icon (Android only)
 
-| Token            | Typical use                     |
-| ---------------- | ------------------------------- |
-| `bg.app`         | Root screen background          |
-| `bg.surface`     | Cards, sheets                   |
-| `border.subtle`  | Dividers, card outlines         |
-| `text.primary`   | Headings, values                |
-| `text.secondary` | Captions, hints                 |
-| `text.accent`    | Labels, links (non-destructive) |
-| `accent.primary` | Key CTAs, active indicators     |
-| `state.success`  | Connected, completed            |
-| `state.danger`   | Destructive / errors            |
-
+Vector **ghost**, fill **`#00E5FF`** (cyan): `android/app/src/main/res/drawable/ic_stat_vpn.xml`. On other OSes, reuse the same 24×24 silhouette and proportions.
 
 ---
 
-## 4. Typography
+## 2. Color (foundation)
 
-- **Type scale** — Define a limited set: display / title / body / caption / overline (small caps labels). Do not exceed ~6 distinct sizes per platform.
-- **Weights** — Use weight for hierarchy (e.g., semibold for titles, regular for body). Avoid ultra-light weights on small sizes.
-- **Line length** — On phone-width layouts, favor full-width stacks; avoid multi-column text. On tablet/desktop, cap line length for readability (~60–75 characters) where applicable.
-- **Locale** — Leave room for longer strings in translations; avoid fixed-height single-line labels for user-generated or localized copy.
+All values are **sRGB**, `#RRGGBB`. Alpha is noted separately.
 
----
+### 2.1 Background
 
-## 5. Iconography & imagery
+| Token | Hex | Usage |
+|-------|-----|--------|
+| `bgRoot` | `#070B14` | Root app background (main screen behind the gradient). |
+| `bgScreen` | `#0B0F1A` | **Settings** screen solid fill. |
+| `bgRadialAccent` | `#16203B` | **Center** of the main screen **radial gradient** (top), blending into `bgRoot`. |
+| `tvBannerBg` | `#0B0F1A` | **Android TV banner** background (`tv_banner.xml`). |
 
-- Prefer **simple, recognizable** system or custom icons aligned to the same stroke/corner style.
-- **Emoji as UI** — Acceptable for low-friction prototypes or informal apps; for production, prefer vector icons for accessibility and consistency across OS versions.
-- **Status indicators** — Pair color with shape or text; do not rely on color alone (e.g., “Connected” + dot, not only a green dot).
+### 2.2 Cards and fields
 
----
+| Token | Hex | Usage |
+|-------|-----|--------|
+| `cardBg` | `#121826` | Card surfaces (status, server row). |
+| `cardBgSettings` | `cardBg` @ **92%** opacity | Settings section surfaces (`CardBg.copy(alpha = 0.92f)`). |
+| `fieldInsetBg` | `#020617` @ **55%** opacity | Multiline inset fields and `OutlinedTextField` container. |
+| `fieldText` | `#F8FAFC` | Input text. |
 
-## 6. Motion & feedback
+### 2.3 Accents and text
 
-- **Duration** — Short (100–200 ms) for micro-interactions; avoid long decorative animations blocking input.
-- **Purpose** — Motion clarifies **state change** (expand/collapse, connect/disconnect), not brand vanity on every tap.
-- **Reduced motion** — Respect OS “reduce motion” / accessibility settings; provide equivalent non-animated feedback.
+| Token | Hex | Usage |
+|-------|-----|--------|
+| `labelSky` | `#60A5FA` | Secondary accents, helper copy, field labels (sky blue). |
+| `textMuted` | `#94A3B8` | Secondary text, subtitles, placeholders. |
+| `textSlate200` | `#E2E8F0` | Primary “light” text in headers / secondary blocks. |
+| `mint` | `#00FFA3` | Primary accent: status, toggle, cursor, CTA chrome. |
+| `mintSoft` | `#34D399` | Softer green (active connection status dot core). |
 
----
+### 2.4 Borders and translucency
 
-## 7. Interaction patterns
+| Token | Value | Usage |
+|-------|-------|--------|
+| `borderSubtle` | white **8%** | Card, circular button, and field outlines (`Color.White` α=0.08). |
+| `mainButtonBorder` | `#60A5FA` **20%** | Main **Connect / Disconnect** button outline (`0x3360A5FA`). |
+| `iconButtonFill` | white **3%** | Circular header buttons (settings, back). |
 
-- **Primary action** — One clear primary per view; visual weight (color, size) matches importance.
-- **Destructive actions** — Require confirmation or an undo path when data loss or billing impact is possible.
-- **Loading & errors** — Show explicit progress for operations > ~1 s. Errors: what failed, what the user can do next, no raw stack traces in UI.
-- **Forms** — Label fields; group server/identity vs. advanced transport; mask secrets with optional reveal; persist drafts where appropriate.
+### 2.5 Main CTA gradient (vertical)
 
----
+**Connect / Disconnect** button:
 
-## 8. Content & voice
+- Top: `#1A2950`
+- Bottom: `#14203C`
 
-- **Tone** — Direct, calm, technical when needed, without blame (“Couldn’t connect” not “You failed”).
-- **Titles** — Use sentence case unless brand guidelines specify otherwise.
-- **Units & data** — Show meaningful precision (latency with ms, addresses with ports) and avoid fake metrics if the app cannot measure them.
+Direction: **top to bottom** (`linear-gradient(180deg, #1A2950, #14203C)`).
 
----
+### 2.6 Main screen radial gradient
 
-## 9. Platform notes
-
-- **Android (phone)** — Material 3 can underpin components; still align colors/spacing to this document’s tokens. Foreground services and VPN require clear ongoing status communication.
-- **Android TV** — Declare **TV launcher** metadata (`LEANBACK_LAUNCHER`), banners, and `touchscreen required=false` so sideloaded apps appear in the launcher. Simplify navigation for D-pad.
-- **Desktop / web** — Keyboard shortcuts, focus rings, and window resizing should behave predictably.
-
----
-
-## 10. Design–engineering handoff
-
-- **Single source of truth** — Tokens (color, type, radius, elevation) should live in code or a shared token file, not only in Figma.
-- **Naming** — Use stable token names; avoid embedding hex in component names.
-- **Screenshots & states** — Document default, loading, error, empty, and “connected / active” states for critical flows.
-- **Accessibility checklist** — Contrast, focus order, screen reader labels for non-text controls, and configurable text scaling.
+- Center: **top center** (in UI terms — `center = (0.5, 0)` relative to the screen).
+- Stops from center: `#16203B` → `#070B14` → `#070B14`.
+- Large radius (~1200 dp equivalent) so edges read as flat `bgRoot`.
 
 ---
 
-## 11. Review checklist (before ship)
+## 3. Typography
 
-- Primary task completable in minimal steps from cold start  
-- Typography and spacing match the agreed scale  
-- Colors map to tokens; contrast checked on real devices  
-- Touch targets and hit slop verified  
-- Settings / advanced options discoverable but not noisy  
-- Copy reviewed for clarity and localization headroom  
-- Motion respects reduced-motion settings  
-- Platform-specific entry points (TV launcher, notifications) covered
+Android uses the **Material 3 system font** (Roboto). Elsewhere, a **neutral geometric sans** is enough: **Inter**, **SF Pro** (iOS), **Segoe UI** (Windows).
+
+| Level | Size | Weight | Color (typical) |
+|-------|------|--------|-----------------|
+| Status “Connected” | 20 sp | SemiBold (600) | `#FFFFFF` |
+| Main CTA title | 22 sp | SemiBold | `#FFFFFF` |
+| Subtitle under CTA | 14 sp | Regular | `labelSky` @ 75% |
+| Server card title | 18 sp | SemiBold | `#FFFFFF` |
+| “SERVER” label | 11 sp | Medium (500), letter-spacing **2.4** | `textMuted` |
+| Body / secondary on server card | 14 sp | Regular | `textMuted` |
+| Settings section title | 18 sp | SemiBold | `#FFFFFF` |
+| Section subtitle | 14 sp | Regular | `textMuted` |
+| Field label | 12 sp | Medium | `labelSky` @ 90% |
+| Field value | 14 sp | Regular | `#F8FAFC` |
+| Hint under field | 11 sp | Regular | `textMuted` |
+| Settings header | 14 sp | Medium, letter-spacing **0.6** | `textSlate200` |
+| Circular button glyph | 18 sp | — | `textSlate200` @ 88% |
+| Server card chevron `›` | 22 sp | — | `textMuted` @ 55% |
+
+**Header logo** — bitmap, not live text; height **36 dp**, horizontal padding **12 dp**, horizontally **flex-1** between the settings control and a balancing **40 dp** spacer.
 
 ---
 
-## 12. Evolution
+## 4. Spacing and grid
 
-- Version this document when **breaking** visual or behavioral conventions change.
-- Deprecate tokens instead of silently redefining them; migrate screens in batches to avoid a fragmented UI.
+Base unit **4 dp**. Common values:
+
+- Screen horizontal inset **20 dp** (home and settings).
+- Below header to status card: **24 dp**.
+- Status card to main CTA: **40 dp**.
+- Main CTA to server card: **32 dp**.
+- Inside status card: **20 dp**; title margin below: **12 dp**.
+- CTA: padding **24 h / 22 v**; decorative square on the right **48 dp**, corner radius **16 dp**.
 
 ---
 
-*This guide is intentionally general. Product-specific flows (e.g., VPN lifecycle, server profiles) should extend it with appendices or linked specs rather than bloating the core document.*
+## 5. Corner radii
+
+| Element | Radius |
+|---------|--------|
+| Status card | **26 dp** |
+| Main CTA | **28 dp** |
+| Server card | **24 dp** |
+| Settings section wrapper | **28 dp** |
+| Inputs, insets | **16 dp** |
+| “Apply to connection fields” button | **14 dp** |
+| Small square on CTA | **16 dp** |
+| Circular icon buttons | **50%** (circle) |
+| Status indicator (outer ring) | **18 dp**; inner dot **10 dp** |
+
+Strokes are **1 dp**, using `borderSubtle` or the special variants in §2.4.
+
+---
+
+## 6. Key components (behavior and look)
+
+### 6.1 Main screen
+
+- Top: **left** circular settings button, **center** wordmark, **right** empty **40 dp** for symmetry.
+- **Status card**: subtle border, `cardBg` fill; **dot** on the left (active: outer ring `mint` 35% + core `mintSoft`; inactive: muted dot).
+- **Main button**: gradient + `mainButtonBorder`; when config is incomplete, entire control **α = 0.55**.
+- **Server card**: fully tappable; top **SERVER** label in all caps with increased tracking.
+
+### 6.2 Settings
+
+- `bgScreen` background, full-height scroll.
+- Sections in cards with `cardBg` @ 92%.
+- **TLS skip toggle**: on — thumb `mint`, track `mint` 40%; off — `textMuted`.
+- **Invite apply button**: `mint` 20% fill, `mint` label, full width.
+
+### 6.3 Notification (Android)
+
+- Channel: low importance; title/body strings live in resources.
+- Actions: Russian strings in `values/strings.xml`; English **Disable** / **Enable** in `values-en/strings.xml`.
+
+---
+
+## 7. System chrome (Android)
+
+- **Status bar / navigation bar**: transparent (`themes.xml`).
+- **App display name**: `BibaVPN` (`app_name`).
+
+---
+
+## 8. Checklist for a new platform
+
+1. Wire up **two PNGs**: wordmark + app icon (from `branding/`).
+2. Implement the **palette** from §2 (including gradients).
+3. Recreate the main screen **radial** background and settings **solid** background.
+4. Match **radii**, **1 dp** strokes, and **spacing** from §§4–5.
+5. Typography: sans family; size/weight scale from §3.
+6. Accent semantics: **mint** for success/ON, **sky** for secondary labels.
+
+For the Android source of truth, see the constants at the top of `android/app/src/main/java/dev/bibavpn/MainActivity.kt` (`BgRoot`, `CardBg`, `Mint`, …) and `fieldInsetColors()` for field styling.
