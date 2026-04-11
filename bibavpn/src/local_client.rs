@@ -426,7 +426,7 @@ pub async fn run_local_client(
         let http_listener = TcpListener::bind(http_bind)
             .await
             .with_context(|| format!("bind http proxy {http_bind}"))?;
-        info!("HTTP CONNECT on {http_bind}");
+        info!("HTTP proxy (CONNECT + http:// forward) on {http_bind}");
         let cfg_http = cfg.clone();
         let tcp_mux_http = tcp_mux_slot.clone();
         let mut shutdown_http = shutdown.clone();
@@ -620,18 +620,30 @@ async fn handle_http_peer(
     cfg: Arc<ClientCfg>,
     tcp_mux_slot: TcpMuxSlot,
 ) -> anyhow::Result<()> {
-    let (host, port, prefetch) = match http_connect::http_connect_handshake(&mut local).await {
-        Ok(x) => x,
+    match http_connect::http_proxy_handshake(&mut local).await {
+        Ok(http_connect::HttpProxyHandshake::Connect {
+            host,
+            port,
+            client_prefetch,
+        }) => {
+            http_connect::reply_connect_ok(&mut local).await?;
+            if cfg.use_tcp_mux {
+                tcp_mux_open_stream_with_retry(local, host, port, client_prefetch, cfg, tcp_mux_slot).await
+            } else {
+                tunnel_to_biba(local, host, port, cfg, client_prefetch).await
+            }
+        }
+        Ok(http_connect::HttpProxyHandshake::ForwardHttp { host, port, to_origin }) => {
+            if cfg.use_tcp_mux {
+                tcp_mux_open_stream_with_retry(local, host, port, to_origin, cfg, tcp_mux_slot).await
+            } else {
+                tunnel_to_biba(local, host, port, cfg, to_origin).await
+            }
+        }
         Err(e) => {
             let _ = http_connect::reply_connect_error(&mut local, 400, "Bad Request").await;
-            return Err(e);
+            Err(e)
         }
-    };
-    http_connect::reply_connect_ok(&mut local).await?;
-    if cfg.use_tcp_mux {
-        tcp_mux_open_stream_with_retry(local, host, port, prefetch, cfg, tcp_mux_slot).await
-    } else {
-        tunnel_to_biba(local, host, port, cfg, prefetch).await
     }
 }
 

@@ -273,11 +273,14 @@ where
                             });
                         }
                         MUX_FLAG_DATA => {
-                            let g = streams.lock().await;
-                            if let Some(tx) = g.get(&sid) {
-                                let tx = tx.clone();
-                                drop(g);
-                                let _ = tx.send(payload).await;
+                            let mut g = streams.lock().await;
+                            let overflow = if let Some(tx) = g.get(&sid) {
+                                tx.try_send(payload).is_err()
+                            } else {
+                                false
+                            };
+                            if overflow {
+                                g.remove(&sid);
                             }
                         }
                         MUX_FLAG_CLOSE | MUX_FLAG_RST => {
@@ -664,11 +667,14 @@ async fn mux_client_reader_loop<S>(
                 };
                 match flags {
                     MUX_FLAG_DATA => {
-                        let g = down.lock().await;
-                        if let Some(tx) = g.get(&sid) {
-                            let tx = tx.clone();
-                            drop(g);
-                            let _ = tx.send(payload).await;
+                        let mut g = down.lock().await;
+                        let overflow = if let Some(tx) = g.get(&sid) {
+                            tx.try_send(payload).is_err()
+                        } else {
+                            false
+                        };
+                        if overflow {
+                            g.remove(&sid);
                         }
                     }
                     MUX_FLAG_CLOSE | MUX_FLAG_RST => {

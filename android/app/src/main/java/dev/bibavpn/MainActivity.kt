@@ -198,6 +198,65 @@ private fun BibaRootScreen(
     var bibaInvite by remember { mutableStateOf(last?.optString("from_invite") ?: "") }
     var invitePassphrase by remember { mutableStateOf(last?.optString("invite_passphrase") ?: "") }
     var tlsProfile by remember { mutableStateOf(last?.optString("tls_profile") ?: "") }
+    var wsPath by remember { mutableStateOf(last?.optString("ws_path") ?: "") }
+    var useTcpMux by remember {
+        mutableStateOf(last?.let { it.optBoolean("use_tcp_mux", true) } ?: true)
+    }
+    var padMode by remember { mutableStateOf(last?.optString("pad_mode") ?: "") }
+    var wsPingJitter by remember {
+        mutableStateOf(
+            if (last?.has("ws_ping_jitter_percent") == true) {
+                last!!.getInt("ws_ping_jitter_percent").toString()
+            } else {
+                "0"
+            },
+        )
+    }
+    var wsBinaryJitter by remember {
+        mutableStateOf(
+            if (last?.has("ws_binary_send_jitter_ms") == true) {
+                last!!.getInt("ws_binary_send_jitter_ms").toString()
+            } else {
+                "0"
+            },
+        )
+    }
+    var udpMaxPad by remember {
+        mutableStateOf(
+            if (last?.has("udp_max_pad") == true && last!!.isNull("udp_max_pad").not()) {
+                last!!.getInt("udp_max_pad").toString()
+            } else {
+                ""
+            },
+        )
+    }
+    var udpMaxWsBin by remember {
+        mutableStateOf(
+            if (last?.has("udp_max_ws_binary") == true && last!!.isNull("udp_max_ws_binary").not()) {
+                last!!.getInt("udp_max_ws_binary").toString()
+            } else {
+                ""
+            },
+        )
+    }
+    var udpMuxTimeout by remember {
+        mutableStateOf(
+            if (last?.has("udp_mux_reply_timeout_secs") == true) {
+                last!!.getLong("udp_mux_reply_timeout_secs").toString()
+            } else {
+                ""
+            },
+        )
+    }
+    var dummyInterval by remember {
+        mutableStateOf(
+            if (last?.has("dummy_interval_secs") == true && !last!!.isNull("dummy_interval_secs")) {
+                last!!.getLong("dummy_interval_secs").toString()
+            } else {
+                "0"
+            },
+        )
+    }
 
     val activity = context as ComponentActivity
     DisposableEffect(activity) {
@@ -242,6 +301,29 @@ private fun BibaRootScreen(
             wsPing = j.optLong("ws_ping_secs", 25).toString()
             insecure = j.optBoolean("insecure", false)
             tlsProfile = j.optString("tls_profile", "default")
+            wsPath = j.optString("ws_path", "")
+            padMode = j.optString("pad_mode", "")
+            wsPingJitter =
+                if (j.has("ws_ping_jitter_percent")) j.getInt("ws_ping_jitter_percent").toString() else "0"
+            wsBinaryJitter =
+                if (j.has("ws_binary_send_jitter_ms")) j.getInt("ws_binary_send_jitter_ms").toString() else "0"
+            udpMaxPad =
+                if (j.has("udp_max_pad") && !j.isNull("udp_max_pad")) j.getInt("udp_max_pad").toString() else ""
+            udpMaxWsBin =
+                if (j.has("udp_max_ws_binary") && !j.isNull("udp_max_ws_binary")) {
+                    j.getInt("udp_max_ws_binary").toString()
+                } else {
+                    ""
+                }
+            udpMuxTimeout =
+                if (j.has("udp_mux_reply_timeout_secs")) j.getLong("udp_mux_reply_timeout_secs").toString() else ""
+            dummyInterval =
+                if (j.has("dummy_interval_secs") && !j.isNull("dummy_interval_secs")) {
+                    j.getLong("dummy_interval_secs").toString()
+                } else {
+                    "0"
+                }
+            useTcpMux = true
             Toast.makeText(context, "Поля подключения обновлены", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(context, e.message ?: "decode", Toast.LENGTH_LONG).show()
@@ -265,6 +347,15 @@ private fun BibaRootScreen(
         maxWsBinary = maxWsBin.toIntOrNull() ?: 1400,
         wsPing = wsPing.toLongOrNull() ?: 25L,
         wsHeaders = wsHeaders,
+        wsPath = wsPath,
+        useTcpMux = useTcpMux,
+        padMode = padMode,
+        wsPingJitter = wsPingJitter.toIntOrNull() ?: 0,
+        wsBinaryJitter = wsBinaryJitter.toIntOrNull() ?: 0,
+        udpMaxPad = udpMaxPad.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
+        udpMaxWsBinary = udpMaxWsBin.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
+        udpMuxTimeout = udpMuxTimeout.trim().takeIf { it.isNotEmpty() }?.toLongOrNull(),
+        dummyInterval = dummyInterval.toLongOrNull() ?: 0L,
     )
 
     /** Актуальный сохранённый конфиг (не застывший snapshot из remember). */
@@ -312,6 +403,15 @@ private fun BibaRootScreen(
             maxWsBinary = maxWsBin.toIntOrNull() ?: 1400,
             wsPing = wsPing.toLongOrNull() ?: 25L,
             wsHeaders = wsHeaders,
+            wsPath = wsPath,
+            useTcpMux = useTcpMux,
+            padMode = padMode,
+            wsPingJitter = wsPingJitter.toIntOrNull() ?: 0,
+            wsBinaryJitter = wsBinaryJitter.toIntOrNull() ?: 0,
+            udpMaxPad = udpMaxPad.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
+            udpMaxWsBinary = udpMaxWsBin.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
+            udpMuxTimeout = udpMuxTimeout.trim().takeIf { it.isNotEmpty() }?.toLongOrNull(),
+            dummyInterval = dummyInterval.toLongOrNull() ?: 0L,
         )
     }
 
@@ -365,6 +465,24 @@ private fun BibaRootScreen(
                 onWsPingChange = { wsPing = it },
                 wsHeaders = wsHeaders,
                 onWsHeadersChange = { wsHeaders = it },
+                wsPath = wsPath,
+                onWsPathChange = { wsPath = it },
+                useTcpMux = useTcpMux,
+                onUseTcpMuxChange = { useTcpMux = it },
+                padMode = padMode,
+                onPadModeChange = { padMode = it },
+                wsPingJitter = wsPingJitter,
+                onWsPingJitterChange = { wsPingJitter = it },
+                wsBinaryJitter = wsBinaryJitter,
+                onWsBinaryJitterChange = { wsBinaryJitter = it },
+                udpMaxPad = udpMaxPad,
+                onUdpMaxPadChange = { udpMaxPad = it },
+                udpMaxWsBin = udpMaxWsBin,
+                onUdpMaxWsBinChange = { udpMaxWsBin = it },
+                udpMuxTimeout = udpMuxTimeout,
+                onUdpMuxTimeoutChange = { udpMuxTimeout = it },
+                dummyInterval = dummyInterval,
+                onDummyIntervalChange = { dummyInterval = it },
                 onBack = { showSettings = false },
             )
         } else {
@@ -649,6 +767,24 @@ private fun SettingsScreen(
     onWsPingChange: (String) -> Unit,
     wsHeaders: String,
     onWsHeadersChange: (String) -> Unit,
+    wsPath: String,
+    onWsPathChange: (String) -> Unit,
+    useTcpMux: Boolean,
+    onUseTcpMuxChange: (Boolean) -> Unit,
+    padMode: String,
+    onPadModeChange: (String) -> Unit,
+    wsPingJitter: String,
+    onWsPingJitterChange: (String) -> Unit,
+    wsBinaryJitter: String,
+    onWsBinaryJitterChange: (String) -> Unit,
+    udpMaxPad: String,
+    onUdpMaxPadChange: (String) -> Unit,
+    udpMaxWsBin: String,
+    onUdpMaxWsBinChange: (String) -> Unit,
+    udpMuxTimeout: String,
+    onUdpMuxTimeoutChange: (String) -> Unit,
+    dummyInterval: String,
+    onDummyIntervalChange: (String) -> Unit,
     onBack: () -> Unit,
 ) {
     val scroll = rememberScrollState()
@@ -818,7 +954,41 @@ private fun SettingsScreen(
                 value = tlsProfile,
                 onChange = onTlsProfileChange,
                 placeholder = "default",
-                hint = "Справочно после расшифровки ключа; этот билд клиента профиль TLS не переключает",
+                hint = "Профиль ClientHello (default, chrome70, firefox65, …); для ключа можно переопределить",
+            )
+            SettingsTextField(
+                label = "ws_path",
+                value = wsPath,
+                onChange = onWsPathChange,
+                placeholder = "/ws",
+                hint = "Путь WebSocket на сервере (пусто = /ws после ключа)",
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("TCP multiplex (WSS)", color = Color.White, fontSize = 14.sp)
+                    Text("Выключите для режима как --no-mux", color = TextMuted, fontSize = 12.sp)
+                }
+                Switch(
+                    checked = useTcpMux,
+                    onCheckedChange = onUseTcpMuxChange,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Mint,
+                        checkedTrackColor = Mint.copy(alpha = 0.4f),
+                        uncheckedThumbColor = TextMuted,
+                        uncheckedTrackColor = TextMuted.copy(alpha = 0.3f),
+                    ),
+                )
+            }
+            SettingsTextField(
+                label = "pad_mode",
+                value = padMode,
+                onChange = onPadModeChange,
+                placeholder = "random или http-buckets",
+                hint = "Режим паддинга; пусто = из ключа или random",
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -873,6 +1043,58 @@ private fun SettingsScreen(
                     modifier = Modifier.weight(1f),
                 )
             }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "ws_ping_jitter_%",
+                    value = wsPingJitter,
+                    onChange = onWsPingJitterChange,
+                    hint = "0–50",
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "ws_send_jitter_ms",
+                    value = wsBinaryJitter,
+                    onChange = onWsBinaryJitterChange,
+                    hint = "0–255",
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "udp_max_pad",
+                    value = udpMaxPad,
+                    onChange = onUdpMaxPadChange,
+                    hint = "пусто = как max_pad",
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "udp_max_ws",
+                    value = udpMaxWsBin,
+                    onChange = onUdpMaxWsBinChange,
+                    hint = "пусто = как max_ws",
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "udp_mux_to",
+                    value = udpMuxTimeout,
+                    onChange = onUdpMuxTimeoutChange,
+                    hint = "сек, пусто = по умолч.",
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            SettingsMiniField(
+                label = "dummy_interval_secs",
+                value = dummyInterval,
+                onChange = onDummyIntervalChange,
+                hint = "0 = выкл; idle WS кадры",
+                modifier = Modifier.fillMaxWidth(),
+            )
             SettingsTextField(
                 label = "ws_headers",
                 value = wsHeaders,
@@ -1049,6 +1271,15 @@ private fun buildJson(
     maxWsBinary: Int,
     wsPing: Long,
     wsHeaders: String,
+    wsPath: String,
+    useTcpMux: Boolean,
+    padMode: String,
+    wsPingJitter: Int,
+    wsBinaryJitter: Int,
+    udpMaxPad: Int?,
+    udpMaxWsBinary: Int?,
+    udpMuxTimeout: Long?,
+    dummyInterval: Long,
 ): JSONObject {
     val o = JSONObject()
     val useInvite = fromInvite.isNotBlank() && invitePassphrase.isNotBlank()
@@ -1071,6 +1302,19 @@ private fun buildJson(
     o.put("early_ws_frames", earlyWs)
     o.put("max_ws_binary", maxWsBinary)
     o.put("ws_ping_secs", wsPing)
+    o.put("use_tcp_mux", useTcpMux)
+    val wp = wsPath.trim()
+    if (wp.isNotEmpty()) o.put("ws_path", wp)
+    val pm = padMode.trim()
+    if (pm.isNotEmpty()) o.put("pad_mode", pm)
+    val jPing = wsPingJitter.coerceIn(0, 50)
+    if (jPing > 0) o.put("ws_ping_jitter_percent", jPing)
+    val jBin = wsBinaryJitter.coerceIn(0, 255)
+    if (jBin > 0) o.put("ws_binary_send_jitter_ms", jBin)
+    udpMaxPad?.let { o.put("udp_max_pad", it.coerceIn(0, 255)) }
+    udpMaxWsBinary?.let { if (it > 0) o.put("udp_max_ws_binary", it) }
+    udpMuxTimeout?.let { if (it >= 0) o.put("udp_mux_reply_timeout_secs", it) }
+    if (dummyInterval > 0) o.put("dummy_interval_secs", dummyInterval)
     if (psk.isNotBlank()) o.put("psk", psk)
     val lines = wsHeaders.lines().map { it.trim() }.filter { it.isNotBlank() }
     if (lines.isNotEmpty()) o.put("ws_headers", JSONArray(lines))
