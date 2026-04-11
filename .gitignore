@@ -20,6 +20,9 @@ docker-compose.override.yml
 scripts/deploy-biba-docker-alt-port.sh
 scripts/.deploy-run-once.sh
 
+# VPS camouflage static tree (deployed via tar + docker volume)
+camouflage-site/
+
 # ADB / local debug log dumps (may contain device paths or stack traces)
 biba-*-capture.txt
 biba-listen*.txt
@@ -27,3 +30,5 @@ biba-listen*.txt
 # Prebuilt Android JNI libraries (build with scripts/wsl-build-all.sh or build-android-jni.ps1)
 android/app/src/main/jniLibs/**/*.so
 TODO_TOTHINK.txt
+deepreseach.md
+deepresearch-dpi-biba.md

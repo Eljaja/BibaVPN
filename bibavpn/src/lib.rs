@@ -12,6 +12,7 @@ pub mod invite_uri;
 mod retry;
 mod tcp_mux_roadmap;
 pub mod local_client;
+pub mod outbound_protect;
 pub mod protocol;
 pub mod socks5;
 pub mod stealth;

@@ -1,0 +1,7 @@
+# 16 KB memory pages (Android 15+ / Pixel и др.): LOAD-сегменты ELF должны быть align 2**14.
+# https://developer.android.com/guide/practices/page-sizes
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

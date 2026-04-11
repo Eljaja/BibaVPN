@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::crypto_layer::SessionCrypto;
 use crate::protocol::encode_atyp_host_port;
@@ -432,15 +432,35 @@ impl TcpMuxClientHandle {
     }
 }
 
+static TCP_MUX_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// When the outer WSS reader or writer task ends, drop the app-wide mux handle so the next SOCKS session opens a new WSS.
+pub(crate) async fn clear_tcp_mux_slot_if_current(
+    slot: &Arc<tokio::sync::Mutex<Option<(u64, TcpMuxClientHandle)>>>,
+    session_id: u64,
+) {
+    let mut g = slot.lock().await;
+    if let Some((id, _)) = *g {
+        if id == session_id {
+            *g = None;
+            info!("tcp mux session {session_id} closed; slot cleared for reconnect");
+        }
+    }
+}
+
 /// After WebSocket is established and `MUX_OPEN` already sent: spawn reader/writer and return handle.
 pub fn spawn_tcp_mux_client<S>(
     ws: WebSocketStream<S>,
     crypto: Option<SharedCrypto>,
     mut cfg: MuxClientConfig,
-) -> TcpMuxClientHandle
+    tcp_mux_slot: Arc<tokio::sync::Mutex<Option<(u64, TcpMuxClientHandle)>>>,
+) -> (u64, TcpMuxClientHandle)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let session_id = TCP_MUX_SESSION_GEN.fetch_add(1, Ordering::Relaxed);
+    let slot_w = tcp_mux_slot.clone();
+    let slot_r = tcp_mux_slot;
     cfg.transport_v2 = crypto.is_some();
     let (mut ws_sink, ws_rx) = ws.split();
     let (tx, mut rx) = mpsc::channel::<MuxWriteCmd>(256);
@@ -584,18 +604,28 @@ where
                         }
                     }
                 }
-            }
+                       }
         }
+        clear_tcp_mux_slot_if_current(&slot_w, session_id).await;
     });
 
-    tokio::spawn(mux_client_reader_loop(ws_rx, crypto_r, cfg_r, down_r, tx_reader));
+    tokio::spawn(mux_client_reader_loop(
+        ws_rx,
+        crypto_r,
+        cfg_r,
+        down_r,
+        tx_reader,
+        session_id,
+        slot_r,
+    ));
 
-    TcpMuxClientHandle {
+    let handle = TcpMuxClientHandle {
         tx,
         next_stream_id: Arc::new(AtomicU32::new(1)),
         down,
         cfg,
-    }
+    };
+    (session_id, handle)
 }
 
 async fn mux_client_reader_loop<S>(
@@ -604,6 +634,8 @@ async fn mux_client_reader_loop<S>(
     cfg: MuxClientConfig,
     down: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     out_tx: mpsc::Sender<MuxWriteCmd>,
+    session_id: u64,
+    tcp_mux_slot: Arc<Mutex<Option<(u64, TcpMuxClientHandle)>>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -652,6 +684,7 @@ async fn mux_client_reader_loop<S>(
             _ => {}
         }
     }
+    clear_tcp_mux_slot_if_current(&tcp_mux_slot, session_id).await;
 }
 
 async fn mux_client_stream_bridge(

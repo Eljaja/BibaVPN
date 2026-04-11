@@ -5,7 +5,6 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{Duration, sleep};
 use tracing::warn;
 
@@ -85,7 +84,7 @@ pub async fn run_decoy_gets_loop(cfg: DecoyConfig, mut shutdown: tokio::sync::wa
         );
 
         let run = async {
-            let tcp = TcpStream::connect((cfg.server_host.as_str(), cfg.server_port))
+            let tcp = crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
                 .await
                 .context("decoy tcp")?;
             let mut tls = connector.connect(domain.clone(), tcp).await.context("decoy tls")?;

@@ -5,10 +5,12 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -47,11 +49,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -93,15 +98,31 @@ class MainActivity : ComponentActivity() {
     private val vpnPermission = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
-        val json = pendingConnectJson
+        val json =
+            pendingConnectJson
+                ?: BibaVpnService.takePendingConnectJson(this)
         pendingConnectJson = null
-        if (result.resultCode == RESULT_OK && json != null) {
-            BibaVpnService.startWithJson(this, json)
+        if (result.resultCode != RESULT_OK) {
+            BibaVpnService.clearPendingConnectJson(this)
+            Log.w(TAG, "VpnService.prepare: denied or cancelled resultCode=${result.resultCode}")
+            return@registerForActivityResult
         }
+        if (json == null) {
+            Log.w(TAG, "VpnService.prepare: OK but pending config lost (memory + prefs empty)")
+            return@registerForActivityResult
+        }
+        BibaVpnService.clearPendingConnectJson(this)
+        Log.i(
+            TAG,
+            "VpnService.prepare OK — start service len=${json.length} fp=${Integer.toHexString(json.hashCode())}",
+        )
+        BibaVpnService.startWithJson(this, json)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingConnectJson =
+            pendingConnectJson ?: savedInstanceState?.getString(STATE_PENDING_VPN_JSON)
         if (Build.VERSION.SDK_INT >= 33) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
@@ -117,8 +138,10 @@ class MainActivity : ComponentActivity() {
                             val prep = VpnService.prepare(this@MainActivity)
                             if (prep != null) {
                                 pendingConnectJson = json
+                                BibaVpnService.stashPendingConnectJson(this@MainActivity, json)
                                 vpnPermission.launch(prep)
                             } else {
+                                BibaVpnService.clearPendingConnectJson(this@MainActivity)
                                 BibaVpnService.startWithJson(this@MainActivity, json)
                             }
                         },
@@ -126,6 +149,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingConnectJson?.let { outState.putString(STATE_PENDING_VPN_JSON, it) }
+    }
+
+    private companion object {
+        private const val TAG = "BibaMain"
+        private const val STATE_PENDING_VPN_JSON = "pending_vpn_json"
     }
 }
 
@@ -234,6 +267,54 @@ private fun BibaRootScreen(
         wsHeaders = wsHeaders,
     )
 
+    /** Актуальный сохранённый конфиг (не застывший snapshot из remember). */
+    fun savedConfigObject(): JSONObject? =
+        BibaVpnService.getLastConfigJson(context)?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+    /** Поля формы + fallback на последний сохранённый JSON (после сброса состояния invite часто «теряется» в UI). */
+    fun mergedInvitePair(): Pair<String, String> {
+        val snap = savedConfigObject()
+        val bi = bibaInvite.trim().ifBlank { snap?.optString("from_invite") ?: "" }
+        val ip = invitePassphrase.ifBlank { snap?.optString("invite_passphrase") ?: "" }
+        return Pair(bi, ip)
+    }
+
+    fun mergedServerToken(): Pair<String, String> {
+        val snap = savedConfigObject()
+        val sv = server.trim().ifBlank { snap?.optString("server") ?: "" }
+        val tk = token.trim().ifBlank { snap?.optString("token") ?: "" }
+        return Pair(sv, tk)
+    }
+
+    fun canConnectWithSavedFallback(): Boolean {
+        val (bi, ip) = mergedInvitePair()
+        val (sv, tk) = mergedServerToken()
+        return (bi.isNotBlank() && ip.isNotBlank()) || (sv.isNotBlank() && tk.isNotBlank())
+    }
+
+    fun buildConnectJsonForVpn(): JSONObject {
+        val (bi, ip) = mergedInvitePair()
+        val (sv, tk) = mergedServerToken()
+        return buildJson(
+            fromInvite = bi,
+            invitePassphrase = ip,
+            server = sv,
+            token = tk,
+            sni = sni.trim(),
+            psk = psk.trim(),
+            socksBind = socksBind.trim(),
+            insecure = insecure,
+            tlsProfile = tlsProfile.trim(),
+            maxPad = maxPad.toIntOrNull() ?: 64,
+            decoyMax = decoyMax.toIntOrNull() ?: 32,
+            junkFrames = junkFrames.toIntOrNull() ?: 0,
+            earlyWs = earlyWs.toIntOrNull() ?: 0,
+            maxWsBinary = maxWsBin.toIntOrNull() ?: 1400,
+            wsPing = wsPing.toLongOrNull() ?: 25L,
+            wsHeaders = wsHeaders,
+        )
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -292,15 +373,19 @@ private fun BibaRootScreen(
                 server = server.trim(),
                 sni = sni.trim(),
                 bibaInvite = bibaInvite.trim(),
-                canConnect =
-                    (bibaInvite.isNotBlank() && invitePassphrase.isNotBlank()) ||
-                        (server.isNotBlank() && token.isNotBlank()),
+                configLooksReady = canConnectWithSavedFallback(),
                 onOpenSettings = { showSettings = true },
                 onConnectToggle = {
                     if (tunnelUp) {
                         BibaVpnService.stop(context)
+                    } else if (!canConnectWithSavedFallback()) {
+                        Toast.makeText(
+                            context,
+                            "Укажите сервер в настройках или задайте ключ biba:// и passphrase",
+                            Toast.LENGTH_LONG,
+                        ).show()
                     } else {
-                        val json = buildConfigJson()
+                        val json = buildConnectJsonForVpn()
                         BibaVpnService.saveConfig(context, json.toString())
                         onRequestVpnConnect(json.toString())
                     }
@@ -317,7 +402,8 @@ private fun HomeScreen(
     server: String,
     sni: String,
     bibaInvite: String,
-    canConnect: Boolean,
+    /** Есть ли данные для подключения (включая fallback из последнего JSON) — только для подсказки/прозрачности. */
+    configLooksReady: Boolean,
     onOpenSettings: () -> Unit,
     onConnectToggle: () -> Unit,
     onServerCardTap: () -> Unit,
@@ -345,15 +431,16 @@ private fun HomeScreen(
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             RoundIconButton(onClick = onOpenSettings, symbol = "⚙")
-            Text(
-                "BibaVPN",
-                color = TextSlate200,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 0.8.sp,
+            Image(
+                painter = painterResource(id = R.drawable.img_biba_wordmark),
+                contentDescription = null,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(36.dp)
+                    .padding(horizontal = 12.dp),
+                contentScale = ContentScale.Fit,
             )
             Spacer(Modifier.width(40.dp))
         }
@@ -388,15 +475,15 @@ private fun HomeScreen(
 
         Spacer(Modifier.height(40.dp))
 
-        // Main action
-        val buttonEnabled = if (tunnelUp) true else canConnect
+        // Main action — всегда кликабельно: проверка данных и Toast в onConnectToggle
         Box(
             modifier = Modifier
                 .fillMaxWidth()
+                .alpha(if (tunnelUp || configLooksReady) 1f else 0.55f)
                 .clip(RoundedCornerShape(28.dp))
                 .border(1.dp, MainButtonBorder, RoundedCornerShape(28.dp))
                 .background(MainButtonBrush)
-                .clickable(enabled = buttonEnabled) { if (buttonEnabled) onConnectToggle() }
+                .clickable { onConnectToggle() }
                 .padding(horizontal = 24.dp, vertical = 22.dp),
         ) {
             Row(

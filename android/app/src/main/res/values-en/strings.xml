@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BibaVPN</string>
+    <string name="channel_name">Proxy</string>
+    <string name="notification_title">BibaVPN active</string>
+    <string name="notification_text">VPN tunnel is active</string>
+    <string name="notification_action_disable">Disable</string>
+    <string name="notification_action_enable">Enable</string>
+</resources>

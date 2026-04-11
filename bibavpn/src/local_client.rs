@@ -46,21 +46,25 @@ fn tcp_mux_writer_gone(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("tcp mux writer stopped")
 }
 
+type TcpMuxSlot = Arc<Mutex<Option<(u64, TcpMuxClientHandle)>>>;
+
 async fn tcp_mux_open_stream_with_retry(
     mut local: TcpStream,
     host: String,
     port: u16,
     tcp_uplink_prefix: Vec<u8>,
     cfg: Arc<ClientCfg>,
-    tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>>,
+    tcp_mux_slot: TcpMuxSlot,
 ) -> anyhow::Result<()> {
     for attempt in 0..TCP_MUX_SLOT_RETRIES {
         let h = {
             let mut slot = tcp_mux_slot.lock().await;
             if slot.is_none() {
-                *slot = Some(connect_tcp_mux_handle(&cfg).await?);
+                drop(slot);
+                connect_tcp_mux_handle(&cfg, &tcp_mux_slot).await?;
+                slot = tcp_mux_slot.lock().await;
             }
-            slot.as_ref().expect("mux set").clone()
+            slot.as_ref().expect("mux set").1.clone()
         };
         match h
             .open_stream(local, host.clone(), port, tcp_uplink_prefix.clone())
@@ -221,9 +225,9 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Optio
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
     let path = cfg.ws_path.clone();
 
-    let tcp = TcpStream::connect((cfg.server_host.as_str(), cfg.server_port))
+       let tcp = crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
         .await
-        .context("connect server")?;
+        .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
     let _ = tcp.set_nodelay(true);
     let tls = connector.connect(domain, tcp).await.context("tls")?;
 
@@ -275,10 +279,10 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Optio
     Ok((ws, crypto))
 }
 
-async fn connect_tcp_mux_handle(cfg: &Arc<ClientCfg>) -> anyhow::Result<TcpMuxClientHandle> {
+async fn connect_tcp_mux_handle(cfg: &Arc<ClientCfg>, tcp_mux_slot: &TcpMuxSlot) -> anyhow::Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
-        let res: anyhow::Result<TcpMuxClientHandle> = async {
+        let res: anyhow::Result<()> = async {
             let (mut ws, crypto) = one_try_wss_session(cfg).await?;
             let mo = tcp_mux::encode_mux_open();
             if mo.len() > cfg.max_ws_binary {
@@ -298,11 +302,13 @@ async fn connect_tcp_mux_handle(cfg: &Arc<ClientCfg>) -> anyhow::Result<TcpMuxCl
                 pad_mode: cfg.pad_mode,
                 dummy_interval_secs: cfg.dummy_interval_secs,
             };
-            Ok(tcp_mux::spawn_tcp_mux_client(ws, crypto, mcfg))
+            let (sid, h) = tcp_mux::spawn_tcp_mux_client(ws, crypto, mcfg, tcp_mux_slot.clone());
+            *tcp_mux_slot.lock().await = Some((sid, h));
+            Ok(())
         }
         .await;
         match res {
-            Ok(h) => return Ok(h),
+            Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e);
                 if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
@@ -406,7 +412,7 @@ pub async fn run_local_client(
     }
 
     let udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>> = Arc::new(Mutex::new(None));
-    let tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>> = Arc::new(Mutex::new(None));
+    let tcp_mux_slot: TcpMuxSlot = Arc::new(Mutex::new(None));
 
     let socks_listener = TcpListener::bind(&opts.socks_bind)
         .await
@@ -497,7 +503,7 @@ async fn handle_socks_peer(
     mut local: TcpStream,
     cfg: Arc<ClientCfg>,
     udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
-    tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>>,
+    tcp_mux_slot: TcpMuxSlot,
 ) -> anyhow::Result<()> {
     match socks5::socks5_read_command(&mut local).await? {
         SocksCommand::Connect { host, port } => {
@@ -612,7 +618,7 @@ async fn run_socks_udp_assoc(
 async fn handle_http_peer(
     mut local: TcpStream,
     cfg: Arc<ClientCfg>,
-    tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>>,
+    tcp_mux_slot: TcpMuxSlot,
 ) -> anyhow::Result<()> {
     let (host, port, prefetch) = match http_connect::http_connect_handshake(&mut local).await {
         Ok(x) => x,

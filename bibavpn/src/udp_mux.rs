@@ -202,9 +202,9 @@ async fn connect_udp_mux_ws(
     WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     Option<SharedCrypto>,
 )> {
-    let tcp = tokio::net::TcpStream::connect((cfg.server_host.as_str(), cfg.server_port))
+    let tcp = crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
         .await
-        .context("connect server")?;
+        .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
     let _ = tcp.set_nodelay(true);
     let domain = ServerName::try_from(cfg.sni.clone())?;
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());

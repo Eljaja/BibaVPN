@@ -44,11 +44,23 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            useLegacyPackaging = false
+        }
     }
 }
 
 dependencies {
-    implementation("com.ooimi.library:tun2socks:1.0.4")
+    // Предпочтительно локальный AAR (16 KB ELF): scripts/build-tun2socks-gomobile.sh
+    val tun2socksAar = file("${project.projectDir}/libs/tun2socks.aar")
+    if (tun2socksAar.exists()) {
+        implementation(files(tun2socksAar))
+    } else {
+        logger.lifecycle(
+            "BibaVPN: нет libs/tun2socks.aar — используется Maven tun2socks (старый libgojni; на устройствах с 16 KB страниц возможны предупреждения и вылеты). Сборка 16 KB: bash scripts/build-tun2socks-gomobile.sh",
+        )
+        implementation("com.ooimi.library:tun2socks:1.0.4")
+    }
     val composeBom = platform("androidx.compose:compose-bom:2024.02.00")
     implementation(composeBom)
     implementation("androidx.core:core-ktx:1.12.0")

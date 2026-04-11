@@ -29,6 +29,11 @@ static STATE: Mutex<Option<NativeState>> = Mutex::new(None);
 static RING_ONCE: OnceLock<()> = OnceLock::new();
 static TRACING_ONCE: OnceLock<()> = OnceLock::new();
 
+/// Класс приложения нельзя резолвить через FindClass из потоков, порождённых Rust/tokio — только boot classpath.
+/// Кэшируем GlobalRef при входе с Java-стороны ([`Java_dev_bibavpn_core_BibaNative_nativeStart`]).
+#[cfg(target_os = "android")]
+static VPN_PROTECT_CLASS: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
+
 fn ensure_ring() {
     RING_ONCE.get_or_init(|| {
         install_ring_crypto();
@@ -37,13 +42,97 @@ fn ensure_ring() {
 
 fn ensure_tracing() {
     TRACING_ONCE.get_or_init(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .try_init();
+        #[cfg(target_os = "android")]
+        {
+            use std::io::Write;
+            use tracing_subscriber::EnvFilter;
+            android_logger::init_once(
+                android_logger::Config::default()
+                    .with_max_level(log::LevelFilter::Debug)
+                    .with_tag("BibaRust"),
+            );
+            struct LogWriter;
+            impl Write for LogWriter {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    let s = String::from_utf8_lossy(buf);
+                    for line in s.trim_end().lines() {
+                        log::info!("{line}");
+                    }
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("info")),
+                )
+                .with_ansi(false)
+                .with_writer(|| LogWriter)
+                .try_init();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            use tracing_subscriber::util::SubscriberInitExt;
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .try_init();
+        }
     });
+}
+
+#[cfg(target_os = "android")]
+fn cache_vpn_protect_class(env: &mut JNIEnv) -> jni::errors::Result<()> {
+    let mut slot = VPN_PROTECT_CLASS.lock().unwrap();
+    if slot.is_none() {
+        let cls = env.find_class("dev/bibavpn/core/VpnProtect")?;
+        *slot = Some(env.new_global_ref(&cls)?);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn jni_protect_socket(jvm: &jni::JavaVM, fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    use jni::objects::JValue;
+    let mut env = jvm
+        .attach_current_thread()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("jni attach: {e}")))?;
+    let local = {
+        let guard = VPN_PROTECT_CLASS.lock().unwrap();
+        let gref = guard.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "VpnProtect class not cached (nativeStart order?)",
+            )
+        })?;
+        env.new_local_ref(gref.as_obj()).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("VpnProtect local ref: {e}"))
+        })?
+    };
+    let jclass = JClass::from(local);
+    let v = env
+        .call_static_method(
+            &jclass,
+            "protectFd",
+            "(I)Z",
+            &[JValue::Int(fd as jni::sys::jint)],
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("protectFd: {e}")))?;
+    let ok = v
+        .z()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    if !ok {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "VpnProtect.protectFd returned false",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -419,6 +508,18 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
         Ok(s) => s.into(),
         Err(e) => return jni_err(&mut env, format!("config string: {e}")),
     };
+    let json_fingerprint = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        json.as_bytes().hash(&mut h);
+        h.finish()
+    };
+    tracing::info!(
+        json_len = json.len(),
+        json_fingerprint = json_fingerprint,
+        "nativeStart: enter"
+    );
 
     let mut guard = match STATE.lock() {
         Ok(g) => g,
@@ -426,13 +527,57 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
     };
 
     if guard.is_some() {
-        return jni_err(&mut env, "already running");
+        let thread_done = guard
+            .as_ref()
+            .and_then(|s| s.thread.as_ref().map(|t| t.is_finished()))
+            .unwrap_or(true);
+        if thread_done {
+            #[cfg(target_os = "android")]
+            {
+                bibavpn::outbound_protect::set_hook(None);
+            }
+            if let Some(mut s) = guard.take() {
+                if let Some(tx) = s.shutdown_tx.take() {
+                    let _ = tx.send(true);
+                }
+                if let Some(h) = s.thread.take() {
+                    let _ = h.join();
+                }
+            }
+        } else {
+            tracing::warn!("nativeStart: already running");
+            return jni_err(&mut env, "already running");
+        }
     }
 
     let opts = match opts_from_json(&json) {
         Ok(o) => o,
-        Err(e) => return jni_err(&mut env, format!("{e:#}")),
+        Err(e) => {
+            tracing::error!("nativeStart: parse config: {e:#}");
+            return jni_err(&mut env, format!("{e:#}"));
+        }
     };
+    tracing::info!(
+        socks_bind = %opts.socks_bind,
+        server_host = %opts.server_host,
+        "nativeStart: parsed, spawning client"
+    );
+
+    #[cfg(target_os = "android")]
+    {
+        use std::sync::Arc;
+        if let Err(e) = cache_vpn_protect_class(&mut env) {
+            return jni_err(&mut env, format!("cache VpnProtect: {e}"));
+        }
+        let jvm = match env.get_java_vm() {
+            Ok(j) => Arc::new(j),
+            Err(e) => return jni_err(&mut env, format!("java_vm: {e}")),
+        };
+        let jvm_cb = jvm.clone();
+        bibavpn::outbound_protect::set_hook(Some(std::sync::Arc::new(move |fd| {
+            jni_protect_socket(jvm_cb.as_ref(), fd)
+        })));
+    }
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -462,8 +607,12 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
     });
     drop(guard);
 
+    tracing::info!("nativeStart: waiting SOCKS bind (20s timeout)");
     match ready_rx.recv_timeout(std::time::Duration::from_secs(20)) {
-        Ok(()) => std::ptr::null_mut(),
+        Ok(()) => {
+            tracing::info!("nativeStart: SOCKS ready");
+            std::ptr::null_mut()
+        }
         Err(e) => {
             let msg = match e {
                 std::sync::mpsc::RecvTimeoutError::Timeout => {
@@ -473,6 +622,7 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
                     "SOCKS: клиент не поднял порт (см. лог)"
                 }
             };
+            tracing::error!("nativeStart: SOCKS not ready: {msg}");
             let mut guard = match STATE.lock() {
                 Ok(g) => g,
                 Err(_) => return jni_err(&mut env, msg),
@@ -485,6 +635,10 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
                     let _ = h.join();
                 }
             }
+            #[cfg(target_os = "android")]
+            {
+                bibavpn::outbound_protect::set_hook(None);
+            }
             jni_err(&mut env, msg)
         }
     }
@@ -495,6 +649,8 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStop(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
+    ensure_tracing();
+    tracing::info!("nativeStop: enter");
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return jni_err(&mut env, "state mutex poisoned"),
@@ -502,7 +658,10 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStop(
 
     let mut s = match guard.take() {
         Some(s) => s,
-        None => return std::ptr::null_mut(),
+        None => {
+            tracing::info!("nativeStop: idle (no client)");
+            return std::ptr::null_mut();
+        }
     };
 
     if let Some(tx) = s.shutdown_tx.take() {
@@ -512,5 +671,11 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStop(
         let _ = h.join();
     }
 
+    #[cfg(target_os = "android")]
+    {
+        bibavpn::outbound_protect::set_hook(None);
+    }
+
+    tracing::info!("nativeStop: done");
     std::ptr::null_mut()
 }

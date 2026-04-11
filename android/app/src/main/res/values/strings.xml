@@ -3,5 +3,7 @@
     <string name="app_name">BibaVPN</string>
     <string name="channel_name">Прокси</string>
     <string name="notification_title">BibaVPN активен</string>
-    <string name="notification_text">Локальный SOCKS5: %1$s</string>
+    <string name="notification_text">VPN-туннель активен</string>
+    <string name="notification_action_disable">Отключить</string>
+    <string name="notification_action_enable">Включить</string>
 </resources>
