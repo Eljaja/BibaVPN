@@ -45,6 +45,13 @@ rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-andro
 echo "Сборка bibavpn (release) ..."
 cargo build -p bibavpn --release
 
+echo "tun2socks AAR (gomobile, 16 KB ELF) ..."
+if command -v go >/dev/null 2>&1; then
+  bash "$SCRIPT_DIR/build-tun2socks-gomobile.sh" || echo "Предупреждение: не удалось собрать tun2socks.aar"
+else
+  echo "Пропуск: нет Go — положите android/app/libs/tun2socks.aar (см. scripts/build-tun2socks-gomobile.sh) или Gradle возьмёт Maven AAR без 16 KB."
+fi
+
 echo "Сборка libbibavpn_jni.so (4 ABI) ..."
 OUT="$REPO_ROOT/android/app/src/main/jniLibs"
 mkdir -p "$OUT/arm64-v8a" "$OUT/armeabi-v7a" "$OUT/x86" "$OUT/x86_64"
@@ -62,7 +69,7 @@ cargo build -p bibavpn-jni --release --target x86_64-linux-android
 cp -f "$REPO_ROOT/target/x86_64-linux-android/release/libbibavpn_jni.so" "$OUT/x86_64/"
 
 echo "Gradle: wrapper + assembleDebug ..."
-GRADLE_VER="8.2"
+GRADLE_VER="8.7"
 GR_ZIP="/tmp/gradle-${GRADLE_VER}-bin.zip"
 if [[ ! -d "/tmp/gradle-${GRADLE_VER}" ]]; then
   wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -O "$GR_ZIP"
