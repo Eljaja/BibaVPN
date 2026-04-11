@@ -12,7 +12,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::{Duration, sleep};
@@ -49,11 +49,16 @@ pub fn encode_mux_open() -> Vec<u8> {
 
 pub fn encode_mux_record(stream_id: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + 1 + 4 + payload.len());
-    v.extend_from_slice(&stream_id.to_be_bytes());
-    v.push(flags);
-    v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    v.extend_from_slice(payload);
+    write_mux_record_to(&mut v, stream_id, flags, payload);
     v
+}
+
+/// Append a mux record header + payload into an existing buffer (avoids extra allocation).
+pub fn write_mux_record_to(buf: &mut Vec<u8>, stream_id: u32, flags: u8, payload: &[u8]) {
+    buf.extend_from_slice(&stream_id.to_be_bytes());
+    buf.push(flags);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
 }
 
 pub fn decode_mux_record(data: &[u8]) -> anyhow::Result<(u32, u8, Vec<u8>)> {
@@ -109,7 +114,7 @@ where
         .max(256);
 
     let (mut ws_sink, mut ws_rx) = ws.split();
-    const WS_OUT_CAP: usize = 256;
+    const WS_OUT_CAP: usize = 512;
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(WS_OUT_CAP);
     let ws_out_srv = ws_out_tx.clone();
     let ws_dummy_srv = ws_out_srv.clone();
@@ -135,17 +140,10 @@ where
             None
         };
         loop {
-            match ping_sleep.as_mut() {
+            let msg = match ping_sleep.as_mut() {
                 Some(sleep_pin) => {
                     tokio::select! {
-                        m = ws_out_rx.recv() => {
-                            match m {
-                                None => break,
-                                Some(msg) => {
-                                    ws_sink.send(msg).await.context("websocket send")?;
-                                }
-                            }
-                        }
+                        m = ws_out_rx.recv() => m,
                         _ = sleep_pin.as_mut() => {
                             ws_sink
                                 .send(Message::Ping(bytes::Bytes::new()))
@@ -155,23 +153,24 @@ where
                                 ws_ping_secs,
                                 ws_ping_jitter_percent,
                             )));
+                            continue;
                         }
                     }
                 }
-                None => {
-                    match ws_out_rx.recv().await {
-                        None => break,
-                        Some(msg) => {
-                            ws_sink.send(msg).await.context("websocket send")?;
-                        }
-                    }
-                }
+                None => ws_out_rx.recv().await,
+            };
+            let Some(msg) = msg else { break };
+            ws_sink.feed(msg).await.context("ws feed")?;
+            while let Ok(msg) = ws_out_rx.try_recv() {
+                ws_sink.feed(msg).await.context("ws feed")?;
             }
+            ws_sink.flush().await.context("ws flush")?;
         }
         Ok::<_, anyhow::Error>(())
     };
 
-    let streams: Arc<Mutex<HashMap<u32, OwnedWriteHalf>>> = Arc::new(Mutex::new(HashMap::new()));
+    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let sem = Arc::new(Semaphore::new(MUX_SERVER_INFLIGHT));
     let crypto_in = crypto.clone();
 
@@ -210,27 +209,39 @@ where
                                     continue;
                                 }
                             };
-                            let mut map = streams.lock().await;
-                            if map.len() >= MUX_SERVER_MAX_STREAMS {
-                                drop(map);
-                                let _ = permit;
-                                warn!("mux: max streams");
-                                continue;
+                            {
+                                let map = streams.lock().await;
+                                if map.len() >= MUX_SERVER_MAX_STREAMS {
+                                    let _ = permit;
+                                    warn!("mux: max streams");
+                                    continue;
+                                }
                             }
-                            let remote = match TcpStream::connect((host.as_str(), port)).await {
-                                Ok(t) => t,
-                                Err(e) => {
+                            let remote = match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                TcpStream::connect((host.as_str(), port)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(t)) => t,
+                                Ok(Err(e)) => {
                                     error!("mux connect {host}:{port}: {e:#}");
+                                    let _ = permit;
+                                    continue;
+                                }
+                                Err(_) => {
+                                    error!("mux connect {host}:{port}: timeout 10s");
                                     let _ = permit;
                                     continue;
                                 }
                             };
                             let _ = remote.set_nodelay(true);
                             let (r, w) = remote.into_split();
-                            map.insert(sid, w);
-                            drop(map);
+                            let (wtx, mut wrx) = mpsc::channel::<Vec<u8>>(256);
+                            streams.lock().await.insert(sid, wtx);
                             let ws_tx = ws_out_srv.clone();
-                            let streams_clone = streams.clone();
+                            let streams_read = streams.clone();
+                            let streams_write = streams.clone();
                             let crypto_clone = crypto.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -238,7 +249,7 @@ where
                                     sid,
                                     r,
                                     ws_tx,
-                                    streams_clone,
+                                    streams_read,
                                     max_pad,
                                     pad_mode,
                                     crypto_clone,
@@ -251,13 +262,22 @@ where
                                     error!("mux read sid {sid}: {e:#}");
                                 }
                             });
+                            tokio::spawn(async move {
+                                let mut w = w;
+                                while let Some(data) = wrx.recv().await {
+                                    if w.write_all(&data).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                streams_write.lock().await.remove(&sid);
+                            });
                         }
                         MUX_FLAG_DATA => {
-                            let mut g = streams.lock().await;
-                            if let Some(w) = g.get_mut(&sid) {
-                                if let Err(e) = w.write_all(&payload).await {
-                                    error!("mux write sid {sid}: {e:#}");
-                                }
+                            let g = streams.lock().await;
+                            if let Some(tx) = g.get(&sid) {
+                                let tx = tx.clone();
+                                drop(g);
+                                let _ = tx.send(payload).await;
                             }
                         }
                         MUX_FLAG_CLOSE | MUX_FLAG_RST => {
@@ -289,7 +309,7 @@ async fn mux_server_stream_read_loop(
     sid: u32,
     mut tcp_read: OwnedReadHalf,
     ws_out: mpsc::Sender<Message>,
-    streams: Arc<Mutex<HashMap<u32, OwnedWriteHalf>>>,
+    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     max_pad: u8,
     pad_mode: PadMode,
     crypto: Option<SharedCrypto>,
@@ -300,6 +320,7 @@ async fn mux_server_stream_read_loop(
     let read_cap = max_chunk.saturating_mul(8).min(512 * 1024).max(max_chunk);
     let mut buf = vec![0u8; read_cap];
     let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
+    let mut rec_buf = Vec::with_capacity(max_chunk + 9);
     loop {
         let n = tcp_read.read(&mut buf).await?;
         if n == 0 {
@@ -308,8 +329,10 @@ async fn mux_server_stream_read_loop(
         let mut off = 0usize;
         while off < n {
             let take = (n - off).min(max_chunk);
-            let rec = encode_mux_record(sid, MUX_FLAG_DATA, &buf[off..off + take]);
-            write_padded_frame_with_mode(&mut wire, &rec, max_pad, pad_mode).context("mux pad")?;
+            rec_buf.clear();
+            write_mux_record_to(&mut rec_buf, sid, MUX_FLAG_DATA, &buf[off..off + take]);
+            write_padded_frame_with_mode(&mut wire, &rec_buf, max_pad, pad_mode)
+                .context("mux pad")?;
             let blob: Bytes = match &crypto {
                 Some(c) => {
                     let b = c
@@ -333,8 +356,10 @@ async fn mux_server_stream_read_loop(
         }
     }
     wire.clear();
-    let rec = encode_mux_record(sid, MUX_FLAG_CLOSE, &[]);
-    write_padded_frame_with_mode(&mut wire, &rec, max_pad, pad_mode).context("mux close pad")?;
+    rec_buf.clear();
+    write_mux_record_to(&mut rec_buf, sid, MUX_FLAG_CLOSE, &[]);
+    write_padded_frame_with_mode(&mut wire, &rec_buf, max_pad, pad_mode)
+        .context("mux close pad")?;
     let blob: Bytes = match &crypto {
         Some(c) => Bytes::from(c.seal_server_to_client(&wire).await?),
         None => Bytes::from(std::mem::take(&mut wire)),
@@ -408,7 +433,7 @@ impl TcpMuxClientHandle {
         tcp_uplink_prefix: Vec<u8>,
     ) -> Result<(), MuxOpenStreamDropped> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        let (down_tx, down_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (down_tx, down_rx) = mpsc::channel::<Vec<u8>>(1024);
         self.down.lock().await.insert(stream_id, down_tx);
         let open_pl = match encode_mux_open_target(&host, port) {
             Ok(p) => p,
@@ -463,7 +488,7 @@ where
     let slot_r = tcp_mux_slot;
     cfg.transport_v2 = crypto.is_some();
     let (mut ws_sink, ws_rx) = ws.split();
-    let (tx, mut rx) = mpsc::channel::<MuxWriteCmd>(256);
+    let (tx, mut rx) = mpsc::channel::<MuxWriteCmd>(512);
     if cfg.dummy_interval_secs > 0 {
         let tx_d = tx.clone();
         let cfg_d = cfg.clone();
@@ -488,61 +513,13 @@ where
             None
         };
         let mut wire = Vec::with_capacity(cfg_w.max_ws_binary.min(256 * 1024));
+        let mut rec_buf = Vec::with_capacity(cfg_w.max_ws_binary.min(256 * 1024));
 
         loop {
-            match ping_sleep.as_mut() {
+            let cmd = match ping_sleep.as_mut() {
                 Some(sleep_pin) => {
                     tokio::select! {
-                        cmd = rx.recv() => {
-                            let Some(cmd) = cmd else { break };
-                            match cmd {
-                                MuxWriteCmd::Record { stream_id, flags, payload } => {
-                                    let rec = encode_mux_record(stream_id, flags, &payload);
-                                    if write_padded_frame_with_mode(
-                                        &mut wire,
-                                        &rec,
-                                        cfg_w.max_pad,
-                                        cfg_w.pad_mode,
-                                    )
-                                    .is_err()
-                                    {
-                                        break;
-                                    }
-                                    let blob: Bytes = match &crypto_w {
-                                        Some(c) => match c.seal_client_to_server(&wire).await {
-                                            Ok(b) => {
-                                                wire.clear();
-                                                Bytes::from(b)
-                                            }
-                                            Err(e) => {
-                                                error!("mux seal: {e:#}");
-                                                break;
-                                            }
-                                        },
-                                        None => Bytes::from(std::mem::take(&mut wire)),
-                                    };
-                                    if blob.len() > cfg_w.max_ws_binary {
-                                        error!("mux ws binary cap");
-                                        break;
-                                    }
-                                    maybe_ws_binary_send_jitter(cfg_w.ws_binary_send_jitter_ms).await;
-                                    if ws_sink.send(Message::Binary(blob)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                MuxWriteCmd::Pong(p) => {
-                                    if ws_sink.send(Message::Pong(Bytes::from(p))).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                MuxWriteCmd::RawBinary(blob) => {
-                                    maybe_ws_binary_send_jitter(cfg_w.ws_binary_send_jitter_ms).await;
-                                    if ws_sink.send(Message::Binary(blob)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        cmd = rx.recv() => cmd,
                         _ = sleep_pin.as_mut() => {
                             if ws_sink.send(Message::Ping(Bytes::new())).await.is_err() {
                                 break;
@@ -551,60 +528,82 @@ where
                                 cfg_w.ws_ping_secs,
                                 cfg_w.ws_ping_jitter_percent,
                             )));
+                            continue;
                         }
                     }
                 }
-                None => {
-                    let Some(cmd) = rx.recv().await else { break };
-                    match cmd {
-                        MuxWriteCmd::Record { stream_id, flags, payload } => {
-                            let rec = encode_mux_record(stream_id, flags, &payload);
-                            if write_padded_frame_with_mode(
-                                &mut wire,
-                                &rec,
-                                cfg_w.max_pad,
-                                cfg_w.pad_mode,
-                            )
-                            .is_err()
-                            {
-                                break;
-                            }
-                            let blob: Bytes = match &crypto_w {
-                                Some(c) => match c.seal_client_to_server(&wire).await {
-                                    Ok(b) => {
-                                        wire.clear();
-                                        Bytes::from(b)
-                                    }
-                                    Err(e) => {
-                                        error!("mux seal: {e:#}");
-                                        break;
-                                    }
-                                },
-                                None => Bytes::from(std::mem::take(&mut wire)),
-                            };
-                            if blob.len() > cfg_w.max_ws_binary {
-                                error!("mux ws binary cap");
-                                break;
-                            }
-                            maybe_ws_binary_send_jitter(cfg_w.ws_binary_send_jitter_ms).await;
-                            if ws_sink.send(Message::Binary(blob)).await.is_err() {
-                                break;
-                            }
+                None => rx.recv().await,
+            };
+            let Some(first) = cmd else { break };
+            let mut stop = false;
+            let mut pending = Some(first);
+            loop {
+                let cmd = match pending.take() {
+                    Some(c) => c,
+                    None => match rx.try_recv() {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    },
+                };
+                match cmd {
+                    MuxWriteCmd::Record { stream_id, flags, payload } => {
+                        rec_buf.clear();
+                        write_mux_record_to(&mut rec_buf, stream_id, flags, &payload);
+                        if write_padded_frame_with_mode(
+                            &mut wire,
+                            &rec_buf,
+                            cfg_w.max_pad,
+                            cfg_w.pad_mode,
+                        )
+                        .is_err()
+                        {
+                            stop = true;
+                            break;
                         }
-                        MuxWriteCmd::Pong(p) => {
-                            if ws_sink.send(Message::Pong(Bytes::from(p))).await.is_err() {
-                                break;
-                            }
+                        let blob: Bytes = match &crypto_w {
+                            Some(c) => match c.seal_client_to_server(&wire).await {
+                                Ok(b) => {
+                                    wire.clear();
+                                    Bytes::from(b)
+                                }
+                                Err(e) => {
+                                    error!("mux seal: {e:#}");
+                                    stop = true;
+                                    break;
+                                }
+                            },
+                            None => Bytes::from(std::mem::take(&mut wire)),
+                        };
+                        if blob.len() > cfg_w.max_ws_binary {
+                            error!("mux ws binary cap");
+                            stop = true;
+                            break;
                         }
-                        MuxWriteCmd::RawBinary(blob) => {
-                            maybe_ws_binary_send_jitter(cfg_w.ws_binary_send_jitter_ms).await;
-                            if ws_sink.send(Message::Binary(blob)).await.is_err() {
-                                break;
-                            }
+                        if ws_sink.feed(Message::Binary(blob)).await.is_err() {
+                            stop = true;
+                            break;
+                        }
+                    }
+                    MuxWriteCmd::Pong(p) => {
+                        if ws_sink.feed(Message::Pong(Bytes::from(p))).await.is_err() {
+                            stop = true;
+                            break;
+                        }
+                    }
+                    MuxWriteCmd::RawBinary(blob) => {
+                        if ws_sink.feed(Message::Binary(blob)).await.is_err() {
+                            stop = true;
+                            break;
                         }
                     }
                 }
-                       }
+            }
+            if stop {
+                break;
+            }
+            if ws_sink.flush().await.is_err() {
+                break;
+            }
         }
         clear_tcp_mux_slot_if_current(&slot_w, session_id).await;
     });
@@ -665,9 +664,11 @@ async fn mux_client_reader_loop<S>(
                 };
                 match flags {
                     MUX_FLAG_DATA => {
-                        let mut g = down.lock().await;
-                        if let Some(tx) = g.get_mut(&sid) {
-                            let _ = tx.try_send(payload);
+                        let g = down.lock().await;
+                        if let Some(tx) = g.get(&sid) {
+                            let tx = tx.clone();
+                            drop(g);
+                            let _ = tx.send(payload).await;
                         }
                     }
                     MUX_FLAG_CLOSE | MUX_FLAG_RST => {

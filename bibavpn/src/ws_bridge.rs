@@ -99,7 +99,7 @@ where
     let (mut ws_sink, mut ws_rx) = ws.split();
 
     // One writer owns the WebSocket sink; producers use an async channel (no Mutex on send path).
-    const WS_OUT_CAP: usize = 256;
+    const WS_OUT_CAP: usize = 512;
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(WS_OUT_CAP);
     let ws_out_up = ws_out_tx.clone();
     let ws_out_dn = ws_out_tx.clone();
@@ -113,17 +113,10 @@ where
             None
         };
         loop {
-            match ping_sleep.as_mut() {
+            let msg = match ping_sleep.as_mut() {
                 Some(sleep_pin) => {
                     tokio::select! {
-                        m = ws_out_rx.recv() => {
-                            match m {
-                                None => break,
-                                Some(msg) => {
-                                    ws_sink.send(msg).await.context("websocket send")?;
-                                }
-                            }
-                        }
+                        m = ws_out_rx.recv() => m,
                         _ = sleep_pin.as_mut() => {
                             ws_sink
                                 .send(Message::Ping(bytes::Bytes::new()))
@@ -133,18 +126,18 @@ where
                                 ws_ping_secs,
                                 ws_ping_jitter_percent,
                             )));
+                            continue;
                         }
                     }
                 }
-                None => {
-                    match ws_out_rx.recv().await {
-                        None => break,
-                        Some(msg) => {
-                            ws_sink.send(msg).await.context("websocket send")?;
-                        }
-                    }
-                }
+                None => ws_out_rx.recv().await,
+            };
+            let Some(msg) = msg else { break };
+            ws_sink.feed(msg).await.context("ws feed")?;
+            while let Ok(msg) = ws_out_rx.try_recv() {
+                ws_sink.feed(msg).await.context("ws feed")?;
             }
+            ws_sink.flush().await.context("ws flush")?;
         }
         Ok::<_, anyhow::Error>(())
     };

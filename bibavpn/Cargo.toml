@@ -12,6 +12,10 @@ path = "src/bin/server.rs"
 name = "bibavpn-client"
 path = "src/bin/client.rs"
 
+[[bin]]
+name = "bibavpn-mint-invite"
+path = "src/bin/mint_invite.rs"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

@@ -86,11 +86,14 @@ Sec-WebSocket-Accept: {accept}\r\n\
         stream.write_all(resp.as_bytes()).await?;
         stream.flush().await?;
 
+        let mut ws_cfg = WebSocketConfig::default();
+        ws_cfg.write_buffer_size = 256 * 1024;
+        ws_cfg.max_write_buffer_size = 1024 * 1024;
         let ws = WebSocketStream::from_partially_read(
             stream,
             remainder,
             Role::Server,
-            Some(WebSocketConfig::default()),
+            Some(ws_cfg),
         )
         .await;
         return Ok(Some((ws, kind)));

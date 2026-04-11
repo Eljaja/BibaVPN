@@ -13,16 +13,18 @@ This document describes the visual language of the Android app (Jetpack Compose 
 
 ### 1.2 Two graphic types
 
-| Role | Description | File in the repo |
-|------|-------------|------------------|
+
+| Role                    | Description                                                                                                                                                     | File in the repo                                                                                         |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | **Horizontal wordmark** | **BIBA** lettering + **VPN** block with ghost; dark background baked into the asset. Used in the **main screen header** and as the basis for the **TV banner**. | `branding/biba-vpn-logo.png` → in Android also `android/app/src/main/res/drawable/img_biba_wordmark.png` |
-| **App icon** | Square composition: **white ghost** on a **teal-green** rounded rectangle, overall dark background. Phone launcher / Android TV. | `branding/biba-vpn-app-icon.png` → `android/app/src/main/res/drawable/ic_launcher.png` |
+| **App icon**            | Square composition: **white ghost** on a **teal-green** rounded rectangle, overall dark background. Phone launcher / Android TV.                                | `branding/biba-vpn-app-icon.png` → `android/app/src/main/res/drawable/ic_launcher.png`                   |
+
 
 When porting, **keep the same PNGs** (or export from source with the same aspect ratio and padding).
 
 ### 1.3 Status-bar mini icon (Android only)
 
-Vector **ghost**, fill **`#00E5FF`** (cyan): `android/app/src/main/res/drawable/ic_stat_vpn.xml`. On other OSes, reuse the same 24×24 silhouette and proportions.
+Vector **ghost**, fill `**#00E5FF`** (cyan): `android/app/src/main/res/drawable/ic_stat_vpn.xml`. On other OSes, reuse the same 24×24 silhouette and proportions.
 
 ---
 
@@ -32,39 +34,47 @@ All values are **sRGB**, `#RRGGBB`. Alpha is noted separately.
 
 ### 2.1 Background
 
-| Token | Hex | Usage |
-|-------|-----|--------|
-| `bgRoot` | `#070B14` | Root app background (main screen behind the gradient). |
-| `bgScreen` | `#0B0F1A` | **Settings** screen solid fill. |
+
+| Token            | Hex       | Usage                                                                            |
+| ---------------- | --------- | -------------------------------------------------------------------------------- |
+| `bgRoot`         | `#070B14` | Root app background (main screen behind the gradient).                           |
+| `bgScreen`       | `#0B0F1A` | **Settings** screen solid fill.                                                  |
 | `bgRadialAccent` | `#16203B` | **Center** of the main screen **radial gradient** (top), blending into `bgRoot`. |
-| `tvBannerBg` | `#0B0F1A` | **Android TV banner** background (`tv_banner.xml`). |
+| `tvBannerBg`     | `#0B0F1A` | **Android TV banner** background (`tv_banner.xml`).                              |
+
 
 ### 2.2 Cards and fields
 
-| Token | Hex | Usage |
-|-------|-----|--------|
-| `cardBg` | `#121826` | Card surfaces (status, server row). |
-| `cardBgSettings` | `cardBg` @ **92%** opacity | Settings section surfaces (`CardBg.copy(alpha = 0.92f)`). |
-| `fieldInsetBg` | `#020617` @ **55%** opacity | Multiline inset fields and `OutlinedTextField` container. |
-| `fieldText` | `#F8FAFC` | Input text. |
+
+| Token            | Hex                         | Usage                                                     |
+| ---------------- | --------------------------- | --------------------------------------------------------- |
+| `cardBg`         | `#121826`                   | Card surfaces (status, server row).                       |
+| `cardBgSettings` | `cardBg` @ **92%** opacity  | Settings section surfaces (`CardBg.copy(alpha = 0.92f)`). |
+| `fieldInsetBg`   | `#020617` @ **55%** opacity | Multiline inset fields and `OutlinedTextField` container. |
+| `fieldText`      | `#F8FAFC`                   | Input text.                                               |
+
 
 ### 2.3 Accents and text
 
-| Token | Hex | Usage |
-|-------|-----|--------|
-| `labelSky` | `#60A5FA` | Secondary accents, helper copy, field labels (sky blue). |
-| `textMuted` | `#94A3B8` | Secondary text, subtitles, placeholders. |
-| `textSlate200` | `#E2E8F0` | Primary “light” text in headers / secondary blocks. |
-| `mint` | `#00FFA3` | Primary accent: status, toggle, cursor, CTA chrome. |
-| `mintSoft` | `#34D399` | Softer green (active connection status dot core). |
+
+| Token          | Hex       | Usage                                                    |
+| -------------- | --------- | -------------------------------------------------------- |
+| `labelSky`     | `#60A5FA` | Secondary accents, helper copy, field labels (sky blue). |
+| `textMuted`    | `#94A3B8` | Secondary text, subtitles, placeholders.                 |
+| `textSlate200` | `#E2E8F0` | Primary “light” text in headers / secondary blocks.      |
+| `mint`         | `#00FFA3` | Primary accent: status, toggle, cursor, CTA chrome.      |
+| `mintSoft`     | `#34D399` | Softer green (active connection status dot core).        |
+
 
 ### 2.4 Borders and translucency
 
-| Token | Value | Usage |
-|-------|-------|--------|
-| `borderSubtle` | white **8%** | Card, circular button, and field outlines (`Color.White` α=0.08). |
-| `mainButtonBorder` | `#60A5FA` **20%** | Main **Connect / Disconnect** button outline (`0x3360A5FA`). |
-| `iconButtonFill` | white **3%** | Circular header buttons (settings, back). |
+
+| Token              | Value             | Usage                                                             |
+| ------------------ | ----------------- | ----------------------------------------------------------------- |
+| `borderSubtle`     | white **8%**      | Card, circular button, and field outlines (`Color.White` α=0.08). |
+| `mainButtonBorder` | `#60A5FA` **20%** | Main **Connect / Disconnect** button outline (`0x3360A5FA`).      |
+| `iconButtonFill`   | white **3%**      | Circular header buttons (settings, back).                         |
+
 
 ### 2.5 Main CTA gradient (vertical)
 
@@ -87,22 +97,24 @@ Direction: **top to bottom** (`linear-gradient(180deg, #1A2950, #14203C)`).
 
 Android uses the **Material 3 system font** (Roboto). Elsewhere, a **neutral geometric sans** is enough: **Inter**, **SF Pro** (iOS), **Segoe UI** (Windows).
 
-| Level | Size | Weight | Color (typical) |
-|-------|------|--------|-----------------|
-| Status “Connected” | 20 sp | SemiBold (600) | `#FFFFFF` |
-| Main CTA title | 22 sp | SemiBold | `#FFFFFF` |
-| Subtitle under CTA | 14 sp | Regular | `labelSky` @ 75% |
-| Server card title | 18 sp | SemiBold | `#FFFFFF` |
-| “SERVER” label | 11 sp | Medium (500), letter-spacing **2.4** | `textMuted` |
-| Body / secondary on server card | 14 sp | Regular | `textMuted` |
-| Settings section title | 18 sp | SemiBold | `#FFFFFF` |
-| Section subtitle | 14 sp | Regular | `textMuted` |
-| Field label | 12 sp | Medium | `labelSky` @ 90% |
-| Field value | 14 sp | Regular | `#F8FAFC` |
-| Hint under field | 11 sp | Regular | `textMuted` |
-| Settings header | 14 sp | Medium, letter-spacing **0.6** | `textSlate200` |
-| Circular button glyph | 18 sp | — | `textSlate200` @ 88% |
-| Server card chevron `›` | 22 sp | — | `textMuted` @ 55% |
+
+| Level                           | Size  | Weight                               | Color (typical)      |
+| ------------------------------- | ----- | ------------------------------------ | -------------------- |
+| Status “Connected”              | 20 sp | SemiBold (600)                       | `#FFFFFF`            |
+| Main CTA title                  | 22 sp | SemiBold                             | `#FFFFFF`            |
+| Subtitle under CTA              | 14 sp | Regular                              | `labelSky` @ 75%     |
+| Server card title               | 18 sp | SemiBold                             | `#FFFFFF`            |
+| “SERVER” label                  | 11 sp | Medium (500), letter-spacing **2.4** | `textMuted`          |
+| Body / secondary on server card | 14 sp | Regular                              | `textMuted`          |
+| Settings section title          | 18 sp | SemiBold                             | `#FFFFFF`            |
+| Section subtitle                | 14 sp | Regular                              | `textMuted`          |
+| Field label                     | 12 sp | Medium                               | `labelSky` @ 90%     |
+| Field value                     | 14 sp | Regular                              | `#F8FAFC`            |
+| Hint under field                | 11 sp | Regular                              | `textMuted`          |
+| Settings header                 | 14 sp | Medium, letter-spacing **0.6**       | `textSlate200`       |
+| Circular button glyph           | 18 sp | —                                    | `textSlate200` @ 88% |
+| Server card chevron `›`         | 22 sp | —                                    | `textMuted` @ 55%    |
+
 
 **Header logo** — bitmap, not live text; height **36 dp**, horizontal padding **12 dp**, horizontally **flex-1** between the settings control and a balancing **40 dp** spacer.
 
@@ -123,17 +135,19 @@ Base unit **4 dp**. Common values:
 
 ## 5. Corner radii
 
-| Element | Radius |
-|---------|--------|
-| Status card | **26 dp** |
-| Main CTA | **28 dp** |
-| Server card | **24 dp** |
-| Settings section wrapper | **28 dp** |
-| Inputs, insets | **16 dp** |
-| “Apply to connection fields” button | **14 dp** |
-| Small square on CTA | **16 dp** |
-| Circular icon buttons | **50%** (circle) |
-| Status indicator (outer ring) | **18 dp**; inner dot **10 dp** |
+
+| Element                             | Radius                         |
+| ----------------------------------- | ------------------------------ |
+| Status card                         | **26 dp**                      |
+| Main CTA                            | **28 dp**                      |
+| Server card                         | **24 dp**                      |
+| Settings section wrapper            | **28 dp**                      |
+| Inputs, insets                      | **16 dp**                      |
+| “Apply to connection fields” button | **14 dp**                      |
+| Small square on CTA                 | **16 dp**                      |
+| Circular icon buttons               | **50%** (circle)               |
+| Status indicator (outer ring)       | **18 dp**; inner dot **10 dp** |
+
 
 Strokes are **1 dp**, using `borderSubtle` or the special variants in §2.4.
 

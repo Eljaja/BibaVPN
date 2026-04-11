@@ -18,12 +18,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bibavpn::local_client::{
-    parse_host_port, LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY,
-    DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-};
+use bibavpn::local_client::DEFAULT_CLIENT_MAX_WS_BINARY;
+use bibavpn::local_client_options_from_json_str_with_binds;
 use bibavpn::tls_util::install_ring_crypto;
-use bibavpn::TlsClientProfile;
+use bibavpn::decode_invite_v1;
 use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke, Vec2, Visuals};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -47,7 +45,7 @@ struct SavedConfig {
     #[serde(default = "default_max_pad_cfg")]
     max_pad: u8,
     /// Как `--decoy-max` (PSK / v2).
-    #[serde(default)]
+    #[serde(default = "default_decoy_max_cfg")]
     decoy_max: u8,
     /// Как `--max-ws-binary`, верхняя граница размера WS binary.
     #[serde(default = "default_max_ws_binary_cfg")]
@@ -55,6 +53,21 @@ struct SavedConfig {
     /// Как `--tls-profile` у bibavpn-client.
     #[serde(default = "default_tls_profile_cfg")]
     tls_profile: String,
+
+    /// `biba://…` и passphrase — тот же формат, что в Android.
+    #[serde(default)]
+    from_invite: String,
+    #[serde(default)]
+    invite_passphrase: String,
+    #[serde(default)]
+    junk_frames: u32,
+    #[serde(default)]
+    early_ws_frames: u8,
+    #[serde(default = "default_ws_ping_secs_cfg")]
+    ws_ping_secs: u64,
+    /// По строке на заголовок, как `ws_headers` в JSON (`Name: value`).
+    #[serde(default)]
+    ws_headers: String,
 }
 
 impl Default for SavedConfig {
@@ -68,10 +81,75 @@ impl Default for SavedConfig {
             local_http_port: 17_890,
             local_socks_port: 0,
             max_pad: default_max_pad_cfg(),
-            decoy_max: 0,
+            decoy_max: default_decoy_max_cfg(),
             max_ws_binary: default_max_ws_binary_cfg(),
             tls_profile: default_tls_profile_cfg(),
+            from_invite: String::new(),
+            invite_passphrase: String::new(),
+            junk_frames: 0,
+            early_ws_frames: 0,
+            ws_ping_secs: default_ws_ping_secs_cfg(),
+            ws_headers: String::new(),
         }
+    }
+}
+
+impl SavedConfig {
+    fn can_connect(&self) -> bool {
+        let invite_ok = !self.from_invite.trim().is_empty() && !self.invite_passphrase.is_empty();
+        let manual_ok = !self.server.trim().is_empty() && !self.token.trim().is_empty();
+        invite_ok || manual_ok
+    }
+
+    /// JSON для `local_client_options_from_json_str*` (как Android `buildJson`).
+    fn start_config_json(&self) -> Result<String, String> {
+        use serde_json::{json, Map, Value};
+        let use_invite = !self.from_invite.trim().is_empty() && !self.invite_passphrase.is_empty();
+        let mut o = Map::new();
+        if use_invite {
+            o.insert("from_invite".to_string(), json!(self.from_invite.trim()));
+            o.insert(
+                "invite_passphrase".to_string(),
+                json!(self.invite_passphrase.clone()),
+            );
+            o.insert("server".to_string(), json!(""));
+            o.insert("token".to_string(), json!("change-me"));
+        } else {
+            o.insert("server".to_string(), json!(self.server.trim()));
+            o.insert("token".to_string(), json!(self.token.clone()));
+            let tp = self.tls_profile.trim();
+            if !tp.is_empty() && tp != "default" {
+                o.insert("tls_profile".to_string(), json!(tp));
+            }
+        }
+        if !self.sni.trim().is_empty() {
+            o.insert("sni".to_string(), json!(self.sni.trim()));
+        }
+        o.insert("socks_bind".to_string(), json!("127.0.0.1:0"));
+        o.insert("insecure".to_string(), json!(self.insecure));
+        o.insert("max_pad".to_string(), json!(self.max_pad));
+        o.insert(
+            "decoy_max".to_string(),
+            json!(self.decoy_max.min(255)),
+        );
+        o.insert("junk_frames".to_string(), json!(self.junk_frames));
+        o.insert("early_ws_frames".to_string(), json!(self.early_ws_frames));
+        o.insert("max_ws_binary".to_string(), json!(self.max_ws_binary));
+        o.insert("ws_ping_secs".to_string(), json!(self.ws_ping_secs));
+        if !self.psk.trim().is_empty() {
+            o.insert("psk".to_string(), json!(self.psk.trim()));
+        }
+        let lines: Vec<String> = self
+            .ws_headers
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(std::string::ToString::to_string)
+            .collect();
+        if !lines.is_empty() {
+            o.insert("ws_headers".to_string(), json!(lines));
+        }
+        serde_json::to_string(&Value::Object(o)).map_err(|e| e.to_string())
     }
 }
 
@@ -101,27 +179,37 @@ fn default_max_pad_cfg() -> u8 {
     64
 }
 
+fn default_decoy_max_cfg() -> u8 {
+    32
+}
+
 fn default_max_ws_binary_cfg() -> usize {
     DEFAULT_CLIENT_MAX_WS_BINARY
+}
+
+fn default_ws_ping_secs_cfg() -> u64 {
+    25
 }
 
 fn default_tls_profile_cfg() -> String {
     "default".to_string()
 }
 
-/// Токены из `DESIGN.md` §3–4 (тёмная тема, один акцент).
+/// Токены из `DESIGN.md` §2–5 (BibaVPN cross-platform).
 #[derive(Clone, Copy)]
 struct Theme {
-    bg_app: Color32,
-    bg_surface: Color32,
-    bg_elevated: Color32,
+    bg_root: Color32,
+    bg_screen: Color32,
+    card_bg: Color32,
+    field_inset: Color32,
     border_subtle: Color32,
     text_primary: Color32,
-    text_secondary: Color32,
-    text_accent: Color32,
-    accent_primary: Color32,
-    accent_active: Color32,
-    state_success: Color32,
+    text_muted: Color32,
+    label_sky: Color32,
+    mint: Color32,
+    mint_soft: Color32,
+    cta_fill: Color32,
+    main_btn_border: Color32,
     state_warning: Color32,
     state_danger: Color32,
     radius_window: f32,
@@ -132,49 +220,50 @@ struct Theme {
 impl Theme {
     fn dark() -> Self {
         Self {
-            bg_app: Color32::from_rgb(13, 15, 21),
-            bg_surface: Color32::from_rgb(21, 24, 32),
-            bg_elevated: Color32::from_rgb(30, 34, 45),
-            border_subtle: Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-            text_primary: Color32::from_rgb(236, 238, 245),
-            text_secondary: Color32::from_rgb(145, 150, 168),
-            text_accent: Color32::from_rgb(165, 180, 252),
-            accent_primary: Color32::from_rgb(99, 102, 241),
-            accent_active: Color32::from_rgb(79, 70, 229),
-            state_success: Color32::from_rgb(52, 211, 153),
+            bg_root: Color32::from_rgb(0x07, 0x0B, 0x14),
+            bg_screen: Color32::from_rgb(0x0B, 0x0F, 0x1A),
+            card_bg: Color32::from_rgb(0x12, 0x18, 0x26),
+            field_inset: Color32::from_rgba_unmultiplied(0x02, 0x06, 0x17, 140),
+            border_subtle: Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+            text_primary: Color32::from_rgb(0xF8, 0xFA, 0xFC),
+            text_muted: Color32::from_rgb(0x94, 0xA3, 0xB8),
+            label_sky: Color32::from_rgb(0x60, 0xA5, 0xFA),
+            mint: Color32::from_rgb(0x00, 0xFF, 0xA3),
+            mint_soft: Color32::from_rgb(0x34, 0xD3, 0x99),
+            cta_fill: Color32::from_rgb(0x14, 0x20, 0x3C),
+            main_btn_border: Color32::from_rgba_unmultiplied(0x60, 0xA5, 0xFA, 0x33),
             state_warning: Color32::from_rgb(251, 191, 36),
             state_danger: Color32::from_rgb(251, 113, 133),
             radius_window: 12.0,
-            radius_card: 12.0,
-            radius_control: 8.0,
+            radius_card: 26.0,
+            radius_control: 16.0,
         }
     }
 
     fn apply(self, ctx: &egui::Context) {
         let mut visuals = Visuals::dark();
-        visuals.window_fill = self.bg_app;
-        visuals.panel_fill = self.bg_surface;
-        visuals.extreme_bg_color = self.bg_app;
-        visuals.faint_bg_color = self.bg_elevated;
-        visuals.widgets.noninteractive.bg_fill = self.bg_elevated;
-        visuals.widgets.noninteractive.fg_stroke.color = self.text_secondary;
+        visuals.window_fill = self.bg_root;
+        visuals.panel_fill = self.bg_screen;
+        visuals.extreme_bg_color = self.bg_root;
+        visuals.faint_bg_color = self.card_bg;
+        visuals.widgets.noninteractive.bg_fill = self.card_bg;
+        visuals.widgets.noninteractive.fg_stroke.color = self.text_muted;
         visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, self.border_subtle);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(37, 41, 54);
-        visuals.widgets.inactive.weak_bg_fill = self.bg_elevated;
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(44, 49, 64);
-        visuals.widgets.active.bg_fill = self.accent_active;
-        visuals.widgets.open.bg_fill = Color32::from_rgb(40, 44, 60);
-        visuals.selection.bg_fill = self.accent_primary;
-        visuals.hyperlink_color = self.text_accent;
+        visuals.widgets.inactive.bg_fill = self.field_inset;
+        visuals.widgets.inactive.weak_bg_fill = self.card_bg;
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x1A, 0x22, 0x35);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(0x22, 0x2d, 0x44);
+        visuals.widgets.open.bg_fill = self.card_bg;
+        visuals.selection.bg_fill = self.label_sky;
+        visuals.hyperlink_color = self.label_sky;
         visuals.window_stroke = Stroke::new(1.0, self.border_subtle);
         ctx.set_visuals(visuals);
 
         let r = Rounding::same(self.radius_control);
         let mut style = (*ctx.style()).clone();
-        // Масштаб отступов DESIGN.md §2: 8 / 12 / 16 / 20 / 24
         style.spacing.item_spacing = Vec2::new(12.0, 10.0);
         style.spacing.window_margin = Margin::same(20.0);
-        style.spacing.button_padding = Vec2::new(20.0, 14.0);
+        style.spacing.button_padding = Vec2::new(24.0, 14.0);
         style.visuals.widgets.noninteractive.rounding = r;
         style.visuals.widgets.inactive.rounding = r;
         style.visuals.widgets.hovered.rounding = r;
@@ -184,12 +273,12 @@ impl Theme {
     }
 }
 
-fn field_heading(ui: &mut egui::Ui, theme: Theme, label: &str) {
+fn field_heading(ui: &mut egui::Ui, _theme: Theme, label: &str) {
     ui.label(
         RichText::new(label)
             .size(12.0)
             .strong()
-            .color(theme.text_primary),
+            .color(Color32::from_rgba_unmultiplied(0x60, 0xA5, 0xFA, 230)),
     );
     ui.add_space(6.0);
 }
@@ -200,9 +289,18 @@ fn group_heading(ui: &mut egui::Ui, theme: Theme, label: &str) {
         RichText::new(label)
             .size(11.0)
             .strong()
-            .color(theme.text_secondary),
+            .color(theme.text_muted),
     );
     ui.add_space(8.0);
+}
+
+fn load_wordmark(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let bytes = include_bytes!("../../branding/biba-vpn-logo.png");
+    let img = image::load_from_memory(bytes).ok()?;
+    let img = img.into_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture("biba_wordmark", color, egui::TextureOptions::LINEAR))
 }
 
 struct ActiveVpn {
@@ -227,6 +325,7 @@ struct TrayMenuIds {
 
 struct BibaApp {
     cfg: SavedConfig,
+    wordmark: Option<egui::TextureHandle>,
     rt: Arc<tokio::runtime::Runtime>,
     err: Option<String>,
     proxy_backup: Option<ProxyBackup>,
@@ -253,8 +352,10 @@ impl BibaApp {
             cfg.max_ws_binary = DEFAULT_CLIENT_MAX_WS_BINARY;
         }
         let tray_frames_until_icon = if cfg!(target_os = "macos") { 6 } else { 0 };
+        let wordmark = load_wordmark(&cc.egui_ctx);
         Self {
             cfg,
+            wordmark,
             rt,
             err: None,
             proxy_backup: None,
@@ -364,6 +465,32 @@ impl BibaApp {
         }
     }
 
+    fn apply_invite(&mut self) {
+        self.err = None;
+        let uri = self.cfg.from_invite.trim();
+        let pass = self.cfg.invite_passphrase.as_str();
+        if uri.is_empty() || pass.trim().is_empty() {
+            self.err = Some("Укажите ключ biba:// и passphrase.".into());
+            return;
+        }
+        match decode_invite_v1(uri, pass) {
+            Ok(inv) => {
+                self.cfg.server = inv.server;
+                self.cfg.sni = inv.sni;
+                self.cfg.token = inv.token;
+                self.cfg.psk = inv.psk.unwrap_or_default();
+                self.cfg.decoy_max = inv.decoy_max;
+                self.cfg.max_pad = inv.max_pad;
+                self.cfg.max_ws_binary = inv.max_ws_binary;
+                self.cfg.ws_ping_secs = inv.ws_ping_secs;
+                self.cfg.insecure = inv.insecure;
+                self.cfg.tls_profile = inv.tls_profile;
+                save_config(&self.cfg);
+            }
+            Err(e) => self.err = Some(format!("Ключ: {e:#}")),
+        }
+    }
+
     fn disconnect(&mut self) {
         self.err = None;
         self.tunnel_server = None;
@@ -387,22 +514,12 @@ impl BibaApp {
         }
         self.err = None;
 
-        if self.cfg.server.trim().is_empty() {
-            return Err("Укажите адрес сервера (host:port).".into());
+        if !self.cfg.can_connect() {
+            return Err(
+                "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
+                    .into(),
+            );
         }
-
-        let (host, port) =
-            parse_host_port(&self.cfg.server).map_err(|e| format!("Сервер: {e}"))?;
-        let sni = if self.cfg.sni.trim().is_empty() {
-            host.clone()
-        } else {
-            self.cfg.sni.trim().to_string()
-        };
-        let psk = if self.cfg.psk.trim().is_empty() {
-            None
-        } else {
-            Some(self.cfg.psk.trim().to_string())
-        };
 
         let http_port = self.cfg.local_http_port;
         let socks_port = if self.cfg.local_socks_port == 0 {
@@ -422,49 +539,14 @@ impl BibaApp {
         save_config(&self.cfg);
 
         let backup = read_backup().map_err(|e| e.to_string())?;
-        let remote_label = format!("{host}:{port}");
-
-        let tls_profile: TlsClientProfile = self
-            .cfg
-            .tls_profile
-            .parse()
-            .map_err(|e| e.to_string())?;
-
-        let opts = LocalClientOptions {
-            server_host: host,
-            server_port: port,
-            sni,
-            token: self.cfg.token.clone(),
+        let json = self.cfg.start_config_json()?;
+        let opts = local_client_options_from_json_str_with_binds(
+            &json,
             socks_bind,
-            http_proxy_bind: Some(http_bind.clone()),
-            insecure_tls: self.cfg.insecure,
-            max_pad: self.cfg.max_pad,
-            junk_frames: 0,
-            early_ws_frames: 0,
-            psk,
-            decoy_max: self.cfg.decoy_max,
-            ws_host: None,
-            ws_origin: None,
-            ws_user_agent: None,
-            ws_accept_language: None,
-            ws_extra_headers: Arc::new(Vec::new()),
-            max_ws_binary: self.cfg.max_ws_binary,
-            ws_ping_secs: 25,
-            ws_ping_jitter_percent: 0,
-            ws_binary_send_jitter_ms: 0,
-            udp_max_pad: None,
-            udp_max_ws_binary: None,
-            udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-            tls_profile,
-            pinned_certs_pem: None,
-            ws_path: "/ws".to_string(),
-            use_tcp_mux: true,
-            pad_mode: bibavpn::PadMode::Random,
-            dummy_interval_secs: 0,
-            decoy_gets: false,
-            decoy_gets_interval_secs: 30,
-            decoy_gets_paths: Vec::new(),
-        };
+            Some(http_bind.clone()),
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        let remote_label = format!("{}:{}", opts.server_host, opts.server_port);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let join = self.rt.spawn(async move {
@@ -530,32 +612,39 @@ impl eframe::App for BibaApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new("BibaVPN")
-                                    .size(24.0)
-                                    .strong()
-                                    .color(t.text_primary),
-                            );
+                            if let Some(ref tex) = self.wordmark {
+                                ui.add(
+                                    egui::Image::new((tex.id(), tex.size_vec2()))
+                                        .max_height(36.0),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("BibaVPN")
+                                        .size(22.0)
+                                        .strong()
+                                        .color(t.text_primary),
+                                );
+                            }
                             let online = self.vpn.is_some();
                             ui.label(
                                 RichText::new(if online {
-                                    "Подключено · системный прокси активен"
+                                    "Подключено · системный прокси"
                                 } else {
                                     "Не подключено"
                                 })
-                                .size(13.0)
+                                .size(14.0)
                                 .color(if online {
-                                    t.state_success
+                                    t.mint
                                 } else {
-                                    t.text_secondary
+                                    Color32::from_rgba_unmultiplied(0x60, 0xA5, 0xFA, 190)
                                 }),
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let (glyph, color) = if self.vpn.is_some() {
-                                ("●", t.state_success)
+                                ("●", t.mint_soft)
                             } else {
-                                ("○", t.text_secondary)
+                                ("○", t.text_muted)
                             };
                             ui.label(RichText::new(glyph).size(20.0).color(color));
                         });
@@ -564,11 +653,37 @@ impl eframe::App for BibaApp {
                     ui.add_space(20.0);
 
                     egui::Frame::none()
-                        .fill(t.bg_elevated)
+                        .fill(t.card_bg)
                         .rounding(r_card)
                         .stroke(Stroke::new(1.0, t.border_subtle))
                         .inner_margin(Margin::same(20.0))
                         .show(ui, |ui| {
+                            group_heading(ui, t, "Ключ Biba (как в Android)");
+                            field_heading(ui, t, "biba://…");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.cfg.from_invite)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            field_heading(ui, t, "Passphrase");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.cfg.invite_passphrase)
+                                    .desired_width(f32::INFINITY)
+                                    .password(true),
+                            );
+                            ui.add_space(6.0);
+                            let inv_btn = egui::Button::new(
+                                RichText::new("Применить к полям").size(14.0).color(t.mint),
+                            )
+                            .fill(Color32::from_rgba_unmultiplied(0x00, 0xFF, 0xA3, 50))
+                            .rounding(Rounding::same(14.0));
+                            let w = ui.available_width();
+                            if ui
+                                .add_sized(egui::vec2(w, 40.0), inv_btn)
+                                .clicked()
+                            {
+                                self.apply_invite();
+                            }
+
                             group_heading(ui, t, "Подключение");
                             field_heading(ui, t, "Сервер");
                             ui.add(
@@ -609,7 +724,7 @@ impl eframe::App for BibaApp {
                                 ui.label(
                                     RichText::new("HTTP")
                                         .size(12.0)
-                                        .color(t.text_secondary),
+                                        .color(t.text_muted),
                                 );
                                 ui.add(
                                     egui::DragValue::new(&mut self.cfg.local_http_port)
@@ -619,7 +734,7 @@ impl eframe::App for BibaApp {
                                 ui.label(
                                     RichText::new("SOCKS")
                                         .size(12.0)
-                                        .color(t.text_secondary),
+                                        .color(t.text_muted),
                                 );
                                 ui.add(
                                     egui::DragValue::new(&mut self.cfg.local_socks_port)
@@ -629,7 +744,7 @@ impl eframe::App for BibaApp {
                                 ui.label(
                                     RichText::new("0 = HTTP+1")
                                         .size(11.0)
-                                        .color(t.text_secondary),
+                                        .color(t.text_muted),
                                 );
                             });
                         });
@@ -639,34 +754,34 @@ impl eframe::App for BibaApp {
                     egui::CollapsingHeader::new(
                         RichText::new("Дополнительно")
                             .strong()
-                            .color(t.text_accent),
+                            .color(t.label_sky),
                     )
                     .default_open(false)
                     .show(ui, |ui| {
                         egui::Frame::none()
-                            .fill(t.bg_elevated)
+                            .fill(t.card_bg)
                             .rounding(r_card)
                             .stroke(Stroke::new(1.0, t.border_subtle))
                             .inner_margin(Margin::same(20.0))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new("Параметры обмена (как в bibavpn-client)")
+                                    RichText::new("Параметры обмена (как в Android / bibavpn-client)")
                                         .size(12.0)
-                                        .color(t.text_secondary),
+                                        .color(t.text_muted),
                                 );
                                 ui.add_space(12.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new("max-pad")
                                             .size(12.0)
-                                            .color(t.text_secondary),
+                                            .color(t.text_muted),
                                     );
                                     ui.add(egui::DragValue::new(&mut self.cfg.max_pad).range(0..=255));
                                     ui.add_space(12.0);
                                     ui.label(
                                         RichText::new("decoy-max")
                                             .size(12.0)
-                                            .color(t.text_secondary),
+                                            .color(t.text_muted),
                                     );
                                     ui.add(
                                         egui::DragValue::new(&mut self.cfg.decoy_max).range(0..=255),
@@ -675,21 +790,55 @@ impl eframe::App for BibaApp {
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
+                                        RichText::new("junk-frames")
+                                            .size(12.0)
+                                            .color(t.text_muted),
+                                    );
+                                    ui.add(egui::DragValue::new(&mut self.cfg.junk_frames).range(0..=1_000_000));
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        RichText::new("early-ws")
+                                            .size(12.0)
+                                            .color(t.text_muted),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.cfg.early_ws_frames).range(0..=255),
+                                    );
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
                                         RichText::new("max-ws-binary")
                                             .size(12.0)
-                                            .color(t.text_secondary),
+                                            .color(t.text_muted),
                                     );
                                     ui.add(
                                         egui::DragValue::new(&mut self.cfg.max_ws_binary)
                                             .range(1024..=4_194_304)
                                             .speed(1024),
                                     );
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        RichText::new("ws-ping, с")
+                                            .size(12.0)
+                                            .color(t.text_muted),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.cfg.ws_ping_secs).range(1..=3600),
+                                    );
                                 });
                                 ui.add_space(8.0);
+                                field_heading(ui, t, "ws_headers (строка: Header: value)");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.cfg.ws_headers)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(3),
+                                );
+                                ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new("tls-profile — шифры и ALPN (biba)")
+                                    RichText::new("tls-profile")
                                         .size(12.0)
-                                        .color(t.text_secondary),
+                                        .color(t.text_muted),
                                 );
                                 ui.add_space(6.0);
                                 egui::ComboBox::from_id_salt("tls_profile")
@@ -728,7 +877,9 @@ impl eframe::App for BibaApp {
 
                     if self.vpn.is_some() {
                         if let Some(ref active) = self.tunnel_server {
-                            if self.cfg.server.trim() != active.trim() {
+                            let invite_mode = !self.cfg.from_invite.trim().is_empty()
+                                && !self.cfg.invite_passphrase.trim().is_empty();
+                            if !invite_mode && self.cfg.server.trim() != active.trim() {
                                 ui.label(
                                     RichText::new(
                                         "Адрес сервера изменился. Нажмите «Переподключить».",
@@ -743,26 +894,30 @@ impl eframe::App for BibaApp {
 
                     ui.horizontal(|ui| {
                         let can_disconnect = self.vpn.is_some();
+                        let can_go = self.cfg.can_connect();
                         let primary = if can_disconnect {
                             "Переподключить"
                         } else {
                             "Подключить"
                         };
-                        let btn = egui::Button::new(RichText::new(primary).size(15.0).strong())
-                            .fill(t.accent_primary)
-                            .min_size(Vec2::new(168.0, 48.0))
-                            .rounding(Rounding::same(t.radius_control));
-                        if ui.add(btn).clicked() {
+                        let btn = egui::Button::new(
+                            RichText::new(primary).size(16.0).strong().color(t.text_primary),
+                        )
+                        .fill(t.cta_fill)
+                        .stroke(Stroke::new(1.0, t.main_btn_border))
+                        .min_size(Vec2::new(168.0, 48.0))
+                        .rounding(Rounding::same(28.0));
+                        if ui.add_enabled(can_go, btn).clicked() {
                             match self.connect() {
                                 Ok(()) => {}
                                 Err(e) => self.err = Some(e),
                             }
                         }
                         let stop = egui::Button::new(RichText::new("Стоп").size(15.0))
-                            .fill(t.bg_surface)
+                            .fill(t.bg_screen)
                             .stroke(Stroke::new(1.0, t.border_subtle))
                             .min_size(Vec2::new(112.0, 48.0))
-                            .rounding(Rounding::same(t.radius_control));
+                            .rounding(Rounding::same(16.0));
                         if ui.add_enabled(can_disconnect, stop).clicked() {
                             self.disconnect();
                         }
@@ -774,7 +929,7 @@ impl eframe::App for BibaApp {
                             ui.label(
                                 RichText::new(format!("Активный сервер: {active}"))
                                     .size(13.0)
-                                    .color(t.state_success),
+                                    .color(t.mint_soft),
                             );
                         }
                     }
@@ -797,36 +952,9 @@ impl eframe::App for BibaApp {
 }
 
 fn build_tray_icon() -> tray_icon::Icon {
-    const S: u32 = 64;
-    let center = S as f32 * 0.5;
-    let r_core = 15.0_f32;
-    let r_feather = 5.0_f32;
-    let mut rgba = Vec::with_capacity((S * S * 4) as usize);
-    for y in 0..S {
-        for x in 0..S {
-            let cx = x as f32 + 0.5 - center;
-            let cy = y as f32 + 0.5 - center;
-            let d = (cx * cx + cy * cy).sqrt();
-            let a = if d <= r_core {
-                255u8
-            } else if d <= r_core + r_feather {
-                ((1.0 - (d - r_core) / r_feather).clamp(0.0, 1.0) * 255.0) as u8
-            } else {
-                0u8
-            };
-            if a == 0 {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-            // Яркий розово-малиновый диск, заметный на тёмной полосе меню
-            let h = 1.0 - (d / (r_core + r_feather)).min(1.0);
-            let r = (255.0 - 10.0 * h) as u8;
-            let g = (35.0 + 70.0 * h) as u8;
-            let b = (140.0 + 90.0 * (1.0 - h)) as u8;
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, S, S).expect("tray icon")
+    let bytes = include_bytes!("../../branding/biba-vpn-app-icon.png");
+    let icon = eframe::icon_data::from_png_bytes(bytes).expect("tray png");
+    tray_icon::Icon::from_rgba(icon.rgba, icon.width, icon.height).expect("tray icon")
 }
 
 /// Не завершаться при закрытии вкладки Terminal (SIGHUP), не ронять запись в сокеты (SIGPIPE).
@@ -862,11 +990,16 @@ fn run_app() -> eframe::Result<()> {
             .expect("tokio runtime"),
     );
 
+    let app_icon = eframe::icon_data::from_png_bytes(include_bytes!(
+        "../../branding/biba-vpn-app-icon.png"
+    ))
+    .expect("window icon");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 660.0])
-            .with_min_inner_size([440.0, 560.0])
-            .with_title("BibaVPN"),
+            .with_inner_size([480.0, 720.0])
+            .with_min_inner_size([440.0, 580.0])
+            .with_title("BibaVPN")
+            .with_icon(app_icon),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

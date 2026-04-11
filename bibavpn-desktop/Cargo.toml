@@ -12,6 +12,7 @@ eframe = { version = "0.29", default-features = false, features = [
     "wgpu",
 ] }
 egui = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
 dirs = "5"
 serde = { version = "1", features = ["derive"] }
