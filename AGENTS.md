@@ -6,70 +6,78 @@ This document describes architecture, design choices, and workflows for the repo
 
 **BibaVPN** is a proxy stack: local **SOCKS5** (TCP **CONNECT** and **UDP ASSOCIATE**) and optional **HTTP CONNECT** → **TLS + WebSocket** → remote entry server → outbound **TCP or UDP** to the Internet. Optionally **BibaV2** (PSK, AEAD, decoy) and **BibaV2.1** (WS ping, frame size cap, custom headers, early noise) sit on top of the transport.
 
-**TCP** from applications uses one WSS session per SOCKS connection (OPEN → binary loop).
+**TCP — default:** many SOCKS connections share **one** TLS+WSS session (**TCP mux** in `tcp_mux.rs`): after **AUTH** and optional BibaV2 preamble, the client sends **`MUX_OPEN`**; per-target opens use mux records (stream id, flags, payload) inside padded frames, with window-based flow control. Use **`--no-mux`** for legacy **one WSS per SOCKS CONNECT** (`OPEN` + binary loop).
 
-**UDP** (e.g. DNS via SOCKS5 UDP) is carried over a **separate** TLS+WSS session: the client opens a **UDP mux** (`UDP_MUX_OPEN` in `protocol.rs`), then **UDP_REQ** / **UDP_REP** frames fan out to a shared `UdpSocket` on the server. On the wire to the censor, UDP payloads are still **inside WebSocket binary frames over TLS**—same class of fingerprint as the TCP tunnel, not “raw UDP” on the client↔VPS leg. After decapsulation on the server, egress to `host:port` is ordinary UDP.
+**UDP** (e.g. DNS via SOCKS5 UDP) uses a **separate** shared WSS: **`UDP_MUX_OPEN`** (`protocol.rs`), then **UDP_REQ** / **UDP_REP** (`udp_mux.rs`). Same TLS/WebSocket fingerprint class as TCP from the client to the VPS.
 
-Typical traffic path (TCP):
+**HTTP on the TLS port:** non-WebSocket requests are served as **camouflage** (`incoming.rs`, `camouflage.rs`): nginx-style responses, optional **`--camouflage-dir`** static files, or **`--camouflage-url`** (`http://host:port` only — plaintext to origin).
 
-1. The application connects to **SOCKS5** on loopback (or `0.0.0.0` in a container).
-2. The client does **not** encrypt the local SOCKS hop — it is plain SOCKS5.
-3. The client opens **WSS**, optionally **BibaV2**: HELLO/ACK, keys from PSK, **ChaCha20-Poly1305** on frames, random decoy bytes in plaintext before AEAD.
-4. The server terminates TLS/WebSocket and outer crypto, then forwards to target host:port using the inner protocol (OPEN + padded frames).
+**DPI-oriented options:** `--pad-mode random|http-buckets`, `--dummy-interval-secs` (idle empty padded frames on the tunnel; mux shares one outer connection), client-only decoy **`--decoy-gets`** (+ interval and comma-separated paths), **`stealth.rs`** WebSocket upgrade header order per TLS profile (Chrome / Firefox).
 
-Typical path (UDP via SOCKS):
+Typical traffic path (TCP, mux):
 
-1. SOCKS5 **UDP ASSOCIATE** on the client; replies use SOCKS5 UDP framing (`socks5.rs` helpers + `parse_socks5_udp_datagram` / `build_socks5_udp_datagram` in `protocol.rs`).
-2. One **shared** UDP mux handle per process (`local_client.rs`) speaking **UDP_REQ**/**UDP_REP** on the dedicated WSS (`udp_mux.rs`).
+1. Application → **SOCKS5** (plain local hop).
+2. Client opens **WSS** to configured **`--ws-path`** (default `/ws`); **token** in **AUTH** binary (`protocol.rs`, `ws_auth.rs`), not in the URL.
+3. Optional **BibaV2** HELLO/ACK and AEAD on frames.
+4. **MUX_OPEN** then stream **OPEN** / **DATA** / close; server dispatches to per-stream TCP (`bridge_ws_tcp_mux_server`).
+
+Typical path (UDP via SOCKS): same as before — **UDP ASSOCIATE** → shared **UdpMuxHandle** and dedicated WSS.
 
 ## Layout
 
-
-| Path                                                | Role                                                                                                             |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `bibavpn/`                                          | Crate: `lib` plus `bibavpn-server`, `bibavpn-client` binaries                                                    |
-| `bibavpn/src/crypto_layer.rs`                       | BibaV2: BLAKE3 derive, HELLO/ACK, MAC, `SessionCrypto`, decoy                                                    |
-| `bibavpn/src/bin/server.rs`                         | Server entry (TLS, WSS, token, PSK); `wait_first_channel` → TCP bridge or **UDP mux** bridge                     |
-| `bibavpn/src/bin/client.rs`                         | Client entry (SOCKS5, HTTP CONNECT, WSS, PSK)                                                                    |
-| `bibavpn/src/socks5.rs`                             | SOCKS5 frontend (CONNECT + **UDP ASSOCIATE** replies)                                                            |
-| `bibavpn/src/local_client.rs`                       | SOCKS dispatch, **UDP ASSOCIATE**, shared `UdpMuxHandle`                                                         |
-| `bibavpn/src/udp_mux.rs`                            | Client driver + server **bridge_ws_udp_mux_server**; `Arc<UdpSocket>`; pending xid routing                       |
-| `bibavpn/src/protocol.rs`                           | OPEN, padding, **UDP_MUX_OPEN**, UDP_REQ/REP, SOCKS5 UDP helpers, ATYP helpers                                   |
-| `bibavpn/src/tls_util.rs`, `frame.rs`, `stealth.rs` | TLS profiles, optional **PEM pin** (`ClientTlsParams`), framing, WS upgrade (stealth headers, Sec-CH / UA)       |
-| `bibavpn/src/ws_bridge.rs`                          | WS↔TCP bridge: BibaV2 seal/open, MTU cap; outbound WS via **mpsc + one writer**; ping in writer `select!`        |
-| `bibavpn/src/http_connect.rs`                       | HTTP `CONNECT` on a separate listen port                                                                         |
-| `bibavpn/src/lib.rs`                                | Exports `udp_mux` and other modules                                                                              |
-| `docker/`                                           | `Dockerfile.server` (in-container Rust build), `Dockerfile.server.binary` (prebuilt binary), `Dockerfile.client` |
-| `docker-compose.yml`                                | Local lab: server + client on one Docker network                                                                 |
-| `scripts/`                                          | Smoke tests, deploy helpers, benchmarks                                                                          |
-
+| Path | Role |
+| ---- | ---- |
+| `bibavpn/` | Crate: `lib` plus `bibavpn-server`, `bibavpn-client` binaries |
+| `bibavpn/src/crypto_layer.rs` | BibaV2: BLAKE3 derive, HELLO/ACK, MAC, `SessionCrypto`, decoy |
+| `bibavpn/src/bin/server.rs` | TLS accept; **first-byte HTTP vs WS** via `incoming`; AUTH; `wait_first_channel` → TCP bridge, **TCP mux**, or UDP mux |
+| `bibavpn/src/bin/client.rs` | Client CLI; invite merge for `ws_path`, `pad_mode`, `dummy_interval_secs`, decoy flags |
+| `bibavpn/src/incoming.rs` | Read HTTP request on TLS; WebSocket **101** + `WebSocketStream::from_partially_read`; or serve camouflage GET/HEAD |
+| `bibavpn/src/camouflage.rs` | Shared HTML / 404 bodies for rejects and static fallbacks |
+| `bibavpn/src/ws_auth.rs` | Server waits for **AUTH** frame (timeout, skip noise) |
+| `bibavpn/src/tcp_mux.rs` | Mux wire format, client handle, server bridge, optional idle dummy on mux |
+| `bibavpn/src/decoy_traffic.rs` | Optional parallel short **HTTPS GETs** (same TLS profile as tunnel) |
+| `bibavpn/src/socks5.rs` | SOCKS5 frontend (CONNECT + **UDP ASSOCIATE** replies) |
+| `bibavpn/src/local_client.rs` | SOCKS dispatch, mux slot, UDP mux, decoy spawn, `LocalClientOptions` |
+| `bibavpn/src/udp_mux.rs` | Client driver + **`bridge_ws_udp_mux_server`**; padded frames + optional `pad_mode` |
+| `bibavpn/src/protocol.rs` | OPEN, **AUTH**, **UDP_MUX_OPEN**, UDP_REQ/REP, ATYP helpers |
+| `bibavpn/src/tls_util.rs`, `frame.rs`, `stealth.rs` | TLS profiles, **PadMode**, WS upgrade (ordered headers, UA / Sec-CH) |
+| `bibavpn/src/ws_bridge.rs` | WebSocket to TCP bridge (legacy per-connection TCP); ping + **dummy** task; `pad_mode` |
+| `bibavpn/src/http_connect.rs` | HTTP `CONNECT` on a separate listen port |
+| `bibavpn/src/invite_uri.rs` | **`InviteV1`**: optional `ws_path`, `pad_mode`, `dummy_interval_secs` |
+| `bibavpn/src/lib.rs` | Module exports |
+| `docker/` | `Dockerfile.server`, `Dockerfile.server.binary`, `Dockerfile.client` |
+| `docker-compose.yml` | Local lab: server + client on one Docker network |
+| `scripts/` | Smoke tests, deploy helpers, benchmarks |
 
 ## BibaV2 (short)
 
-- Enabled with matching `**--psk`** and `**--decoy-max**` on client and server.
+- Enabled with matching `--psk` and `--decoy-max` on client and server.
 - HELLO: magic `BIBV2HL1` + 32-byte client random.
 - ACK: `BIBV2ACK1` + server random + 16-byte keyed MAC (BLAKE3 over PSK).
-- Directional keys: separate `derive` `**bibavpn.v2.c2s**` / `**bibavpn.v2.s2c**` (split directions like many v2ray-style designs).
-- On the wire: 12-byte nonce + ciphertext; plaintext is optional decoy `0..N` bytes then **inner payload** (for tunnels: the padded TCP frame; see README diagrams).
-- Unit tests live in `crypto_layer` and `frame`; wire-format changes need matching client/server updates and tests.
+- Directional keys: `bibavpn.v2.c2s` / `bibavpn.v2.s2c`.
+- On the wire: 12-byte nonce + ciphertext; plaintext is optional decoy `0..N` bytes then **inner payload** (padded frame or mux record, etc.).
+- Unit tests in `crypto_layer`, `frame`, `protocol` (AUTH); wire-format changes need client **and** server updates.
 
-## BibaV2.1 (WebSocket behaviour and fingerprint)
+## BibaV2.1 and transport knobs
 
-Compatible with the **same** BibaV2 PSK/decoy when both ends use the same new flags.
+Compatible with the same BibaV2 PSK/decoy when both ends match.
 
-- `**--ws-ping-secs`**: periodic WebSocket **Ping** during tunneling (`0` = off). Incoming **Ping** gets **Pong** (including while waiting for HELLO/OPEN). Reduces idle/NAT drops.
-- `**--ws-ping-jitter-percent`**: vary ping interval ±N% (0–50) around the base period.
-- `**--ws-binary-send-jitter-ms**`: optional random delay 0..=N ms before each outbound WS **Binary** (TCP tunnel and UDP mux client path).
-- `**--max-ws-binary`**: max size of one **outgoing** WS binary (and coarse inbound check). TCP is read in chunks; with BibaV2 account for nonce/tag/decoy (see `frame::max_tcp_payload_per_ws_message`). Library default is **262144** bytes (`frame::DEFAULT_MAX_WS_BINARY`, throughput-oriented); use **1400** (or similar) if middleboxes or MTU force smaller frames.
-- `**--udp-max-pad`**, `**--udp-max-ws-binary**`: optional overrides for the **UDP mux** leg only (default: same as `--max-pad` / `--max-ws-binary`).
-- `**--udp-mux-recv-timeout-secs`** (server): upper bound on blocking `recv_from` for UDP mux bridge (seconds, clamped). `**--udp-mux-reply-timeout-secs**` (client): max wait for a mux reply per SOCKS UDP datagram (`0` = unlimited).
-- `**--ws-host**`, `**--ws-origin**`, `**--ws-user-agent**`, `**--ws-accept-language**`, repeatable `**--ws-header 'Name: value'**` customize the HTTP upgrade instead of a fixed header set.
-- `**--early-ws-frames**`: count of random binary frames **right after** the WS upgrade (before junk/HELLO) to vary startup pattern.
-- `**--pin-cert`** (client): trust only given PEM leaf certs (repeatable); **incompatible** with `--insecure`. Production: real PKI or pins, not demo TLS.
+- `--ws-ping-secs`, `--ws-ping-jitter-percent`, `--ws-binary-send-jitter-ms`
+- `--max-ws-binary` — cap outgoing WS binary (see `frame::max_tcp_payload_per_ws_message`; mux code reserves **9 bytes** for the mux record header when chunking TCP).
+- `--udp-max-pad`, `--udp-max-ws-binary`, `--udp-mux-reply-timeout-secs` (client), `--udp-mux-recv-timeout-secs` (server)
+- `--ws-host`, `--ws-origin`, `--ws-user-agent`, `--ws-accept-language`, `--ws-header`
+- `--early-ws-frames`, `--junk-frames`
+- `--pin-cert` (client) — incompatible with `--insecure`
+- `--ws-path` / server `--ws-path` — WebSocket path; token via **AUTH** (default `/ws`)
+- Server `--legacy-path-auth` — accept old `/b/{token}` without AUTH (less safe)
+- `--pad-mode random|http-buckets` — padding distribution (invite may carry `pad_mode` string)
+- `--dummy-interval-secs` — idle empty padded frames (`0` = off); invite may set `dummy_interval_secs`
+- Client `--decoy-gets`, `--decoy-gets-interval-secs`, `--decoy-gets-paths` — not part of invite JSON (client-only)
+- Server `--camouflage-dir`, `--camouflage-url` (`http://` upstream only)
 
-`**rust-toolchain.toml` pins 1.89.0**: on **rustc 1.93** building `bibavpn-server` hit an ICE in early lint; pinning **1.89** stabilizes `cargo build`. Docker images use Rust **1.89+**.
+`rust-toolchain.toml` pins a stable Rust version for reproducible builds. Docker images use a matching or newer toolchain.
 
-Visual wire layouts (padded frame, BibaV2, OPEN, UDP mux) are in **[README.md](README.md)**.
+Wire layouts (padded frame, BibaV2, AUTH, OPEN, mux, UDP mux) are in **[README.md](README.md)**.
 
 ## Build and run (local)
 
@@ -78,7 +86,7 @@ cargo build --release -p bibavpn --bin bibavpn-server
 cargo build --release -p bibavpn --bin bibavpn-client
 ```
 
-Example client to a remote server (lab TLS — only if you trust the path):
+Example client (lab TLS — only if you trust the path):
 
 ```bash
 ./target/release/bibavpn-client \
@@ -100,60 +108,59 @@ Server (demo self-signed):
   --max-ws-binary 1400 --ws-ping-secs 25
 ```
 
-**Note:** `--insecure` on the client and self-signed on the server are for **tests only**. Production should use real certificates (e.g. Let’s Encrypt behind a reverse proxy) and **no** `--insecure`.
+**Note:** `--insecure` and self-signed are for **tests only**. Production: real certificates (e.g. Let’s Encrypt behind a reverse proxy) and no `--insecure`.
 
 ## Docker / Compose gotcha
 
-`Dockerfile.*` sets **`ENTRYPOINT`** to the binary path. In `docker-compose.yml`, **`command`** must list **argument flags only** (do not repeat the binary path). Otherwise `clap` sees an extra token and the container exits with code 2.
+`Dockerfile.*` sets **ENTRYPOINT** to the binary path. In `docker-compose.yml`, **`command`** must list **argument flags only** (do not repeat the binary path). Otherwise `clap` sees an extra token and the container exits with code 2.
 
-Images use **`rust:1.89-bookworm`** (or newer): older `cargo` cannot build dependencies that use edition 2024.
-
-**Small VPS / low disk:** full `Dockerfile.server` pulls the Rust toolchain inside Docker and can exceed available space. Use **local Linux build** (e.g. WSL) + **`docker/Dockerfile.server.binary`** (copy prebuilt `bibavpn-server`) — see **`scripts/remote-deploy.sh`**.
+**Small VPS / low disk:** use local build (e.g. WSL) + **`docker/Dockerfile.server.binary`** — see **`scripts/remote-deploy.sh`**.
 
 ## Scripts
 
+| Script | Purpose |
+| ------ | ------- |
+| `scripts/docker-smoke.sh` | `docker compose up`, `curl` via SOCKS and HTTP proxy, `down` |
+| `scripts/udp-socks-smoke.sh` | TCP via SOCKS + **UDP DNS** over SOCKS |
+| `scripts/wsl-test.sh` | Local smoke (plain/PSK) on WSL |
+| `scripts/wsl-local-bench.sh` | **64 MiB** HTTP direct vs SOCKS+WSS throughput (run in WSL from repo root) |
+| `scripts/remote-deploy.sh` | Sync + build + `Dockerfile.server.binary` deploy |
+| `scripts/remote-install-server.sh` | Build server image, `docker save` |
+| `scripts/speedtest-via-socks.py` | Speedtest via SOCKS |
+| `scripts/run-remote-speedtest.sh` | SSH + `speedtest-cli` on VPS |
 
-| Script                             | Purpose                                                                                                                                                                                  |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scripts/docker-smoke.sh`          | `docker compose up`, `curl` via SOCKS `127.0.0.1:11080` and HTTP proxy, `down`                                                                                                           |
-| `scripts/udp-socks-smoke.sh`       | Ephemeral ports: TCP via SOCKS + **UDP DNS** (8.8.8.8:53) over SOCKS; fails if server/client dies at start                                                                               |
-| `scripts/wsl-test.sh`              | Local smoke (plain/PSK) on WSL                                                                                                                                                           |
-| `scripts/remote-deploy.sh`         | Reads parent **`server.txt`** (lines: IP, user, pass, SSH port): `tar` sync → local `cargo build` → `scp` binary → **`Dockerfile.server.binary`** on host → recreate `bibavpn` container |
-| `scripts/remote-install-server.sh` | Build server image, `docker save`                                                                                                                                                        |
-| `scripts/speedtest-via-socks.py`   | Speedtest via SOCKS (`pysocks`, `speedtest-cli`)                                                                                                                                         |
-| `scripts/run-remote-speedtest.sh`  | SSH to VPS, venv, `speedtest-cli --simple` on the server (reads password/port from `server.txt` — gitignored)                                                                            |
-
-
-**Remote entry, client in Docker (no compose file):** build `docker/Dockerfile.client`, then `docker run` with `-p` for SOCKS and HTTP proxy and the same flags as in the [example client](#build-and-run-local) above. Inside the container use matching `--socks5 0.0.0.0:<socks_port>` and `--http-proxy 0.0.0.0:<http_port>`; publish those ports on the host (e.g. `11090:11090`, `11880:18080`).
+**Remote client in Docker:** build `docker/Dockerfile.client`, `docker run` with published SOCKS/HTTP proxy ports; use `0.0.0.0` binds inside the container.
 
 ## UDP design note (agents)
 
-The server keeps a **pending map** (by destination `SocketAddr`) to correlate **UDP_REP** to **UDP_REQ**. Under **many concurrent requests to the same** `IP:port`, replies could theoretically be matched out of order (same limitation as a naive single-socket demux). Hardening would be additional correlation (per-request id already exists as xid — verify end-to-end ordering guarantees if touching this).
+The server keeps a **pending map** (by destination `SocketAddr`) to correlate **UDP_REP** to **UDP_REQ**. Under many concurrent requests to the same `IP:port`, ordering assumptions matter (xid is per datagram).
 
 ## Security
 
-- **Do not commit:** `server.txt`, `.env`, `.env.remote`, passwords, PEM keys (see `.gitignore`).
-- Treat PSK, token, and invite passphrase as **secrets**; rotate and restart both ends on leak.
-- `**--pin-cert`** narrows trust to specific server leaf PEMs; do not combine with `**--insecure**` (client rejects that combination).
-- Prefer **SSH keys** over long credentials in `server.txt` for `remote-deploy.sh`.
+- **Do not commit:** `server.txt`, `.env`, passwords, PEM keys (see `.gitignore`).
+- Treat PSK, token, and invite passphrase as **secrets**.
+- `--pin-cert` narrows trust; do not combine with `--insecure` on the client.
+- Prefer **SSH keys** for `remote-deploy.sh`.
 - Do not embed real credentials in docs or examples.
 
 ## Guidelines for agents
 
 1. Touch only what the task needs; avoid unrelated refactors.
 2. Match existing style (`clap`, `tracing`, async, imports).
-3. Any BibaV2 wire change: update client **and** server plus tests; keep **[README.md](README.md)** wire diagrams in sync when on-wire layouts change.
-4. After Docker/Compose edits, run `scripts/docker-smoke.sh`; after UDP changes, run `scripts/udp-socks-smoke.sh` (WSL/bash).
-5. Use env vars and placeholders — never real IPs/passwords/PSK in the tree.
+3. Any wire-format change: update client **and** server plus tests; keep **[README.md](README.md)** in sync for on-wire layouts.
+4. After Docker/Compose edits, run `scripts/docker-smoke.sh`; after UDP changes, `scripts/udp-socks-smoke.sh`; for throughput sanity, `scripts/wsl-local-bench.sh` (WSL).
+5. Use placeholders — never real IPs/passwords/PSK in the tree.
 
 ## Scenarios that were validated
 
-- Local compose: SOCKS → `example.com`.
-- Workstation client → remote server → HTTPS (including `api.telegram.org`).
-- **SOCKS UDP** (DNS) via separate WSS mux (`udp-socks-smoke.sh`).
+- Local compose: SOCKS → example hosts.
+- Workstation client → remote server → HTTPS.
+- **SOCKS UDP** (DNS) via UDP mux (`udp-socks-smoke.sh`).
+- **WSL local bench**: direct HTTP vs SOCKS+WSS 64 MiB (`wsl-local-bench.sh`).
 - Speedtest via SOCKS (`speedtest-via-socks.py` in a venv).
-- Server/client images build with the Rust version pinned in the Dockerfiles; **remote** slim image via `Dockerfile.server.binary` on small disks.
+- Server/client images and slim remote image via `Dockerfile.server.binary`.
 
 ---
 
 *For humans and AI agents working on the BibaVPN repository.*
+

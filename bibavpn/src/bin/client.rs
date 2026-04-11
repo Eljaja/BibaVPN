@@ -2,13 +2,15 @@
 //! BibaV2 + BibaV2.1: PSK AEAD, WS ping, MTU-capped frames, custom WS headers, early noise.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
+use bibavpn::frame::PadMode;
 use bibavpn::invite_uri::decode_invite_v1;
 use bibavpn::local_client::{
     LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-    parse_host_port, parse_ws_header,
+    normalize_ws_path, parse_host_port, parse_ws_header,
 };
 use bibavpn::tls_util::{TlsClientProfile, install_ring_crypto};
 use clap::Parser;
@@ -118,6 +120,33 @@ struct Args {
     /// randomized, randomized-alpn, randomized-no-alpn. If omitted with `--from-invite`, uses invite field.
     #[arg(long)]
     tls_profile: Option<String>,
+
+    /// WebSocket path (token is sent in AUTH frame). Invite may override when unset.
+    #[arg(long)]
+    ws_path: Option<String>,
+
+    /// Use legacy per-connection TCP tunnels instead of one multiplexed WSS.
+    #[arg(long, default_value_t = false)]
+    no_mux: bool,
+
+    /// Padding: `random` or `http-buckets`.
+    #[arg(long)]
+    pad_mode: Option<String>,
+
+    /// Idle dummy padded frames on WSS (0 = off). Invite may set default when unset.
+    #[arg(long)]
+    dummy_interval_secs: Option<u64>,
+
+    /// Enable parallel decoy HTTPS GETs to the server.
+    #[arg(long, default_value_t = false)]
+    decoy_gets: bool,
+
+    #[arg(long, default_value_t = 30)]
+    decoy_gets_interval_secs: u64,
+
+    /// Comma-separated paths for decoy GETs (default: built-in list when empty).
+    #[arg(long)]
+    decoy_gets_paths: Option<String>,
 }
 
 #[tokio::main]
@@ -224,6 +253,51 @@ async fn main() -> anyhow::Result<()> {
             TlsClientProfile::default()
         };
 
+    let ws_path = normalize_ws_path(
+        args.ws_path
+            .as_deref()
+            .or(inv_opt.as_ref().and_then(|i| i.ws_path.as_deref()))
+            .unwrap_or("/ws"),
+    );
+
+    let use_tcp_mux = !args.no_mux;
+
+    let pad_mode: PadMode = match args
+        .pad_mode
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => PadMode::from_str(s).context("--pad-mode")?,
+        None => {
+            if let Some(ref inv) = inv_opt {
+                if let Some(ref ps) = inv.pad_mode {
+                    PadMode::from_str(ps).context("invite pad_mode")?
+                } else {
+                    PadMode::Random
+                }
+            } else {
+                PadMode::Random
+            }
+        }
+    };
+
+    let dummy_interval_secs = args
+        .dummy_interval_secs
+        .or(inv_opt.as_ref().and_then(|i| i.dummy_interval_secs))
+        .unwrap_or(0);
+
+    let decoy_gets_paths: Vec<String> = args
+        .decoy_gets_paths
+        .as_ref()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let pinned_certs_pem = if args.pin_cert.is_empty() {
         None
     } else {
@@ -264,6 +338,13 @@ async fn main() -> anyhow::Result<()> {
         udp_mux_reply_timeout_secs,
         tls_profile,
         pinned_certs_pem,
+        ws_path,
+        use_tcp_mux,
+        pad_mode,
+        dummy_interval_secs,
+        decoy_gets: args.decoy_gets,
+        decoy_gets_interval_secs: args.decoy_gets_interval_secs,
+        decoy_gets_paths,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

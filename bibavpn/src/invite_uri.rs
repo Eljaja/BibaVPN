@@ -44,6 +44,15 @@ pub struct InviteV1 {
     pub insecure: bool,
     #[serde(default = "default_tls_profile")]
     pub tls_profile: String,
+    /// WebSocket HTTP path (default `/ws`). Omit in JSON for backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ws_path: Option<String>,
+    /// `random` or `http-buckets` (padding mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pad_mode: Option<String>,
+    /// Idle dummy WSS frames interval seconds (`0` = off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dummy_interval_secs: Option<u64>,
 }
 
 fn default_tls_profile() -> String {
@@ -129,6 +138,9 @@ mod tests {
             udp_mux_reply_timeout_secs: 130,
             insecure: true,
             tls_profile: "default".into(),
+            ws_path: None,
+            pad_mode: None,
+            dummy_interval_secs: None,
         };
         let u = encode_invite_v1(&i, "pass").unwrap();
         assert!(u.starts_with(PREFIX));

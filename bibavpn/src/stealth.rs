@@ -15,7 +15,10 @@ const UA_FIREFOX65: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) 
 
 const UA_FIREFOX63: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0";
 
-fn default_user_agent(profile: TlsClientProfile) -> &'static str {
+const ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
+
+/// Default `User-Agent` for `TlsClientProfile` (also used by decoy GETs).
+pub fn default_user_agent_for_profile(profile: TlsClientProfile) -> &'static str {
     match profile {
         TlsClientProfile::Firefox65 => UA_FIREFOX65,
         TlsClientProfile::Firefox63 => UA_FIREFOX63,
@@ -62,35 +65,61 @@ pub fn build_websocket_request(p: WsHandshakeParams<'_>) -> Request<()> {
     };
     let host_h = p.host_header.unwrap_or(default_host.as_str());
 
-    let ua = p.user_agent.unwrap_or_else(|| default_user_agent(p.tls_profile));
+    let ua = p
+        .user_agent
+        .unwrap_or_else(|| default_user_agent_for_profile(p.tls_profile));
     let origin = p
         .origin
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("https://{}", p.sni));
     let al = p.accept_language.unwrap_or(DEFAULT_AL);
 
-    let mut req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("Host", host_h)
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", key)
-        .header("Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits")
-        .header("User-Agent", ua)
-        .header("Origin", origin)
-        .header("Accept-Language", al);
-
-    if !is_firefox_profile(p.tls_profile) {
-        req = req
+    let mut req = if is_firefox_profile(p.tls_profile) {
+        Request::builder()
+            .method("GET")
+            .uri(uri.clone())
+            .header("Host", host_h)
+            .header("User-Agent", ua)
+            .header("Accept", "*/*")
+            .header("Accept-Language", al)
+            .header("Accept-Encoding", ACCEPT_ENCODING)
+            .header("Sec-WebSocket-Version", "13")
+            .header("Origin", origin)
+            .header(
+                "Sec-WebSocket-Extensions",
+                "permessage-deflate; client_max_window_bits",
+            )
+            .header("Sec-WebSocket-Key", &key)
+            .header("Connection", "keep-alive, Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache")
+    } else {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Host", host_h)
+            .header("Connection", "Upgrade")
+            .header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache")
+            .header("User-Agent", ua)
+            .header("Upgrade", "websocket")
+            .header("Origin", origin)
+            .header("Sec-WebSocket-Version", "13")
+            .header("Accept-Encoding", ACCEPT_ENCODING)
+            .header("Accept-Language", al)
+            .header("Sec-WebSocket-Key", &key)
+            .header(
+                "Sec-WebSocket-Extensions",
+                "permessage-deflate; client_max_window_bits",
+            )
             .header(
                 "Sec-CH-UA",
                 "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
             )
             .header("Sec-CH-UA-Mobile", "?0")
-            .header("Sec-CH-UA-Platform", "\"Windows\"");
-    }
+            .header("Sec-CH-UA-Platform", "\"Windows\"")
+    };
 
     for (k, v) in p.extra_headers {
         req = req.header(k, v);

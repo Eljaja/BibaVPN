@@ -6,17 +6,19 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{Duration, sleep};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::crypto_layer::SessionCrypto;
 use crate::retry::{maybe_ws_binary_send_jitter, ws_ping_period_duration};
-use crate::{read_padded_frame, write_padded_frame};
+use crate::frame::PadMode;
+use crate::{read_padded_frame, write_padded_frame_with_mode};
 
 pub type SharedCrypto = Arc<SessionCrypto>;
 
@@ -70,6 +72,8 @@ impl AsyncRead for BridgedTcpRead {
 /// Bridge after OPEN: TCP ↔ WebSocket padded binary (optional BibaV2 AEAD).
 ///
 /// `tcp_uplink_prefix`: data already consumed from the client socket (forward before reading more).
+///
+/// `dummy_interval_secs`: send empty padded frames on idle (0 = off); interval jittered ±50% around this base.
 pub async fn bridge_ws_tcp_padded<S>(
     ws: WebSocketStream<S>,
     tcp: TcpStream,
@@ -82,6 +86,8 @@ pub async fn bridge_ws_tcp_padded<S>(
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
     end: TunnelEnd,
+    pad_mode: PadMode,
+    dummy_interval_secs: u64,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -97,6 +103,7 @@ where
     let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(WS_OUT_CAP);
     let ws_out_up = ws_out_tx.clone();
     let ws_out_dn = ws_out_tx.clone();
+    let ws_out_dummy = ws_out_tx.clone();
     drop(ws_out_tx);
 
     let writer = async move {
@@ -189,6 +196,7 @@ where
     };
 
     let crypto_dn = crypto.clone();
+    let crypto_dum = crypto.clone();
     let down = async move {
         let read_cap = max_chunk.saturating_mul(8).min(512 * 1024).max(max_chunk);
         let mut buf = vec![0u8; read_cap];
@@ -201,7 +209,8 @@ where
             let mut off = 0usize;
             while off < n {
                 let take = (n - off).min(max_chunk);
-                write_padded_frame(&mut wire, &buf[off..off + take], max_pad).context("pack frame")?;
+                write_padded_frame_with_mode(&mut wire, &buf[off..off + take], max_pad, pad_mode)
+                    .context("pack frame")?;
                 let blob = match (&crypto_dn, end) {
                     (Some(c), TunnelEnd::Client) => {
                         bytes::Bytes::from(
@@ -237,6 +246,41 @@ where
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::try_join!(writer, up, down)?;
+    let dummy = async move {
+        if dummy_interval_secs == 0 {
+            return Ok::<_, anyhow::Error>(());
+        }
+        let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
+        loop {
+            let lo = dummy_interval_secs.saturating_mul(1).saturating_div(2).max(1);
+            let hi = dummy_interval_secs.saturating_mul(3).saturating_div(2).max(lo);
+            let secs = rand::thread_rng().gen_range(lo..=hi);
+            sleep(Duration::from_secs(secs)).await;
+            wire.clear();
+            if write_padded_frame_with_mode(&mut wire, &[], max_pad, pad_mode).is_err() {
+                continue;
+            }
+            let blob = match (&crypto_dum, end) {
+                (Some(c), TunnelEnd::Client) => {
+                    match c.seal_client_to_server(&wire).await {
+                        Ok(b) => bytes::Bytes::from(b),
+                        Err(_) => continue,
+                    }
+                }
+                (Some(c), TunnelEnd::Server) => match c.seal_server_to_client(&wire).await {
+                    Ok(b) => bytes::Bytes::from(b),
+                    Err(_) => continue,
+                },
+                (None, _) => bytes::Bytes::from(std::mem::take(&mut wire)),
+            };
+            if blob.len() > max_ws_binary {
+                continue;
+            }
+            maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
+            let _ = ws_out_dummy.send(Message::Binary(blob)).await;
+        }
+    };
+
+    tokio::try_join!(writer, up, down, dummy)?;
     Ok(())
 }

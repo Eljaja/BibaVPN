@@ -253,6 +253,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http",
+ "httparse",
  "rand 0.8.5",
  "rcgen",
  "rustls",

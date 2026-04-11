@@ -3,22 +3,24 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
-use bibavpn::frame::DEFAULT_MAX_WS_BINARY;
+use bibavpn::frame::{DEFAULT_MAX_WS_BINARY, PadMode};
+use bibavpn::incoming::{CamouflageServeConfig, WsHandshakeKind, accept_websocket_or_camouflage};
 use bibavpn::invite_uri::{InviteV1, encode_invite_v1};
-use bibavpn::local_client::{DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS, parse_host_port};
+use bibavpn::local_client::{DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS, normalize_ws_path, parse_host_port};
 use bibavpn::protocol::{decode_open, is_udp_mux_open};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
+use bibavpn::ws_auth::server_wait_token_auth;
 use bibavpn::ws_bridge::TunnelEnd;
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
+use std::str::FromStr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info};
 
@@ -30,6 +32,14 @@ struct Args {
 
     #[arg(long, default_value = "change-me")]
     token: String,
+
+    /// WebSocket HTTP path (token is sent in AUTH frame). Default `/ws`.
+    #[arg(long, default_value = "/ws")]
+    ws_path: String,
+
+    /// Accept legacy clients that use URL `/b/{token}` without AUTH frame (less secure).
+    #[arg(long, default_value_t = false)]
+    legacy_path_auth: bool,
 
     #[arg(long)]
     cert: Option<PathBuf>,
@@ -63,7 +73,7 @@ struct Args {
     #[arg(long, default_value = "0")]
     ws_ping_jitter_percent: u8,
 
-    /// Random 0..=N ms delay before each outbound WS binary frame (server → client).
+    /// Random 0..=N ms delay before each outbound WebSocket frame (server → client).
     #[arg(long, default_value = "0")]
     ws_binary_send_jitter_ms: u8,
 
@@ -98,6 +108,22 @@ struct Args {
     /// Per-request UDP `recv_from` timeout on the server for UDP mux (seconds, 1–600).
     #[arg(long, default_value_t = 120)]
     udp_mux_recv_timeout_secs: u64,
+
+    /// Serve static files for HTTP GET (camouflage). If unset, GET still returns simple nginx-like pages.
+    #[arg(long)]
+    camouflage_dir: Option<PathBuf>,
+
+    /// Reverse-proxy origin for HTTP GET (`http://host:port` only; TLS to origin not implemented).
+    #[arg(long)]
+    camouflage_url: Option<String>,
+
+    /// Inner frame padding mode: `random` or `http-buckets`.
+    #[arg(long, default_value = "random")]
+    pad_mode: String,
+
+    /// Send idle padded empty frames on TCP tunnels (0 = off). Matches client `--dummy-interval-secs`.
+    #[arg(long, default_value_t = 0)]
+    dummy_interval_secs: u64,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -113,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
 
     install_ring_crypto();
     let args = Args::parse();
+    let ws_path = normalize_ws_path(&args.ws_path);
+    let pad_mode = PadMode::from_str(args.pad_mode.trim()).context("pad-mode")?;
 
     let tls_cfg: Arc<ServerConfig> = match (&args.cert, &args.key, &args.self_signed_san) {
         (Some(c), Some(k), _) => {
@@ -173,6 +201,12 @@ async fn main() -> anyhow::Result<()> {
             udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
             insecure: lab_insecure,
             tls_profile: "default".into(),
+            ws_path: Some(ws_path.clone()),
+            pad_mode: Some(match pad_mode {
+                PadMode::Random => "random".into(),
+                PadMode::HttpBuckets => "http-buckets".into(),
+            }),
+            dummy_interval_secs: Some(args.dummy_interval_secs).filter(|&x| x > 0),
         };
         let uri = encode_invite_v1(&invite, passphrase).context("build invite URI")?;
         println!("{}", uri);
@@ -190,19 +224,30 @@ async fn main() -> anyhow::Result<()> {
     let udp_mux_pad = args.udp_max_pad.unwrap_or(max_pad);
     let udp_mux_ws = args.udp_max_ws_binary.unwrap_or(max_ws_binary);
     let udp_mux_recv = Duration::from_secs(args.udp_mux_recv_timeout_secs.clamp(1, 600));
+    let legacy_path_auth = args.legacy_path_auth;
+    let dummy_interval_secs = args.dummy_interval_secs;
+    let camouflage_dir = args.camouflage_dir.clone();
+    let camouflage_url = args.camouflage_url.clone();
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let token = token.clone();
-        let psk = psk.clone();
+        let ws_path = ws_path.clone();
+        let camo = CamouflageServeConfig {
+            static_dir: camouflage_dir.clone(),
+            reverse_proxy: camouflage_url.clone(),
+        };
+        let psk_conn = psk.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_one(
                 stream,
                 acceptor,
                 token,
+                ws_path,
+                legacy_path_auth,
                 max_pad,
-                psk,
+                psk_conn,
                 decoy_max,
                 max_ws_binary,
                 ws_ping_secs,
@@ -211,6 +256,9 @@ async fn main() -> anyhow::Result<()> {
                 udp_mux_pad,
                 udp_mux_ws,
                 udp_mux_recv,
+                pad_mode,
+                dummy_interval_secs,
+                camo,
             )
             .await
             {
@@ -224,6 +272,8 @@ async fn handle_one(
     tcp: TcpStream,
     acceptor: TlsAcceptor,
     token: String,
+    ws_path: String,
+    legacy_path_auth: bool,
     max_pad: u8,
     psk: Option<String>,
     decoy_max: u8,
@@ -234,23 +284,24 @@ async fn handle_one(
     udp_mux_max_pad: u8,
     udp_mux_max_ws_binary: usize,
     udp_mux_recv_timeout: Duration,
+    pad_mode: PadMode,
+    dummy_interval_secs: u64,
+    camo: CamouflageServeConfig,
 ) -> anyhow::Result<()> {
     let tls = acceptor.accept(tcp).await.context("tls accept")?;
-    let path_ok = format!("/b/{token}");
-    let ws = tokio_tungstenite::accept_hdr_async(tls, |req: &Request, response: Response| {
-        if req.uri().path() != path_ok.as_str() {
-            let err: ErrorResponse = http::Response::builder()
-                .status(404)
-                .body(Some("not found".to_string()))
-                .unwrap();
-            return Err(err);
-        }
-        Ok(response)
-    })
-    .await
-    .context("ws accept")?;
 
-    let mut ws = ws;
+    let Some((mut ws, accept_kind)) =
+        accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo).await?
+    else {
+        return Ok(());
+    };
+
+    if accept_kind == WsHandshakeKind::NewPath {
+        server_wait_token_auth(&mut ws, &token, Duration::from_secs(5))
+            .await
+            .context("AUTH")?;
+    }
+
     let crypto: Option<SharedCrypto> = if let Some(ref secret) = psk {
         info!("BibaV2 PSK mode, decoy_max={decoy_max}");
         Some(Arc::new(
@@ -279,6 +330,8 @@ async fn handle_one(
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
                 TunnelEnd::Server,
+                pad_mode,
+                dummy_interval_secs,
             )
             .await?;
         }
@@ -294,6 +347,23 @@ async fn handle_one(
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
                 udp_mux_recv_timeout,
+                pad_mode,
+            )
+            .await?;
+        }
+        FirstChannel::Mux { ws } => {
+            info!("TCP mux (many streams / one WSS)");
+            bibavpn::tcp_mux::bridge_ws_tcp_mux_server(
+                ws,
+                max_pad,
+                decoy_max,
+                crypto,
+                max_ws_binary,
+                ws_ping_secs,
+                ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms,
+                pad_mode,
+                dummy_interval_secs,
             )
             .await?;
         }
@@ -311,6 +381,7 @@ where
         ws: WebSocketStream<S>,
     },
     UdpMux { ws: WebSocketStream<S> },
+    Mux { ws: WebSocketStream<S> },
 }
 
 async fn wait_first_channel<S>(mut ws: WebSocketStream<S>) -> anyhow::Result<FirstChannel<S>>
@@ -327,6 +398,9 @@ where
                 if is_udp_mux_open(b.as_ref()) {
                     return Ok(FirstChannel::UdpMux { ws });
                 }
+                if bibavpn::tcp_mux::is_mux_open(b.as_ref()) {
+                    return Ok(FirstChannel::Mux { ws });
+                }
             }
             Message::Ping(p) => {
                 ws.send(Message::Pong(p)).await.context("pong during OPEN wait")?;
@@ -335,7 +409,7 @@ where
             _ => {}
         }
     }
-    anyhow::bail!("eof before OPEN / UDP_MUX")
+    anyhow::bail!("eof before OPEN / UDP_MUX / MUX")
 }
 
 async fn v2_server_preamble<S>(
@@ -372,4 +446,3 @@ where
         }
     }
 }
-

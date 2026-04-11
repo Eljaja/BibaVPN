@@ -457,6 +457,13 @@ impl BibaApp {
             udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
             tls_profile,
             pinned_certs_pem: None,
+            ws_path: "/ws".to_string(),
+            use_tcp_mux: true,
+            pad_mode: bibavpn::PadMode::Random,
+            dummy_interval_secs: 0,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 30,
+            decoy_gets_paths: Vec::new(),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

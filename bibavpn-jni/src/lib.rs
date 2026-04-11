@@ -2,12 +2,15 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use std::str::FromStr;
+
 use anyhow::Context;
 use bibavpn::local_client::{
     LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-    parse_host_port, parse_ws_header,
+    normalize_ws_path, parse_host_port, parse_ws_header,
 };
 use bibavpn::tls_util::install_ring_crypto;
+use bibavpn::PadMode;
 use bibavpn::TlsClientProfile;
 use jni::JNIEnv;
 use jni::objects::{JClass, JString};
@@ -94,6 +97,21 @@ struct StartJson {
     /// PEM string (`CERTIFICATE` blocks). Leaf must match; mutually exclusive with `insecure`.
     #[serde(default)]
     pin_cert_pem: Option<String>,
+
+    #[serde(default)]
+    ws_path: Option<String>,
+    #[serde(default = "default_true")]
+    use_tcp_mux: bool,
+    #[serde(default)]
+    pad_mode: Option<String>,
+    #[serde(default)]
+    dummy_interval_secs: Option<u64>,
+    #[serde(default)]
+    decoy_gets: bool,
+    #[serde(default = "default_decoy_interval")]
+    decoy_gets_interval_secs: u64,
+    #[serde(default)]
+    decoy_gets_paths: Option<String>,
 }
 
 fn default_token() -> String {
@@ -120,6 +138,14 @@ fn default_udp_mux_reply_timeout() -> u64 {
     DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_decoy_interval() -> u64 {
+    30
+}
+
 fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
     let j: StartJson = serde_json::from_str(s)?;
     let invite_uri = j
@@ -133,9 +159,11 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
 
-    if invite_uri.is_some() != invite_pass.is_some() {
-        anyhow::bail!("invite: set both from_invite and invite_passphrase, or neither");
-    }
+    let invite_pair: Option<bibavpn::InviteV1> = match (invite_uri, invite_pass) {
+        (Some(uri), Some(pass)) => Some(bibavpn::decode_invite_v1(uri, pass).context("decode invite")?),
+        (None, None) => None,
+        _ => anyhow::bail!("invite: set both from_invite and invite_passphrase, or neither"),
+    };
 
     let mut extra = Vec::new();
     for line in &j.ws_headers {
@@ -168,8 +196,7 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         udp_mux_reply_timeout_secs,
         insecure_tls,
         tls_profile,
-    ) = if let (Some(uri), Some(pass)) = (invite_uri, invite_pass) {
-        let inv = bibavpn::decode_invite_v1(uri, pass).context("decode invite")?;
+    ) = if let Some(ref inv) = invite_pair {
         let (h, p) = parse_host_port(inv.server.trim()).context("invite server")?;
         let sni = j.sni.clone().unwrap_or_else(|| inv.sni.clone());
         let tls_s = j
@@ -184,11 +211,11 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
             h,
             p,
             sni,
-            inv.token,
+            inv.token.clone(),
             inv.max_pad,
             j.junk_frames,
             j.early_ws_frames,
-            inv.psk,
+            inv.psk.clone(),
             inv.decoy_max,
             inv.max_ws_binary,
             inv.ws_ping_secs,
@@ -238,6 +265,46 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         )
     };
 
+    let ws_path = normalize_ws_path(
+        j.ws_path
+            .as_deref()
+            .or(invite_pair.as_ref().and_then(|i| i.ws_path.as_deref()))
+            .unwrap_or("/ws"),
+    );
+
+    let use_tcp_mux = j.use_tcp_mux;
+
+    let pad_mode: PadMode = match j.pad_mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => PadMode::from_str(s).context("pad_mode")?,
+        None => {
+            if let Some(ref inv) = invite_pair {
+                if let Some(ref ps) = inv.pad_mode {
+                    PadMode::from_str(ps).context("invite pad_mode")?
+                } else {
+                    PadMode::Random
+                }
+            } else {
+                PadMode::Random
+            }
+        }
+    };
+
+    let dummy_interval_secs = j
+        .dummy_interval_secs
+        .or(invite_pair.as_ref().and_then(|i| i.dummy_interval_secs))
+        .unwrap_or(0);
+
+    let decoy_gets_paths: Vec<String> = j
+        .decoy_gets_paths
+        .as_ref()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(LocalClientOptions {
         server_host,
         server_port,
@@ -265,6 +332,13 @@ fn opts_from_json(s: &str) -> anyhow::Result<LocalClientOptions> {
         udp_mux_reply_timeout_secs,
         tls_profile,
         pinned_certs_pem,
+        ws_path,
+        use_tcp_mux,
+        pad_mode,
+        dummy_interval_secs,
+        decoy_gets: j.decoy_gets,
+        decoy_gets_interval_secs: j.decoy_gets_interval_secs,
+        decoy_gets_paths,
     })
 }
 
@@ -317,6 +391,9 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeDecodeInvite(
             "udp_mux_reply_timeout_secs": inv.udp_mux_reply_timeout_secs,
             "insecure": inv.insecure,
             "tls_profile": inv.tls_profile,
+            "ws_path": inv.ws_path,
+            "pad_mode": inv.pad_mode,
+            "dummy_interval_secs": inv.dummy_interval_secs,
         })
         .to_string(),
         Err(e) => json!({

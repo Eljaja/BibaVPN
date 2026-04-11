@@ -19,13 +19,14 @@ use tracing::{error, trace, warn};
 
 use crate::crypto_layer::{self, SessionCrypto};
 use crate::protocol::{
-    decode_udp_rep, decode_udp_req, encode_udp_mux_open, encode_udp_rep, encode_udp_req,
+    decode_udp_rep, decode_udp_req, encode_auth, encode_udp_mux_open, encode_udp_rep, encode_udp_req,
 };
 use crate::retry::{maybe_ws_binary_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period};
 use crate::stealth::{WsHandshakeParams, build_websocket_request};
 use crate::tls_util::TlsClientProfile;
 use crate::ws_bridge::SharedCrypto;
-use crate::{read_padded_frame, write_padded_frame};
+use crate::frame::PadMode;
+use crate::{read_padded_frame, write_padded_frame_with_mode};
 
 /// Max concurrent server-side UDP request tasks per mux session.
 const UDP_MUX_SERVER_MAX_INFLIGHT: usize = 512;
@@ -56,6 +57,8 @@ pub struct UdpMuxConfig {
     pub ws_ping_jitter_percent: u8,
     pub ws_binary_send_jitter_ms: u8,
     pub tls_profile: TlsClientProfile,
+    pub ws_path: String,
+    pub pad_mode: PadMode,
 }
 
 pub enum ClientUdpCmd {
@@ -206,7 +209,7 @@ async fn connect_udp_mux_ws(
     let domain = ServerName::try_from(cfg.sni.clone())?;
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
     let tls = connector.connect(domain, tcp).await.context("tls")?;
-    let path = format!("/b/{}", cfg.token);
+    let path = cfg.ws_path.clone();
     let ws_host = cfg.ws_host.as_deref();
     let ws_origin = cfg.ws_origin.as_deref();
     let ws_ua = cfg.ws_user_agent.as_deref();
@@ -233,6 +236,14 @@ async fn connect_udp_mux_ws(
         .await
         .context("junk frames")?;
 
+    let auth = encode_auth(&cfg.token).context("encode AUTH (udp mux)")?;
+    if auth.len() > cfg.max_ws_binary {
+        anyhow::bail!("AUTH frame larger than --max-ws-binary");
+    }
+    ws.send(Message::Binary(Bytes::from(auth)))
+        .await
+        .context("send AUTH (udp mux)")?;
+
     let crypto: Option<SharedCrypto> = if let Some(ref secret) = cfg.psk {
         Some(Arc::new(
             v2_client_preamble(&mut ws, secret, cfg.decoy_max).await?,
@@ -255,12 +266,12 @@ async fn connect_udp_mux_ws(
 async fn pack_tunnel_out(
     crypto: &Option<SharedCrypto>,
     max_pad: u8,
-    _decoy_max: u8,
+    pad_mode: PadMode,
     max_ws_binary: usize,
     body: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let mut wire = Vec::new();
-    write_padded_frame(&mut wire, body, max_pad).context("pack frame")?;
+    write_padded_frame_with_mode(&mut wire, body, max_pad, pad_mode).context("pack frame")?;
     let blob: Vec<u8> = match crypto {
         Some(c) => c
             .seal_client_to_server(&wire)
@@ -344,7 +355,7 @@ async fn run_udp_mux_one_session(
                         let blob = match pack_tunnel_out(
                             &crypto,
                             cfg.max_pad,
-                            cfg.decoy_max,
+                            cfg.pad_mode,
                             cfg.max_ws_binary,
                             &req,
                         )
@@ -427,6 +438,7 @@ pub async fn bridge_ws_udp_mux_server<S>(
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
     recv_timeout: Duration,
+    pad_mode: PadMode,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -517,7 +529,8 @@ where
                             &rbuf[..n],
                         )?;
                         let mut wire = Vec::new();
-                        write_padded_frame(&mut wire, &rep_plain, max_pad).context("pad rep")?;
+                        write_padded_frame_with_mode(&mut wire, &rep_plain, max_pad, pad_mode)
+                            .context("pad rep")?;
                         let blob: Vec<u8> = match &crypto {
                             Some(c) => c
                                 .seal_server_to_client(&wire)

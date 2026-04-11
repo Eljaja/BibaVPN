@@ -1,7 +1,34 @@
+use std::str::FromStr;
+
 use rand::{Rng, RngCore};
 
 const FRAME_VER: u8 = 1;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// Padding strategy for inner frames (wire format unchanged).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PadMode {
+    #[default]
+    Random,
+    /// Pad total inner frame size toward common HTTP response lengths.
+    HttpBuckets,
+}
+
+impl FromStr for PadMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "" | "random" => PadMode::Random,
+            "http-buckets" | "buckets" => PadMode::HttpBuckets,
+            other => anyhow::bail!("unknown pad-mode {other:?}: use random or http-buckets"),
+        })
+    }
+}
+
+const HTTP_BUCKETS: &[usize] = &[
+    128, 256, 512, 1024, 1460, 2048, 4096, 8192, 16384, 32768, 65536,
+];
 
 /// Default cap for one WebSocket binary message (fewer frames = higher throughput; lower if middleboxes break).
 pub const DEFAULT_MAX_WS_BINARY: usize = 262_144;
@@ -39,6 +66,16 @@ pub enum FrameError {
 /// On-wire (inside one WebSocket binary message):
 /// `[ver u8][payload_len u24 BE][pad_len u8][pad * pad_len][payload * payload_len]`
 pub fn write_padded_frame(buf: &mut Vec<u8>, payload: &[u8], max_pad: u8) -> Result<(), FrameError> {
+    write_padded_frame_with_mode(buf, payload, max_pad, PadMode::Random)
+}
+
+/// Same as [`write_padded_frame`] with selectable padding distribution.
+pub fn write_padded_frame_with_mode(
+    buf: &mut Vec<u8>,
+    payload: &[u8],
+    max_pad: u8,
+    mode: PadMode,
+) -> Result<(), FrameError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(FrameError::TooLarge);
     }
@@ -47,10 +84,24 @@ pub fn write_padded_frame(buf: &mut Vec<u8>, payload: &[u8], max_pad: u8) -> Res
         return Err(FrameError::TooLarge);
     }
     let mut rng = rand::thread_rng();
+    let base = 5usize.saturating_add(len);
     let pad_len: u8 = if max_pad == 0 {
         0
     } else {
-        rng.gen_range(0..=max_pad)
+        match mode {
+            PadMode::Random => rng.gen_range(0..=max_pad),
+            PadMode::HttpBuckets => {
+                let mut target = HTTP_BUCKETS
+                    .iter()
+                    .copied()
+                    .find(|&b| b >= base)
+                    .unwrap_or(*HTTP_BUCKETS.last().unwrap_or(&base));
+                let j = rng.gen_range(95u16..=105u16);
+                target = (target.saturating_mul(j as usize) / 100).max(base);
+                let need = target.saturating_sub(base).min(usize::from(max_pad));
+                need as u8
+            }
+        }
     };
 
     buf.clear();

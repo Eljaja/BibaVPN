@@ -11,18 +11,21 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+use tokio_rustls::client::TlsStream;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info};
 
 use crate::crypto_layer::{self, SessionCrypto};
-use crate::frame::DEFAULT_MAX_WS_BINARY;
+use crate::decoy_traffic::{DecoyConfig, spawn_decoy_gets};
+use crate::frame::{DEFAULT_MAX_WS_BINARY, PadMode};
 use crate::http_connect;
-use crate::protocol::encode_open;
+use crate::protocol::{encode_auth, encode_open};
 use crate::retry::{OUTBOUND_CONNECT_ATTEMPTS, sleep_outbound_backoff};
-use crate::stealth::{WsHandshakeParams, build_websocket_request};
+use crate::stealth::{WsHandshakeParams, build_websocket_request, default_user_agent_for_profile};
 use crate::tls_util::{ClientTlsParams, TlsClientProfile, client_tls_config};
+use crate::tcp_mux::{self, MuxClientConfig, TcpMuxClientHandle};
 use crate::udp_mux::{UdpMuxConfig, UdpMuxHandle, spawn_udp_mux_driver};
 use crate::ws_bridge::{self, TunnelEnd};
 use crate::{socks5, socks5::SocksCommand};
@@ -40,6 +43,7 @@ pub struct LocalClientOptions {
     pub token: String,
     pub socks_bind: String,
     pub http_proxy_bind: Option<String>,
+    /// Passed through for decoy GETs and logging.
     pub insecure_tls: bool,
     pub max_pad: u8,
     pub junk_frames: u32,
@@ -67,6 +71,17 @@ pub struct LocalClientOptions {
     pub tls_profile: TlsClientProfile,
     /// PEM bytes (`CERTIFICATE` blocks). Leaf must match one DER exactly; mutually exclusive with `insecure_tls`.
     pub pinned_certs_pem: Option<Vec<u8>>,
+    /// WebSocket HTTP path; token is sent in AUTH frame, not in URL (default `/ws`).
+    pub ws_path: String,
+    /// Multiplex SOCKS TCP over one WSS (default true). Set false for legacy per-connection tunnels.
+    pub use_tcp_mux: bool,
+    pub pad_mode: PadMode,
+    /// Idle dummy WSS binary interval (0 = off).
+    pub dummy_interval_secs: u64,
+    /// Parallel decoy HTTPS GETs to the same server (camouflage).
+    pub decoy_gets: bool,
+    pub decoy_gets_interval_secs: u64,
+    pub decoy_gets_paths: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -75,6 +90,7 @@ struct ClientCfg {
     server_port: u16,
     sni: String,
     token: String,
+    insecure_tls: bool,
     tls: Arc<rustls::ClientConfig>,
     max_pad: u8,
     junk_frames: u32,
@@ -94,6 +110,13 @@ struct ClientCfg {
     udp_mux_max_ws_binary: usize,
     udp_mux_reply_timeout_secs: u64,
     tls_profile: TlsClientProfile,
+    ws_path: String,
+    use_tcp_mux: bool,
+    pad_mode: PadMode,
+    dummy_interval_secs: u64,
+    decoy_gets: bool,
+    decoy_gets_interval_secs: u64,
+    decoy_gets_paths: Vec<String>,
 }
 
 impl ClientCfg {
@@ -119,11 +142,127 @@ impl ClientCfg {
             ws_ping_jitter_percent: self.ws_ping_jitter_percent,
             ws_binary_send_jitter_ms: self.ws_binary_send_jitter_ms,
             tls_profile: self.tls_profile,
+            ws_path: self.ws_path.clone(),
+            pad_mode: self.pad_mode,
         }
     }
 }
 
+pub fn normalize_ws_path(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return "/ws".to_string();
+    }
+    if t.starts_with('/') {
+        t.to_string()
+    } else {
+        format!("/{t}")
+    }
+}
+
 type SharedCrypto = Arc<SessionCrypto>;
+
+type ClientWs = WebSocketStream<TlsStream<TcpStream>>;
+
+/// One attempt: TCP + TLS + WS + noise + AUTH + optional BibaV2 preamble (no OPEN / MUX).
+async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Option<SharedCrypto>)> {
+    let domain = ServerName::try_from(cfg.sni.clone())?;
+    let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
+    let path = cfg.ws_path.clone();
+
+    let tcp = TcpStream::connect((cfg.server_host.as_str(), cfg.server_port))
+        .await
+        .context("connect server")?;
+    let _ = tcp.set_nodelay(true);
+    let tls = connector.connect(domain, tcp).await.context("tls")?;
+
+    let ws_host = cfg.ws_host.as_deref();
+    let ws_origin = cfg.ws_origin.as_deref();
+    let ws_ua = cfg.ws_user_agent.as_deref();
+    let ws_al = cfg.ws_accept_language.as_deref();
+    let extra = cfg.ws_extra_headers.as_ref().clone();
+    let req = build_websocket_request(WsHandshakeParams {
+        host_for_tcp: &cfg.server_host,
+        port: cfg.server_port,
+        path: &path,
+        sni: &cfg.sni,
+        host_header: ws_host,
+        origin: ws_origin,
+        user_agent: ws_ua,
+        accept_language: ws_al,
+        extra_headers: &extra,
+        tls_profile: cfg.tls_profile,
+    });
+
+    let mut ws = tokio_tungstenite::client_async(req, tls)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("websocket")?
+        .0;
+
+    send_noise_binaries(&mut ws, u32::from(cfg.early_ws_frames), cfg.max_ws_binary).await?;
+    send_noise_binaries(&mut ws, cfg.junk_frames, cfg.max_ws_binary)
+        .await
+        .context("junk frames")?;
+
+    let auth = encode_auth(&cfg.token).context("encode AUTH")?;
+    if auth.len() > cfg.max_ws_binary {
+        anyhow::bail!("AUTH frame larger than --max-ws-binary");
+    }
+    ws.send(Message::Binary(Bytes::from(auth)))
+        .await
+        .context("send AUTH")?;
+
+    let crypto: Option<SharedCrypto> = if let Some(ref secret) = cfg.psk {
+        Some(Arc::new(
+            v2_client_preamble(&mut ws, secret, cfg.decoy_max).await?,
+        ))
+    } else {
+        None
+    };
+
+    Ok((ws, crypto))
+}
+
+async fn connect_tcp_mux_handle(cfg: &Arc<ClientCfg>) -> anyhow::Result<TcpMuxClientHandle> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
+        let res: anyhow::Result<TcpMuxClientHandle> = async {
+            let (mut ws, crypto) = one_try_wss_session(cfg).await?;
+            let mo = tcp_mux::encode_mux_open();
+            if mo.len() > cfg.max_ws_binary {
+                anyhow::bail!("MUX_OPEN larger than --max-ws-binary");
+            }
+            ws.send(Message::Binary(Bytes::from(mo)))
+                .await
+                .context("send MUX_OPEN")?;
+            let mcfg = MuxClientConfig {
+                max_pad: cfg.max_pad,
+                decoy_max: cfg.decoy_max,
+                max_ws_binary: cfg.max_ws_binary,
+                ws_ping_secs: cfg.ws_ping_secs,
+                ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
+                transport_v2: false,
+                pad_mode: cfg.pad_mode,
+                dummy_interval_secs: cfg.dummy_interval_secs,
+            };
+            Ok(tcp_mux::spawn_tcp_mux_client(ws, crypto, mcfg))
+        }
+        .await;
+        match res {
+            Ok(h) => return Ok(h),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
+                    break;
+                }
+                sleep_outbound_backoff(attempt).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tcp mux: connect failed")))
+}
 
 /// Build TLS config and run SOCKS5 (+ optional HTTP CONNECT) until `shutdown` becomes `true`.
 ///
@@ -157,12 +296,18 @@ pub async fn run_local_client(
             opts.decoy_max, opts.max_ws_binary, opts.ws_ping_secs
         );
     }
+    if opts.use_tcp_mux {
+        info!("TCP mode: multiplexed WSS (one outer connection)");
+    } else {
+        info!("TCP mode: legacy per-connection WSS (--no-mux)");
+    }
 
     let cfg = Arc::new(ClientCfg {
         server_host: opts.server_host.clone(),
         server_port: opts.server_port,
         sni: opts.sni,
         token: opts.token,
+        insecure_tls: opts.insecure_tls,
         tls,
         max_pad: opts.max_pad,
         junk_frames: opts.junk_frames,
@@ -182,9 +327,35 @@ pub async fn run_local_client(
         udp_mux_max_ws_binary,
         udp_mux_reply_timeout_secs: opts.udp_mux_reply_timeout_secs,
         tls_profile: opts.tls_profile,
+        ws_path: normalize_ws_path(&opts.ws_path),
+        use_tcp_mux: opts.use_tcp_mux,
+        pad_mode: opts.pad_mode,
+        dummy_interval_secs: opts.dummy_interval_secs,
+        decoy_gets: opts.decoy_gets,
+        decoy_gets_interval_secs: opts.decoy_gets_interval_secs,
+        decoy_gets_paths: opts.decoy_gets_paths.clone(),
     });
 
+    if cfg.decoy_gets {
+        let ua = default_user_agent_for_profile(cfg.tls_profile).to_string();
+        spawn_decoy_gets(
+            DecoyConfig {
+                server_host: cfg.server_host.clone(),
+                server_port: cfg.server_port,
+                sni: cfg.sni.clone(),
+                insecure: cfg.insecure_tls,
+                tls_profile: cfg.tls_profile,
+                pinned_certs_pem: opts.pinned_certs_pem.clone(),
+                interval_secs: cfg.decoy_gets_interval_secs.max(5),
+                paths: cfg.decoy_gets_paths.clone(),
+                user_agent: ua,
+            },
+            shutdown.clone(),
+        );
+    }
+
     let udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>> = Arc::new(Mutex::new(None));
+    let tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>> = Arc::new(Mutex::new(None));
 
     let socks_listener = TcpListener::bind(&opts.socks_bind)
         .await
@@ -200,6 +371,7 @@ pub async fn run_local_client(
             .with_context(|| format!("bind http proxy {http_bind}"))?;
         info!("HTTP CONNECT on {http_bind}");
         let cfg_http = cfg.clone();
+        let tcp_mux_http = tcp_mux_slot.clone();
         let mut shutdown_http = shutdown.clone();
         tokio::spawn(async move {
             loop {
@@ -213,8 +385,9 @@ pub async fn run_local_client(
                         match res {
                             Ok((sock, peer)) => {
                                 let c = cfg_http.clone();
+                                let tms = tcp_mux_http.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_http_peer(sock, c).await {
+                                    if let Err(e) = handle_http_peer(sock, c, tms).await {
                                         error!("http {peer}: {e:#}");
                                     }
                                 });
@@ -241,8 +414,9 @@ pub async fn run_local_client(
                 let (sock, peer) = res.context("socks accept")?;
                 let c = cfg.clone();
                 let ums = udp_mux_slot.clone();
+                let tms = tcp_mux_slot.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_socks_peer(sock, c, ums).await {
+                    if let Err(e) = handle_socks_peer(sock, c, ums, tms).await {
                         error!("socks {peer}: {e:#}");
                     }
                 });
@@ -272,11 +446,23 @@ async fn handle_socks_peer(
     mut local: TcpStream,
     cfg: Arc<ClientCfg>,
     udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
+    tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>>,
 ) -> anyhow::Result<()> {
     match socks5::socks5_read_command(&mut local).await? {
         SocksCommand::Connect { host, port } => {
             socks5::socks5_reply_ok(&mut local).await?;
-            tunnel_to_biba(local, host, port, cfg, Vec::new()).await
+            if cfg.use_tcp_mux {
+                let h = {
+                    let mut slot = tcp_mux_slot.lock().await;
+                    if slot.is_none() {
+                        *slot = Some(connect_tcp_mux_handle(&cfg).await?);
+                    }
+                    slot.as_ref().expect("mux set").clone()
+                };
+                h.open_stream(local, host, port, Vec::new()).await
+            } else {
+                tunnel_to_biba(local, host, port, cfg, Vec::new()).await
+            }
         }
         SocksCommand::UdpAssociate { .. } => {
             let udp = UdpSocket::bind("0.0.0.0:0").await.context("bind udp relay")?;
@@ -379,7 +565,11 @@ async fn run_socks_udp_assoc(
     Ok(())
 }
 
-async fn handle_http_peer(mut local: TcpStream, cfg: Arc<ClientCfg>) -> anyhow::Result<()> {
+async fn handle_http_peer(
+    mut local: TcpStream,
+    cfg: Arc<ClientCfg>,
+    tcp_mux_slot: Arc<Mutex<Option<TcpMuxClientHandle>>>,
+) -> anyhow::Result<()> {
     let (host, port, prefetch) = match http_connect::http_connect_handshake(&mut local).await {
         Ok(x) => x,
         Err(e) => {
@@ -388,7 +578,18 @@ async fn handle_http_peer(mut local: TcpStream, cfg: Arc<ClientCfg>) -> anyhow::
         }
     };
     http_connect::reply_connect_ok(&mut local).await?;
-    tunnel_to_biba(local, host, port, cfg, prefetch).await
+    if cfg.use_tcp_mux {
+        let h = {
+            let mut slot = tcp_mux_slot.lock().await;
+            if slot.is_none() {
+                *slot = Some(connect_tcp_mux_handle(&cfg).await?);
+            }
+            slot.as_ref().expect("mux set").clone()
+        };
+        h.open_stream(local, host, port, prefetch).await
+    } else {
+        tunnel_to_biba(local, host, port, cfg, prefetch).await
+    }
 }
 
 fn junk_upper_bound(max_ws_binary: usize) -> usize {
@@ -429,102 +630,44 @@ async fn tunnel_to_biba(
     cfg: Arc<ClientCfg>,
     tcp_uplink_prefix: Vec<u8>,
 ) -> anyhow::Result<()> {
-    let domain = ServerName::try_from(cfg.sni.clone())?;
-    let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
-    let path = format!("/b/{}", cfg.token);
-
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
-        let tcp = match TcpStream::connect((cfg.server_host.as_str(), cfg.server_port)).await {
-            Ok(t) => t,
+        match one_try_wss_session(&cfg).await {
+            Ok((mut ws, crypto)) => {
+                let open = encode_open(&host, port)?;
+                if open.len() > cfg.max_ws_binary {
+                    anyhow::bail!("OPEN frame larger than --max-ws-binary");
+                }
+                ws.send(Message::Binary(Bytes::from(open)))
+                    .await
+                    .context("send OPEN")?;
+
+                ws_bridge::bridge_ws_tcp_padded(
+                    ws,
+                    local,
+                    tcp_uplink_prefix,
+                    cfg.max_pad,
+                    cfg.decoy_max,
+                    crypto,
+                    cfg.max_ws_binary,
+                    cfg.ws_ping_secs,
+                    cfg.ws_ping_jitter_percent,
+                    cfg.ws_binary_send_jitter_ms,
+                    TunnelEnd::Client,
+                    cfg.pad_mode,
+                    cfg.dummy_interval_secs,
+                )
+                .await?;
+                return Ok(());
+            }
             Err(e) => {
-                last_err = Some(e.into());
+                last_err = Some(e);
                 if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
                     break;
                 }
                 sleep_outbound_backoff(attempt).await;
-                continue;
             }
-        };
-        let _ = tcp.set_nodelay(true);
-        let tls = match connector.connect(domain.clone(), tcp).await {
-            Ok(t) => t,
-            Err(e) => {
-                last_err = Some(e.into());
-                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
-                    break;
-                }
-                sleep_outbound_backoff(attempt).await;
-                continue;
-            }
-        };
-
-        let ws_host = cfg.ws_host.as_deref();
-        let ws_origin = cfg.ws_origin.as_deref();
-        let ws_ua = cfg.ws_user_agent.as_deref();
-        let ws_al = cfg.ws_accept_language.as_deref();
-        let extra = cfg.ws_extra_headers.as_ref().clone();
-        let req = build_websocket_request(WsHandshakeParams {
-            host_for_tcp: &cfg.server_host,
-            port: cfg.server_port,
-            path: &path,
-            sni: &cfg.sni,
-            host_header: ws_host,
-            origin: ws_origin,
-            user_agent: ws_ua,
-            accept_language: ws_al,
-            extra_headers: &extra,
-            tls_profile: cfg.tls_profile,
-        });
-
-        let mut ws = match tokio_tungstenite::client_async(req, tls).await {
-            Ok((w, _)) => w,
-            Err(e) => {
-                last_err = Some(e.into());
-                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
-                    break;
-                }
-                sleep_outbound_backoff(attempt).await;
-                continue;
-            }
-        };
-
-        send_noise_binaries(&mut ws, u32::from(cfg.early_ws_frames), cfg.max_ws_binary).await?;
-        send_noise_binaries(&mut ws, cfg.junk_frames, cfg.max_ws_binary)
-            .await
-            .context("junk frames")?;
-
-        let crypto: Option<SharedCrypto> = if let Some(ref secret) = cfg.psk {
-            Some(Arc::new(
-                v2_client_preamble(&mut ws, secret, cfg.decoy_max).await?,
-            ))
-        } else {
-            None
-        };
-
-        let open = encode_open(&host, port)?;
-        if open.len() > cfg.max_ws_binary {
-            anyhow::bail!("OPEN frame larger than --max-ws-binary");
         }
-        ws.send(Message::Binary(Bytes::from(open)))
-            .await
-            .context("send OPEN")?;
-
-        ws_bridge::bridge_ws_tcp_padded(
-            ws,
-            local,
-            tcp_uplink_prefix,
-            cfg.max_pad,
-            cfg.decoy_max,
-            crypto,
-            cfg.max_ws_binary,
-            cfg.ws_ping_secs,
-            cfg.ws_ping_jitter_percent,
-            cfg.ws_binary_send_jitter_ms,
-            TunnelEnd::Client,
-        )
-        .await?;
-        return Ok(());
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tunnel: connect failed")))

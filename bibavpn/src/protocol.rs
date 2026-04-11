@@ -8,6 +8,9 @@ use anyhow::Context;
 /// Fixed magic so random junk frames never collide.
 pub const OPEN_MAGIC: &[u8] = b"BIBA\x01OPEN\x00";
 
+/// Client → server: session token after WebSocket upgrade (auth outside URL path).
+pub const AUTH_MAGIC: &[u8] = b"BIBA\x01AUTH\x00";
+
 /// Opens a WebSocket session that carries UDP datagrams (same TLS+WSS envelope as TCP tun).
 pub const UDP_MUX_OPEN_MAGIC: &[u8] = b"BIBA\x01UDPM\x00";
 
@@ -18,6 +21,38 @@ pub const UDP_REQ_MAGIC: &[u8] = b"BIBA\x01UDPR\x00";
 pub const UDP_REP_MAGIC: &[u8] = b"BIBA\x01UDPQ\x00";
 
 pub const MAX_UDP_PAYLOAD: usize = 60 * 1024;
+
+pub fn encode_auth(token: &str) -> anyhow::Result<Vec<u8>> {
+    let t = token.as_bytes();
+    if t.len() > 0xffff {
+        anyhow::bail!("token too long");
+    }
+    let mut v = Vec::with_capacity(AUTH_MAGIC.len() + 2 + t.len());
+    v.extend_from_slice(AUTH_MAGIC);
+    v.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    v.extend_from_slice(t);
+    Ok(v)
+}
+
+pub fn decode_auth(data: &[u8]) -> anyhow::Result<String> {
+    if data.len() < AUTH_MAGIC.len() + 2 {
+        anyhow::bail!("short auth frame");
+    }
+    if !data.starts_with(AUTH_MAGIC) {
+        anyhow::bail!("not an auth frame");
+    }
+    let i = AUTH_MAGIC.len();
+    let tl = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+    if data.len() < i + 2 + tl {
+        anyhow::bail!("truncated auth token");
+    }
+    let s = std::str::from_utf8(&data[i + 2..i + 2 + tl])?.to_string();
+    Ok(s)
+}
+
+pub fn is_auth_frame(data: &[u8]) -> bool {
+    data.len() >= AUTH_MAGIC.len() && data.starts_with(AUTH_MAGIC)
+}
 
 pub fn encode_open(host: &str, port: u16) -> anyhow::Result<Vec<u8>> {
     let h = host.as_bytes();
@@ -197,6 +232,18 @@ pub fn parse_socks5_udp_datagram(data: &[u8]) -> anyhow::Result<(String, u16, Ve
     }
     let (h, p, n) = decode_atyp_host_port(&data[3..])?;
     Ok((h, p, data[3 + n..].to_vec()))
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn auth_roundtrip() {
+        let t = "secret-token-xyz";
+        let b = encode_auth(t).unwrap();
+        assert_eq!(decode_auth(&b).unwrap(), t);
+    }
 }
 
 #[cfg(test)]
