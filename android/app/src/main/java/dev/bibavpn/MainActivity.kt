@@ -257,6 +257,22 @@ private fun BibaRootScreen(
             },
         )
     }
+    var decoyGets by remember { mutableStateOf(last?.optBoolean("decoy_gets") ?: false) }
+    var decoyGetsInterval by remember {
+        mutableStateOf(
+            if (last?.has("decoy_gets_interval_secs") == true) {
+                last!!.getLong("decoy_gets_interval_secs").toString()
+            } else {
+                "30"
+            },
+        )
+    }
+    var decoyGetsPaths by remember {
+        mutableStateOf(last?.optString("decoy_gets_paths") ?: "")
+    }
+    var pinCertPem by remember {
+        mutableStateOf(last?.optString("pin_cert_pem") ?: "")
+    }
 
     val activity = context as ComponentActivity
     DisposableEffect(activity) {
@@ -356,6 +372,10 @@ private fun BibaRootScreen(
         udpMaxWsBinary = udpMaxWsBin.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
         udpMuxTimeout = udpMuxTimeout.trim().takeIf { it.isNotEmpty() }?.toLongOrNull(),
         dummyInterval = dummyInterval.toLongOrNull() ?: 0L,
+        decoyGets = decoyGets,
+        decoyGetsInterval = decoyGetsInterval.toLongOrNull() ?: 30L,
+        decoyGetsPaths = decoyGetsPaths,
+        pinCertPem = pinCertPem,
     )
 
     /** Актуальный сохранённый конфиг (не застывший snapshot из remember). */
@@ -412,6 +432,10 @@ private fun BibaRootScreen(
             udpMaxWsBinary = udpMaxWsBin.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
             udpMuxTimeout = udpMuxTimeout.trim().takeIf { it.isNotEmpty() }?.toLongOrNull(),
             dummyInterval = dummyInterval.toLongOrNull() ?: 0L,
+            decoyGets = decoyGets,
+            decoyGetsInterval = decoyGetsInterval.toLongOrNull() ?: 30L,
+            decoyGetsPaths = decoyGetsPaths,
+            pinCertPem = pinCertPem,
         )
     }
 
@@ -483,6 +507,14 @@ private fun BibaRootScreen(
                 onUdpMuxTimeoutChange = { udpMuxTimeout = it },
                 dummyInterval = dummyInterval,
                 onDummyIntervalChange = { dummyInterval = it },
+                decoyGets = decoyGets,
+                onDecoyGetsChange = { decoyGets = it },
+                decoyGetsInterval = decoyGetsInterval,
+                onDecoyGetsIntervalChange = { decoyGetsInterval = it },
+                decoyGetsPaths = decoyGetsPaths,
+                onDecoyGetsPathsChange = { decoyGetsPaths = it },
+                pinCertPem = pinCertPem,
+                onPinCertPemChange = { pinCertPem = it },
                 onBack = { showSettings = false },
             )
         } else {
@@ -785,6 +817,14 @@ private fun SettingsScreen(
     onUdpMuxTimeoutChange: (String) -> Unit,
     dummyInterval: String,
     onDummyIntervalChange: (String) -> Unit,
+    decoyGets: Boolean,
+    onDecoyGetsChange: (Boolean) -> Unit,
+    decoyGetsInterval: String,
+    onDecoyGetsIntervalChange: (String) -> Unit,
+    decoyGetsPaths: String,
+    onDecoyGetsPathsChange: (String) -> Unit,
+    pinCertPem: String,
+    onPinCertPemChange: (String) -> Unit,
     onBack: () -> Unit,
 ) {
     val scroll = rememberScrollState()
@@ -1103,6 +1143,51 @@ private fun SettingsScreen(
                 maxLines = 5,
                 placeholder = "Name: value",
             )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Decoy HTTPS GET", color = Color.White, fontSize = 14.sp)
+                    Text("Параллельные GET на сервер (как --decoy-gets)", color = TextMuted, fontSize = 12.sp)
+                }
+                Switch(
+                    checked = decoyGets,
+                    onCheckedChange = onDecoyGetsChange,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Mint,
+                        checkedTrackColor = Mint.copy(alpha = 0.4f),
+                        uncheckedThumbColor = TextMuted,
+                        uncheckedTrackColor = TextMuted.copy(alpha = 0.3f),
+                    ),
+                )
+            }
+            if (decoyGets) {
+                SettingsMiniField(
+                    label = "decoy_gets_interval_secs",
+                    value = decoyGetsInterval,
+                    onChange = onDecoyGetsIntervalChange,
+                    hint = "≥1 сек",
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                SettingsTextField(
+                    label = "decoy_gets_paths",
+                    value = decoyGetsPaths,
+                    onChange = onDecoyGetsPathsChange,
+                    placeholder = "/,/favicon.ico",
+                    hint = "Через запятую (как у desktop-клиента)",
+                )
+            }
+            SettingsTextField(
+                label = "pin_cert_pem",
+                value = pinCertPem,
+                onChange = onPinCertPemChange,
+                singleLine = false,
+                maxLines = 8,
+                placeholder = "-----BEGIN CERTIFICATE-----",
+                hint = "Один или несколько PEM; взаимоисключимо с insecure",
+            )
         }
 
         Spacer(Modifier.height(24.dp))
@@ -1280,6 +1365,10 @@ private fun buildJson(
     udpMaxWsBinary: Int?,
     udpMuxTimeout: Long?,
     dummyInterval: Long,
+    decoyGets: Boolean,
+    decoyGetsInterval: Long,
+    decoyGetsPaths: String,
+    pinCertPem: String,
 ): JSONObject {
     val o = JSONObject()
     val useInvite = fromInvite.isNotBlank() && invitePassphrase.isNotBlank()
@@ -1318,5 +1407,13 @@ private fun buildJson(
     if (psk.isNotBlank()) o.put("psk", psk)
     val lines = wsHeaders.lines().map { it.trim() }.filter { it.isNotBlank() }
     if (lines.isNotEmpty()) o.put("ws_headers", JSONArray(lines))
+    o.put("decoy_gets", decoyGets)
+    if (decoyGets) {
+        o.put("decoy_gets_interval_secs", decoyGetsInterval.coerceAtLeast(1))
+        val dp = decoyGetsPaths.trim()
+        if (dp.isNotEmpty()) o.put("decoy_gets_paths", dp)
+    }
+    val pin = pinCertPem.trim()
+    if (pin.isNotEmpty()) o.put("pin_cert_pem", pin)
     return o
 }

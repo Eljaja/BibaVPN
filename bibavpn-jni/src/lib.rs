@@ -6,9 +6,9 @@ use anyhow::Context;
 use bibavpn::local_client::LocalClientOptions;
 use bibavpn::start_json_config::local_client_options_from_json_str;
 use bibavpn::tls_util::install_ring_crypto;
-use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
+use jni::JNIEnv;
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -59,8 +59,7 @@ fn ensure_tracing() {
             }
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new("info")),
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
                 )
                 .with_ansi(false)
                 .with_writer(|| LogWriter)
@@ -104,7 +103,10 @@ fn jni_protect_socket(jvm: &jni::JavaVM, fd: std::os::unix::io::RawFd) -> std::i
             )
         })?;
         env.new_local_ref(gref.as_obj()).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("VpnProtect local ref: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("VpnProtect local ref: {e}"),
+            )
         })?
     };
     let jclass = JClass::from(local);
@@ -312,9 +314,7 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
         }
         Err(e) => {
             let msg = match e {
-                std::sync::mpsc::RecvTimeoutError::Timeout => {
-                    "SOCKS: таймаут ожидания bind (20 с)"
-                }
+                std::sync::mpsc::RecvTimeoutError::Timeout => "SOCKS: таймаут ожидания bind (20 с)",
                 std::sync::mpsc::RecvTimeoutError::Disconnected => {
                     "SOCKS: клиент не поднял порт (см. лог)"
                 }
