@@ -35,3 +35,6 @@ TODO_TOTHINK.txt
 deepreseach.md
 deepresearch-dpi-biba.md
 test.py
+
+*.pyc
+__pycache__/
