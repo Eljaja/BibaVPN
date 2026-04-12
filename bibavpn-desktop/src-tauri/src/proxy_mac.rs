@@ -214,16 +214,15 @@ fn split_host_port(hp: &str) -> Result<(String, String), String> {
 
 pub fn apply_proxy(
     http_host_port: &str,
-    socks_host_port: &str,
+    _socks_host_port: &str,
     _prior_proxy_override: Option<&str>,
 ) -> Result<(), String> {
     let (http_host, http_port) = split_host_port(http_host_port)?;
-    let (socks_host, socks_port) = split_host_port(socks_host_port)?;
     let services = services_for_proxy()?;
     let mut ok_any = false;
     let mut last_err = String::new();
     for service in &services {
-        match apply_to_service(service, &http_host, &http_port, &socks_host, &socks_port) {
+        match apply_to_service(service, &http_host, &http_port) {
             Ok(()) => ok_any = true,
             Err(e) => last_err = e,
         }
@@ -241,15 +240,14 @@ fn apply_to_service(
     service: &str,
     http_host: &str,
     http_port: &str,
-    socks_host: &str,
-    socks_port: &str,
 ) -> Result<(), String> {
     run_netsetup(&["-setwebproxy", service, http_host, http_port])?;
     run_netsetup(&["-setwebproxystate", service, "on"])?;
     run_netsetup(&["-setsecurewebproxy", service, http_host, http_port])?;
     run_netsetup(&["-setsecurewebproxystate", service, "on"])?;
-    run_netsetup(&["-setsocksfirewallproxy", service, socks_host, socks_port])?;
-    run_netsetup(&["-setsocksfirewallproxystate", service, "on"])?;
+    // Do not advertise SOCKS at the OS level: some clients fall back to SOCKS4-style behavior,
+    // while the local BibaVPN listener only speaks SOCKS5.
+    run_netsetup(&["-setsocksfirewallproxystate", service, "off"])?;
     Ok(())
 }
 

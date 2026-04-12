@@ -74,15 +74,18 @@ fn notify_changed() -> Result<(), String> {
     Ok(())
 }
 
-/// WinInet `ProxyServer`: HTTP/HTTPS → локальный CONNECT-прокси; `socks` → SOCKS5 (TCP + UDP ASSOCIATE).
+/// WinInet `ProxyServer`: only advertise local HTTP/HTTPS CONNECT on Windows.
+/// Many Windows clients treat `socks=` in Internet Settings as SOCKS4, while BibaVPN only serves
+/// SOCKS5 on the local port. Keeping `socks=` here causes browsers/background services to hit the
+/// SOCKS listener with version 4 and fail before the tunnel is even involved.
+///
 /// `prior_proxy_override` — значение `ProxyOverride` до применения (из [`read_backup`]); сохраняется и дополняется.
 pub fn apply_proxy(
     http_host_port: &str,
-    socks_host_port: &str,
+    _socks_host_port: &str,
     prior_proxy_override: Option<&str>,
 ) -> Result<(), String> {
-    let proxy_server =
-        format!("http={http_host_port};https={http_host_port};socks={socks_host_port}");
+    let proxy_server = format!("http={http_host_port};https={http_host_port}");
     let key = internet_settings_key(true).map_err(|e| e.to_string())?;
     let merged_override = merge_proxy_override_with_loopback(prior_proxy_override);
     key.set_value("ProxyEnable", &1u32)
