@@ -269,7 +269,12 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
 
     let use_tcp_mux = j.use_tcp_mux;
 
-    let pad_mode: PadMode = match j.pad_mode.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    let pad_mode: PadMode = match j
+        .pad_mode
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         Some(s) => PadMode::from_str(s).context("pad_mode")?,
         None => {
             if let Some(ref inv) = invite_pair {

@@ -2,16 +2,22 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// SOCKS5 command after method negotiation.
 #[derive(Debug)]
 pub enum SocksCommand {
-    Connect { host: String, port: u16 },
+    Connect {
+        host: String,
+        port: u16,
+    },
     /// BND in reply is where the client must send UDP datagrams.
-    UdpAssociate { host: String, port: u16 },
+    UdpAssociate {
+        host: String,
+        port: u16,
+    },
 }
 
 pub async fn socks5_read_command(local: &mut TcpStream) -> anyhow::Result<SocksCommand> {
@@ -23,7 +29,10 @@ pub async fn socks5_read_command(local: &mut TcpStream) -> anyhow::Result<SocksC
     let nmethods = buf[1] as usize;
     let mut methods = vec![0u8; nmethods];
     local.read_exact(&mut methods).await.context("methods")?;
-    local.write_all(&[5u8, 0u8]).await.context("socks no auth")?;
+    local
+        .write_all(&[5u8, 0u8])
+        .await
+        .context("socks no auth")?;
 
     let mut hdr = [0u8; 4];
     local.read_exact(&mut hdr).await.context("request hdr")?;
@@ -79,16 +88,17 @@ pub async fn socks5_handshake(local: &mut TcpStream) -> anyhow::Result<(String, 
 
 /// SOCKS5 reply: success, bind 0.0.0.0:0
 pub async fn socks5_reply_ok(local: &mut TcpStream) -> anyhow::Result<()> {
-    const REPLY: &[u8] = &[
-        5, 0, 0, 1, 0, 0, 0, 0, 0, 0,
-    ];
+    const REPLY: &[u8] = &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     local.write_all(REPLY).await.context("socks reply")?;
     Ok(())
 }
 
 /// Reply to UDP ASSOCIATE: relay is reachable at `local_addr` of this control connection
 /// (fallback `127.0.0.1` if the listener was bound to an unspecified address).
-pub async fn socks5_reply_udp_associate(local: &mut TcpStream, relay_port: u16) -> anyhow::Result<()> {
+pub async fn socks5_reply_udp_associate(
+    local: &mut TcpStream,
+    relay_port: u16,
+) -> anyhow::Result<()> {
     let sock_ip = match local.local_addr().context("socks local_addr")? {
         SocketAddr::V4(v4) => {
             if v4.ip().is_unspecified() {
@@ -118,14 +128,15 @@ pub async fn socks5_reply_udp_associate(local: &mut TcpStream, relay_port: u16) 
         }
     }
     reply.extend_from_slice(&relay_port.to_be_bytes());
-    local.write_all(&reply).await.context("socks udp associate reply")?;
+    local
+        .write_all(&reply)
+        .await
+        .context("socks udp associate reply")?;
     Ok(())
 }
 
 pub async fn socks5_reply_err(local: &mut TcpStream) -> anyhow::Result<()> {
-    const REPLY: &[u8] = &[
-        5, 1, 0, 1, 0, 0, 0, 0, 0, 0,
-    ];
+    const REPLY: &[u8] = &[5, 1, 0, 1, 0, 0, 0, 0, 0, 0];
     let _ = local.write_all(REPLY).await;
     Ok(())
 }

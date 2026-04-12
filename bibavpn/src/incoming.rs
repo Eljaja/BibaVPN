@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::WebSocketStream;
 
 use crate::camouflage;
 
@@ -89,13 +89,9 @@ Sec-WebSocket-Accept: {accept}\r\n\
         let mut ws_cfg = WebSocketConfig::default();
         ws_cfg.write_buffer_size = 256 * 1024;
         ws_cfg.max_write_buffer_size = 1024 * 1024;
-        let ws = WebSocketStream::from_partially_read(
-            stream,
-            remainder,
-            Role::Server,
-            Some(ws_cfg),
-        )
-        .await;
+        let ws =
+            WebSocketStream::from_partially_read(stream, remainder, Role::Server, Some(ws_cfg))
+                .await;
         return Ok(Some((ws, kind)));
     }
 
@@ -149,7 +145,9 @@ fn is_websocket_upgrade(req: &httparse::Request<'_, '_>) -> bool {
 fn header_line<'h>(req: &httparse::Request<'_, 'h>, name: &str) -> Option<String> {
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case(name) {
-            return std::str::from_utf8(h.value).ok().map(|s| s.trim().to_string());
+            return std::str::from_utf8(h.value)
+                .ok()
+                .map(|s| s.trim().to_string());
         }
     }
     None
@@ -218,7 +216,14 @@ async fn serve_camouflage_http<S: AsyncRead + AsyncWrite + Unpin>(
         }
         "/robots.txt" => {
             let body = "User-agent: *\nDisallow:\n";
-            write_binary_response(stream, method, 200, "text/plain; charset=utf-8", body.as_bytes()).await?;
+            write_binary_response(
+                stream,
+                method,
+                200,
+                "text/plain; charset=utf-8",
+                body.as_bytes(),
+            )
+            .await?;
         }
         "/favicon.ico" => {
             write_binary_response(stream, method, 204, "image/x-icon", &[]).await?;
@@ -284,7 +289,14 @@ async fn write_html_response<S: AsyncWrite + Unpin>(
     status: u16,
     body: &str,
 ) -> anyhow::Result<()> {
-    write_binary_response(stream, method, status, "text/html; charset=utf-8", body.as_bytes()).await
+    write_binary_response(
+        stream,
+        method,
+        status,
+        "text/html; charset=utf-8",
+        body.as_bytes(),
+    )
+    .await
 }
 
 async fn write_binary_response<S: AsyncWrite + Unpin>(
@@ -325,7 +337,9 @@ async fn forward_http_get<S: AsyncWrite + AsyncRead + Unpin>(
     path: &str,
     origin: &str,
 ) -> anyhow::Result<()> {
-    let uri = origin.parse::<http::Uri>().context("camouflage-url parse")?;
+    let uri = origin
+        .parse::<http::Uri>()
+        .context("camouflage-url parse")?;
     if uri.scheme_str() != Some("http") {
         anyhow::bail!("camouflage-url must be http://host:port (TLS to origin not implemented)");
     }
@@ -348,7 +362,11 @@ Accept: */*\r\n\
 Accept-Encoding: identity\r\n\
 Connection: close\r\n\
 \r\n",
-        method = if method.eq_ignore_ascii_case("HEAD") { "HEAD" } else { "GET" },
+        method = if method.eq_ignore_ascii_case("HEAD") {
+            "HEAD"
+        } else {
+            "GET"
+        },
         path = path,
         host_header = host_header,
     );

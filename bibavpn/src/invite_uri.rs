@@ -1,8 +1,8 @@
 //! `biba://` invite links: ChaCha20-Poly1305 encrypted JSON (key from BLAKE3 KDF on a passphrase).
 
 use anyhow::Context;
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use blake3::derive_key;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};

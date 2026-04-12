@@ -5,10 +5,10 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tracing::warn;
 
-use crate::tls_util::{ClientTlsParams, TlsClientProfile, client_tls_config};
+use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile};
 
 pub struct DecoyConfig {
     pub server_host: String,
@@ -23,7 +23,10 @@ pub struct DecoyConfig {
 }
 
 /// Background task: periodic tiny GETs (same TLS stack as the tunnel).
-pub async fn run_decoy_gets_loop(cfg: DecoyConfig, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+pub async fn run_decoy_gets_loop(
+    cfg: DecoyConfig,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let tls = match client_tls_config(&ClientTlsParams {
         insecure: cfg.insecure,
         profile: cfg.tls_profile,
@@ -70,7 +73,10 @@ pub async fn run_decoy_gets_loop(cfg: DecoyConfig, mut shutdown: tokio::sync::wa
         if *shutdown.borrow() {
             break;
         }
-        let path = paths.choose(&mut rand::thread_rng()).map(|s| s.as_str()).unwrap_or("/");
+        let path = paths
+            .choose(&mut rand::thread_rng())
+            .map(|s| s.as_str())
+            .unwrap_or("/");
         let host_hdr = if cfg.server_port == 443 {
             cfg.sni.clone()
         } else {
@@ -84,10 +90,16 @@ pub async fn run_decoy_gets_loop(cfg: DecoyConfig, mut shutdown: tokio::sync::wa
         );
 
         let run = async {
-            let tcp = crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
+            let tcp = crate::outbound_protect::tcp_connect_host_protected(
+                &cfg.server_host,
+                cfg.server_port,
+            )
+            .await
+            .context("decoy tcp")?;
+            let mut tls = connector
+                .connect(domain.clone(), tcp)
                 .await
-                .context("decoy tcp")?;
-            let mut tls = connector.connect(domain.clone(), tcp).await.context("decoy tls")?;
+                .context("decoy tls")?;
             tls.write_all(req.as_bytes()).await.context("decoy write")?;
             let mut buf = vec![0u8; 8192];
             let _ = tls.read(&mut buf).await;

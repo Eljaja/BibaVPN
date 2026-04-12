@@ -11,9 +11,11 @@ const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 const DEFAULT_AL: &str = "en-US,en;q=0.9";
 
-const UA_FIREFOX65: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+const UA_FIREFOX65: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
-const UA_FIREFOX63: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0";
+const UA_FIREFOX63: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0";
 
 const ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 
@@ -129,7 +131,12 @@ pub fn build_websocket_request(p: WsHandshakeParams<'_>) -> Request<()> {
 }
 
 /// Default browser-like handshake (backward compatible).
-pub fn browser_websocket_request(host_for_tcp: &str, port: u16, path: &str, sni: &str) -> Request<()> {
+pub fn browser_websocket_request(
+    host_for_tcp: &str,
+    port: u16,
+    path: &str,
+    sni: &str,
+) -> Request<()> {
     build_websocket_request(WsHandshakeParams {
         host_for_tcp,
         port,

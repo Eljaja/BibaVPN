@@ -1,7 +1,7 @@
 //! Exponential backoff between outbound TCP+TLS+WSS connection attempts and optional WS timing jitter.
 
 use rand::Rng;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 /// Outbound TCP+TLS+WSS attempts before giving up.
 pub(crate) const OUTBOUND_CONNECT_ATTEMPTS: u32 = 12;

@@ -18,11 +18,13 @@ impl FromStr for PadMode {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "" | "random" => PadMode::Random,
-            "http-buckets" | "buckets" => PadMode::HttpBuckets,
-            other => anyhow::bail!("unknown pad-mode {other:?}: use random or http-buckets"),
-        })
+        Ok(
+            match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+                "" | "random" => PadMode::Random,
+                "http-buckets" | "buckets" => PadMode::HttpBuckets,
+                other => anyhow::bail!("unknown pad-mode {other:?}: use random or http-buckets"),
+            },
+        )
     }
 }
 
@@ -65,7 +67,11 @@ pub enum FrameError {
 
 /// On-wire (inside one WebSocket binary message):
 /// `[ver u8][payload_len u24 BE][pad_len u8][pad * pad_len][payload * payload_len]`
-pub fn write_padded_frame(buf: &mut Vec<u8>, payload: &[u8], max_pad: u8) -> Result<(), FrameError> {
+pub fn write_padded_frame(
+    buf: &mut Vec<u8>,
+    payload: &[u8],
+    max_pad: u8,
+) -> Result<(), FrameError> {
     write_padded_frame_with_mode(buf, payload, max_pad, PadMode::Random)
 }
 
@@ -129,8 +135,7 @@ pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
     if raw[0] != FRAME_VER {
         return Err(FrameError::Proto(format!("bad ver {}", raw[0])));
     }
-    let plen =
-        (usize::from(raw[1]) << 16) | (usize::from(raw[2]) << 8) | usize::from(raw[3]);
+    let plen = (usize::from(raw[1]) << 16) | (usize::from(raw[2]) << 8) | usize::from(raw[3]);
     if plen > MAX_PAYLOAD {
         return Err(FrameError::TooLarge);
     }

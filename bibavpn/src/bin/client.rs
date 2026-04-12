@@ -9,10 +9,10 @@ use anyhow::Context;
 use bibavpn::frame::PadMode;
 use bibavpn::invite_uri::decode_invite_v1;
 use bibavpn::local_client::{
-    LocalClientOptions, DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-    normalize_ws_path, parse_host_port, parse_ws_header,
+    normalize_ws_path, parse_host_port, parse_ws_header, LocalClientOptions,
+    DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
-use bibavpn::tls_util::{TlsClientProfile, install_ring_crypto};
+use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile};
 use clap::Parser;
 use tokio::signal;
 use tokio::sync::watch;
@@ -32,7 +32,11 @@ struct Args {
     #[arg(long)]
     invite_passphrase: Option<String>,
 
-    #[arg(long, conflicts_with = "from_invite", required_unless_present = "from_invite")]
+    #[arg(
+        long,
+        conflicts_with = "from_invite",
+        required_unless_present = "from_invite"
+    )]
     server: Option<String>,
 
     #[arg(long, default_value = "change-me", conflicts_with = "from_invite")]
@@ -244,14 +248,18 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    let tls_profile: TlsClientProfile =
-        if let Some(s) = args.tls_profile.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-            s.parse().context("tls-profile")?
-        } else if let Some(ref inv) = inv_opt {
-            inv.tls_profile.parse().context("invite tls_profile")?
-        } else {
-            TlsClientProfile::default()
-        };
+    let tls_profile: TlsClientProfile = if let Some(s) = args
+        .tls_profile
+        .as_ref()
+        .map(|x| x.trim())
+        .filter(|x| !x.is_empty())
+    {
+        s.parse().context("tls-profile")?
+    } else if let Some(ref inv) = inv_opt {
+        inv.tls_profile.parse().context("invite tls_profile")?
+    } else {
+        TlsClientProfile::default()
+    };
 
     let ws_path = normalize_ws_path(
         args.ws_path

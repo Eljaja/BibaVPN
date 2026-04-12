@@ -5,8 +5,8 @@
 //!   cargo run -p bibavpn --bin bibavpn-mint-invite --release
 
 use anyhow::Context;
-use bibavpn::invite_uri::{InviteV1, encode_invite_v1};
-use bibavpn::local_client::{DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS, normalize_ws_path};
+use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
+use bibavpn::local_client::{normalize_ws_path, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -30,8 +30,8 @@ fn env_u64(name: &str, default: u64) -> u64 {
 }
 
 fn main() -> anyhow::Result<()> {
-    let public = std::env::var("INVITE_PUBLIC")
-        .unwrap_or_else(|_| "vpn.example.com:8444".to_string());
+    let public =
+        std::env::var("INVITE_PUBLIC").unwrap_or_else(|_| "vpn.example.com:8444".to_string());
     let sni = std::env::var("INVITE_SNI").unwrap_or_else(|_| {
         public
             .split_once(':')
@@ -40,11 +40,11 @@ fn main() -> anyhow::Result<()> {
     });
     let token = std::env::var("BIBA_VPN_TOKEN").context("set BIBA_VPN_TOKEN")?;
     let psk = std::env::var("BIBA_VPN_PSK").context("set BIBA_VPN_PSK")?;
-    let passphrase = std::env::var("BIBA_INVITE_PASSPHRASE").context("set BIBA_INVITE_PASSPHRASE")?;
+    let passphrase =
+        std::env::var("BIBA_INVITE_PASSPHRASE").context("set BIBA_INVITE_PASSPHRASE")?;
 
-    let ws_path = normalize_ws_path(
-        &std::env::var("WS_PATH").unwrap_or_else(|_| "/ws".to_string()),
-    );
+    let ws_path =
+        normalize_ws_path(&std::env::var("WS_PATH").unwrap_or_else(|_| "/ws".to_string()));
 
     let invite = InviteV1 {
         v: 1,

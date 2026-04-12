@@ -4,29 +4,29 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
+use rand::rngs::OsRng;
 use rand::Rng;
 use rand::RngCore;
-use rand::rngs::OsRng;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
+use tokio::time::{timeout, Duration};
 use tokio_rustls::client::TlsStream;
-use tokio::time::{Duration, timeout};
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use tracing::{error, info};
 
 use crate::crypto_layer::{self, SessionCrypto};
-use crate::decoy_traffic::{DecoyConfig, spawn_decoy_gets};
-use crate::frame::{DEFAULT_MAX_WS_BINARY, PadMode};
+use crate::decoy_traffic::{spawn_decoy_gets, DecoyConfig};
+use crate::frame::{PadMode, DEFAULT_MAX_WS_BINARY};
 use crate::http_connect;
-use crate::protocol::{encode_auth, encode_open};
-use crate::retry::{OUTBOUND_CONNECT_ATTEMPTS, sleep_outbound_backoff};
-use crate::stealth::{WsHandshakeParams, build_websocket_request, default_user_agent_for_profile};
-use crate::tls_util::{ClientTlsParams, TlsClientProfile, client_tls_config};
+use crate::protocol::{decode_open_err, encode_auth, encode_open, is_open_ok};
+use crate::retry::{sleep_outbound_backoff, OUTBOUND_CONNECT_ATTEMPTS};
+use crate::stealth::{build_websocket_request, default_user_agent_for_profile, WsHandshakeParams};
 use crate::tcp_mux::{self, MuxClientConfig, MuxOpenStreamDropped, TcpMuxClientHandle};
-use crate::udp_mux::{UdpMuxConfig, UdpMuxHandle, spawn_udp_mux_driver};
+use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile};
+use crate::udp_mux::{spawn_udp_mux_driver, UdpMuxConfig, UdpMuxHandle};
 use crate::ws_bridge::{self, TunnelEnd};
 use crate::{socks5, socks5::SocksCommand};
 use bytes::Bytes;
@@ -36,6 +36,7 @@ const SOCKS_UDP_WORKERS: usize = 256;
 
 /// After the shared mux WSS dies, reopen quickly without the full outbound backoff ladder.
 const TCP_MUX_SLOT_RETRIES: u32 = 8;
+const OPEN_STATUS_WAIT: Duration = Duration::from_millis(350);
 
 async fn sleep_mux_slot_retry(attempt: u32) {
     let ms = (50u64 * (attempt as u64 + 1)).min(800);
@@ -225,9 +226,10 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Optio
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
     let path = cfg.ws_path.clone();
 
-       let tcp = crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
-        .await
-        .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
+    let tcp =
+        crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
+            .await
+            .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
     let _ = tcp.set_nodelay(true);
     let tls = connector.connect(domain, tcp).await.context("tls")?;
 
@@ -279,7 +281,73 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Optio
     Ok((ws, crypto))
 }
 
-async fn connect_tcp_mux_handle(cfg: &Arc<ClientCfg>, tcp_mux_slot: &TcpMuxSlot) -> anyhow::Result<()> {
+async fn wait_open_status_or_payload<S>(ws: &mut WebSocketStream<S>) -> anyhow::Result<Vec<Message>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        let m = ws.next().await.context("eof before OPEN result")??;
+        match m {
+            Message::Binary(b) => {
+                if is_open_ok(b.as_ref()) {
+                    return Ok(Vec::new());
+                }
+                if let Ok(err) = decode_open_err(b.as_ref()) {
+                    anyhow::bail!("remote OPEN failed: {err}");
+                }
+                return Ok(vec![Message::Binary(b)]);
+            }
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p))
+                    .await
+                    .context("pong during OPEN wait")?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => anyhow::bail!("closed before OPEN result"),
+            other => return Ok(vec![other]),
+        }
+    }
+}
+
+async fn open_legacy_biba_channel(
+    cfg: &Arc<ClientCfg>,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<(ClientWs, Option<SharedCrypto>, Vec<Message>)> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
+        match one_try_wss_session(cfg).await {
+            Ok((mut ws, crypto)) => {
+                let open = encode_open(host, port)?;
+                if open.len() > cfg.max_ws_binary {
+                    anyhow::bail!("OPEN frame larger than --max-ws-binary");
+                }
+                ws.send(Message::Binary(Bytes::from(open)))
+                    .await
+                    .context("send OPEN")?;
+                let prefetched =
+                    match timeout(OPEN_STATUS_WAIT, wait_open_status_or_payload(&mut ws)).await {
+                        Ok(res) => res?,
+                        Err(_) => Vec::new(),
+                    };
+                return Ok((ws, crypto, prefetched));
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
+                    break;
+                }
+                sleep_outbound_backoff(attempt).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tunnel: connect failed")))
+}
+
+async fn connect_tcp_mux_handle(
+    cfg: &Arc<ClientCfg>,
+    tcp_mux_slot: &TcpMuxSlot,
+) -> anyhow::Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         let res: anyhow::Result<()> = async {
@@ -507,15 +575,43 @@ async fn handle_socks_peer(
 ) -> anyhow::Result<()> {
     match socks5::socks5_read_command(&mut local).await? {
         SocksCommand::Connect { host, port } => {
-            socks5::socks5_reply_ok(&mut local).await?;
             if cfg.use_tcp_mux {
-                tcp_mux_open_stream_with_retry(local, host, port, Vec::new(), cfg, tcp_mux_slot).await
+                socks5::socks5_reply_ok(&mut local).await?;
+                tcp_mux_open_stream_with_retry(local, host, port, Vec::new(), cfg, tcp_mux_slot)
+                    .await
             } else {
-                tunnel_to_biba(local, host, port, cfg, Vec::new()).await
+                let (ws, crypto, prefetched_ws_messages) =
+                    match open_legacy_biba_channel(&cfg, &host, port).await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            let _ = socks5::socks5_reply_err(&mut local).await;
+                            return Err(e);
+                        }
+                    };
+                socks5::socks5_reply_ok(&mut local).await?;
+                ws_bridge::bridge_ws_tcp_padded(
+                    ws,
+                    prefetched_ws_messages,
+                    local,
+                    Vec::new(),
+                    cfg.max_pad,
+                    cfg.decoy_max,
+                    crypto,
+                    cfg.max_ws_binary,
+                    cfg.ws_ping_secs,
+                    cfg.ws_ping_jitter_percent,
+                    cfg.ws_binary_send_jitter_ms,
+                    TunnelEnd::Client,
+                    cfg.pad_mode,
+                    cfg.dummy_interval_secs,
+                )
+                .await
             }
         }
         SocksCommand::UdpAssociate { .. } => {
-            let udp = UdpSocket::bind("0.0.0.0:0").await.context("bind udp relay")?;
+            let udp = UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("bind udp relay")?;
             let relay_port = udp.local_addr()?.port();
             socks5::socks5_reply_udp_associate(&mut local, relay_port).await?;
             run_socks_udp_assoc(local, udp, cfg, udp_mux_slot).await
@@ -548,9 +644,7 @@ async fn run_socks_udp_assoc(
         if g.is_none() {
             *g = Some(spawn_udp_mux_driver(cfg.udp_mux_config()));
         }
-        g.as_ref()
-            .expect("udp mux just set")
-            .clone()
+        g.as_ref().expect("udp mux just set").clone()
     };
 
     let workers = Arc::new(Semaphore::new(SOCKS_UDP_WORKERS));
@@ -626,16 +720,56 @@ async fn handle_http_peer(
             port,
             client_prefetch,
         }) => {
-            http_connect::reply_connect_ok(&mut local).await?;
             if cfg.use_tcp_mux {
-                tcp_mux_open_stream_with_retry(local, host, port, client_prefetch, cfg, tcp_mux_slot).await
+                http_connect::reply_connect_ok(&mut local).await?;
+                tcp_mux_open_stream_with_retry(
+                    local,
+                    host,
+                    port,
+                    client_prefetch,
+                    cfg,
+                    tcp_mux_slot,
+                )
+                .await
             } else {
-                tunnel_to_biba(local, host, port, cfg, client_prefetch).await
+                let (ws, crypto, prefetched_ws_messages) =
+                    match open_legacy_biba_channel(&cfg, &host, port).await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            let _ =
+                                http_connect::reply_connect_error(&mut local, 502, "Bad Gateway")
+                                    .await;
+                            return Err(e);
+                        }
+                    };
+                http_connect::reply_connect_ok(&mut local).await?;
+                ws_bridge::bridge_ws_tcp_padded(
+                    ws,
+                    prefetched_ws_messages,
+                    local,
+                    client_prefetch,
+                    cfg.max_pad,
+                    cfg.decoy_max,
+                    crypto,
+                    cfg.max_ws_binary,
+                    cfg.ws_ping_secs,
+                    cfg.ws_ping_jitter_percent,
+                    cfg.ws_binary_send_jitter_ms,
+                    TunnelEnd::Client,
+                    cfg.pad_mode,
+                    cfg.dummy_interval_secs,
+                )
+                .await
             }
         }
-        Ok(http_connect::HttpProxyHandshake::ForwardHttp { host, port, to_origin }) => {
+        Ok(http_connect::HttpProxyHandshake::ForwardHttp {
+            host,
+            port,
+            to_origin,
+        }) => {
             if cfg.use_tcp_mux {
-                tcp_mux_open_stream_with_retry(local, host, port, to_origin, cfg, tcp_mux_slot).await
+                tcp_mux_open_stream_with_retry(local, host, port, to_origin, cfg, tcp_mux_slot)
+                    .await
             } else {
                 tunnel_to_biba(local, host, port, cfg, to_origin).await
             }
@@ -685,47 +819,24 @@ async fn tunnel_to_biba(
     cfg: Arc<ClientCfg>,
     tcp_uplink_prefix: Vec<u8>,
 ) -> anyhow::Result<()> {
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
-        match one_try_wss_session(&cfg).await {
-            Ok((mut ws, crypto)) => {
-                let open = encode_open(&host, port)?;
-                if open.len() > cfg.max_ws_binary {
-                    anyhow::bail!("OPEN frame larger than --max-ws-binary");
-                }
-                ws.send(Message::Binary(Bytes::from(open)))
-                    .await
-                    .context("send OPEN")?;
-
-                ws_bridge::bridge_ws_tcp_padded(
-                    ws,
-                    local,
-                    tcp_uplink_prefix,
-                    cfg.max_pad,
-                    cfg.decoy_max,
-                    crypto,
-                    cfg.max_ws_binary,
-                    cfg.ws_ping_secs,
-                    cfg.ws_ping_jitter_percent,
-                    cfg.ws_binary_send_jitter_ms,
-                    TunnelEnd::Client,
-                    cfg.pad_mode,
-                    cfg.dummy_interval_secs,
-                )
-                .await?;
-                return Ok(());
-            }
-            Err(e) => {
-                last_err = Some(e);
-                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
-                    break;
-                }
-                sleep_outbound_backoff(attempt).await;
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tunnel: connect failed")))
+    let (ws, crypto, prefetched_ws_messages) = open_legacy_biba_channel(&cfg, &host, port).await?;
+    ws_bridge::bridge_ws_tcp_padded(
+        ws,
+        prefetched_ws_messages,
+        local,
+        tcp_uplink_prefix,
+        cfg.max_pad,
+        cfg.decoy_max,
+        crypto,
+        cfg.max_ws_binary,
+        cfg.ws_ping_secs,
+        cfg.ws_ping_jitter_percent,
+        cfg.ws_binary_send_jitter_ms,
+        TunnelEnd::Client,
+        cfg.pad_mode,
+        cfg.dummy_interval_secs,
+    )
+    .await
 }
 
 async fn v2_client_preamble<S>(

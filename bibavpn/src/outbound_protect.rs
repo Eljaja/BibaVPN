@@ -31,7 +31,10 @@ fn apply_hook(fd: RawFd) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub async fn tcp_connect_host_protected(host: &str, port: u16) -> io::Result<tokio::net::TcpStream> {
+pub async fn tcp_connect_host_protected(
+    host: &str,
+    port: u16,
+) -> io::Result<tokio::net::TcpStream> {
     let mut last_err: Option<io::Error> = None;
     for addr in tokio::net::lookup_host((host, port)).await? {
         match tcp_connect_socket_protected(addr).await {
@@ -40,7 +43,10 @@ pub async fn tcp_connect_host_protected(host: &str, port: u16) -> io::Result<tok
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "tcp_connect_host_protected: no addresses")
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "tcp_connect_host_protected: no addresses",
+        )
     }))
 }
 
@@ -60,6 +66,9 @@ async fn tcp_connect_socket_protected(addr: SocketAddr) -> io::Result<tokio::net
 pub fn set_hook(_hook: Option<()>) {}
 
 #[cfg(not(unix))]
-pub async fn tcp_connect_host_protected(host: &str, port: u16) -> io::Result<tokio::net::TcpStream> {
+pub async fn tcp_connect_host_protected(
+    host: &str,
+    port: u16,
+) -> io::Result<tokio::net::TcpStream> {
     tokio::net::TcpStream::connect((host, port)).await
 }

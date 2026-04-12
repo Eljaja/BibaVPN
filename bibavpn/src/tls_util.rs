@@ -7,8 +7,8 @@ use biba::ClientHelloId;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::{client::danger::ServerCertVerifier, crypto::CryptoProvider, SupportedCipherSuite};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
-use rustls::{SupportedCipherSuite, client::danger::ServerCertVerifier, crypto::CryptoProvider};
 
 /// TLS client preset: maps to [`biba::ClientHelloId`] and aligns rustls cipher order + ALPN (best-effort).
 ///
@@ -83,7 +83,10 @@ fn read_key(pem: &[u8]) -> anyhow::Result<PrivateKeyDer<'static>> {
     anyhow::bail!("no PKCS8 private key in pem")
 }
 
-pub fn server_config_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<Arc<ServerConfig>> {
+pub fn server_config_from_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> anyhow::Result<Arc<ServerConfig>> {
     let certs = read_certs(cert_pem)?;
     let key = read_key(key_pem)?;
     let cfg = ServerConfig::builder()
@@ -161,7 +164,10 @@ pub fn client_config_for_profile(
         }
     }
     if cipher_suites.is_empty() {
-        anyhow::bail!("TLS profile {:?}: no cipher suites overlap rustls provider", profile);
+        anyhow::bail!(
+            "TLS profile {:?}: no cipher suites overlap rustls provider",
+            profile
+        );
     }
 
     let mut provider = base.clone();
@@ -238,7 +244,9 @@ pub fn client_tls_config(params: &ClientTlsParams) -> anyhow::Result<Arc<ClientC
     }
 }
 
-fn client_config_pinned_only(pins: &[CertificateDer<'static>]) -> anyhow::Result<Arc<ClientConfig>> {
+fn client_config_pinned_only(
+    pins: &[CertificateDer<'static>],
+) -> anyhow::Result<Arc<ClientConfig>> {
     Ok(Arc::new(
         ClientConfig::builder()
             .dangerous()
@@ -267,7 +275,10 @@ fn client_config_profile_with_pins(
         }
     }
     if cipher_suites.is_empty() {
-        anyhow::bail!("TLS profile {:?}: no cipher suites overlap rustls provider", profile);
+        anyhow::bail!(
+            "TLS profile {:?}: no cipher suites overlap rustls provider",
+            profile
+        );
     }
 
     let mut provider = base.clone();
@@ -311,11 +322,7 @@ impl ServerCertVerifier for PinnedCertsVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if self
-            .pins
-            .iter()
-            .any(|p| p.as_ref() == end_entity.as_ref())
-        {
+        if self.pins.iter().any(|p| p.as_ref() == end_entity.as_ref()) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::InvalidCertificate(

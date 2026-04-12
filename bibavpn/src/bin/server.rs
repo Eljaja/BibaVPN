@@ -3,11 +3,15 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
-use bibavpn::frame::{DEFAULT_MAX_WS_BINARY, PadMode};
-use bibavpn::incoming::{CamouflageServeConfig, WsHandshakeKind, accept_websocket_or_camouflage};
-use bibavpn::invite_uri::{InviteV1, encode_invite_v1};
-use bibavpn::local_client::{DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS, normalize_ws_path, parse_host_port};
-use bibavpn::protocol::{decode_open, is_udp_mux_open};
+use bibavpn::frame::{PadMode, DEFAULT_MAX_WS_BINARY};
+use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig, WsHandshakeKind};
+use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
+use bibavpn::local_client::{
+    normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
+};
+use bibavpn::protocol::{
+    decode_open_with_flags, encode_open_err, encode_open_ok, is_udp_mux_open, OPEN_FLAG_STATUS,
+};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_auth::server_wait_token_auth;
 use bibavpn::ws_bridge::TunnelEnd;
@@ -20,12 +24,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
-#[command(name = "bibavpn-server", about = "BibaVPN WSS entrypoint (use behind a real TLS proxy in production).")]
+#[command(
+    name = "bibavpn-server",
+    about = "BibaVPN WSS entrypoint (use behind a real TLS proxy in production)."
+)]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:8443")]
     listen: String,
@@ -312,14 +319,36 @@ async fn handle_one(
     };
 
     match wait_first_channel(ws).await? {
-        FirstChannel::Tcp { host, port, ws } => {
+        FirstChannel::Tcp {
+            host,
+            port,
+            mut ws,
+            supports_open_status,
+        } => {
             info!("OPEN {host}:{port}");
-            let remote = TcpStream::connect((host.as_str(), port))
-                .await
-                .with_context(|| format!("connect {host}:{port}"))?;
+            let remote = match TcpStream::connect((host.as_str(), port)).await {
+                Ok(remote) => remote,
+                Err(e) => {
+                    if supports_open_status {
+                        let payload = encode_open_err(&format!("connect {host}:{port}: {e:#}"))
+                            .unwrap_or_else(|_| {
+                                encode_open_err("connect failed").expect("static open error")
+                            });
+                        let _ = ws.send(Message::Binary(Bytes::from(payload))).await;
+                        return Ok(());
+                    }
+                    return Err(e).with_context(|| format!("connect {host}:{port}"));
+                }
+            };
             let _ = remote.set_nodelay(true);
+            if supports_open_status {
+                ws.send(Message::Binary(Bytes::from(encode_open_ok())))
+                    .await
+                    .context("send OPEN_OK")?;
+            }
             bibavpn::ws_bridge::bridge_ws_tcp_padded(
                 ws,
+                Vec::new(),
                 remote,
                 Vec::new(),
                 max_pad,
@@ -378,10 +407,15 @@ where
     Tcp {
         host: String,
         port: u16,
+        supports_open_status: bool,
         ws: WebSocketStream<S>,
     },
-    UdpMux { ws: WebSocketStream<S> },
-    Mux { ws: WebSocketStream<S> },
+    UdpMux {
+        ws: WebSocketStream<S>,
+    },
+    Mux {
+        ws: WebSocketStream<S>,
+    },
 }
 
 async fn wait_first_channel<S>(mut ws: WebSocketStream<S>) -> anyhow::Result<FirstChannel<S>>
@@ -392,8 +426,13 @@ where
         let m = m.context("ws read")?;
         match m {
             Message::Binary(b) => {
-                if let Ok((h, p)) = decode_open(b.as_ref()) {
-                    return Ok(FirstChannel::Tcp { host: h, port: p, ws });
+                if let Ok((h, p, flags)) = decode_open_with_flags(b.as_ref()) {
+                    return Ok(FirstChannel::Tcp {
+                        host: h,
+                        port: p,
+                        supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
+                        ws,
+                    });
                 }
                 if is_udp_mux_open(b.as_ref()) {
                     return Ok(FirstChannel::UdpMux { ws });
@@ -403,7 +442,9 @@ where
                 }
             }
             Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong during OPEN wait")?;
+                ws.send(Message::Pong(p))
+                    .await
+                    .context("pong during OPEN wait")?;
             }
             Message::Close(_) => anyhow::bail!("closed before channel open"),
             _ => {}
@@ -429,7 +470,9 @@ where
         let b = match m {
             Message::Binary(b) => b,
             Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong during HELLO")?;
+                ws.send(Message::Pong(p))
+                    .await
+                    .context("pong during HELLO")?;
                 continue;
             }
             Message::Pong(_) => continue,

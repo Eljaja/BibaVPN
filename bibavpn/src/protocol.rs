@@ -7,6 +7,10 @@ use anyhow::Context;
 
 /// Fixed magic so random junk frames never collide.
 pub const OPEN_MAGIC: &[u8] = b"BIBA\x01OPEN\x00";
+pub const OPEN_OK_MAGIC: &[u8] = b"BIBA\x01OPOK\x00";
+pub const OPEN_ERR_MAGIC: &[u8] = b"BIBA\x01OPER\x00";
+const OPEN_EXT_V1: u8 = 1;
+pub const OPEN_FLAG_STATUS: u8 = 0x01;
 
 /// Client → server: session token after WebSocket upgrade (auth outside URL path).
 pub const AUTH_MAGIC: &[u8] = b"BIBA\x01AUTH\x00";
@@ -59,15 +63,18 @@ pub fn encode_open(host: &str, port: u16) -> anyhow::Result<Vec<u8>> {
     if h.len() > 0xffff {
         anyhow::bail!("host too long");
     }
-    let mut v = Vec::with_capacity(OPEN_MAGIC.len() + 2 + h.len() + 2);
+    let mut v = Vec::with_capacity(OPEN_MAGIC.len() + 2 + h.len() + 2 + 2);
     v.extend_from_slice(OPEN_MAGIC);
     v.extend_from_slice(&(h.len() as u16).to_be_bytes());
     v.extend_from_slice(h);
     v.extend_from_slice(&port.to_be_bytes());
+    // Optional trailer. Older servers ignore trailing bytes after `host:port`.
+    v.push(OPEN_EXT_V1);
+    v.push(OPEN_FLAG_STATUS);
     Ok(v)
 }
 
-pub fn decode_open(data: &[u8]) -> anyhow::Result<(String, u16)> {
+fn decode_open_inner(data: &[u8]) -> anyhow::Result<(String, u16, &[u8])> {
     if data.len() < OPEN_MAGIC.len() + 2 + 2 {
         anyhow::bail!("short open frame");
     }
@@ -77,14 +84,64 @@ pub fn decode_open(data: &[u8]) -> anyhow::Result<(String, u16)> {
     let mut i = OPEN_MAGIC.len();
     let hl = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
     i += 2;
-    let host =
-        std::str::from_utf8(data.get(i..i + hl).context("host slice")?)?.to_string();
+    let host = std::str::from_utf8(data.get(i..i + hl).context("host slice")?)?.to_string();
     i += hl;
     if data.len() < i + 2 {
         anyhow::bail!("missing port");
     }
     let port = u16::from_be_bytes([data[i], data[i + 1]]);
+    i += 2;
+    Ok((host, port, &data[i..]))
+}
+
+pub fn decode_open(data: &[u8]) -> anyhow::Result<(String, u16)> {
+    let (host, port, _) = decode_open_inner(data)?;
     Ok((host, port))
+}
+
+pub fn decode_open_with_flags(data: &[u8]) -> anyhow::Result<(String, u16, u8)> {
+    let (host, port, rest) = decode_open_inner(data)?;
+    let flags = if rest.len() >= 2 && rest[0] == OPEN_EXT_V1 {
+        rest[1]
+    } else {
+        0
+    };
+    Ok((host, port, flags))
+}
+
+pub fn encode_open_ok() -> Vec<u8> {
+    OPEN_OK_MAGIC.to_vec()
+}
+
+pub fn is_open_ok(data: &[u8]) -> bool {
+    data == OPEN_OK_MAGIC
+}
+
+pub fn encode_open_err(reason: &str) -> anyhow::Result<Vec<u8>> {
+    let msg = reason.as_bytes();
+    if msg.len() > 0xffff {
+        anyhow::bail!("open error too long");
+    }
+    let mut v = Vec::with_capacity(OPEN_ERR_MAGIC.len() + 2 + msg.len());
+    v.extend_from_slice(OPEN_ERR_MAGIC);
+    v.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    v.extend_from_slice(msg);
+    Ok(v)
+}
+
+pub fn decode_open_err(data: &[u8]) -> anyhow::Result<String> {
+    if data.len() < OPEN_ERR_MAGIC.len() + 2 {
+        anyhow::bail!("short open error frame");
+    }
+    if !data.starts_with(OPEN_ERR_MAGIC) {
+        anyhow::bail!("not an open error frame");
+    }
+    let i = OPEN_ERR_MAGIC.len();
+    let ml = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+    if data.len() < i + 2 + ml {
+        anyhow::bail!("truncated open error");
+    }
+    Ok(std::str::from_utf8(&data[i + 2..i + 2 + ml])?.to_string())
 }
 
 pub fn encode_udp_mux_open() -> Vec<u8> {
@@ -95,7 +152,11 @@ pub fn is_udp_mux_open(data: &[u8]) -> bool {
     data == UDP_MUX_OPEN_MAGIC
 }
 
-pub(crate) fn encode_atyp_host_port(host: &str, port: u16, buf: &mut Vec<u8>) -> anyhow::Result<()> {
+pub(crate) fn encode_atyp_host_port(
+    host: &str,
+    port: u16,
+    buf: &mut Vec<u8>,
+) -> anyhow::Result<()> {
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         buf.push(1);
         buf.extend_from_slice(&ip.octets());
@@ -184,7 +245,12 @@ pub fn decode_udp_req(data: &[u8]) -> anyhow::Result<(u64, String, u16, Vec<u8>)
     Ok((xid, h, p, payload))
 }
 
-pub fn encode_udp_rep(xid: u64, src_host: &str, src_port: u16, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn encode_udp_rep(
+    xid: u64,
+    src_host: &str,
+    src_port: u16,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     if payload.len() > MAX_UDP_PAYLOAD {
         anyhow::bail!("UDP payload too large");
     }
@@ -212,7 +278,11 @@ pub fn decode_udp_rep(data: &[u8]) -> anyhow::Result<(u64, String, u16, Vec<u8>)
 }
 
 /// SOCKS5 UDP request/response header + payload (RSV+FRAG+ATYP+ADDR+PORT already consumed in parse).
-pub fn build_socks5_udp_datagram(dest_host: &str, dest_port: u16, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn build_socks5_udp_datagram(
+    dest_host: &str,
+    dest_port: u16,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let mut v = vec![0u8, 0, 0];
     encode_atyp_host_port(dest_host, dest_port, &mut v)?;
     v.extend_from_slice(payload);

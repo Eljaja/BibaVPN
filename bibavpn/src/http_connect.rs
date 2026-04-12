@@ -2,7 +2,7 @@
 
 use std::net::Ipv6Addr;
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -76,7 +76,11 @@ pub async fn http_proxy_handshake(stream: &mut TcpStream) -> anyhow::Result<Http
     to_origin.extend_from_slice(b"\r\n");
     to_origin.extend_from_slice(reader.buffer());
 
-    Ok(HttpProxyHandshake::ForwardHttp { host, port, to_origin })
+    Ok(HttpProxyHandshake::ForwardHttp {
+        host,
+        port,
+        to_origin,
+    })
 }
 
 async fn read_header_block<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<()> {
@@ -154,8 +158,13 @@ pub async fn reply_connect_ok(stream: &mut TcpStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn reply_connect_error(stream: &mut TcpStream, status: u16, reason: &str) -> anyhow::Result<()> {
-    let body = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+pub async fn reply_connect_error(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let body =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let _ = stream.write_all(body.as_bytes()).await;
     let _ = stream.flush().await;
     Ok(())
@@ -168,21 +177,27 @@ mod tests {
 
     #[test]
     fn authority_host_port() {
-        assert_eq!(parse_authority("example.com:443").unwrap(), ("example.com".into(), 443));
+        assert_eq!(
+            parse_authority("example.com:443").unwrap(),
+            ("example.com".into(), 443)
+        );
     }
 
     #[test]
     fn authority_default_443() {
-        assert_eq!(parse_authority("example.com").unwrap(), ("example.com".into(), 443));
+        assert_eq!(
+            parse_authority("example.com").unwrap(),
+            ("example.com".into(), 443)
+        );
     }
 
     #[test]
     fn authority_ipv6() {
+        assert_eq!(parse_authority("[::1]:8443").unwrap(), ("::1".into(), 8443));
         assert_eq!(
-            parse_authority("[::1]:8443").unwrap(),
-            ("::1".into(), 8443)
+            parse_authority("[2001:db8::1]").unwrap(),
+            ("2001:db8::1".into(), 443)
         );
-        assert_eq!(parse_authority("[2001:db8::1]").unwrap(), ("2001:db8::1".into(), 443));
     }
 
     #[test]
@@ -199,10 +214,7 @@ mod tests {
             parse_authority("93.184.216.34:443").unwrap(),
             ("93.184.216.34".into(), 443)
         );
-        assert_eq!(
-            parse_authority("1.1.1.1").unwrap(),
-            ("1.1.1.1".into(), 443)
-        );
+        assert_eq!(parse_authority("1.1.1.1").unwrap(), ("1.1.1.1".into(), 443));
     }
 
     #[test]

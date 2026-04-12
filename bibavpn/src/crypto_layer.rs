@@ -1,13 +1,13 @@
 //! BibaV2: PSK handshake + ChaCha20-Poly1305 outer framing (inspired by AmneziaWG2 session noise
 //! and v2ray-style distinct bidirectional keys). Not compatible with stock WireGuard/Xray.
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use blake3::derive_key;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
+use rand::rngs::OsRng;
 use rand::Rng;
 use rand::RngCore;
-use rand::rngs::OsRng;
 
 pub const HELLO_MAGIC: &[u8] = b"BIBV2HL1";
 pub const ACK_MAGIC: &[u8] = b"BIBV2ACK1";
@@ -31,7 +31,11 @@ fn compute_mac(psk: &[u8], client_random: &[u8; 32], server_random: &[u8; 32]) -
     tag
 }
 
-fn transport_keys(psk: &[u8], client_random: &[u8; 32], server_random: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+fn transport_keys(
+    psk: &[u8],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+) -> ([u8; 32], [u8; 32]) {
     let mut ctx = Vec::with_capacity(psk.len() + 64);
     ctx.extend_from_slice(psk);
     ctx.extend_from_slice(client_random);
@@ -121,7 +125,12 @@ pub struct SessionCrypto {
 }
 
 impl SessionCrypto {
-    pub fn new(psk: &str, client_random: &[u8; 32], server_random: &[u8; 32], decoy_max: u8) -> Self {
+    pub fn new(
+        psk: &str,
+        client_random: &[u8; 32],
+        server_random: &[u8; 32],
+        decoy_max: u8,
+    ) -> Self {
         let (k_up, k_dn) = transport_keys(psk.as_bytes(), client_random, server_random);
         Self {
             c2s: tokio::sync::Mutex::new(ChaHalf::new(&k_up)),

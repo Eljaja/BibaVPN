@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 use crate::protocol::{decode_auth, is_auth_frame};
 
@@ -38,7 +38,9 @@ where
                     }
                 }
                 Message::Ping(p) => {
-                    ws.send(Message::Pong(p)).await.context("pong during auth")?;
+                    ws.send(Message::Pong(p))
+                        .await
+                        .context("pong during auth")?;
                 }
                 Message::Pong(_) => {}
                 Message::Close(_) => anyhow::bail!("closed during auth"),

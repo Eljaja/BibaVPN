@@ -1,23 +1,25 @@
 //! Shared WebSocket ↔ TCP bridge: BibaV2 seals, padded frames, MTU cap, optional WS ping (v2.1).
 
+use anyhow::Context;
+use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use anyhow::Context;
-use futures_util::{SinkExt, StreamExt};
-use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
-use tokio_tungstenite::WebSocketStream;
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 use crate::crypto_layer::SessionCrypto;
-use crate::retry::{maybe_ws_binary_send_jitter, ws_ping_period_duration};
 use crate::frame::PadMode;
+use crate::protocol::{decode_open_err, is_open_ok};
+use crate::retry::{maybe_ws_binary_send_jitter, ws_ping_period_duration};
 use crate::{read_padded_frame, write_padded_frame_with_mode};
 
 pub type SharedCrypto = Arc<SessionCrypto>;
@@ -61,7 +63,11 @@ enum BridgedTcpRead {
 }
 
 impl AsyncRead for BridgedTcpRead {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             BridgedTcpRead::Plain(r) => Pin::new(r).poll_read(cx, buf),
             BridgedTcpRead::Prefixed(r) => Pin::new(r).poll_read(cx, buf),
@@ -76,6 +82,7 @@ impl AsyncRead for BridgedTcpRead {
 /// `dummy_interval_secs`: send empty padded frames on idle (0 = off); interval jittered ±50% around this base.
 pub async fn bridge_ws_tcp_padded<S>(
     ws: WebSocketStream<S>,
+    prefetched_ws_messages: Vec<Message>,
     tcp: TcpStream,
     tcp_uplink_prefix: Vec<u8>,
     max_pad: u8,
@@ -93,10 +100,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let v2 = crypto.is_some();
-    let max_chunk = crate::frame::max_tcp_payload_per_ws_message(v2, decoy_max, max_pad, max_ws_binary)
-        .max(256);
+    let max_chunk =
+        crate::frame::max_tcp_payload_per_ws_message(v2, decoy_max, max_pad, max_ws_binary)
+            .max(256);
 
     let (mut ws_sink, mut ws_rx) = ws.split();
+    let mut prefetched_ws_messages: VecDeque<Message> = prefetched_ws_messages.into();
 
     // One writer owns the WebSocket sink; producers use an async channel (no Mutex on send path).
     const WS_OUT_CAP: usize = 512;
@@ -108,7 +117,10 @@ where
 
     let writer = async move {
         let mut ping_sleep: Option<Pin<Box<tokio::time::Sleep>>> = if ws_ping_secs > 0 {
-            Some(Box::pin(sleep(ws_ping_period_duration(ws_ping_secs, ws_ping_jitter_percent))))
+            Some(Box::pin(sleep(ws_ping_period_duration(
+                ws_ping_secs,
+                ws_ping_jitter_percent,
+            ))))
         } else {
             None
         };
@@ -154,12 +166,26 @@ where
 
     let crypto_up = crypto.clone();
     let up = async move {
-        while let Some(m) = ws_rx.next().await {
-            let m = m.context("websocket read")?;
+        loop {
+            let m = if let Some(m) = prefetched_ws_messages.pop_front() {
+                m
+            } else {
+                let Some(m) = ws_rx.next().await else { break };
+                m.context("websocket read")?
+            };
             match m {
                 Message::Binary(b) => {
+                    if is_open_ok(b.as_ref()) {
+                        continue;
+                    }
+                    if let Ok(err) = decode_open_err(b.as_ref()) {
+                        anyhow::bail!("remote OPEN failed: {err}");
+                    }
                     if b.len() > max_ws_binary.saturating_mul(4) {
-                        anyhow::bail!("oversized WS binary from peer (>{})", max_ws_binary.saturating_mul(4));
+                        anyhow::bail!(
+                            "oversized WS binary from peer (>{})",
+                            max_ws_binary.saturating_mul(4)
+                        );
                     }
                     let raw = match (&crypto_up, end) {
                         (Some(c), TunnelEnd::Client) => c
@@ -205,20 +231,16 @@ where
                 write_padded_frame_with_mode(&mut wire, &buf[off..off + take], max_pad, pad_mode)
                     .context("pack frame")?;
                 let blob = match (&crypto_dn, end) {
-                    (Some(c), TunnelEnd::Client) => {
-                        bytes::Bytes::from(
-                            c.seal_client_to_server(&wire)
-                                .await
-                                .context("v2 seal c2s")?,
-                        )
-                    }
-                    (Some(c), TunnelEnd::Server) => {
-                        bytes::Bytes::from(
-                            c.seal_server_to_client(&wire)
-                                .await
-                                .context("v2 seal s2c")?,
-                        )
-                    }
+                    (Some(c), TunnelEnd::Client) => bytes::Bytes::from(
+                        c.seal_client_to_server(&wire)
+                            .await
+                            .context("v2 seal c2s")?,
+                    ),
+                    (Some(c), TunnelEnd::Server) => bytes::Bytes::from(
+                        c.seal_server_to_client(&wire)
+                            .await
+                            .context("v2 seal s2c")?,
+                    ),
                     (None, _) => bytes::Bytes::from(std::mem::take(&mut wire)),
                 };
                 if blob.len() > max_ws_binary {
@@ -245,8 +267,14 @@ where
         }
         let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
         loop {
-            let lo = dummy_interval_secs.saturating_mul(1).saturating_div(2).max(1);
-            let hi = dummy_interval_secs.saturating_mul(3).saturating_div(2).max(lo);
+            let lo = dummy_interval_secs
+                .saturating_mul(1)
+                .saturating_div(2)
+                .max(1);
+            let hi = dummy_interval_secs
+                .saturating_mul(3)
+                .saturating_div(2)
+                .max(lo);
             let secs = rand::thread_rng().gen_range(lo..=hi);
             sleep(Duration::from_secs(secs)).await;
             wire.clear();
@@ -254,12 +282,10 @@ where
                 continue;
             }
             let blob = match (&crypto_dum, end) {
-                (Some(c), TunnelEnd::Client) => {
-                    match c.seal_client_to_server(&wire).await {
-                        Ok(b) => bytes::Bytes::from(b),
-                        Err(_) => continue,
-                    }
-                }
+                (Some(c), TunnelEnd::Client) => match c.seal_client_to_server(&wire).await {
+                    Ok(b) => bytes::Bytes::from(b),
+                    Err(_) => continue,
+                },
                 (Some(c), TunnelEnd::Server) => match c.seal_server_to_client(&wire).await {
                     Ok(b) => bytes::Bytes::from(b),
                     Err(_) => continue,

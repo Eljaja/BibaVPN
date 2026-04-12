@@ -6,26 +6,27 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use rand::rngs::OsRng;
 use rand::Rng;
 use rand::RngCore;
-use rand::rngs::OsRng;
 use rustls::pki_types::ServerName;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Semaphore, mpsc};
-use tokio::time::{Duration, timeout};
-use tokio_tungstenite::WebSocketStream;
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use tracing::{error, trace, warn};
 
 use crate::crypto_layer::{self, SessionCrypto};
+use crate::frame::PadMode;
 use crate::protocol::{
-    decode_udp_rep, decode_udp_req, encode_auth, encode_udp_mux_open, encode_udp_rep, encode_udp_req,
+    decode_udp_rep, decode_udp_req, encode_auth, encode_udp_mux_open, encode_udp_rep,
+    encode_udp_req,
 };
 use crate::retry::{maybe_ws_binary_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period};
-use crate::stealth::{WsHandshakeParams, build_websocket_request};
+use crate::stealth::{build_websocket_request, WsHandshakeParams};
 use crate::tls_util::TlsClientProfile;
 use crate::ws_bridge::SharedCrypto;
-use crate::frame::PadMode;
 use crate::{read_padded_frame, write_padded_frame_with_mode};
 
 /// Max concurrent server-side UDP request tasks per mux session.
@@ -202,9 +203,10 @@ async fn connect_udp_mux_ws(
     WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     Option<SharedCrypto>,
 )> {
-    let tcp = crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
-        .await
-        .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
+    let tcp =
+        crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
+            .await
+            .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
     let _ = tcp.set_nodelay(true);
     let domain = ServerName::try_from(cfg.sni.clone())?;
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
@@ -280,7 +282,11 @@ async fn pack_tunnel_out(
         None => wire,
     };
     if blob.len() > max_ws_binary {
-        anyhow::bail!("WS binary {} exceeds max_ws_binary {}", blob.len(), max_ws_binary);
+        anyhow::bail!(
+            "WS binary {} exceeds max_ws_binary {}",
+            blob.len(),
+            max_ws_binary
+        );
     }
     Ok(blob)
 }
@@ -517,17 +523,14 @@ where
                             .with_context(|| format!("no addr for {host}:{port}"))?;
                         sock.send_to(&payload, dest).await.context("udp send")?;
                         let mut rbuf = vec![0u8; 65535];
-                        let (n, src) = match timeout(recv_timeout, sock.recv_from(&mut rbuf)).await {
+                        let (n, src) = match timeout(recv_timeout, sock.recv_from(&mut rbuf)).await
+                        {
                             Ok(Ok(v)) => v,
                             Ok(Err(e)) => return Err(e.into()),
                             Err(_) => return Ok(()),
                         };
-                        let rep_plain = encode_udp_rep(
-                            xid,
-                            &src.ip().to_string(),
-                            src.port(),
-                            &rbuf[..n],
-                        )?;
+                        let rep_plain =
+                            encode_udp_rep(xid, &src.ip().to_string(), src.port(), &rbuf[..n])?;
                         let mut wire = Vec::new();
                         write_padded_frame_with_mode(&mut wire, &rep_plain, max_pad, pad_mode)
                             .context("pad rep")?;
