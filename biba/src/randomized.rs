@@ -153,9 +153,7 @@ pub fn generate_randomized_spec(id: ClientHelloId) -> Result<ClientHelloSpec> {
         Extension::ServerName {
             host: String::new(),
         },
-        Extension::SessionTicket {
-            ticket: Vec::new(),
-        },
+        Extension::SessionTicket { ticket: Vec::new() },
         Extension::SignatureAlgorithms { schemes: sig },
         Extension::SupportedPoints {
             formats: vec![POINT_FORMAT_UNCOMPRESSED],

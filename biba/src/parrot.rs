@@ -29,9 +29,7 @@ pub fn utls_id_to_spec(id: ClientHelloId) -> Result<ClientHelloSpec> {
         ClientHelloId::Firefox63 | ClientHelloId::Firefox65 => Ok(firefox_63_65()),
         ClientHelloId::HelloRandomized
         | ClientHelloId::HelloRandomizedAlpn
-        | ClientHelloId::HelloRandomizedNoAlpn => {
-            crate::randomized::generate_randomized_spec(id)
-        }
+        | ClientHelloId::HelloRandomizedNoAlpn => crate::randomized::generate_randomized_spec(id),
         _ => Err(Error::UnknownClientHelloId),
     }
 }
@@ -72,9 +70,7 @@ fn chrome_70() -> ClientHelloSpec {
                 host: String::new(),
             },
             Extension::ExtendedMasterSecret,
-            Extension::SessionTicket {
-                ticket: Vec::new(),
-            },
+            Extension::SessionTicket { ticket: Vec::new() },
             Extension::SignatureAlgorithms {
                 schemes: vec![
                     ECDSA_SECP256R1_SHA256,
@@ -124,12 +120,7 @@ fn chrome_70() -> ClientHelloSpec {
                 ],
             },
             Extension::SupportedCurves {
-                curves: vec![
-                    GREASE_PLACEHOLDER,
-                    X25519,
-                    CURVE_P256,
-                    CURVE_P384,
-                ],
+                curves: vec![GREASE_PLACEHOLDER, X25519, CURVE_P256, CURVE_P384],
             },
             Extension::CompressCertificate {
                 algorithms: vec![CERT_COMPRESSION_BROTLI],
@@ -191,9 +182,7 @@ fn firefox_63_65() -> ClientHelloSpec {
             Extension::SupportedPoints {
                 formats: vec![POINT_FORMAT_UNCOMPRESSED],
             },
-            Extension::SessionTicket {
-                ticket: Vec::new(),
-            },
+            Extension::SessionTicket { ticket: Vec::new() },
             Extension::Alpn {
                 protocols: vec!["h2".into(), "http/1.1".into()],
             },
@@ -211,12 +200,7 @@ fn firefox_63_65() -> ClientHelloSpec {
                 ],
             },
             Extension::SupportedVersions {
-                versions: vec![
-                    VERSION_TLS13,
-                    VERSION_TLS12,
-                    VERSION_TLS11,
-                    VERSION_TLS10,
-                ],
+                versions: vec![VERSION_TLS13, VERSION_TLS12, VERSION_TLS11, VERSION_TLS10],
             },
             Extension::SignatureAlgorithms {
                 schemes: vec![

@@ -28,7 +28,10 @@ impl Default for MarshalParams<'_> {
 }
 
 /// Build TLS plaintext record: type 22, legacy version 0x0301, handshake ClientHello.
-pub fn marshal_tls_client_hello_record(spec: &ClientHelloSpec, p: &MarshalParams) -> Result<Vec<u8>> {
+pub fn marshal_tls_client_hello_record(
+    spec: &ClientHelloSpec,
+    p: &MarshalParams,
+) -> Result<Vec<u8>> {
     let hs = marshal_handshake_client_hello(spec, p)?;
     let mut rec = Vec::with_capacity(5 + hs.len());
     rec.push(RECORD_TYPE_HANDSHAKE);
@@ -39,7 +42,10 @@ pub fn marshal_tls_client_hello_record(spec: &ClientHelloSpec, p: &MarshalParams
 }
 
 /// Handshake message only (type + 24-bit length + ClientHello body).
-pub fn marshal_handshake_client_hello(spec: &ClientHelloSpec, p: &MarshalParams) -> Result<Vec<u8>> {
+pub fn marshal_handshake_client_hello(
+    spec: &ClientHelloSpec,
+    p: &MarshalParams,
+) -> Result<Vec<u8>> {
     let body = marshal_client_hello_body(spec, p)?;
     let mut out = Vec::with_capacity(4 + body.len());
     out.push(HANDSHAKE_TYPE_CLIENT_HELLO);
@@ -143,7 +149,11 @@ fn marshal_extensions(spec: &ClientHelloSpec, p: &MarshalParams) -> Result<Vec<u
     Ok(parts.into_iter().flatten().collect())
 }
 
-fn marshal_one_extension(ext: &Extension, p: &MarshalParams, grease_ext_slot: &mut u8) -> Result<Vec<u8>> {
+fn marshal_one_extension(
+    ext: &Extension,
+    p: &MarshalParams,
+    grease_ext_slot: &mut u8,
+) -> Result<Vec<u8>> {
     let mut e = ext.clone();
     apply_grease_to_extension(&mut e, p.grease_seed, grease_ext_slot);
     inject_sni(&mut e, p.server_name);
@@ -211,7 +221,8 @@ mod tests {
         let mut p = MarshalParams::default();
         p.server_name = "example.com";
         let record = marshal_tls_client_hello_record(&spec, &p).expect("marshal");
-        let parsed = crate::parse::client_hello_spec_from_tls_record(&record, false, false).expect("parse");
+        let parsed =
+            crate::parse::client_hello_spec_from_tls_record(&record, false, false).expect("parse");
         assert_eq!(parsed.cipher_suites.len(), spec.cipher_suites.len());
         assert_eq!(parsed.extensions.len(), spec.extensions.len());
     }

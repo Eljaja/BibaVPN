@@ -1,10 +1,10 @@
 //! Parse TLS records and ClientHello into [`ClientHelloSpec`](crate::spec::ClientHelloSpec).
 
+use crate::constants::*;
 use crate::error::{Error, Result};
 use crate::extensions::{parse_extension_block, Extension};
 use crate::grease::ungrease_u16;
 use crate::spec::ClientHelloSpec;
-use crate::constants::*;
 
 /// Parse full TLS record (as in uTLS `ClientHelloSpec.FromRaw`).
 pub fn client_hello_spec_from_tls_record(
@@ -34,8 +34,7 @@ fn parse_client_hello_handshake(data: &[u8], blunt: bool) -> Result<ClientHelloS
     if data[0] != HANDSHAKE_TYPE_CLIENT_HELLO {
         return Err(Error::InvalidClientHello("not client hello"));
     }
-    let hs_len =
-        ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
+    let hs_len = ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
     if data.len() < 4 + hs_len {
         return Err(Error::UnexpectedEof);
     }

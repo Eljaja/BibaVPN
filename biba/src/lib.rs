@@ -13,8 +13,8 @@ pub mod extensions;
 pub mod fingerprinter;
 pub mod grease;
 pub mod marshal;
-pub mod parse;
 pub mod parrot;
+pub mod parse;
 pub mod randomized;
 pub mod roller;
 pub mod spec;
@@ -56,10 +56,13 @@ mod tests {
     #[test]
     fn fingerprinter_accepts_record() {
         let spec = utls_id_to_spec(ClientHelloId::Chrome70).unwrap();
-        let rec = marshal_tls_client_hello_record(&spec, &MarshalParams {
-            server_name: "t.example",
-            ..Default::default()
-        })
+        let rec = marshal_tls_client_hello_record(
+            &spec,
+            &MarshalParams {
+                server_name: "t.example",
+                ..Default::default()
+            },
+        )
         .unwrap();
         let fp = Fingerprinter::default();
         let s2 = fp.raw_client_hello(&rec).unwrap();

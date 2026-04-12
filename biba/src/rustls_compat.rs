@@ -47,5 +47,8 @@ pub fn hints_from_spec(spec: &ClientHelloSpec) -> RustlsClientConfigHints {
         }
     }
 
-    RustlsClientConfigHints { cipher_suites: suites, alpn }
+    RustlsClientConfigHints {
+        cipher_suites: suites,
+        alpn,
+    }
 }

@@ -23,26 +23,60 @@ pub struct KeyShareEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Extension {
-    Grease { value: u16, body: Vec<u8> },
-    ServerName { host: String },
+    Grease {
+        value: u16,
+        body: Vec<u8>,
+    },
+    ServerName {
+        host: String,
+    },
     ExtendedMasterSecret,
-    RenegotiationInfo { renegotiation: u8 },
-    SessionTicket { ticket: Vec<u8> },
-    SignatureAlgorithms { schemes: Vec<u16> },
+    RenegotiationInfo {
+        renegotiation: u8,
+    },
+    SessionTicket {
+        ticket: Vec<u8>,
+    },
+    SignatureAlgorithms {
+        schemes: Vec<u16>,
+    },
     StatusRequest,
     SignedCertificateTimestamp,
-    Alpn { protocols: Vec<String> },
-    FakeChannelId { old_extension_id: bool },
-    SupportedPoints { formats: Vec<u8> },
-    KeyShare { entries: Vec<KeyShareEntry> },
-    PskKeyExchangeModes { modes: Vec<u8> },
-    SupportedVersions { versions: Vec<u16> },
-    SupportedCurves { curves: Vec<u16> },
-    CompressCertificate { algorithms: Vec<u16> },
-    Padding { style: PaddingStyle },
+    Alpn {
+        protocols: Vec<String>,
+    },
+    FakeChannelId {
+        old_extension_id: bool,
+    },
+    SupportedPoints {
+        formats: Vec<u8>,
+    },
+    KeyShare {
+        entries: Vec<KeyShareEntry>,
+    },
+    PskKeyExchangeModes {
+        modes: Vec<u8>,
+    },
+    SupportedVersions {
+        versions: Vec<u16>,
+    },
+    SupportedCurves {
+        curves: Vec<u16>,
+    },
+    CompressCertificate {
+        algorithms: Vec<u16>,
+    },
+    Padding {
+        style: PaddingStyle,
+    },
     /// `record_size_limit` (28) — Firefox / uTLS fake compatibility.
-    RecordSizeLimit { limit: u16 },
-    Generic { id: u16, data: Vec<u8> },
+    RecordSizeLimit {
+        limit: u16,
+    },
+    Generic {
+        id: u16,
+        data: Vec<u8>,
+    },
 }
 
 impl Extension {
@@ -228,7 +262,10 @@ pub fn marshal_extensions_with_padding(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, ext) in exts.iter().enumerate() {
-        if let Extension::Padding { style: PaddingStyle::Boring } = ext {
+        if let Extension::Padding {
+            style: PaddingStyle::Boring,
+        } = ext
+        {
             let prefix_len = boring_unpadded_client_hello_len(i);
             let (plen, will_pad) = boring_padding_len(prefix_len);
             if !will_pad {
@@ -277,9 +314,7 @@ pub fn extension_from_wire(id: u16, data: &[u8]) -> Result<Extension> {
         EXT_EXTENDED_MASTER_SECRET => Ok(Extension::ExtendedMasterSecret),
         EXT_RENEGOTIATION_INFO => {
             let r = *data.first().unwrap_or(&0);
-            Ok(Extension::RenegotiationInfo {
-                renegotiation: r,
-            })
+            Ok(Extension::RenegotiationInfo { renegotiation: r })
         }
         EXT_SESSION_TICKET => Ok(Extension::SessionTicket {
             ticket: data.to_vec(),
@@ -376,9 +411,7 @@ fn parse_sig_algs(data: &[u8]) -> Result<Extension> {
 
 fn parse_alpn(data: &[u8]) -> Result<Extension> {
     if data.len() < 2 {
-        return Ok(Extension::Alpn {
-            protocols: vec![],
-        });
+        return Ok(Extension::Alpn { protocols: vec![] });
     }
     let n = u16::from_be_bytes([data[0], data[1]]) as usize;
     let mut protos = Vec::new();
@@ -451,9 +484,7 @@ fn parse_supported_curves(data: &[u8]) -> Result<Extension> {
 
 fn parse_compress_cert(data: &[u8]) -> Result<Extension> {
     if data.is_empty() {
-        return Ok(Extension::CompressCertificate {
-            algorithms: vec![],
-        });
+        return Ok(Extension::CompressCertificate { algorithms: vec![] });
     }
     let n = data[0] as usize;
     let mut algs = Vec::new();
