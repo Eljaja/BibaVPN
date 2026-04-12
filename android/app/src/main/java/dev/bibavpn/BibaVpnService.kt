@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -59,6 +60,31 @@ class BibaVpnService : VpnService() {
 
     @Volatile
     private var connectBootstrapThread: Thread? = null
+
+    private var connectivityManager: ConnectivityManager? = null
+
+    /** После смены Wi‑Fi ↔ LTE обновляем underlying network и перезапускаем стек (WSS привязан к старому пути). */
+    private val networkRestartHandler = Handler(Looper.getMainLooper())
+    private var networkRestartRunnable: Runnable? = null
+
+    private val defaultNetworkCallback =
+        object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.i(TAG, "default network available: $network")
+                if (!isTunnelActive) return
+                applyUnderlyingNetworks(arrayOf(network))
+                scheduleFullRestartAfterNetworkChange()
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: android.net.NetworkCapabilities,
+            ) {
+                if (!isTunnelActive) return
+                // Только маршрутизация; полный перезапуск — в onAvailable (смена дефолтной сети).
+                applyUnderlyingNetworks(arrayOf(network))
+            }
+        }
 
     private val screenOnOffReceiver =
         object : BroadcastReceiver() {
@@ -129,6 +155,47 @@ class BibaVpnService : VpnService() {
             @Suppress("DEPRECATION")
             registerReceiver(screenOnOffReceiver, f)
         }
+
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        runCatching {
+            connectivityManager?.registerDefaultNetworkCallback(defaultNetworkCallback)
+        }.onFailure { e ->
+            Log.w(TAG, "registerDefaultNetworkCallback: ${e.message}")
+        }
+    }
+
+    /** [VpnService.setUnderlyingNetworks] — API 22+; при смене default network без этого трафик VPN может остаться на старом интерфейсе. */
+    private fun applyUnderlyingNetworks(networks: Array<Network>) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP_MR1) return
+        runCatching {
+            setUnderlyingNetworks(networks)
+        }.onFailure { e ->
+            Log.w(TAG, "setUnderlyingNetworks: ${e.message}")
+        }
+    }
+
+    private fun scheduleFullRestartAfterNetworkChange() {
+        networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
+        val r =
+            Runnable {
+                networkRestartRunnable = null
+                if (!isTunnelActive) return@Runnable
+                val json = loadSavedConfigJson()
+                if (json.isNullOrBlank()) {
+                    Log.w(TAG, "network change: no saved config, skip full restart")
+                    return@Runnable
+                }
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastFullStackRestartElapsed < 2500L) {
+                    Log.d(TAG, "network change: skip full restart (throttle ${now - lastFullStackRestartElapsed}ms)")
+                    return@Runnable
+                }
+                lastFullStackRestartElapsed = now
+                Log.i(TAG, "network change: full stack restart (native + TUN + tun2socks)")
+                restartFullStackAfterScreenOn(json)
+            }
+        networkRestartRunnable = r
+        networkRestartHandler.postDelayed(r, 1500L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -138,6 +205,8 @@ class BibaVpnService : VpnService() {
         )
         when (intent?.action) {
             ACTION_STOP -> {
+                networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
+                networkRestartRunnable = null
                 stopTunnelAndNative()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -286,6 +355,9 @@ class BibaVpnService : VpnService() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onDestroy() {
+        networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
+        networkRestartRunnable = null
+        runCatching { connectivityManager?.unregisterNetworkCallback(defaultNetworkCallback) }
         runCatching { unregisterReceiver(screenOnOffReceiver) }
         if (VpnProtect.vpn === this) {
             VpnProtect.vpn = null
@@ -361,13 +433,13 @@ class BibaVpnService : VpnService() {
                 /* IPv6 маршрут необязателен */
             }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 runCatching {
-                    (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
-                        ?.activeNetwork
-                        ?.let { builder.setUnderlyingNetworks(arrayOf(it)) }
+                    connectivityManager?.activeNetwork?.let { n ->
+                        builder.setUnderlyingNetworks(arrayOf(n))
+                    }
                 }.onFailure { e ->
-                    Log.w(TAG, "setUnderlyingNetworks skipped: ${e.message}")
+                    Log.w(TAG, "Builder.setUnderlyingNetworks skipped: ${e.message}")
                 }
             }
 
@@ -407,6 +479,11 @@ class BibaVpnService : VpnService() {
                         acquireTunnelWakeLock()
                         isTunnelActive = true
                         allowScreenOnStackRestart = true
+                        mainHandler.post {
+                            connectivityManager?.activeNetwork?.let { n ->
+                                applyUnderlyingNetworks(arrayOf(n))
+                            }
+                        }
                     } catch (e: Throwable) {
                         Log.e(TAG, "tun2socks", e)
                         abortVpnFromWorker(e.message)
