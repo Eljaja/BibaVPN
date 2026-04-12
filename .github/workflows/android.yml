@@ -86,11 +86,22 @@ jobs:
             -o android/app/src/main/jniLibs \
             build -p bibavpn-jni --release
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: android
+
       - name: Assemble debug APK
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          attempt=1
+          until [ "$attempt" -gt 3 ]; do
+            ./gradlew assembleDebug --no-daemon --stacktrace && exit 0
+            attempt=$((attempt + 1))
+            sleep 30
+          done
+          exit 1
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

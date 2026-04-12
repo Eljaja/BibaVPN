@@ -53,7 +53,8 @@ jobs:
           cache-dependency-path: bibavpn-desktop/ui/package-lock.json
 
       - name: Install UI deps & build frontend
-        run: npm ci && npm run build --prefix bibavpn-desktop/ui
+        working-directory: bibavpn-desktop/ui
+        run: npm install --no-audit --no-fund && npm run build
 
       - name: Build bibavpn-desktop (release)
         run: cargo build -p bibavpn-desktop --release
