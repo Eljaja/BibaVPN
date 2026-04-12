@@ -46,6 +46,15 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: bibavpn-desktop/ui/package-lock.json
+
+      - name: Install UI deps & build frontend
+        run: npm ci && npm run build --prefix bibavpn-desktop/ui
+
       - name: Build bibavpn-desktop (release)
         run: cargo build -p bibavpn-desktop --release
 

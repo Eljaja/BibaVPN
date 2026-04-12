@@ -1,11 +1,11 @@
 //! Windows WinInet registry proxy (same keys as most “system proxy” UIs).
 
 use std::io;
-use winreg::enums::*;
-use winreg::RegKey;
 use windows::Win32::Networking::WinInet::{
     InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
 };
+use winreg::enums::*;
+use winreg::RegKey;
 
 #[derive(Debug, Clone)]
 pub struct ProxyBackup {
@@ -44,6 +44,26 @@ pub fn read_backup() -> io::Result<ProxyBackup> {
     })
 }
 
+/// WinInet: keep prior user bypass list and always add loopback exclusions so WebView2 / Tauri
+/// (`localhost`, `127.0.0.1`) do not go through the VPN system proxy.
+fn merge_proxy_override_with_loopback(existing: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(e) = existing {
+        for p in e.split(';') {
+            let t = p.trim();
+            if !t.is_empty() {
+                parts.push(t.to_string());
+            }
+        }
+    }
+    for req in ["<-loopback>", "localhost", "127.0.0.1", "tauri.localhost"] {
+        if !parts.iter().any(|p| p.eq_ignore_ascii_case(req)) {
+            parts.push(req.to_string());
+        }
+    }
+    parts.join(";")
+}
+
 fn notify_changed() -> Result<(), String> {
     unsafe {
         InternetSetOptionW(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0)
@@ -55,15 +75,22 @@ fn notify_changed() -> Result<(), String> {
 }
 
 /// WinInet `ProxyServer`: HTTP/HTTPS → локальный CONNECT-прокси; `socks` → SOCKS5 (TCP + UDP ASSOCIATE).
-pub fn apply_proxy(http_host_port: &str, socks_host_port: &str) -> Result<(), String> {
-    let proxy_server = format!(
-        "http={http_host_port};https={http_host_port};socks={socks_host_port}"
-    );
+/// `prior_proxy_override` — значение `ProxyOverride` до применения (из [`read_backup`]); сохраняется и дополняется.
+pub fn apply_proxy(
+    http_host_port: &str,
+    socks_host_port: &str,
+    prior_proxy_override: Option<&str>,
+) -> Result<(), String> {
+    let proxy_server =
+        format!("http={http_host_port};https={http_host_port};socks={socks_host_port}");
     let key = internet_settings_key(true).map_err(|e| e.to_string())?;
+    let merged_override = merge_proxy_override_with_loopback(prior_proxy_override);
     key.set_value("ProxyEnable", &1u32)
         .map_err(|e| format!("ProxyEnable: {e}"))?;
     key.set_value("ProxyServer", &proxy_server)
         .map_err(|e| format!("ProxyServer: {e}"))?;
+    key.set_value("ProxyOverride", &merged_override)
+        .map_err(|e| format!("ProxyOverride: {e}"))?;
     notify_changed()
 }
 

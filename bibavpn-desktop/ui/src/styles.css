@@ -1,0 +1,496 @@
+/* DESIGN.md tokens — BibaVPN */
+
+:root {
+  --bg-root: #070b14;
+  --bg-screen: #0b0f1a;
+  --bg-radial-center: #16203b;
+  --card-bg: #121826;
+  --card-settings: rgba(18, 24, 38, 0.92);
+  --field-inset: rgba(2, 6, 23, 0.55);
+  --field-text: #f8fafc;
+  --label-sky: #60a5fa;
+  --label-sky-90: rgba(96, 165, 250, 0.9);
+  --label-sky-75: rgba(96, 165, 250, 0.75);
+  --text-muted: #94a3b8;
+  --text-slate200: #e2e8f0;
+  --mint: #00ffa3;
+  --mint-soft: #34d399;
+  --mint-20: rgba(0, 255, 163, 0.2);
+  --mint-40: rgba(0, 255, 163, 0.4);
+  --mint-ring-35: rgba(0, 255, 163, 0.35);
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --main-btn-border: rgba(96, 165, 250, 0.2);
+  --icon-btn-fill: rgba(255, 255, 255, 0.03);
+  --cta-top: #1a2950;
+  --cta-bottom: #14203c;
+  --danger: #fb7185;
+  --warning: #fbbf24;
+  --radius-status: 26px;
+  --radius-cta: 28px;
+  --radius-server: 24px;
+  --radius-settings: 28px;
+  --radius-field: 16px;
+  --radius-invite: 14px;
+  --radius-cta-square: 16px;
+  --space-screen-x: 20px;
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  color: var(--field-text);
+  background: var(--bg-root);
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.view {
+  min-height: 100vh;
+  padding: 0 var(--space-screen-x) 24px;
+}
+
+/* Main: radial top (§2.6) */
+.view-home {
+  background: radial-gradient(
+    1200px 800px at 50% 0%,
+    var(--bg-radial-center) 0%,
+    var(--bg-root) 55%,
+    var(--bg-root) 100%
+  );
+}
+
+.view-settings {
+  background: var(--bg-screen);
+  display: flex;
+  flex-direction: column;
+  max-height: 100vh;
+}
+
+.home-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 12px;
+  min-height: 52px;
+}
+
+.wordmark {
+  flex: 1;
+  object-fit: contain;
+  object-position: center;
+  max-height: 36px;
+  width: 0;
+  min-width: 0;
+}
+
+.header-spacer {
+  width: 40px;
+  flex-shrink: 0;
+}
+
+.icon-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid var(--border-subtle);
+  background: var(--icon-btn-fill);
+  color: rgba(226, 232, 240, 0.88);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+}
+
+.card-dim {
+  background: var(--card-settings);
+  border: 1px solid var(--border-subtle);
+}
+
+.status-card {
+  border-radius: var(--radius-status);
+  padding: 20px;
+  margin-top: 24px;
+}
+
+.status-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.status-dot-wrap {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  margin-top: 4px;
+}
+
+.status-dot-outer {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: transparent;
+}
+
+.status-dot-inner {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.view-home.is-connected .status-dot-outer {
+  background: var(--mint-ring-35);
+}
+
+.view-home.is-connected .status-dot-inner {
+  background: var(--mint-soft);
+}
+
+.status-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.status-sub {
+  margin: 12px 0 0;
+  font-size: 14px;
+  color: rgba(226, 232, 240, 0.85);
+  line-height: 1.35;
+}
+
+.cta {
+  display: block;
+  width: 100%;
+  margin-top: 40px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  border-radius: var(--radius-cta);
+  position: relative;
+  overflow: hidden;
+}
+
+.cta:disabled {
+  cursor: not-allowed;
+}
+
+.cta-inner {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-direction: row-reverse;
+  gap: 16px;
+  min-height: 72px;
+  padding: 22px 24px;
+  border-radius: var(--radius-cta);
+  background: linear-gradient(180deg, var(--cta-top), var(--cta-bottom));
+  border: 1px solid var(--main-btn-border);
+}
+
+.cta.muted .cta-inner {
+  opacity: 0.55;
+}
+
+.cta-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.cta-title {
+  display: block;
+  font-size: 22px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.cta-sub {
+  display: block;
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--label-sky-75);
+  line-height: 1.3;
+}
+
+.cta-square {
+  width: 48px;
+  height: 48px;
+  flex-shrink: 0;
+  border-radius: var(--radius-cta-square);
+  border: 1px solid rgba(0, 255, 163, 0.35);
+  background: rgba(0, 255, 163, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cta-square-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--mint-soft);
+}
+
+.server-card {
+  margin-top: 32px;
+  border-radius: var(--radius-server);
+  padding: 16px;
+  width: 100%;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.server-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 2.4px;
+  color: var(--text-muted);
+}
+
+.server-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.server-title {
+  display: block;
+  font-size: 18px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.server-sub {
+  display: block;
+  margin-top: 4px;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.server-chevron {
+  font-size: 22px;
+  color: rgba(148, 163, 184, 0.55);
+  flex-shrink: 0;
+}
+
+.warn-banner {
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--warning);
+  line-height: 1.35;
+}
+
+.active-remote {
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--mint-soft);
+}
+
+.error-banner {
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--danger);
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+/* Settings */
+.settings-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 12px;
+  flex-shrink: 0;
+}
+
+.settings-heading {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--field-text);
+}
+
+.settings-scroll {
+  flex: 1;
+  overflow-y: auto;
+  margin-top: 20px;
+  padding-bottom: 32px;
+}
+
+.settings-card {
+  border-radius: var(--radius-settings);
+  padding: 20px;
+}
+
+.group-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.group-label.spaced {
+  margin-top: 20px;
+}
+
+.field-label {
+  display: block;
+  margin-top: 12px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--label-sky-90);
+}
+
+.field-label:first-of-type {
+  margin-top: 0;
+}
+
+.field {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--radius-field);
+  border: 1px solid var(--border-subtle);
+  background: var(--field-inset);
+  color: var(--field-text);
+  font-size: 14px;
+}
+
+.field:focus {
+  outline: 1px solid rgba(96, 165, 250, 0.35);
+  outline-offset: 0;
+}
+
+.field-num {
+  max-width: 100%;
+}
+
+.field-area {
+  resize: vertical;
+  min-height: 72px;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+}
+
+.field-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.field-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+@media (max-width: 440px) {
+  .field-grid-2,
+  .field-grid-3 {
+    grid-template-columns: 1fr;
+  }
+}
+
+.field-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.ports-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  font-size: 14px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.toggle-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--mint);
+}
+
+.btn-invite {
+  margin-top: 12px;
+  width: 100%;
+  padding: 12px 16px;
+  border: none;
+  border-radius: var(--radius-invite);
+  background: var(--mint-20);
+  color: var(--mint);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.btn-invite:hover {
+  background: rgba(0, 255, 163, 0.28);
+}
+
+.more-block {
+  margin-top: 16px;
+  border: none;
+}
+
+.more-summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--label-sky);
+  padding: 8px 0;
+}
+
+.more-summary::-webkit-details-marker {
+  display: none;
+}
+
+.more-inner {
+  margin-top: 8px;
+}

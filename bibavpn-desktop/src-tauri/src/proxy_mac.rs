@@ -112,9 +112,7 @@ fn filter_proxy_services(services: Vec<String>) -> Vec<String> {
         })
         .collect();
 
-    scored.sort_by(|a, b| {
-        a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
-    });
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     scored
         .into_iter()
@@ -210,26 +208,22 @@ fn split_host_port(hp: &str) -> Result<(String, String), String> {
     let (h, p) = hp
         .rsplit_once(':')
         .ok_or_else(|| format!("неверный host:port: {hp}"))?;
-    let _: u16 = p
-        .parse()
-        .map_err(|_| format!("неверный порт: {p}"))?;
+    let _: u16 = p.parse().map_err(|_| format!("неверный порт: {p}"))?;
     Ok((h.to_string(), p.to_string()))
 }
 
-pub fn apply_proxy(http_host_port: &str, socks_host_port: &str) -> Result<(), String> {
+pub fn apply_proxy(
+    http_host_port: &str,
+    socks_host_port: &str,
+    _prior_proxy_override: Option<&str>,
+) -> Result<(), String> {
     let (http_host, http_port) = split_host_port(http_host_port)?;
     let (socks_host, socks_port) = split_host_port(socks_host_port)?;
     let services = services_for_proxy()?;
     let mut ok_any = false;
     let mut last_err = String::new();
     for service in &services {
-        match apply_to_service(
-            service,
-            &http_host,
-            &http_port,
-            &socks_host,
-            &socks_port,
-        ) {
+        match apply_to_service(service, &http_host, &http_port, &socks_host, &socks_port) {
             Ok(()) => ok_any = true,
             Err(e) => last_err = e,
         }
@@ -252,19 +246,9 @@ fn apply_to_service(
 ) -> Result<(), String> {
     run_netsetup(&["-setwebproxy", service, http_host, http_port])?;
     run_netsetup(&["-setwebproxystate", service, "on"])?;
-    run_netsetup(&[
-        "-setsecurewebproxy",
-        service,
-        http_host,
-        http_port,
-    ])?;
+    run_netsetup(&["-setsecurewebproxy", service, http_host, http_port])?;
     run_netsetup(&["-setsecurewebproxystate", service, "on"])?;
-    run_netsetup(&[
-        "-setsocksfirewallproxy",
-        service,
-        socks_host,
-        socks_port,
-    ])?;
+    run_netsetup(&["-setsocksfirewallproxy", service, socks_host, socks_port])?;
     run_netsetup(&["-setsocksfirewallproxystate", service, "on"])?;
     Ok(())
 }

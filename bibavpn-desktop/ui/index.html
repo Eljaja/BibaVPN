@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BibaVPN</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="view-home" class="view view-home">
+        <header class="home-header">
+          <button type="button" class="icon-btn" id="btn-settings" aria-label="Настройки">&#9881;</button>
+          <img class="wordmark" src="/wordmark.png" alt="BibaVPN" height="36" />
+          <span class="header-spacer" aria-hidden="true"></span>
+        </header>
+
+        <section class="status-card card" id="status-card">
+          <div class="status-row">
+            <div class="status-dot-wrap" id="status-dot-wrap" aria-hidden="true">
+              <span class="status-dot-outer"></span>
+              <span class="status-dot-inner"></span>
+            </div>
+            <div class="status-text">
+              <h1 class="status-title" id="status-title">Не подключено</h1>
+              <p class="status-sub" id="status-sub"></p>
+            </div>
+          </div>
+        </section>
+
+        <button type="button" class="cta" id="btn-cta" disabled>
+          <span class="cta-inner">
+            <span class="cta-copy">
+              <span class="cta-title" id="cta-title">Подключить</span>
+              <span class="cta-sub" id="cta-sub"></span>
+            </span>
+            <span class="cta-square" aria-hidden="true"><span class="cta-square-dot"></span></span>
+          </span>
+        </button>
+
+        <button type="button" class="server-card card" id="btn-server-card">
+          <span class="server-label">SERVER</span>
+          <div class="server-row">
+            <div class="server-text">
+              <span class="server-title" id="server-title">—</span>
+              <span class="server-sub" id="server-sub"></span>
+            </div>
+            <span class="server-chevron">›</span>
+          </div>
+        </button>
+
+        <p class="warn-banner" id="warn-server-changed" hidden></p>
+        <p class="active-remote" id="active-remote" hidden></p>
+        <p class="error-banner" id="error-banner" hidden></p>
+      </div>
+
+      <div id="view-settings" class="view view-settings" hidden>
+        <header class="settings-top">
+          <button type="button" class="icon-btn" id="btn-back" aria-label="Назад">←</button>
+          <h2 class="settings-heading">Настройки</h2>
+        </header>
+
+        <div class="settings-scroll">
+          <section class="settings-card card-dim">
+            <p class="group-label">Ключ Biba (как в Android)</p>
+            <label class="field-label" for="f-from_invite">biba://…</label>
+            <input class="field" id="f-from_invite" name="from_invite" autocomplete="off" />
+            <label class="field-label" for="f-invite_passphrase">Passphrase</label>
+            <input class="field" id="f-invite_passphrase" name="invite_passphrase" type="password" autocomplete="off" />
+            <button type="button" class="btn-invite" id="btn-apply-invite">Применить к полям</button>
+
+            <p class="group-label spaced">Подключение</p>
+            <label class="field-label" for="f-server">Сервер</label>
+            <input class="field" id="f-server" name="server" autocomplete="off" />
+
+            <p class="group-label spaced">Учётные данные</p>
+            <div class="field-grid-2">
+              <div>
+                <label class="field-label" for="f-token">Токен</label>
+                <input class="field" id="f-token" name="token" autocomplete="off" />
+              </div>
+              <div>
+                <label class="field-label" for="f-sni">SNI</label>
+                <input class="field" id="f-sni" name="sni" autocomplete="off" />
+              </div>
+            </div>
+            <label class="field-label" for="f-psk">PSK</label>
+            <input class="field" id="f-psk" name="psk" type="password" autocomplete="off" />
+            <label class="toggle-row">
+              <input type="checkbox" id="f-insecure" name="insecure" />
+              <span>Без проверки TLS (insecure)</span>
+            </label>
+
+            <p class="group-label spaced">Локальные порты</p>
+            <div class="ports-row">
+              <div>
+                <label class="field-label" for="f-local_http_port">HTTP</label>
+                <input class="field field-num" id="f-local_http_port" name="local_http_port" type="number" min="1024" max="65533" />
+              </div>
+              <div>
+                <label class="field-label" for="f-local_socks_port">SOCKS</label>
+                <input class="field field-num" id="f-local_socks_port" name="local_socks_port" type="number" min="0" max="65535" />
+              </div>
+            </div>
+            <p class="field-hint">SOCKS: 0 = автоматически HTTP+1</p>
+          </section>
+
+          <details class="more-block">
+            <summary class="more-summary">Дополнительно</summary>
+            <section class="settings-card card-dim more-inner">
+              <div class="field-grid-2">
+                <div>
+                  <label class="field-label" for="f-max_pad">max_pad</label>
+                  <input class="field field-num" id="f-max_pad" name="max_pad" type="number" min="0" max="255" />
+                </div>
+                <div>
+                  <label class="field-label" for="f-decoy_max">decoy_max</label>
+                  <input class="field field-num" id="f-decoy_max" name="decoy_max" type="number" min="0" max="255" />
+                </div>
+              </div>
+              <div class="field-grid-2">
+                <div>
+                  <label class="field-label" for="f-junk_frames">junk_frames</label>
+                  <input class="field field-num" id="f-junk_frames" name="junk_frames" type="number" min="0" />
+                </div>
+                <div>
+                  <label class="field-label" for="f-early_ws_frames">early_ws_frames</label>
+                  <input class="field field-num" id="f-early_ws_frames" name="early_ws_frames" type="number" min="0" max="255" />
+                </div>
+              </div>
+              <div class="field-grid-2">
+                <div>
+                  <label class="field-label" for="f-max_ws_binary">max_ws_binary</label>
+                  <input class="field field-num" id="f-max_ws_binary" name="max_ws_binary" type="number" min="1024" />
+                </div>
+                <div>
+                  <label class="field-label" for="f-ws_ping_secs">ws_ping_secs</label>
+                  <input class="field field-num" id="f-ws_ping_secs" name="ws_ping_secs" type="number" min="0" />
+                </div>
+              </div>
+              <label class="toggle-row">
+                <input type="checkbox" id="f-use_tcp_mux" name="use_tcp_mux" />
+                <span>TCP multiplex (use_tcp_mux)</span>
+              </label>
+              <label class="field-label" for="f-ws_path">ws_path</label>
+              <input class="field" id="f-ws_path" name="ws_path" placeholder="/ws" />
+              <label class="field-label" for="f-pad_mode">pad_mode</label>
+              <input class="field" id="f-pad_mode" name="pad_mode" placeholder="random / http-buckets" />
+              <div class="field-grid-3">
+                <div>
+                  <label class="field-label" for="f-ws_ping_jitter_percent">ping jitter %</label>
+                  <input class="field field-num" id="f-ws_ping_jitter_percent" name="ws_ping_jitter_percent" type="number" min="0" max="50" />
+                </div>
+                <div>
+                  <label class="field-label" for="f-ws_binary_send_jitter_ms">bin jitter ms</label>
+                  <input class="field field-num" id="f-ws_binary_send_jitter_ms" name="ws_binary_send_jitter_ms" type="number" min="0" max="255" />
+                </div>
+                <div>
+                  <label class="field-label" for="f-dummy_interval_secs">dummy interval</label>
+                  <input class="field field-num" id="f-dummy_interval_secs" name="dummy_interval_secs" type="number" min="0" />
+                </div>
+              </div>
+              <label class="toggle-row">
+                <input type="checkbox" id="f-decoy_gets" name="decoy_gets" />
+                <span>Decoy HTTPS GET</span>
+              </label>
+              <div id="decoy-gets-extra" hidden>
+                <label class="field-label" for="f-decoy_gets_interval_secs">decoy interval (с)</label>
+                <input class="field field-num" id="f-decoy_gets_interval_secs" name="decoy_gets_interval_secs" type="number" min="1" />
+                <label class="field-label" for="f-decoy_gets_paths">decoy_gets_paths</label>
+                <input class="field" id="f-decoy_gets_paths" name="decoy_gets_paths" />
+              </div>
+              <p class="group-label spaced">UDP mux (пусто = по умолчанию)</p>
+              <div class="field-grid-3">
+                <div>
+                  <label class="field-label" for="f-udp_max_pad">udp_max_pad</label>
+                  <input class="field" id="f-udp_max_pad" name="udp_max_pad" />
+                </div>
+                <div>
+                  <label class="field-label" for="f-udp_max_ws_binary">udp_max_ws_binary</label>
+                  <input class="field" id="f-udp_max_ws_binary" name="udp_max_ws_binary" />
+                </div>
+                <div>
+                  <label class="field-label" for="f-udp_mux_reply_timeout_secs">udp_mux_timeout</label>
+                  <input class="field" id="f-udp_mux_reply_timeout_secs" name="udp_mux_reply_timeout_secs" />
+                </div>
+              </div>
+              <label class="field-label" for="f-pin_cert_pem">pin_cert_pem</label>
+              <textarea class="field field-area" id="f-pin_cert_pem" name="pin_cert_pem" rows="4"></textarea>
+              <label class="field-label" for="f-ws_headers">ws_headers</label>
+              <textarea class="field field-area" id="f-ws_headers" name="ws_headers" rows="3" placeholder="Header: value"></textarea>
+              <label class="field-label" for="f-tls_profile">tls_profile</label>
+              <select class="field" id="f-tls_profile" name="tls_profile">
+                <option value="default">По умолчанию (rustls)</option>
+                <option value="chrome70">Chrome 70</option>
+                <option value="firefox65">Firefox 65</option>
+                <option value="firefox63">Firefox 63</option>
+                <option value="randomized">Randomized</option>
+                <option value="randomized-alpn">Randomized + ALPN</option>
+                <option value="randomized-no-alpn">Randomized без ALPN</option>
+              </select>
+            </section>
+          </details>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
