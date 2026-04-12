@@ -263,11 +263,14 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     let http_hp = format!("127.0.0.1:{http_port}");
     let socks_hp = format!("127.0.0.1:{socks_port}");
-    if let Err(e) = apply_proxy(
-        &http_hp,
-        &socks_hp,
-        backup.override_val.as_deref().filter(|s| !s.is_empty()),
-    ) {
+    #[cfg(windows)]
+    let prior_proxy_override = match backup.override_val.as_deref() {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    };
+    #[cfg(not(windows))]
+    let prior_proxy_override: Option<&str> = None;
+    if let Err(e) = apply_proxy(&http_hp, &socks_hp, prior_proxy_override) {
         warn!(target: "bibavpn_desktop", "системный прокси: {e}");
         let _ = shutdown_tx.send(true);
         let _ = state.rt.block_on(join);
