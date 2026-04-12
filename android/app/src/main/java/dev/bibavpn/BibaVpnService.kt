@@ -12,6 +12,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -34,9 +35,7 @@ class BibaVpnService : VpnService() {
 
     private val tunLock = Any()
     private var tun2socksThread: Thread? = null
-    /** После успешного Engine.start() fd закрывает Go; не вызывать ParcelFileDescriptor.close() — fdsan/SIGABRT. */
-    @Volatile
-    private var tunFdMustCloseInJava = false
+    /** Java держит свой dup TUN fd; в Go отдаём отдельный dup, чтобы не спорить за ownership с fdsan. */
     private var tunParcelOrphan: ParcelFileDescriptor? = null
     private var tunnelWakeLock: PowerManager.WakeLock? = null
 
@@ -72,45 +71,35 @@ class BibaVpnService : VpnService() {
      * — сам VPN без [NetworkCapabilities.NET_CAPABILITY_NOT_VPN]; обрабатывать её нельзя (иначе цикл перезапусков).
      */
     private var lastPhysicalNetworkForRestart: Network? = null
+    private var pendingPhysicalNetworkRestart: Network? = null
 
     /** После смены Wi‑Fi ↔ LTE обновляем underlying network и перезапускаем стек (WSS привязан к старому пути). */
     private val networkRestartHandler = Handler(Looper.getMainLooper())
     private var networkRestartRunnable: Runnable? = null
+    private val restartLock = Any()
 
-    private val defaultNetworkCallback =
+    @Volatile
+    private var fullStackRestartInProgress: Boolean = false
+
+    @Volatile
+    private var fullStackRestartQueued: Boolean = false
+
+    private val physicalNetworkCallback =
         object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                val cm = connectivityManager ?: return
-                val caps = cm.getNetworkCapabilities(network) ?: return
-                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
-                    Log.d(TAG, "onAvailable skip (not physical / likely VPN): $network")
-                    return
-                }
-                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
-                if (!isTunnelActive) return
-                val underlying = physicalInternetNetwork(cm) ?: return
-                applyUnderlyingNetworks(arrayOf(underlying))
-                val shouldRestart =
-                    synchronized(networkTrackingLock) {
-                        val prev = lastPhysicalNetworkForRestart
-                        lastPhysicalNetworkForRestart = underlying
-                        prev != null && prev != underlying
-                    }
-                if (shouldRestart) {
-                    Log.i(TAG, "physical network changed -> schedule full restart")
-                    scheduleFullRestartAfterNetworkChange()
-                }
+                handlePhysicalNetworkSignal("onAvailable", network)
             }
 
             override fun onCapabilitiesChanged(
                 network: Network,
                 networkCapabilities: NetworkCapabilities,
             ) {
-                if (!isTunnelActive) return
                 if (!networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return
-                val cm = connectivityManager ?: return
-                val underlying = physicalInternetNetwork(cm) ?: return
-                applyUnderlyingNetworks(arrayOf(underlying))
+                handlePhysicalNetworkSignal("onCapabilitiesChanged", network)
+            }
+
+            override fun onLost(network: Network) {
+                handlePhysicalNetworkSignal("onLost", network)
             }
         }
 
@@ -178,7 +167,7 @@ class BibaVpnService : VpnService() {
         }
         lastFullStackRestartElapsed = now
         Log.i(TAG, "$source: scheduling full stack restart (nativeStop + nativeStart + new TUN + tun2socks)")
-        restartFullStackAfterScreenOn(json)
+        requestFullStackRestart(source, json)
     }
 
     override fun onBind(intent: Intent?) = null
@@ -202,9 +191,14 @@ class BibaVpnService : VpnService() {
 
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         runCatching {
-            connectivityManager?.registerDefaultNetworkCallback(defaultNetworkCallback)
+            val request =
+                NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build()
+            connectivityManager?.registerNetworkCallback(request, physicalNetworkCallback)
         }.onFailure { e ->
-            Log.w(TAG, "registerDefaultNetworkCallback: ${e.message}")
+            Log.w(TAG, "registerNetworkCallback(physical): ${e.message}")
         }
     }
 
@@ -218,12 +212,26 @@ class BibaVpnService : VpnService() {
         }
     }
 
-    private fun scheduleFullRestartAfterNetworkChange() {
+    private fun scheduleFullRestartAfterNetworkChange(targetNetwork: Network) {
+        synchronized(networkTrackingLock) {
+            pendingPhysicalNetworkRestart = targetNetwork
+        }
         networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
         val r =
             Runnable {
                 networkRestartRunnable = null
                 if (!isTunnelActive) return@Runnable
+                val cm = connectivityManager
+                val stillPending =
+                    synchronized(networkTrackingLock) {
+                        pendingPhysicalNetworkRestart == targetNetwork &&
+                            lastPhysicalNetworkForRestart == targetNetwork
+                    }
+                val stableSelection = cm != null && physicalInternetNetwork(cm) == targetNetwork
+                if (!stillPending || !stableSelection) {
+                    Log.d(TAG, "network change: skip full restart (selection changed before debounce)")
+                    return@Runnable
+                }
                 val json = loadSavedConfigJson()
                 if (json.isNullOrBlank()) {
                     Log.w(TAG, "network change: no saved config, skip full restart")
@@ -236,7 +244,7 @@ class BibaVpnService : VpnService() {
                 }
                 lastFullStackRestartElapsed = now
                 Log.i(TAG, "network change: full stack restart (native + TUN + tun2socks)")
-                restartFullStackAfterScreenOn(json)
+                requestFullStackRestart("network change", json)
             }
         networkRestartRunnable = r
         networkRestartHandler.postDelayed(r, 1500L)
@@ -245,15 +253,185 @@ class BibaVpnService : VpnService() {
     /** Сеть для underlying VPN: только не-VPN с INTERNET (при активном VPN [activeNetwork] часто указывает на TUN). */
     private fun physicalInternetNetwork(cm: ConnectivityManager?): Network? {
         if (cm == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return cm?.activeNetwork
+        cm.activeNetwork?.let { active ->
+            val caps = cm.getNetworkCapabilities(active)
+            if (caps != null && isUsablePhysicalInternet(caps)) return active
+        }
+        var validatedWifi: Network? = null
+        var validatedCellular: Network? = null
+        var validatedOther: Network? = null
         var fallback: Network? = null
         for (n in cm.allNetworks) {
             val caps = cm.getNetworkCapabilities(n) ?: continue
-            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
-            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
-            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return n
+            if (!isUsablePhysicalInternet(caps)) continue
+            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && validatedWifi == null -> validatedWifi = n
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && validatedCellular == null -> validatedCellular = n
+                    validatedOther == null -> validatedOther = n
+                }
+                continue
+            }
             if (fallback == null) fallback = n
         }
-        return fallback
+        return validatedWifi ?: validatedCellular ?: validatedOther ?: fallback
+    }
+
+    private fun isUsablePhysicalInternet(caps: NetworkCapabilities): Boolean =
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+
+    private fun shouldPromotePhysicalNetwork(
+        cm: ConnectivityManager,
+        current: Network,
+        candidate: Network,
+    ): Boolean {
+        if (current == candidate) return false
+        val currentCaps = cm.getNetworkCapabilities(current)
+        val candidateCaps = cm.getNetworkCapabilities(candidate) ?: return false
+        if (currentCaps == null || !isUsablePhysicalInternet(currentCaps)) return true
+        val currentValidated = currentCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val candidateValidated = candidateCaps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        if (candidateValidated && !currentValidated) return true
+        val currentCellular = currentCaps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+        val candidateWifi = candidateCaps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        return currentCellular && candidateWifi && candidateValidated
+    }
+
+    private fun handlePhysicalNetworkSignal(
+        source: String,
+        network: Network,
+    ) {
+        if (!isTunnelActive) return
+        val cm = connectivityManager ?: return
+        val selected = physicalInternetNetwork(cm)
+        val networkToApply: Network
+        var shouldRestart = false
+        synchronized(networkTrackingLock) {
+            val current = lastPhysicalNetworkForRestart
+            when {
+                selected == null -> {
+                    if (current == network) {
+                        lastPhysicalNetworkForRestart = null
+                        pendingPhysicalNetworkRestart = null
+                        Log.i(TAG, "$source: lost current physical network and no replacement yet")
+                    }
+                    return
+                }
+                current == null -> {
+                    lastPhysicalNetworkForRestart = selected
+                    pendingPhysicalNetworkRestart = null
+                    networkToApply = selected
+                }
+                current == selected -> {
+                    pendingPhysicalNetworkRestart = null
+                    networkToApply = current
+                }
+                shouldPromotePhysicalNetwork(cm, current, selected) || current == network -> {
+                    lastPhysicalNetworkForRestart = selected
+                    pendingPhysicalNetworkRestart = selected
+                    networkToApply = selected
+                    shouldRestart = true
+                }
+                else -> {
+                    networkToApply = current
+                }
+            }
+        }
+        applyUnderlyingNetworks(arrayOf(networkToApply))
+        if (shouldRestart) {
+            Log.i(TAG, "$source: physical network changed -> schedule full restart")
+            scheduleFullRestartAfterNetworkChange(networkToApply)
+        }
+    }
+
+    private fun requestFullStackRestart(
+        reason: String,
+        json: String,
+    ) {
+        val shouldStartNow =
+            synchronized(restartLock) {
+                if (fullStackRestartInProgress) {
+                    fullStackRestartQueued = true
+                    false
+                } else {
+                    fullStackRestartInProgress = true
+                    true
+                }
+            }
+        if (!shouldStartNow) {
+            Log.i(TAG, "$reason: full restart already in progress, queued one follow-up run")
+            return
+        }
+        performFullStackRestart(reason, json)
+    }
+
+    private fun performFullStackRestart(
+        reason: String,
+        json: String,
+    ) {
+        val socks =
+            runCatching {
+                JSONObject(json).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
+            }.getOrDefault(SOCKS_LOCAL)
+        Thread(
+            {
+                try {
+                    Log.i(TAG, "$reason: begin full stack restart")
+                    synchronized(nativeLifecycleLock) {
+                        stopTunnelAndNative()
+                        allowScreenOnStackRestart = false
+                        val err =
+                            try {
+                                BibaNative.nativeStart(json)
+                            } catch (e: Throwable) {
+                                Log.e(TAG, "$reason: nativeStart", e)
+                                e.message ?: e.javaClass.simpleName
+                            }
+                        if (err != null) {
+                            Log.e(TAG, "$reason: nativeStart failed: $err")
+                            allowScreenOnStackRestart = true
+                            mainHandler.post {
+                                isTunnelActive = false
+                                android.widget.Toast.makeText(
+                                    applicationContext,
+                                    err,
+                                    android.widget.Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                            return@Thread
+                        }
+                    }
+                    if (!startVpnTunnel(socks)) {
+                        isTunnelActive = false
+                        synchronized(nativeLifecycleLock) {
+                            BibaNative.nativeStop()
+                        }
+                        allowScreenOnStackRestart = true
+                        Log.e(TAG, "$reason: startVpnTunnel failed")
+                    }
+                } catch (e: Throwable) {
+                    allowScreenOnStackRestart = true
+                    Log.e(TAG, "$reason: full restart", e)
+                } finally {
+                    val rerun =
+                        synchronized(restartLock) {
+                            val queued = fullStackRestartQueued
+                            fullStackRestartQueued = false
+                            fullStackRestartInProgress = false
+                            queued
+                        }
+                    if (rerun) {
+                        val latestJson = loadSavedConfigJson()
+                        if (!latestJson.isNullOrBlank()) {
+                            Log.i(TAG, "$reason: running queued full restart")
+                            requestFullStackRestart("$reason (queued)", latestJson)
+                        }
+                    }
+                }
+            },
+            "biba-full-restart",
+        ).start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -313,7 +491,7 @@ class BibaVpnService : VpnService() {
             }
             if (isTunnelActive) {
                 Log.i(TAG, "ACTION_ENABLE: tunnel up — full stack refresh")
-                restartFullStackAfterScreenOn(json)
+                requestFullStackRestart("ACTION_ENABLE", json)
                 return START_STICKY
             }
             enqueueBootstrapWorker(json, socks)
@@ -422,63 +600,13 @@ class BibaVpnService : VpnService() {
     override fun onDestroy() {
         networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
         networkRestartRunnable = null
-        runCatching { connectivityManager?.unregisterNetworkCallback(defaultNetworkCallback) }
+        runCatching { connectivityManager?.unregisterNetworkCallback(physicalNetworkCallback) }
         runCatching { unregisterReceiver(screenOnOffReceiver) }
         if (VpnProtect.vpn === this) {
             VpnProtect.vpn = null
         }
         stopTunnelAndNative()
         super.onDestroy()
-    }
-
-    /** Полный перезапуск: остановка tun2socks + Rust, снова nativeStart и новый [Builder.establish]. */
-    private fun restartFullStackAfterScreenOn(json: String) {
-        val socks =
-            runCatching {
-                JSONObject(json).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
-            }.getOrDefault(SOCKS_LOCAL)
-        Thread(
-            {
-                try {
-                    synchronized(nativeLifecycleLock) {
-                        stopTunnelAndNative()
-                        allowScreenOnStackRestart = false
-                        val err =
-                            try {
-                                BibaNative.nativeStart(json)
-                            } catch (e: Throwable) {
-                                Log.e(TAG, "screen-on nativeStart", e)
-                                e.message ?: e.javaClass.simpleName
-                            }
-                        if (err != null) {
-                            Log.e(TAG, "screen-on nativeStart failed: $err")
-                            allowScreenOnStackRestart = true
-                            mainHandler.post {
-                                isTunnelActive = false
-                                android.widget.Toast.makeText(
-                                    applicationContext,
-                                    err,
-                                    android.widget.Toast.LENGTH_LONG,
-                                ).show()
-                            }
-                            return@Thread
-                        }
-                    }
-                    if (!startVpnTunnel(socks)) {
-                        isTunnelActive = false
-                        synchronized(nativeLifecycleLock) {
-                            BibaNative.nativeStop()
-                        }
-                        allowScreenOnStackRestart = true
-                        Log.e(TAG, "screen-on startVpnTunnel failed")
-                    }
-                } catch (e: Throwable) {
-                    allowScreenOnStackRestart = true
-                    Log.e(TAG, "screen-on full restart", e)
-                }
-            },
-            "biba-screen-on-restart",
-        ).start()
     }
 
     private fun startVpnTunnel(socksBind: String): Boolean {
@@ -513,16 +641,27 @@ class BibaVpnService : VpnService() {
                 return false
             }
 
-            val fd = try {
-                pfd.detachFd()
+            val javaOwnedTun = try {
+                ParcelFileDescriptor.dup(pfd.fileDescriptor)
             } catch (e: Exception) {
-                Log.e(TAG, "detachFd", e)
+                Log.e(TAG, "dup(tun fd)", e)
                 pfd.close()
                 return false
             }
-            tunFdMustCloseInJava = true
+
+            val fd = try {
+                val engineTun = ParcelFileDescriptor.dup(pfd.fileDescriptor)
+                val detached = engineTun.detachFd()
+                pfd.close()
+                detached
+            } catch (e: Exception) {
+                Log.e(TAG, "detachFd(engine tun)", e)
+                javaOwnedTun.close()
+                pfd.close()
+                return false
+            }
             runCatching { tunParcelOrphan?.close() }
-            tunParcelOrphan = ParcelFileDescriptor.adoptFd(fd)
+            tunParcelOrphan = javaOwnedTun
 
             val proxy =
                 socksBind.trim().let { b ->
@@ -540,7 +679,6 @@ class BibaVpnService : VpnService() {
                         Log.i(TAG, "tun2socks Key.logLevel=${key.logLevel}")
                         Engine.insert(key)
                         Engine.start()
-                        synchronized(tunLock) { tunFdMustCloseInJava = false }
                         acquireTunnelWakeLock()
                         isTunnelActive = true
                         allowScreenOnStackRestart = true
@@ -601,6 +739,7 @@ class BibaVpnService : VpnService() {
         isTunnelActive = false
         synchronized(networkTrackingLock) {
             lastPhysicalNetworkForRestart = null
+            pendingPhysicalNetworkRestart = null
         }
         allowScreenOnStackRestart = false
         releaseTunnelWakeLock()
@@ -613,11 +752,8 @@ class BibaVpnService : VpnService() {
         }
         tun2socksThread = null
         synchronized(tunLock) {
-            if (tunFdMustCloseInJava) {
-                runCatching { tunParcelOrphan?.close() }
-            }
+            runCatching { tunParcelOrphan?.close() }
             tunParcelOrphan = null
-            tunFdMustCloseInJava = false
         }
     }
 
