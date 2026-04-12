@@ -50,7 +50,7 @@ pub fn max_tcp_payload_per_ws_message(
         let overhead = 5usize.saturating_add(usize::from(max_pad));
         return max_ws_binary.saturating_sub(overhead);
     }
-    let fixed = 28usize
+    let fixed = 29usize
         .saturating_add(usize::from(decoy_max))
         .saturating_add(5)
         .saturating_add(usize::from(max_pad));
@@ -178,6 +178,7 @@ mod tests {
         let n = max_tcp_payload_per_ws_message(false, 0, 64, small);
         assert!(n > 1300);
         let v2 = max_tcp_payload_per_ws_message(true, 32, 64, small);
+        assert_eq!(v2, small - (29 + 32 + 5 + 64));
         assert!(v2 < n);
         assert!(v2 > 1000);
 

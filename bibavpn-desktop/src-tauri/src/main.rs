@@ -30,7 +30,7 @@ use config::{
 };
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{include_image, AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -498,7 +498,14 @@ fn run() -> anyhow::Result<()> {
                     _ => {}
                 })
                 .on_tray_icon_event(move |tray, event| {
-                    if let TrayIconEvent::Click { .. } = event {
+                    // Только левый клик открывает окно. Правый зарезервирован под контекстное меню
+                    // (иначе show_main_window на WM_RBUTTON* мешает TrackPopupMenu на Windows).
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         show_main_window(tray.app_handle());
                     }
                 })
