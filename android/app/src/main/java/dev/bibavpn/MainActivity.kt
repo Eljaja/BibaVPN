@@ -1,8 +1,12 @@
 package dev.bibavpn
 
 import android.Manifest
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.VpnService
+import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -273,6 +277,9 @@ private fun BibaRootScreen(
     var pinCertPem by remember {
         mutableStateOf(last?.optString("pin_cert_pem") ?: "")
     }
+    var screenOffBatterySaver by remember {
+        mutableStateOf(BibaVpnService.isScreenOffBatterySaverEnabled(context))
+    }
 
     val activity = context as ComponentActivity
     DisposableEffect(activity) {
@@ -515,6 +522,14 @@ private fun BibaRootScreen(
                 onDecoyGetsPathsChange = { decoyGetsPaths = it },
                 pinCertPem = pinCertPem,
                 onPinCertPemChange = { pinCertPem = it },
+                screenOffBatterySaver = screenOffBatterySaver,
+                onScreenOffBatterySaverChange = { v ->
+                    screenOffBatterySaver = v
+                    BibaVpnService.setScreenOffBatterySaver(context, v)
+                    if (!v && BibaVpnService.isTunnelActive) {
+                        BibaVpnService.requestSyncWakeLock(context)
+                    }
+                },
                 onBack = { showSettings = false },
             )
         } else {
@@ -825,6 +840,8 @@ private fun SettingsScreen(
     onDecoyGetsPathsChange: (String) -> Unit,
     pinCertPem: String,
     onPinCertPemChange: (String) -> Unit,
+    screenOffBatterySaver: Boolean,
+    onScreenOffBatterySaverChange: (Boolean) -> Unit,
     onBack: () -> Unit,
 ) {
     val scroll = rememberScrollState()
@@ -981,6 +998,63 @@ private fun SettingsScreen(
                 placeholder = BibaVpnService.SOCKS_LOCAL,
                 hint = "Пусто = ${BibaVpnService.SOCKS_LOCAL}",
             )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Экономия при блокировке", color = Color.White, fontSize = 14.sp)
+                    Text(
+                        "Снимать wake lock при выкл. экране. VPN и уведомление остаются; в Doze возможны обрывы — разблокировка снова держит CPU.",
+                        color = TextMuted,
+                        fontSize = 12.sp,
+                    )
+                }
+                Switch(
+                    checked = screenOffBatterySaver,
+                    onCheckedChange = onScreenOffBatterySaverChange,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Mint,
+                        checkedTrackColor = Mint.copy(alpha = 0.4f),
+                        uncheckedThumbColor = TextMuted,
+                        uncheckedTrackColor = TextMuted.copy(alpha = 0.3f),
+                    ),
+                )
+            }
+            val settingsCtx = LocalContext.current
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
+                    .clickable {
+                        val act = settingsCtx as? ComponentActivity
+                        if (act != null) {
+                            openBatteryOptimizationSettings(act)
+                        }
+                    }
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "Оптимизация батареи (система)",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Открыть запрос Android: не экономить батарею для BibaVPN — меньше обрывов VPN в фоне.",
+                        color = TextMuted,
+                        fontSize = 12.sp,
+                    )
+                }
+                Text("›", color = TextMuted.copy(alpha = 0.55f), fontSize = 22.sp)
+            }
         }
 
         Spacer(Modifier.height(16.dp))
@@ -1416,4 +1490,46 @@ private fun buildJson(
     val pin = pinCertPem.trim()
     if (pin.isNotEmpty()) o.put("pin_cert_pem", pin)
     return o
+}
+
+/** Системный экран: разрешить приложению игнорировать оптимизацию батареи (или запасные настройки). */
+private fun openBatteryOptimizationSettings(activity: ComponentActivity) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+        Toast.makeText(activity, "Настройка доступна с Android 6", Toast.LENGTH_SHORT).show()
+        return
+    }
+    val pkg = activity.packageName
+    try {
+        activity.startActivity(
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$pkg")
+            },
+        )
+    } catch (e: ActivityNotFoundException) {
+        Log.w("BibaMain", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", e)
+        openBatteryOptimizationFallback(activity, pkg)
+    } catch (e: SecurityException) {
+        Log.w("BibaMain", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS denied", e)
+        openBatteryOptimizationFallback(activity, pkg)
+    }
+}
+
+private fun openBatteryOptimizationFallback(
+    activity: ComponentActivity,
+    pkg: String,
+) {
+    try {
+        activity.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+    } catch (_: Exception) {
+        try {
+            activity.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", pkg, null)
+                },
+            )
+        } catch (e: Exception) {
+            Log.e("BibaMain", "battery optimization settings", e)
+            Toast.makeText(activity, "Не удалось открыть настройки", Toast.LENGTH_SHORT).show()
+        }
+    }
 }

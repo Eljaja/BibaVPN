@@ -1,11 +1,17 @@
 //! Файловые логи в `%LOCALAPPDATA%\\BibaVPN\\logs\\` + дублирование в stderr (если есть консоль).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
 fn env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Подавляем шум UI-стека; bibavpn / bibavpn_desktop / bibavpn_client остаются на info.
+        EnvFilter::new("info,tauri=warn,wry=warn,tao=warn")
+    })
 }
 
 fn try_init_stderr_only(filter: EnvFilter) {
@@ -15,6 +21,27 @@ fn try_init_stderr_only(filter: EnvFilter) {
         .with_ansi(true)
         .with_target(true)
         .try_init();
+}
+
+/// Каталог с ротированными `bibavpn-desktop.log.*` (после успешного [`init`]).
+pub fn logs_directory() -> Option<&'static Path> {
+    LOG_DIR.get().map(|p| p.as_path())
+}
+
+/// Открыть путь в проводнике / Finder / файловом менеджере.
+pub fn open_in_file_manager(path: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
 }
 
 /// Включает `tracing`: ежедневная ротация `bibavpn-desktop.log.YYYY-MM-DD` в `…\BibaVPN\logs\`.
@@ -31,6 +58,7 @@ pub fn init() -> Option<PathBuf> {
         try_init_stderr_only(filter);
         return None;
     }
+    let _ = LOG_DIR.set(log_dir.clone());
 
     let file_appender = tracing_appender::rolling::RollingFileAppender::new(
         tracing_appender::rolling::Rotation::DAILY,
@@ -62,7 +90,7 @@ pub fn init() -> Option<PathBuf> {
     tracing::info!(
         target: "bibavpn_desktop",
         dir = %log_dir.display(),
-        "логи: ежедневные файлы bibavpn-desktop.log.* в этой папке (переменная RUST_LOG задаёт уровень)"
+        "логи: ежедневные файлы bibavpn-desktop.log.* (RUST_LOG переопределяет уровни; шум tauri/wry по умолчанию warn)"
     );
     Some(log_dir)
 }

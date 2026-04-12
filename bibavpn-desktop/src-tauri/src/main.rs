@@ -17,6 +17,7 @@ use proxy_stub::{apply_proxy, read_backup, restore, ProxyBackup};
 #[cfg(windows)]
 use proxy_win::{apply_proxy, read_backup, restore, ProxyBackup};
 
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -213,12 +214,52 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             .map_err(|e| format!("{e:#}"))?;
     let remote_label = format!("{}:{}", opts.server_host, opts.server_port);
 
+    let (socks_tx, socks_rx) = std::sync::mpsc::channel::<()>();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let join = state.rt.spawn(async move {
-        bibavpn::local_client::run_local_client(opts, shutdown_rx, None).await
+        let out = bibavpn::local_client::run_local_client(opts, shutdown_rx, Some(socks_tx)).await;
+        match &out {
+            Ok(()) => info!(target: "bibavpn_desktop", "VPN-клиент (bibavpn) завершился"),
+            Err(e) => error!(target: "bibavpn_desktop", "VPN-клиент (bibavpn): {e:#}"),
+        }
+        out
     });
 
-    std::thread::sleep(Duration::from_millis(220));
+    match socks_rx.recv_timeout(Duration::from_secs(25)) {
+        Ok(()) => {
+            info!(
+                target: "bibavpn_desktop",
+                "локальный SOCKS5 слушает, можно применять системный прокси"
+            );
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            warn!(
+                target: "bibavpn_desktop",
+                "таймаут 25 с: SOCKS не поднялся, отмена подключения"
+            );
+            let _ = shutdown_tx.send(true);
+            match state.rt.block_on(join) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!(target: "bibavpn_desktop", "клиент после таймаута: {e:#}"),
+                Err(e) => error!(target: "bibavpn_desktop", "join клиента: {e}"),
+            }
+            return Err(
+                "Локальный SOCKS не поднялся за 25 с. Смотрите лог в папке BibaVPN\\logs.".into(),
+            );
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let msg = match state.rt.block_on(join) {
+                Ok(Ok(())) => "Клиент завершился до готовности SOCKS.".to_string(),
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(e) => format!("join: {e}"),
+            };
+            error!(
+                target: "bibavpn_desktop",
+                "SOCKS не стартовал (канал закрыт): {msg}"
+            );
+            return Err(msg);
+        }
+    }
 
     let http_hp = format!("127.0.0.1:{http_port}");
     let socks_hp = format!("127.0.0.1:{socks_port}");
@@ -391,6 +432,7 @@ fn run() -> anyhow::Result<()> {
             let show = MenuItem::with_id(app, "show", "Открыть окно", true, None::<&str>)?;
             let on = MenuItem::with_id(app, "on", "Включить VPN", true, None::<&str>)?;
             let off = MenuItem::with_id(app, "off", "Отключить VPN", true, None::<&str>)?;
+            let logs = MenuItem::with_id(app, "logs", "Папка с логами…", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
@@ -399,6 +441,8 @@ fn run() -> anyhow::Result<()> {
                     &PredefinedMenuItem::separator(app)?,
                     &on,
                     &off,
+                    &PredefinedMenuItem::separator(app)?,
+                    &logs,
                     &PredefinedMenuItem::separator(app)?,
                     &quit,
                 ],
@@ -440,6 +484,13 @@ fn run() -> anyhow::Result<()> {
                         let g = st.inner.lock().unwrap_or_else(|e| e.into_inner());
                         let snap = snapshot(&g);
                         let _ = h.emit("vpn-state", &snap);
+                    }
+                    "logs" => {
+                        if let Some(dir) = logging::logs_directory() {
+                            logging::open_in_file_manager(dir);
+                        } else {
+                            warn!(target: "bibavpn_desktop", "каталог логов недоступен");
+                        }
                     }
                     _ => {}
                 })

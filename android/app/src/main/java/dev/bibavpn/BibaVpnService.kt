@@ -11,6 +11,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -63,6 +64,15 @@ class BibaVpnService : VpnService() {
 
     private var connectivityManager: ConnectivityManager? = null
 
+    /** Синхронизация с [lastPhysicalNetworkForRestart]: не считать сменой сеть при первом известном состоянии. */
+    private val networkTrackingLock = Any()
+
+    /**
+     * Последняя **физическая** (не VPN) интернет-сеть. Когда VPN поднят, default network в колбэках часто
+     * — сам VPN без [NetworkCapabilities.NET_CAPABILITY_NOT_VPN]; обрабатывать её нельзя (иначе цикл перезапусков).
+     */
+    private var lastPhysicalNetworkForRestart: Network? = null
+
     /** После смены Wi‑Fi ↔ LTE обновляем underlying network и перезапускаем стек (WSS привязан к старому пути). */
     private val networkRestartHandler = Handler(Looper.getMainLooper())
     private var networkRestartRunnable: Runnable? = null
@@ -70,19 +80,37 @@ class BibaVpnService : VpnService() {
     private val defaultNetworkCallback =
         object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.i(TAG, "default network available: $network")
+                val cm = connectivityManager ?: return
+                val caps = cm.getNetworkCapabilities(network) ?: return
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
+                    Log.d(TAG, "onAvailable skip (not physical / likely VPN): $network")
+                    return
+                }
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return
                 if (!isTunnelActive) return
-                applyUnderlyingNetworks(arrayOf(network))
-                scheduleFullRestartAfterNetworkChange()
+                val underlying = physicalInternetNetwork(cm) ?: return
+                applyUnderlyingNetworks(arrayOf(underlying))
+                val shouldRestart =
+                    synchronized(networkTrackingLock) {
+                        val prev = lastPhysicalNetworkForRestart
+                        lastPhysicalNetworkForRestart = underlying
+                        prev != null && prev != underlying
+                    }
+                if (shouldRestart) {
+                    Log.i(TAG, "physical network changed -> schedule full restart")
+                    scheduleFullRestartAfterNetworkChange()
+                }
             }
 
             override fun onCapabilitiesChanged(
                 network: Network,
-                networkCapabilities: android.net.NetworkCapabilities,
+                networkCapabilities: NetworkCapabilities,
             ) {
                 if (!isTunnelActive) return
-                // Только маршрутизация; полный перезапуск — в onAvailable (смена дефолтной сети).
-                applyUnderlyingNetworks(arrayOf(network))
+                if (!networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return
+                val cm = connectivityManager ?: return
+                val underlying = physicalInternetNetwork(cm) ?: return
+                applyUnderlyingNetworks(arrayOf(underlying))
             }
         }
 
@@ -95,9 +123,25 @@ class BibaVpnService : VpnService() {
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_OFF -> {
                         lastScreenOffElapsed = SystemClock.elapsedRealtime()
+                        if (screenOffBatterySaverEnabled() && isTunnelActive) {
+                            releaseTunnelWakeLock()
+                            Log.i(TAG, "SCREEN_OFF: wake lock released (screen-off battery saver)")
+                        }
                     }
-                    Intent.ACTION_SCREEN_ON -> maybeRestartStackAfterUnlockEvent("SCREEN_ON")
-                    Intent.ACTION_USER_PRESENT -> maybeRestartStackAfterUnlockEvent("USER_PRESENT")
+                    Intent.ACTION_SCREEN_ON -> {
+                        if (screenOffBatterySaverEnabled() && isTunnelActive) {
+                            acquireTunnelWakeLock()
+                            Log.i(TAG, "SCREEN_ON: wake lock re-acquired (battery saver)")
+                        }
+                        maybeRestartStackAfterUnlockEvent("SCREEN_ON")
+                    }
+                    Intent.ACTION_USER_PRESENT -> {
+                        if (screenOffBatterySaverEnabled() && isTunnelActive) {
+                            acquireTunnelWakeLock()
+                            Log.i(TAG, "USER_PRESENT: wake lock re-acquired (battery saver)")
+                        }
+                        maybeRestartStackAfterUnlockEvent("USER_PRESENT")
+                    }
                 }
             }
         }
@@ -198,6 +242,20 @@ class BibaVpnService : VpnService() {
         networkRestartHandler.postDelayed(r, 1500L)
     }
 
+    /** Сеть для underlying VPN: только не-VPN с INTERNET (при активном VPN [activeNetwork] часто указывает на TUN). */
+    private fun physicalInternetNetwork(cm: ConnectivityManager?): Network? {
+        if (cm == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return cm?.activeNetwork
+        var fallback: Network? = null
+        for (n in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(n) ?: continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
+            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) return n
+            if (fallback == null) fallback = n
+        }
+        return fallback
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(
             TAG,
@@ -211,6 +269,13 @@ class BibaVpnService : VpnService() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
+            }
+            ACTION_SYNC_WAKE_LOCK -> {
+                if (isTunnelActive && !screenOffBatterySaverEnabled()) {
+                    acquireTunnelWakeLock()
+                    Log.i(TAG, "SYNC_WAKE_LOCK: wake lock restored (saver off)")
+                }
+                return START_STICKY
             }
         }
 
@@ -433,9 +498,9 @@ class BibaVpnService : VpnService() {
                 /* IPv6 маршрут необязателен */
             }
 
-                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 runCatching {
-                    connectivityManager?.activeNetwork?.let { n ->
+                    physicalInternetNetwork(connectivityManager)?.let { n ->
                         builder.setUnderlyingNetworks(arrayOf(n))
                     }
                 }.onFailure { e ->
@@ -480,8 +545,11 @@ class BibaVpnService : VpnService() {
                         isTunnelActive = true
                         allowScreenOnStackRestart = true
                         mainHandler.post {
-                            connectivityManager?.activeNetwork?.let { n ->
-                                applyUnderlyingNetworks(arrayOf(n))
+                            val cm = connectivityManager ?: return@post
+                            val und = physicalInternetNetwork(cm) ?: return@post
+                            applyUnderlyingNetworks(arrayOf(und))
+                            synchronized(networkTrackingLock) {
+                                lastPhysicalNetworkForRestart = und
                             }
                         }
                     } catch (e: Throwable) {
@@ -531,6 +599,9 @@ class BibaVpnService : VpnService() {
 
     private fun stopTun2socksOnly() {
         isTunnelActive = false
+        synchronized(networkTrackingLock) {
+            lastPhysicalNetworkForRestart = null
+        }
         allowScreenOnStackRestart = false
         releaseTunnelWakeLock()
         runCatching { Engine.stop() }
@@ -604,6 +675,10 @@ class BibaVpnService : VpnService() {
     private fun loadSavedConfigJson(): String? =
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_LAST_JSON, null)
 
+    /** См. [Companion.isScreenOffBatterySaverEnabled]. */
+    private fun screenOffBatterySaverEnabled(): Boolean =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_SCREEN_OFF_BATTERY_SAVER, false)
+
     companion object {
         /** true после успешного Engine.start() tun2socks; сбрасывается при остановке. */
         @Volatile
@@ -617,11 +692,40 @@ class BibaVpnService : VpnService() {
         private const val NOTIFICATION_ID = 42
         const val ACTION_STOP = "dev.bibavpn.STOP"
         const val ACTION_ENABLE = "dev.bibavpn.ENABLE"
+        const val ACTION_SYNC_WAKE_LOCK = "dev.bibavpn.SYNC_WAKE_LOCK"
+
+        /** После выключения «экономии при блокировке» восстановить wake lock, если туннель ещё активен. */
+        fun requestSyncWakeLock(ctx: Context) {
+            ctx.startService(
+                Intent(ctx, BibaVpnService::class.java).setAction(ACTION_SYNC_WAKE_LOCK),
+            )
+        }
         const val EXTRA_CONFIG_JSON = "config_json"
         private const val PREFS = "bibavpn"
         private const val KEY_LAST_JSON = "last_config_json"
+        /**
+         * Если true: при ACTION_SCREEN_OFF снимаем PARTIAL_WAKE_LOCK, при SCREEN_ON/USER_PRESENT снова берём.
+         * Экономит батарею при заблокированном телефоне; VPN и foreground service остаются, но возможны чаще обрывы WSS в Doze.
+         */
+        private const val KEY_SCREEN_OFF_BATTERY_SAVER = "screen_off_battery_saver"
         /** Конфиг на время [VpnService.prepare] — Activity может быть убита до возврата из системного диалога. */
         private const val KEY_PENDING_AFTER_PREPARE = "pending_after_vpn_prepare"
+
+        fun isScreenOffBatterySaverEnabled(ctx: Context): Boolean =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(
+                KEY_SCREEN_OFF_BATTERY_SAVER,
+                false,
+            )
+
+        fun setScreenOffBatterySaver(
+            ctx: Context,
+            enabled: Boolean,
+        ) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_SCREEN_OFF_BATTERY_SAVER, enabled)
+                .apply()
+        }
 
         fun stashPendingConnectJson(ctx: Context, json: String) {
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

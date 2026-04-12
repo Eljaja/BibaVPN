@@ -257,6 +257,15 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Optio
         .context("websocket")?
         .0;
 
+    info!(
+        target: "bibavpn_client",
+        server = %cfg.server_host,
+        port = cfg.server_port,
+        sni = %cfg.sni,
+        path = %path,
+        "WSS handshake OK, sending noise + AUTH"
+    );
+
     send_noise_binaries(&mut ws, u32::from(cfg.early_ws_frames), cfg.max_ws_binary).await?;
     send_noise_binaries(&mut ws, cfg.junk_frames, cfg.max_ws_binary)
         .await
@@ -371,6 +380,13 @@ async fn connect_tcp_mux_handle(
                 dummy_interval_secs: cfg.dummy_interval_secs,
             };
             let (sid, h) = tcp_mux::spawn_tcp_mux_client(ws, crypto, mcfg, tcp_mux_slot.clone());
+            info!(
+                target: "bibavpn_client",
+                session_id = sid,
+                server = %cfg.server_host,
+                port = cfg.server_port,
+                "TCP mux tunnel ready"
+            );
             *tcp_mux_slot.lock().await = Some((sid, h));
             Ok(())
         }
@@ -426,6 +442,18 @@ pub async fn run_local_client(
     } else {
         info!("TCP mode: legacy per-connection WSS (--no-mux)");
     }
+
+    info!(
+        target: "bibavpn_client",
+        server = %opts.server_host,
+        port = opts.server_port,
+        sni = %opts.sni,
+        socks_bind = %opts.socks_bind,
+        http_proxy = ?opts.http_proxy_bind,
+        use_tcp_mux = opts.use_tcp_mux,
+        ws_path = %normalize_ws_path(&opts.ws_path),
+        "local client starting"
+    );
 
     let cfg = Arc::new(ClientCfg {
         server_host: opts.server_host.clone(),
