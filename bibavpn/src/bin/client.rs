@@ -13,7 +13,9 @@ use bibavpn::local_client::{
     DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile};
+use bibavpn::reality::{RealityClientConfig, connect_reality_client, encode_client_hello};
 use clap::Parser;
+use base64::Engine;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::info;
@@ -151,6 +153,19 @@ struct Args {
     /// Comma-separated paths for decoy GETs (default: built-in list when empty).
     #[arg(long)]
     decoy_gets_paths: Option<String>,
+
+    // ===== REALITY Mode =====
+    /// REALITY mode: server's public key (base64 encoded X25519)
+    #[arg(long, requires = "reality_target")]
+    reality_public_key: Option<String>,
+
+    /// REALITY mode: short ID (hex, 8 bytes). Empty = auto.
+    #[arg(long, requires = "reality_public_key")]
+    reality_short_id: Option<String>,
+
+    /// REALITY mode: target website (for SNI, e.g., wikipedia.org)
+    #[arg(long, requires = "reality_public_key")]
+    reality_target: Option<String>,
 }
 
 #[tokio::main]
@@ -319,6 +334,31 @@ async fn main() -> anyhow::Result<()> {
         Some(buf)
     };
 
+    // ===== REALITY Mode: Parse keys for later use =====
+    // We'll pass these to local_client which will handle REALITY connection
+    let reality_public_key: Option<[u8; 32]> = args.reality_public_key.as_ref().map(|pubkey_b64| {
+        let pubkey_bytes = base64::engine::general_purpose::STANDARD
+            .decode(pubkey_b64)
+            .context("decode reality public key")
+            .unwrap();
+        if pubkey_bytes.len() != 32 {
+            panic!("reality public key must be 32 bytes");
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&pubkey_bytes);
+        arr
+    });
+
+    let reality_short_id: Option<[u8; 8]> = args.reality_short_id.as_ref().map(|s| {
+        let bytes = hex::decode(s.trim()).expect("decode short id");
+        if bytes.len() != 8 {
+            panic!("short id must be 8 bytes");
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        arr
+    });
+
     let opts = LocalClientOptions {
         server_host,
         server_port,
@@ -353,6 +393,10 @@ async fn main() -> anyhow::Result<()> {
         decoy_gets: args.decoy_gets,
         decoy_gets_interval_secs: args.decoy_gets_interval_secs,
         decoy_gets_paths,
+        // ===== REALITY Mode =====
+        reality_target: args.reality_target,
+        reality_public_key, // Parsed above
+        reality_short_id,   // Parsed above
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
