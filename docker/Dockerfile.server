@@ -2,6 +2,7 @@
 FROM rust:1.89-bookworm AS chef
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY biba ./biba
 COPY bibavpn ./bibavpn
 COPY bibavpn-jni ./bibavpn-jni
 COPY bibavpn-desktop ./bibavpn-desktop
