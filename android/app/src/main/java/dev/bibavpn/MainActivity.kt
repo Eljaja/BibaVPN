@@ -1325,7 +1325,6 @@ private fun SettingsTabsRow(
 @Composable
 private fun SplitTunnelSettingsPanel() {
     val ctx = LocalContext.current
-    val pm = ctx.packageManager
     var enabled by remember { mutableStateOf(BibaVpnService.isSplitTunnelEnabled(ctx)) }
     var selected by remember {
         mutableStateOf(BibaVpnService.getSplitTunnelSelectedPackages(ctx).toMutableSet())
@@ -1410,7 +1409,6 @@ private fun SplitTunnelSettingsPanel() {
                 entries = SplitTunnelCatalog.forGroup(group),
                 selected = selected,
                 enabledMaster = enabled,
-                packageManager = pm,
                 onAppCheckedChange = { pkg, checked ->
                     val next = selected.toMutableSet()
                     if (checked) next.add(pkg) else next.remove(pkg)
@@ -1430,7 +1428,6 @@ private fun SplitTunnelGroupDropdown(
     entries: List<SplitTunnelApp>,
     selected: Set<String>,
     enabledMaster: Boolean,
-    packageManager: PackageManager,
     onAppCheckedChange: (String, Boolean) -> Unit,
 ) {
     Column(
@@ -1475,7 +1472,6 @@ private fun SplitTunnelGroupDropdown(
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 entries.forEach { app ->
-                    val installed = isPackageInstalled(packageManager, app.packageName)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -1493,7 +1489,7 @@ private fun SplitTunnelGroupDropdown(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 app.label,
-                                color = if (installed) TextSlate200 else TextMuted,
+                                color = TextSlate200,
                                 fontSize = 14.sp,
                             )
                             Text(
@@ -1503,13 +1499,6 @@ private fun SplitTunnelGroupDropdown(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            if (!installed) {
-                                Text(
-                                    "Не установлено на устройстве",
-                                    color = LabelSky.copy(alpha = 0.7f),
-                                    fontSize = 11.sp,
-                                )
-                            }
                         }
                     }
                 }
@@ -1517,22 +1506,6 @@ private fun SplitTunnelGroupDropdown(
         }
     }
 }
-
-private fun isPackageInstalled(
-    pm: PackageManager,
-    packageName: String,
-): Boolean =
-    try {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            pm.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getPackageInfo(packageName, 0)
-        }
-        true
-    } catch (_: PackageManager.NameNotFoundException) {
-        false
-    }
 
 @Composable
 private fun SettingsSection(
