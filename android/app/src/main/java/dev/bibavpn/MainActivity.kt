@@ -37,6 +37,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -844,6 +846,7 @@ private fun SettingsScreen(
     onScreenOffBatterySaverChange: (Boolean) -> Unit,
     onBack: () -> Unit,
 ) {
+    var settingsTab by remember { mutableStateOf(0) }
     val scroll = rememberScrollState()
     Column(
         modifier = Modifier
@@ -870,6 +873,14 @@ private fun SettingsScreen(
 
         Spacer(Modifier.height(24.dp))
 
+        SettingsTabsRow(
+            selectedIndex = settingsTab,
+            onSelect = { settingsTab = it },
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        if (settingsTab == 0) {
         SettingsSection(
             title = "Ключ Biba",
             subtitle = "Зашифрованный biba://… и passphrase (как --from-invite у desktop-клиента)",
@@ -1265,8 +1276,263 @@ private fun SettingsScreen(
         }
 
         Spacer(Modifier.height(24.dp))
+        } else {
+            SplitTunnelSettingsPanel()
+            Spacer(Modifier.height(24.dp))
+        }
     }
 }
+
+@Composable
+private fun SettingsTabsRow(
+    selectedIndex: Int,
+    onSelect: (Int) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
+            .background(Color(0xFF020617).copy(alpha = 0.35f))
+            .padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        listOf(
+            "Подключение" to 0,
+            "Сплит‑туннель" to 1,
+        ).forEach { (label, idx) ->
+            val selected = selectedIndex == idx
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (selected) Mint.copy(alpha = 0.15f) else Color.Transparent)
+                    .clickable { onSelect(idx) }
+                    .padding(vertical = 12.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    label,
+                    color = if (selected) Mint else TextMuted,
+                    fontSize = 14.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SplitTunnelSettingsPanel() {
+    val ctx = LocalContext.current
+    val pm = ctx.packageManager
+    var enabled by remember { mutableStateOf(BibaVpnService.isSplitTunnelEnabled(ctx)) }
+    var selected by remember {
+        mutableStateOf(BibaVpnService.getSplitTunnelSelectedPackages(ctx).toMutableSet())
+    }
+    var expandedGroups by remember {
+        mutableStateOf<Set<SplitTunnelGroup>>(emptySet())
+    }
+
+    fun persist(
+        newEnabled: Boolean = enabled,
+        newSelected: Set<String> = selected,
+    ) {
+        enabled = newEnabled
+        selected = newSelected.toMutableSet()
+        BibaVpnService.setSplitTunnelConfig(ctx, newEnabled, selected)
+    }
+
+    SettingsSection(
+        title = "Раздельный туннель",
+        subtitle = "Выбранные приложения идут в обход VPN (ваш обычный IP). Остальной трафик — через BibaVPN.",
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Включить обход для приложений", color = Color.White, fontSize = 14.sp)
+                Text(
+                    "По умолчанию выключено. После изменения списка переподключите VPN.",
+                    color = TextMuted,
+                    fontSize = 12.sp,
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = { v ->
+                    val sel =
+                        if (v && selected.isEmpty()) {
+                            SplitTunnelCatalog.allPackageNames().toMutableSet()
+                        } else {
+                            selected
+                        }
+                    persist(v, sel)
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Mint,
+                    checkedTrackColor = Mint.copy(alpha = 0.4f),
+                    uncheckedThumbColor = TextMuted,
+                    uncheckedTrackColor = TextMuted.copy(alpha = 0.3f),
+                ),
+            )
+        }
+
+        if (BibaVpnService.isTunnelActive) {
+            Text(
+                "Чтобы применить изменения, отключите и снова включите туннель.",
+                color = LabelSky.copy(alpha = 0.85f),
+                fontSize = 12.sp,
+            )
+        }
+
+        if (!enabled) {
+            Text(
+                "Включите переключатель, затем отметьте приложения по группам.",
+                color = TextMuted,
+                fontSize = 12.sp,
+            )
+            return@SettingsSection
+        }
+
+        enumValues<SplitTunnelGroup>().forEach { group ->
+            SplitTunnelGroupDropdown(
+                group = group,
+                expanded = expandedGroups.contains(group),
+                onToggleExpand = {
+                    expandedGroups =
+                        expandedGroups.toMutableSet().apply {
+                            if (contains(group)) remove(group) else add(group)
+                        }
+                },
+                entries = SplitTunnelCatalog.forGroup(group),
+                selected = selected,
+                enabledMaster = enabled,
+                packageManager = pm,
+                onAppCheckedChange = { pkg, checked ->
+                    val next = selected.toMutableSet()
+                    if (checked) next.add(pkg) else next.remove(pkg)
+                    persist(enabled, next)
+                },
+            )
+            Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun SplitTunnelGroupDropdown(
+    group: SplitTunnelGroup,
+    expanded: Boolean,
+    onToggleExpand: () -> Unit,
+    entries: List<SplitTunnelApp>,
+    selected: Set<String>,
+    enabledMaster: Boolean,
+    packageManager: PackageManager,
+    onAppCheckedChange: (String, Boolean) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
+            .background(Color(0xFF020617).copy(alpha = 0.55f)),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onToggleExpand)
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    group.title,
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    "${entries.count { selected.contains(it.packageName) }} / ${entries.size} выбрано",
+                    color = TextMuted,
+                    fontSize = 12.sp,
+                )
+            }
+            Text(
+                if (expanded) "\u25B2" else "\u25BC",
+                color = TextMuted.copy(alpha = 0.75f),
+                fontSize = 14.sp,
+            )
+        }
+        if (expanded) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 8.dp, end = 8.dp, bottom = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                entries.forEach { app ->
+                    val installed = isPackageInstalled(packageManager, app.packageName)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = selected.contains(app.packageName),
+                            onCheckedChange = { onAppCheckedChange(app.packageName, it) },
+                            enabled = enabledMaster,
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = Mint,
+                                uncheckedColor = TextMuted,
+                                checkmarkColor = Color(0xFF020617),
+                            ),
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                app.label,
+                                color = if (installed) TextSlate200 else TextMuted,
+                                fontSize = 14.sp,
+                            )
+                            Text(
+                                app.packageName,
+                                color = TextMuted.copy(alpha = 0.8f),
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (!installed) {
+                                Text(
+                                    "Не установлено на устройстве",
+                                    color = LabelSky.copy(alpha = 0.7f),
+                                    fontSize = 11.sp,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun isPackageInstalled(
+    pm: PackageManager,
+    packageName: String,
+): Boolean =
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getPackageInfo(packageName, 0)
+        }
+        true
+    } catch (_: PackageManager.NameNotFoundException) {
+        false
+    }
 
 @Composable
 private fun SettingsSection(

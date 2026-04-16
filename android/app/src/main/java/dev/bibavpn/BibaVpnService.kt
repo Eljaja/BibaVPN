@@ -620,6 +620,7 @@ class BibaVpnService : VpnService() {
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
             builder.addDisallowedApplication(packageName)
+            builder.applySplitTunnelBypasses()
             try {
                 builder.addRoute("::", 0)
             } catch (_: Throwable) {
@@ -699,6 +700,21 @@ class BibaVpnService : VpnService() {
             ).also { it.start() }
             Log.i(TAG, "VPN up, tun2socks -> $proxy")
             return true
+        }
+    }
+
+    /**
+     * Трафик выбранных приложений не идёт в TUN (прямой IP), если включено в настройках.
+     * Нет пакета на устройстве — [addDisallowedApplication] бросает, игнорируем.
+     */
+    private fun Builder.applySplitTunnelBypasses() {
+        if (!isSplitTunnelEnabled(this@BibaVpnService)) return
+        val selected = getSplitTunnelSelectedPackages(this@BibaVpnService)
+        for (pkg in selected) {
+            if (pkg == packageName) continue
+            runCatching { addDisallowedApplication(pkg) }.onFailure { e ->
+                Log.d(TAG, "split tunnel: не добавлен $pkg (${e.message})")
+            }
         }
     }
 
@@ -846,6 +862,32 @@ class BibaVpnService : VpnService() {
         private const val KEY_SCREEN_OFF_BATTERY_SAVER = "screen_off_battery_saver"
         /** Конфиг на время [VpnService.prepare] — Activity может быть убита до возврата из системного диалога. */
         private const val KEY_PENDING_AFTER_PREPARE = "pending_after_vpn_prepare"
+        private const val KEY_SPLIT_TUNNEL_ENABLED = "split_tunnel_enabled"
+        private const val KEY_SPLIT_TUNNEL_PACKAGES = "split_tunnel_packages"
+
+        /** Раздельный туннель: выбранные приложения в обход VPN (прямой IP). */
+        fun isSplitTunnelEnabled(ctx: Context): Boolean =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(
+                KEY_SPLIT_TUNNEL_ENABLED,
+                false,
+            )
+
+        fun getSplitTunnelSelectedPackages(ctx: Context): Set<String> =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getStringSet(KEY_SPLIT_TUNNEL_PACKAGES, null)
+                ?.toHashSet()
+                ?: emptySet()
+
+        fun setSplitTunnelConfig(
+            ctx: Context,
+            enabled: Boolean,
+            packages: Set<String>,
+        ) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(KEY_SPLIT_TUNNEL_ENABLED, enabled)
+                .putStringSet(KEY_SPLIT_TUNNEL_PACKAGES, HashSet(packages))
+                .apply()
+        }
 
         fun isScreenOffBatterySaverEnabled(ctx: Context): Boolean =
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(

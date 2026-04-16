@@ -41,3 +41,4 @@ __pycache__/
 
 /bibavpn-desktop/ui/node_modules
 /bibavpn-desktop/ui/dist
+scripts/publish_remote_image.py
