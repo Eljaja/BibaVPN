@@ -8,7 +8,7 @@ Thumbs.db
 *.exe
 release-staging/
 
-# Secrets and local overrides (do not commit)
+# Secrets and local overrides — NEVER commit
 server.txt
 .env
 .env.*
@@ -16,8 +16,7 @@ server.txt
 *.key
 docker-compose.override.yml
 
-# Local deploy helpers (host / secrets); keep out of git
-scripts/deploy-biba-docker-alt-port.sh
+# Local deploy helpers created by one-off runs
 scripts/.deploy-run-once.sh
 scripts/.invite_local_test.uri
 scripts/.invite_local_test.pass
@@ -31,14 +30,16 @@ biba-listen*.txt
 
 # Prebuilt Android JNI libraries (build with scripts/wsl-build-all.sh or build-android-jni.ps1)
 android/app/src/main/jniLibs/**/*.so
-TODO_TOTHINK.txt
+
+# Local brainstorm / research notes (kept out of the public tree)
 deepreseach.md
 deepresearch-dpi-biba.md
 test.py
 
+# Python
 *.pyc
 __pycache__/
 
+# Desktop UI build artifacts
 /bibavpn-desktop/ui/node_modules
 /bibavpn-desktop/ui/dist
-scripts/publish_remote_image.py

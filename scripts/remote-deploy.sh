@@ -1,34 +1,73 @@
 #!/usr/bin/env bash
-# Deploy biba-vpn sources to server from server.txt (run from WSL). Not for CI.
+# Build bibavpn-server locally and redeploy it to a remote VPS via SSH.
+# Not for CI — this is a one-liner for a personal lab. Secrets come from env.
+#
+# Usage (Linux / WSL):
+#   export BIBA_HOST=vpn.example.com      # or IP
+#   export BIBA_SSH_PORT=22
+#   export BIBA_SSH_USER=root
+#   export BIBA_VPN_PSK='...'
+#   export BIBA_VPN_TOKEN='...'
+#   # auth: either
+#   export SSHPASS='...'                  # sshpass will be used
+#   # or rely on the default SSH agent / keys (do not set SSHPASS)
+#
+#   ./scripts/remote-deploy.sh
+#
+# Optional knobs:
+#   BIBA_REMOTE_DIR [/root/biba-vpn]  BIBA_TLS_SAN [$BIBA_HOST]
+#   BIBA_DECOY_MAX [32]  BIBA_MAX_PAD [64]  BIBA_MAX_WS_BINARY [1400]
+#   BIBA_WS_PING_SECS [25]
+
 set -euo pipefail
+
+: "${BIBA_HOST:?set BIBA_HOST}"
+: "${BIBA_SSH_PORT:?set BIBA_SSH_PORT}"
+: "${BIBA_VPN_PSK:?set BIBA_VPN_PSK}"
+: "${BIBA_VPN_TOKEN:?set BIBA_VPN_TOKEN}"
+
+BIBA_SSH_USER="${BIBA_SSH_USER:-root}"
+REM_DIR="${BIBA_REMOTE_DIR:-/root/biba-vpn}"
+SAN="${BIBA_TLS_SAN:-$BIBA_HOST}"
+DECOY_MAX="${BIBA_DECOY_MAX:-32}"
+MAX_PAD="${BIBA_MAX_PAD:-64}"
+MAX_WS_BINARY="${BIBA_MAX_WS_BINARY:-1400}"
+WS_PING_SECS="${BIBA_WS_PING_SECS:-25}"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TXT="$(cd "$(dirname "$0")/../.." && pwd)/server.txt"
-if [[ ! -f "$TXT" ]]; then
-  echo "missing $TXT" >&2
-  exit 1
-fi
-HOST="$(sed -n '2p' "$TXT" | tr -d '\r')"
-USER_="$(sed -n '4p' "$TXT" | tr -d '\r')"
-PASS="$(sed -n '6p' "$TXT" | tr -d '\r')"
-PORT="$(sed -n '8p' "$TXT" | tr -d '\r')"
-REM_DIR="/root/biba-vpn"
-SAN="$HOST"
 
 run() {
-  sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER_@$HOST" "$@"
+  if [[ -n "${SSHPASS:-}" ]]; then
+    sshpass -e ssh -o StrictHostKeyChecking=accept-new -p "$BIBA_SSH_PORT" "$BIBA_SSH_USER@$BIBA_HOST" "$@"
+  else
+    ssh -o StrictHostKeyChecking=accept-new -p "$BIBA_SSH_PORT" "$BIBA_SSH_USER@$BIBA_HOST" "$@"
+  fi
+}
+
+scp_to() {
+  local src="$1" dest="$2"
+  if [[ -n "${SSHPASS:-}" ]]; then
+    sshpass -e scp -o StrictHostKeyChecking=accept-new -P "$BIBA_SSH_PORT" "$src" "$BIBA_SSH_USER@$BIBA_HOST:$dest"
+  else
+    scp -o StrictHostKeyChecking=accept-new -P "$BIBA_SSH_PORT" "$src" "$BIBA_SSH_USER@$BIBA_HOST:$dest"
+  fi
 }
 
 echo "Build Linux binary locally"
 ( cd "$ROOT" && cargo build --release -p bibavpn --bin bibavpn-server )
 
-echo "Sync $ROOT -> $USER_@$HOST:$REM_DIR"
+echo "Sync $ROOT -> $BIBA_SSH_USER@$BIBA_HOST:$REM_DIR"
 run "rm -rf '$REM_DIR' && install -d -m 0755 '$REM_DIR'"
-tar cf - --exclude=target --exclude=.git -C "$ROOT" . \
-  | sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER_@$HOST" "tar xf - -C '$REM_DIR'"
+if [[ -n "${SSHPASS:-}" ]]; then
+  tar cf - --exclude=target --exclude=.git -C "$ROOT" . \
+    | sshpass -e ssh -o StrictHostKeyChecking=accept-new -p "$BIBA_SSH_PORT" "$BIBA_SSH_USER@$BIBA_HOST" "tar xf - -C '$REM_DIR'"
+else
+  tar cf - --exclude=target --exclude=.git -C "$ROOT" . \
+    | ssh -o StrictHostKeyChecking=accept-new -p "$BIBA_SSH_PORT" "$BIBA_SSH_USER@$BIBA_HOST" "tar xf - -C '$REM_DIR'"
+fi
 
 echo "Upload prebuilt bibavpn-server + free Docker disk (small VPS)"
-sshpass -p "$PASS" scp -o StrictHostKeyChecking=no -P "$PORT" \
-  "$ROOT/target/release/bibavpn-server" "$USER_@$HOST:$REM_DIR/bibavpn-server"
+scp_to "$ROOT/target/release/bibavpn-server" "$REM_DIR/bibavpn-server"
 run "chmod +x '$REM_DIR/bibavpn-server'"
 run "docker image prune -f 2>/dev/null || true; docker builder prune -af 2>/dev/null || true"
 
@@ -40,12 +79,12 @@ run "docker stop bibavpn 2>/dev/null || true; docker rm bibavpn 2>/dev/null || t
 run "docker run -d --name bibavpn --restart unless-stopped -p 8443:8443 bibavpn-server:local \
   --listen 0.0.0.0:8443 \
   --self-signed-san $SAN \
-  --token REDACTED_TOKEN \
-  --psk REDACTED_PSK \
-  --decoy-max 32 \
-  --max-pad 64 \
-  --max-ws-binary 1400 \
-  --ws-ping-secs 25"
+  --token $BIBA_VPN_TOKEN \
+  --psk $BIBA_VPN_PSK \
+  --decoy-max $DECOY_MAX \
+  --max-pad $MAX_PAD \
+  --max-ws-binary $MAX_WS_BINARY \
+  --ws-ping-secs $WS_PING_SECS"
 
 run "docker ps --filter name=bibavpn"
-echo "Done."
+echo "Done. Server: $BIBA_HOST:8443 (SNI $SAN)"

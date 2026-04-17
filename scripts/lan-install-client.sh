@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
 # Deploy bibavpn-client Docker image to a LAN host via SSH + sshpass.
+#
 # Usage:
-#   export SSHPASS='...'
-#   export BIBA_LAN_HOST=192.168.88.220
-#   export BIBA_LAN_USER=ilya
+#   export SSHPASS='...'                  # password for the LAN user
+#   export BIBA_LAN_HOST=192.168.1.10
+#   export BIBA_LAN_USER=youruser
+#   export BIBA_REMOTE=vpn.example.com:8443
+#   export BIBA_SNI=vpn.example.com
+#   export BIBA_VPN_TOKEN='...'
+#   export BIBA_VPN_PSK='...'
 #   ./scripts/lan-install-client.sh
 #
-# Optional (defaults match VPS lab):
-#   BIBA_REMOTE BIBA_SNI BIBA_VPN_TOKEN BIBA_VPN_PSK BIBA_SOCKS_HOST_PORT etc.
-#   BIBA_CLIENT_NO_CACHE=1 — force `docker build --no-cache` (avoids stale Rust binary in image).
+# Optional tuning (sane defaults in brackets):
+#   BIBA_DECOY_MAX [32]  BIBA_MAX_PAD [64]  BIBA_MAX_WS_BINARY [1400]
+#   BIBA_WS_PING_SECS [25]  BIBA_EARLY_WS_FRAMES [0]
+#   BIBA_SOCKS_PORT [11090]  BIBA_HTTP_PORT [11880]
+#   BIBA_CLIENT_NO_CACHE=1 — force `docker build --no-cache`.
 
 set -euo pipefail
 : "${BIBA_LAN_HOST:?set BIBA_LAN_HOST}"
 : "${BIBA_LAN_USER:?set BIBA_LAN_USER}"
-: "${SSHPASS:?set SSHPASS for LAN user}"
+: "${SSHPASS:?set SSHPASS for the LAN user}"
 
-: "${BIBA_REMOTE:=vpn.example.com:8443}"
-: "${BIBA_SNI:=vpn.example.com}"
-: "${BIBA_VPN_TOKEN:=REDACTED_TOKEN}"
-: "${BIBA_VPN_PSK:=REDACTED_PSK}"
+: "${BIBA_REMOTE:?set BIBA_REMOTE=host:port (your bibavpn-server endpoint)}"
+: "${BIBA_SNI:?set BIBA_SNI (TLS SNI for the server)}"
+: "${BIBA_VPN_TOKEN:?set BIBA_VPN_TOKEN}"
+: "${BIBA_VPN_PSK:?set BIBA_VPN_PSK}"
+
 : "${BIBA_DECOY_MAX:=32}"
 : "${BIBA_MAX_PAD:=64}"
 : "${BIBA_MAX_WS_BINARY:=1400}"

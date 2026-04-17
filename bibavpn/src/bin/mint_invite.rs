@@ -1,7 +1,8 @@
 //! Print one `biba://` invite (same crypto as bibavpn-server --print-invite-uri).
 //! Usage:
 //!   export BIBA_VPN_TOKEN=... BIBA_VPN_PSK=... BIBA_INVITE_PASSPHRASE=...
-//!   # optional: INVITE_PUBLIC INVITE_SNI MAX_WS_BINARY DECOY_MAX MAX_PAD WS_PING_SECS
+//!   export INVITE_PUBLIC=host:port
+//!   # optional: INVITE_SNI MAX_WS_BINARY DECOY_MAX MAX_PAD WS_PING_SECS
 //!   cargo run -p bibavpn --bin bibavpn-mint-invite --release
 
 use anyhow::Context;
@@ -31,7 +32,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 fn main() -> anyhow::Result<()> {
     let public =
-        std::env::var("INVITE_PUBLIC").unwrap_or_else(|_| "vpn.example.com:8444".to_string());
+        std::env::var("INVITE_PUBLIC").context("set INVITE_PUBLIC=host:port")?;
     let sni = std::env::var("INVITE_SNI").unwrap_or_else(|_| {
         public
             .split_once(':')

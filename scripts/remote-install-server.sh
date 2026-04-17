@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Usage (do NOT commit passwords): 
-#   export BIBA_SSH_PASS='...'
+# Usage (do NOT commit passwords):
+#   export SSHPASS='...'          # root password on the VPS (sshpass), or set up SSH keys
 #   export BIBA_HOST=vpn.example.com
-#   export BIBA_SSH_PORT=3333
+#   export BIBA_SSH_PORT=22
+#   export BIBA_VPN_PSK='...'
+#   export BIBA_VPN_TOKEN='...'
 #   ./scripts/remote-install-server.sh
 #
 # Installs Docker if needed and runs bibavpn-server on port 8443 with PSK from BIBA_VPN_PSK.
@@ -10,8 +12,8 @@
 set -euo pipefail
 : "${BIBA_HOST:?set BIBA_HOST}"
 : "${BIBA_SSH_PORT:?set BIBA_SSH_PORT}"
-: "${BIBA_VPN_PSK:=ChangeThisPSK}"
-: "${BIBA_VPN_TOKEN:=biba-remote-token}"
+: "${BIBA_VPN_PSK:?set BIBA_VPN_PSK (shared secret, 32+ bytes hex)}"
+: "${BIBA_VPN_TOKEN:?set BIBA_VPN_TOKEN (authentication token)}"
 
 SSH=(sshpass -e ssh -p "$BIBA_SSH_PORT" -o StrictHostKeyChecking=accept-new "root@$BIBA_HOST")
 SCP=(sshpass -e scp -P "$BIBA_SSH_PORT" -o StrictHostKeyChecking=accept-new)

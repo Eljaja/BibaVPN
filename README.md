@@ -1,296 +1,290 @@
 # BibaVPN
 
-Local **SOCKS5** and optional **HTTP CONNECT** over **TLS + WebSocket** to an entry server; the server opens outbound **TCP** (and **UDP** via a dedicated mux) to the target `host:port`. Optional **BibaV2**: shared PSK, HELLO/ACK, ChaCha20-Poly1305, and random decoy per frame. **BibaV2.1** adds a max WS binary size, periodic WebSocket Ping (with optional jitter), configurable upgrade headers, early-session noise, optional **TLS leaf pinning** (`--pin-cert`), and UDP-mux-specific limits.
+A DPI-resistant **SOCKS5 / HTTP-CONNECT** tunnel that wraps your traffic in
+**TLS + WebSocket** and ships it through a single VPS. Optional shared-PSK
+layer (**BibaV2**), per-frame random padding, browser-ordered upgrade headers,
+and HTTP camouflage on the same TLS port.
 
-**DPI / traffic shape (recent):** TCP over **one multiplexed WSS** by default (many SOCKS streams on a single tunnel); **AUTH** sends the token in the first binary control frame instead of the URL. The server can answer plain **HTTP** on the same TLS port (**camouflage**: static dir or `http://` reverse origin). Optional **HTTP-buckets** padding, **idle dummy** padded frames on the tunnel, **decoy HTTPS GETs** (short parallel connections, client-only), and **browser-ordered** WebSocket upgrade headers (Chrome / Firefox profiles).
+Pure Rust server and client; Android app (Jetpack Compose) and a Tauri desktop
+wrapper live in the same workspace.
 
+> **Status:** experimental. Protocol is not frozen — treat any deployment as a
+> personal lab, not a production service. See [Security](#security).
 
-|                         |                                                   |
-| ----------------------- | ------------------------------------------------- |
-| Developer / agent guide | [AGENTS.md](AGENTS.md)                            |
-| Local Docker lab        | `docker compose -f docker-compose.yml up --build` |
+- **Docs**
+  - [PROTOCOL.md](PROTOCOL.md) — wire formats, session flow, invite URI
+  - [AGENTS.md](AGENTS.md) — architecture, CLI flags, deploy notes, scripts
+  - [DESIGN.md](DESIGN.md) — brand / UI design system for ports
 
 ---
 
 ## Contents
 
-- [Stack at a glance](#stack-at-a-glance)
-- [TCP vs UDP paths](#tcp-vs-udp-paths)
-- [Wire formats (packets and frames)](#wire-formats-packets-and-frames)
-- [End-to-end picture (session flow)](#end-to-end-picture-session-flow)
-- [Encrypted invite `biba://`](#encrypted-invite-biba)
-- [Build](#build)
+- [What it does](#what-it-does)
+- [Features](#features)
+- [Quick start](#quick-start)
+  - [A. Local lab in one command (docker compose)](#a-local-lab-in-one-command-docker-compose)
+  - [B. Real VPS + client from source](#b-real-vps--client-from-source)
+  - [C. Client against an existing server](#c-client-against-an-existing-server)
+  - [D. Encrypted `biba://` invite](#d-encrypted-biba-invite)
+- [Using the tunnel](#using-the-tunnel)
+- [Build from source](#build-from-source)
+- [Configuration](#configuration)
+- [Android and desktop](#android-and-desktop)
 - [Security](#security)
-- [Repository](#repository)
+- [License](#license)
 
 ---
 
-## Stack at a glance
+## What it does
 
-How one byte from your app is wrapped before it leaves the machine toward the VPS (TCP tunnel). Each layer is opaque to the one below; DPI on the link sees **TLS record traffic** and, inside it, **WebSocket frames**.
-
-```mermaid
-flowchart LR
-  subgraph L7["Application payload"]
-    P["TCP segment copy\n(from SOCKS CONNECT)"]
-  end
-
-  subgraph L6["Inner frame (padded)"]
-    F["ver 1B | len u24 | pad_len | pad | payload"]
-  end
-
-  subgraph L5["BibaV2 (optional)"]
-    V2["decoy_len | random decoy | padded frame"]
-    AEAD["ChaCha20-Poly1305 to ciphertext"]
-    NONCE["12-byte nonce"]
-    W2["on wire: nonce + ciphertext"]
-  end
-
-  subgraph L4["WebSocket"]
-    WS["Binary frame\n(opcode 2)"]
-  end
-
-  subgraph L3["TLS"]
-    TLS["Encrypted records\n(whole WS stream)"]
-  end
-
-  P --> F
-  F --> V2
-  V2 --> AEAD
-  NONCE --> W2
-  AEAD --> W2
-  W2 --> WS
-  WS --> TLS
+```
+┌─────────┐   SOCKS5 /     ┌───────────────┐   TLS + WSS    ┌───────────────┐   TCP/UDP   ┌────────┐
+│  apps   │ ─HTTP CONNECT─►│ bibavpn-client│ ─────────────► │ bibavpn-server│ ──────────► │ target │
+└─────────┘   (plaintext)  └───────────────┘  one socket    └───────────────┘             └────────┘
+                                              (mux)
 ```
 
-Without PSK, **L5** is skipped: the WebSocket Binary payload **is** the padded frame from **L6**. Padding length can follow **uniform random** or **HTTP-like size buckets** (`--pad-mode`).
+- **Client** runs on your machine and exposes a local **SOCKS5** (and optional
+  HTTP CONNECT) endpoint.
+- **Server** runs on a VPS, terminates TLS + WebSocket, and dials the target
+  TCP / UDP destination.
+- Many logical streams are multiplexed over **one** persistent WebSocket —
+  fewer TLS handshakes, less distinctive traffic shape.
+
+For the full wire format, frame layout and session setup see
+**[PROTOCOL.md](PROTOCOL.md)**.
 
 ---
 
-## TCP vs UDP paths
+## Features
 
-```mermaid
-flowchart TB
-  subgraph client["bibavpn-client"]
-    APP[Apps] --> SOCKS[SOCKS5 / HTTP CONNECT]
-    SOCKS --> TUN_TCP[TCP: mux driver\n1 shared WSS default]
-    SOCKS --> TUN_UDP[UDP mux driver\n1 shared WSS]
-  end
-
-  subgraph path_tcp["TCP channel (default)"]
-    TUN_TCP --> WSS1[TLS + WebSocket]
-    WSS1 --> MUXO2[First logical: MUX_OPEN magic]
-    MUXO2 --> STREAMS[Per-stream mux records\nOPEN target / DATA / CLOSE / WIN]
-  end
-
-  subgraph path_tcp_legacy["TCP legacy (--no-mux)"]
-    TUN_TCP -.-> WSSL[1 WSS per SOCKS CONNECT]
-    WSSL -.-> OPENL[First Binary: OPEN host:port]
-    OPENL -.-> LOOPL[Padded / sealed payloads]
-  end
-
-  subgraph path_udp["UDP channel"]
-    TUN_UDP --> WSS2[TLS + WebSocket]
-    WSS2 --> MUXO[First Binary: UDP_MUX_OPEN]
-    MUXO --> UDPR[UDP_REQ / UDP_REP datagrams]
-  end
-
-  subgraph server["bibavpn-server"]
-    STREAMS --> REMOTE_TCP[(Target TCP)]
-    LOOPL -.-> REMOTE_TCP
-    UDPR --> REMOTE_UDP[(Target UDP)]
-  end
-```
+- **SOCKS5** (TCP CONNECT + UDP ASSOCIATE) and **HTTP CONNECT** on the client.
+- **TLS + WebSocket** transport; the server serves plain HTTP on the same port
+  as camouflage (`--camouflage-dir` for a static site, `--camouflage-url` for a
+  reverse origin).
+- **BibaV2** shared-PSK layer: HELLO / ACK, ChaCha20-Poly1305 AEAD, per-frame
+  random decoy.
+- **BibaV2.1** shaping knobs: random / HTTP-bucket padding, WS Ping with
+  jitter, binary size cap, configurable upgrade headers per TLS profile
+  (Chrome / Firefox), early-session noise, TLS leaf pinning (`--pin-cert`).
+- **TCP mux** over one WSS (stream open / data / window / close) + a separate
+  UDP mux.
+- **Encrypted invite URIs** (`biba://…`) so you can ship one line of config
+  instead of a wall of flags.
+- **Android** app (Jetpack Compose, JNI core) and **Tauri desktop** wrapper.
 
 ---
 
-## Wire formats (packets and frames)
+## Quick start
 
-### 1) Padded TCP tunnel frame (plaintext inside crypto, or plain mode)
+You will need **Rust 1.78+** (the repo pins a toolchain in
+`rust-toolchain.toml`), **Docker** (for the lab / VPS image), and a spare
+VPS or LAN host to act as the server.
 
-This is what `frame::write_padded_frame` / `write_padded_frame_with_mode` emits. It is the **payload** of a WebSocket **Binary** message in plain mode; in PSK mode it sits **after** decoy inside the ChaCha plaintext (see section 2).
+### A. Local lab in one command (docker compose)
 
-**Layout (byte-aligned):**
-
-```text
- offset | 0      | 1 2 3   | 4       | 5 .. 5+pad_len-1 | 5+pad_len .. end |
- +----------+--------+---------+------------------+------------------+
- | field    | ver=1  | len u24 | pad_len | random pad       | payload (len B)  |
- | width    | 1 B    | BE      | 1 B     | 0 .. max_pad     | TCP chunk / OPEN |
- +----------+--------+---------+------------------+------------------+
-```
-
-### 2) BibaV2 outer wrapper (inside one WebSocket Binary)
-
-After HELLO/ACK, each direction uses **ChaCha20-Poly1305** with a **12-byte nonce** (see `crypto_layer.rs`).
-
-**On the wire:**
-
-```text
- +-------------+------------------------------------------------------+
- | nonce 12 B  | ciphertext = AEAD( plaintext_inner )               |
- +-------------+------------------------------------------------------+
-```
-
-**Plaintext inner (before AEAD):**
-
-```text
- +----+--------------+----------------------------------------------+
- | N  | N B decoy    | inner: padded frame, OPEN, mux record, UDP_… |
- |    | (optional)   |                                              |
- +----+--------------+----------------------------------------------+
-      N <= decoy_max
-```
-
-### 3) AUTH (after WS upgrade; token not in URL)
-
-```text
- "BIBA\x01AUTH\x00"  |  token_len u16 BE  |  token UTF-8
- +---- 9 bytes -----+
-```
-
-### 4) TCP OPEN (legacy single-stream mode, first logical binary after optional junk / HELLO)
-
-```text
- "BIBA\x01OPEN\x00"  |  host_len u16 BE  |  host UTF-8  |  port u16 BE
- +---- 9 bytes -----+
-```
-
-### 5) TCP mux: capability and stream records
-
-**Channel open (client → server), fixed magic:**
-
-```text
- "BIBA\x01MUXO\x00"     (9 bytes)
-```
-
-**Mux record (inside one padded inner payload):**
-
-```text
- stream_id u32 BE | flags u8 | payload_len u32 BE | payload
-```
-
-Flags include stream open, data, close, RST, and window update (flow control). See `tcp_mux.rs`.
-
-### 6) UDP mux: channel open
-
-```text
- "BIBA\x01UDPM\x00"     (9 bytes, fixed)
-```
-
-### 7) UDP_REQ (client to server)
-
-```text
- "BIBA\x01UDPR\x00"  |  xid u64 BE  |  ATYP | address | port u16 BE  |  payload
-```
-
-**ATYP** (SOCKS-like): `1` + IPv4 (4 B) + port; `3` + len + hostname + port; `4` + IPv6 (16 B) + port.
-
-### 8) UDP_REP (server to client)
-
-```text
- "BIBA\x01UDPQ\x00"  |  xid u64 BE  |  ATYP | src_addr | port u16 BE  |  payload
-```
-
----
-
-## End-to-end picture (session flow)
-
-Top to bottom: **from the app to bytes inside one tunnel frame**. The hop from the app to `bibavpn-client` is **not** BibaVPN-encrypted — plain SOCKS5/CONNECT.
-
-**Default TCP (multiplexed):** one **TLS + WSS** per client process; many SOCKS connections become **mux streams** on that socket.
-
-```mermaid
-flowchart TB
-  subgraph loc [Local plaintext]
-    APP[Application] --> PX[SOCKS5 or HTTP CONNECT] --> CL[bibavpn-client]
-  end
-
-  subgraph wire [On the wire: outer client-server socket]
-    CL --> TCP[TCP]
-    TCP --> TLS[TLS encrypts all of WS]
-    TLS --> WFR[WebSocket: HTTP Upgrade, then Binary]
-  end
-
-  subgraph setup [Order within one WSS session]
-    WFR --> U[1 GET Upgrade to configured path e.g. /ws — no token in URL]
-    U --> N[2 optional Binary noise / junk BibaV2.1]
-    N --> AU[3 AUTH binary with token]
-    AU --> Q{BibaV2 PSK?}
-    Q -->|yes| HA[4 HELLO / ACK]
-    Q -->|no| MX
-    HA --> MX[5 MUX_OPEN magic]
-    MX --> ST[6 Stream OPEN + DATA mux records to target]
-    ST --> SV[bibavpn-server connects per stream]
-    SV --> LOOP[7 Binary loop: padded / sealed payloads]
-  end
-
-  subgraph payload [One tunnel WebSocket Binary in data phase]
-    LOOP --> R{mode}
-    R -->|no PSK| PF[padded frame as payload]
-    R -->|PSK| AE[12 B nonce + ChaCha20-Poly1305 ciphertext]
-    PF --> PF1["version 1B | payload len u24 BE | pad_len | pad | inner"]
-    AE --> AE1["after decrypt: dlen 1B | decoy 0..decoy_max | same inner"]
-  end
-
-  SV --> DST[(Target host:port)]
-```
-
-**Legacy TCP (`--no-mux`):** each SOCKS CONNECT opens a **new** WSS; step 5 is **OPEN host:port** instead of MUX_OPEN + stream records.
-
-DPI on the outside sees **TLS** and **WebSocket**; **inside** Binary is either **padded** data or **nonce + AEAD**. BibaV2.1 may send **WebSocket Ping** and optional **idle dummy** padded frames.
-
----
-
-## Encrypted invite `biba://`
-
-The server can print a **single-line encrypted config** after it binds: JSON (`InviteV1`) sealed with **ChaCha20-Poly1305** and a key derived from a **passphrase** (BLAKE3 KDF). Clients and Android JNI can consume the same blob instead of spelling out `--server`, `--token`, and matching tunnel options by hand.
-
-Invite JSON may include optional **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`** (and existing tunnel fields). **Do not** paste real invites or passphrases into tickets or public logs.
-
-**Server** (stdout = only the URI; passphrase must stay secret — share out-of-band):
+Brings up `biba-server` + `biba-client` on one Docker network and exposes the
+client's SOCKS5 on `localhost:11080` and HTTP CONNECT on `localhost:11880`.
+The PSK / token in `docker-compose.yml` are **example values — change them**
+before trusting anything.
 
 ```bash
-./target/release/bibavpn-server \
-  --listen 0.0.0.0:8443 --self-signed-san vpn.example \
-  --token YOUR_TOKEN --psk YOUR_PSK --decoy-max 32 --max-pad 64 \
-  --ws-path /ws \
-  --print-invite-uri \
-  --invite-passphrase 'shared-out-of-band-secret' \
-  --invite-public 'YOUR_VPS_PUBLIC_IP:8443' \
-  --invite-sni 'vpn.example'
+docker compose up --build
+# SOCKS5:  127.0.0.1:11080
+# HTTP:    127.0.0.1:11880
 ```
 
-**Client** (mutually exclusive with `--server` / `--token`):
+Smoke test:
+
+```bash
+curl --socks5-hostname 127.0.0.1:11080 https://ifconfig.io
+curl -x http://127.0.0.1:11880 https://ifconfig.io
+```
+
+Or run the one-shot script that does build + curl + teardown:
+
+```bash
+./scripts/docker-smoke.sh
+```
+
+### B. Real VPS + client from source
+
+1. **Build both binaries locally** (Linux or WSL):
+
+   ```bash
+   cargo build --release -p bibavpn --bin bibavpn-server
+   cargo build --release -p bibavpn --bin bibavpn-client
+   ```
+
+2. **Pick your secrets** and put them in your shell (do *not* commit):
+
+   ```bash
+   export BIBA_VPN_TOKEN="$(openssl rand -hex 16)"
+   export BIBA_VPN_PSK="$(openssl rand -hex 32)"
+   export BIBA_HOST="vpn.example.com"   # or IP
+   ```
+
+3. **Start the server** on the VPS (here: self-signed TLS for a quick lab —
+   for production use real certs, see [Security](#security)):
+
+   ```bash
+   ./target/release/bibavpn-server \
+     --listen 0.0.0.0:8443 \
+     --self-signed-san "$BIBA_HOST" \
+     --token "$BIBA_VPN_TOKEN" \
+     --psk "$BIBA_VPN_PSK" \
+     --decoy-max 32 --max-pad 64 \
+     --max-ws-binary 262144 --ws-ping-secs 25
+   ```
+
+4. **Start the client** locally, pointing at the VPS:
+
+   ```bash
+   ./target/release/bibavpn-client \
+     --server "$BIBA_HOST:8443" --sni "$BIBA_HOST" \
+     --token "$BIBA_VPN_TOKEN" --psk "$BIBA_VPN_PSK" \
+     --decoy-max 32 --max-pad 64 \
+     --max-ws-binary 262144 --ws-ping-secs 25 \
+     --insecure \
+     --socks5 127.0.0.1:1080
+   ```
+
+   `--insecure` disables cert verification and is **lab-only**. Remove it
+   together with `--self-signed-san` once you have a real certificate or
+   switch to `--pin-cert <leaf.pem>`.
+
+### C. Client against an existing server
+
+If somebody else is already running a BibaVPN server and shared `host`,
+`token`, `psk` (and optionally a TLS pin) with you out of band:
 
 ```bash
 ./target/release/bibavpn-client \
-  --from-invite 'biba://...' \
-  --invite-passphrase 'shared-out-of-band-secret' \
+  --server "$HOST:8443" --sni "$HOST" \
+  --token "$TOKEN" --psk "$PSK" \
+  --pin-cert server-leaf.pem \
   --socks5 127.0.0.1:1080
 ```
 
+### D. Encrypted `biba://` invite
+
+Instead of juggling flags, the server can emit a one-line encrypted config
+and the client can consume it:
+
+```bash
+# server (prints exactly one biba://… line to stdout after bind)
+./target/release/bibavpn-server … \
+  --print-invite-uri \
+  --invite-passphrase "$BIBA_INVITE_PASSPHRASE" \
+  --invite-public "$BIBA_HOST:8443" \
+  --invite-sni "$BIBA_HOST"
+
+# client (mutually exclusive with --server / --token)
+./target/release/bibavpn-client \
+  --from-invite 'biba://…' \
+  --invite-passphrase "$BIBA_INVITE_PASSPHRASE" \
+  --socks5 127.0.0.1:1080
+```
+
+Share the passphrase out-of-band, never in the same channel as the URI. See
+[PROTOCOL.md#encrypted-invite-biba](PROTOCOL.md#encrypted-invite-biba).
+
 ---
 
-## Build
+## Using the tunnel
+
+Once the client is up, point your apps at the local SOCKS5 / HTTP CONNECT:
+
+- **Browser (Firefox)**: *Settings → Network → Manual proxy*,
+  SOCKS5 host `127.0.0.1`, port `1080`, "Proxy DNS when using SOCKS v5" **on**.
+- **Browser (Chrome / Chromium)**:
+  `--proxy-server="socks5://127.0.0.1:1080"`.
+- **curl**: `curl --socks5-hostname 127.0.0.1:1080 https://…`.
+- **System-wide on Linux**: use `proxychains` or set `ALL_PROXY=socks5h://127.0.0.1:1080`.
+
+---
+
+## Build from source
+
+Workspace layout (cargo workspace):
+
+| Crate | Role |
+| ----- | ---- |
+| `bibavpn` | `lib` + binaries `bibavpn-server`, `bibavpn-client`, `bibavpn-mint-invite` |
+| `biba` | uTLS-like TLS fingerprint helpers |
+| `bibavpn-jni` | Android JNI glue around `bibavpn` |
+| `bibavpn-desktop/src-tauri` | Tauri desktop wrapper (systray, platform proxy setup) |
+
+Common commands:
 
 ```bash
 cargo build --release -p bibavpn --bin bibavpn-server
 cargo build --release -p bibavpn --bin bibavpn-client
+cargo test --workspace
 ```
 
-CLI flags, camouflage, benchmarks, Docker notes, and deploy gotchas live in **[AGENTS.md](AGENTS.md)**. Short redirect for old links: [AGENT.md](AGENT.md).
+A `rust-toolchain.toml` pins the compiler version so CI and local builds stay
+reproducible. Docker images use the same or a newer toolchain.
 
-Workspace crates also include `bibavpn-jni` (Android JNI) and `bibavpn-desktop` (desktop helper); see `android/` for the Android app.
+---
+
+## Configuration
+
+Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. The short story:
+
+- **Required for an encrypted tunnel:** `--server`, `--sni`, `--token`, `--psk`.
+- **Shape / anti-DPI:** `--decoy-max`, `--max-pad`, `--pad-mode`,
+  `--dummy-interval-secs`, `--ws-ping-secs`, `--junk-frames`,
+  `--decoy-gets*` (client-only).
+- **Camouflage on the TLS port (server):** `--camouflage-dir <path>` or
+  `--camouflage-url http://…`.
+- **TLS trust (client):** real CA by default, `--pin-cert <pem>` to pin the
+  leaf, `--insecure` **lab only**.
+
+Never put secrets in the URL: the token is carried in the `AUTH` binary
+frame, and the WebSocket path (`--ws-path`, default `/ws`) does not
+contain credentials.
+
+---
+
+## Android and desktop
+
+- **Android:** `android/` (Jetpack Compose + `BibaVpnService`). Build the JNI
+  core with `scripts/wsl-build-all.sh`, then open the `android/` project in
+  Android Studio.
+- **Desktop (Tauri):** `bibavpn-desktop/` (Vite UI + Tauri shell). Prebuilt
+  binaries are emitted by the GitHub Actions workflows in `.github/workflows/`
+  for Windows and macOS.
+
+See [DESIGN.md](DESIGN.md) for the shared visual language if you want to port
+the UI elsewhere.
 
 ---
 
 ## Security
 
-Treat PSK, **token**, and **invite passphrase** as **secrets** — do not commit them. The token is carried in the **AUTH** frame (default path `/ws`), not in the URL, so it should not appear in HTTP access logs as a path segment. For production use proper certificates, **`--pin-cert`** (or a public CA you trust), and avoid **`--insecure`** on the client. **`--legacy-path-auth`** on the server (URL `/b/{token}`) is weaker and only for old clients.
+BibaVPN is an **experimental tunnel**, not a hardened product. Known caveats:
+
+- **Secrets in the repo:** `PSK`, `token` and any `invite-passphrase` must
+  stay out of git. The repo ships an `.gitignore` that covers `server.txt`,
+  `.env*`, `*.pem`, `*.key` and related local files. **Do not commit real
+  credentials. Rotate anything that ever leaked.**
+- **`--insecure` is lab-only.** For anything you actually care about, use a
+  real certificate (e.g. Let's Encrypt via a reverse proxy) or pin the leaf
+  with `--pin-cert`.
+- **Threat model:** BibaVPN aims to make the outer flow *look like* a
+  long-lived HTTPS WebSocket to a reasonable camouflage site. It is not
+  anonymity software; the server operator sees every byte you send, and
+  active probing with the right keys recovers the inner protocol.
+- **Token path:** `--legacy-path-auth` accepts an old `/b/{token}` URL
+  form without the AUTH frame. It is only there for old clients and is
+  strictly weaker than the default.
+- **Report security issues** privately — see [SECURITY.md](SECURITY.md).
 
 ---
 
-## Repository
+## License
 
-Rust stack; protocol modules and layout are documented in [AGENTS.md](AGENTS.md) (BibaV2 / BibaV2.1, UDP mux, TCP mux, scripts).
+MIT — see [LICENSE](LICENSE). Third-party crates retain their own licenses
+(`cargo tree --duplicates`, `cargo about` if you want a full inventory).
