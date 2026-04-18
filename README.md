@@ -1,5 +1,9 @@
 # BibaVPN
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Docker Hub — server](https://img.shields.io/docker/pulls/eljaja/bibavpn-server?label=docker%20server)](https://hub.docker.com/r/eljaja/bibavpn-server)
+[![Docker Hub — client](https://img.shields.io/docker/pulls/eljaja/bibavpn-client?label=docker%20client)](https://hub.docker.com/r/eljaja/bibavpn-client)
+
 A DPI-resistant **SOCKS5 / HTTP-CONNECT** tunnel that wraps your traffic in
 **TLS + WebSocket** and ships it through a single VPS. Optional shared-PSK
 layer (**BibaV2**), per-frame random padding, browser-ordered upgrade headers,
@@ -23,10 +27,11 @@ wrapper live in the same workspace.
 - [What it does](#what-it-does)
 - [Features](#features)
 - [Quick start](#quick-start)
-  - [A. Local lab in one command (docker compose)](#a-local-lab-in-one-command-docker-compose)
-  - [B. Real VPS + client from source](#b-real-vps--client-from-source)
-  - [C. Client against an existing server](#c-client-against-an-existing-server)
-  - [D. Encrypted `biba://` invite](#d-encrypted-biba-invite)
+  - [A. One-liner from Docker Hub](#a-one-liner-from-docker-hub)
+  - [B. Local lab, built from source (docker compose)](#b-local-lab-built-from-source-docker-compose)
+  - [C. Real VPS + client from source](#c-real-vps--client-from-source)
+  - [D. Client against an existing server](#d-client-against-an-existing-server)
+  - [E. Encrypted `biba://` invite](#e-encrypted-biba-invite)
 - [Using the tunnel](#using-the-tunnel)
 - [Build from source](#build-from-source)
 - [Configuration](#configuration)
@@ -78,21 +83,42 @@ For the full wire format, frame layout and session setup see
 
 ## Quick start
 
-You will need **Rust 1.78+** (the repo pins a toolchain in
-`rust-toolchain.toml`), **Docker** (for the lab / VPS image), and a spare
-VPS or LAN host to act as the server.
+You will need **Docker** (for the image-based paths) or **Rust 1.78+** (the
+repo pins a toolchain in `rust-toolchain.toml`) if you want to build from
+source. For anything beyond a local lab you also need a spare **VPS or LAN
+host** to act as the server.
 
-### A. Local lab in one command (docker compose)
+### A. One-liner from Docker Hub
 
-Brings up `biba-server` + `biba-client` on one Docker network and exposes the
-client's SOCKS5 on `localhost:11080` and HTTP CONNECT on `localhost:11880`.
-The PSK / token in `docker-compose.yml` are **example values — change them**
-before trusting anything.
+Prebuilt multi-arch (`linux/amd64`, `linux/arm64`) images live on Docker Hub:
+
+- [`eljaja/bibavpn-server`](https://hub.docker.com/r/eljaja/bibavpn-server)
+- [`eljaja/bibavpn-client`](https://hub.docker.com/r/eljaja/bibavpn-client)
+
+The repo ships a ready-made compose file that pulls both images, wires them
+on one Docker network, and exposes the client's SOCKS5 on `localhost:11080`
+and HTTP CONNECT on `localhost:11880`:
 
 ```bash
-docker compose up --build
+# pull + run (no build step)
+curl -fsSL https://raw.githubusercontent.com/Eljaja/BibaVPN/main/docker-compose.hub.yml \
+  -o docker-compose.hub.yml
+
+# pick your own secrets (both sides must agree)
+export BIBA_VPN_TOKEN="$(openssl rand -hex 16)"
+export BIBA_VPN_PSK="$(openssl rand -hex 32)"
+
+docker compose -f docker-compose.hub.yml up -d
 # SOCKS5:  127.0.0.1:11080
 # HTTP:    127.0.0.1:11880
+```
+
+Or, if you've already cloned the repo:
+
+```bash
+BIBA_VPN_TOKEN=$(openssl rand -hex 16) \
+BIBA_VPN_PSK=$(openssl rand -hex 32) \
+docker compose -f docker-compose.hub.yml up -d
 ```
 
 Smoke test:
@@ -102,13 +128,34 @@ curl --socks5-hostname 127.0.0.1:11080 https://ifconfig.io
 curl -x http://127.0.0.1:11880 https://ifconfig.io
 ```
 
-Or run the one-shot script that does build + curl + teardown:
+> This variant uses a **self-signed** cert inside the Docker network and the
+> client runs with `--insecure`. That is fine for a localhost lab, *not* for
+> a real VPN. For that, see [C](#c-real-vps--client-from-source).
+
+Image tags:
+
+| Tag            | Meaning                                              |
+| -------------- | ---------------------------------------------------- |
+| `:latest`      | HEAD of `main` (CI publishes on every push).         |
+| `:vX.Y.Z`      | Pinned release. Prefer this for anything long-lived. |
+| `:sha-abc1234` | Exact commit. Useful for rollback.                   |
+
+### B. Local lab, built from source (docker compose)
+
+Same layout as [A](#a-one-liner-from-docker-hub) but builds both images
+locally from this checkout — useful when hacking on the code:
+
+```bash
+docker compose up --build
+```
+
+Or the one-shot script (build + curl + teardown):
 
 ```bash
 ./scripts/docker-smoke.sh
 ```
 
-### B. Real VPS + client from source
+### C. Real VPS + client from source
 
 1. **Build both binaries locally** (Linux or WSL):
 
@@ -154,7 +201,7 @@ Or run the one-shot script that does build + curl + teardown:
    together with `--self-signed-san` once you have a real certificate or
    switch to `--pin-cert <leaf.pem>`.
 
-### C. Client against an existing server
+### D. Client against an existing server
 
 If somebody else is already running a BibaVPN server and shared `host`,
 `token`, `psk` (and optionally a TLS pin) with you out of band:
@@ -167,7 +214,7 @@ If somebody else is already running a BibaVPN server and shared `host`,
   --socks5 127.0.0.1:1080
 ```
 
-### D. Encrypted `biba://` invite
+### E. Encrypted `biba://` invite
 
 Instead of juggling flags, the server can emit a one-line encrypted config
 and the client can consume it:
