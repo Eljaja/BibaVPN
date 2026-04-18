@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
+mod locale;
 mod logging;
 
 #[cfg(target_os = "macos")]
@@ -28,10 +29,11 @@ use config::{
     display_host_line, load_config_disk, normalize_loaded, save_config_disk, server_card_subtitle,
     SavedConfig,
 };
+use locale::{resolved_tray_lang, tray_strings};
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{include_image, AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{include_image, AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -85,15 +87,47 @@ fn snapshot(inner: &Inner) -> StateSnapshot {
     }
 }
 
-fn sync_tray_tooltip(app: &AppHandle, connected: bool) {
+fn sync_tray_tooltip_i18n(app: &AppHandle, connected: bool, cfg: &SavedConfig) {
+    let s = tray_strings(resolved_tray_lang(cfg));
     if let Some(tray) = app.tray_by_id("main-tray") {
         let tip = if connected {
-            "BibaVPN — подключено"
+            s.tip_connected
         } else {
-            "BibaVPN — отключено"
+            s.tip_disconnected
         };
         let _ = tray.set_tooltip(Some(tip));
     }
+}
+
+fn build_tray_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
+    let s = tray_strings(lang);
+    let show = MenuItem::with_id(app, "show", s.show, true, None::<&str>)?;
+    let on = MenuItem::with_id(app, "on", s.on, true, None::<&str>)?;
+    let off = MenuItem::with_id(app, "off", s.off, true, None::<&str>)?;
+    let logs = MenuItem::with_id(app, "logs", s.logs, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", s.quit, true, None::<&str>)?;
+    Menu::with_items(
+        app,
+        &[
+            &show,
+            &PredefinedMenuItem::separator(app)?,
+            &on,
+            &off,
+            &PredefinedMenuItem::separator(app)?,
+            &logs,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )
+}
+
+fn apply_tray_menu_locale(app: &AppHandle, cfg: &SavedConfig, connected: bool) -> Result<(), String> {
+    let menu = build_tray_menu(app, resolved_tray_lang(cfg)).map_err(|e| e.to_string())?;
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+    }
+    sync_tray_tooltip_i18n(app, connected, cfg);
+    Ok(())
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -120,7 +154,7 @@ fn disconnect_inner(state: &AppState, app: &AppHandle) {
     if let Some(vpn) = g.vpn.take() {
         vpn.stop(&state.rt);
     }
-    sync_tray_tooltip(app, false);
+    sync_tray_tooltip_i18n(app, false, &g.cfg);
     let snap = snapshot(&g);
     let _ = app.emit("vpn-state", &snap);
 }
@@ -290,7 +324,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         join,
     });
     g.tunnel_server = Some(remote_label);
-    sync_tray_tooltip(app, true);
+    sync_tray_tooltip_i18n(app, true, &g.cfg);
     Ok(())
 }
 
@@ -307,11 +341,21 @@ fn save_config_cmd(
     app: AppHandle,
 ) -> Result<StateSnapshot, String> {
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let old_locale = g.cfg.ui_locale.clone();
     g.cfg = cfg;
     normalize_loaded(&mut g.cfg);
+    let locale_changed = old_locale != g.cfg.ui_locale;
     save_config_disk(&g.cfg);
+    let connected = g.vpn.is_some();
+    let cfg_for_tray = g.cfg.clone();
     let snap = snapshot(&g);
+    drop(g);
     let _ = app.emit("vpn-state", &snap);
+    if locale_changed {
+        if let Err(e) = apply_tray_menu_locale(&app, &cfg_for_tray, connected) {
+            warn!(target: "bibavpn_desktop", "обновление меню трея: {e}");
+        }
+    }
     Ok(snap)
 }
 
@@ -432,28 +476,20 @@ fn run() -> anyhow::Result<()> {
             }
         })
         .setup(move |app| {
-            let show = MenuItem::with_id(app, "show", "Открыть окно", true, None::<&str>)?;
-            let on = MenuItem::with_id(app, "on", "Включить VPN", true, None::<&str>)?;
-            let off = MenuItem::with_id(app, "off", "Отключить VPN", true, None::<&str>)?;
-            let logs = MenuItem::with_id(app, "logs", "Папка с логами…", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &show,
-                    &PredefinedMenuItem::separator(app)?,
-                    &on,
-                    &off,
-                    &PredefinedMenuItem::separator(app)?,
-                    &logs,
-                    &PredefinedMenuItem::separator(app)?,
-                    &quit,
-                ],
-            )?;
+            let tray_cfg = app
+                .state::<AppState>()
+                .inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .cfg
+                .clone();
+            let lang = resolved_tray_lang(&tray_cfg);
+            let menu = build_tray_menu(&app.handle(), lang)?;
+            let ts = tray_strings(lang);
 
             let icon = tray_icon();
             let _tray = TrayIconBuilder::with_id("main-tray")
-                .tooltip("BibaVPN")
+                .tooltip(ts.tip_disconnected)
                 .icon(icon)
                 .menu(&menu)
                 .show_menu_on_left_click(false)

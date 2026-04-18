@@ -61,6 +61,9 @@ pub struct SavedConfig {
     pub decoy_gets_paths: String,
     #[serde(default)]
     pub pin_cert_pem: String,
+    /// `auto` | `ru` | `en` — язык UI и меню в трее (десктоп).
+    #[serde(default = "default_ui_locale")]
+    pub ui_locale: String,
 }
 
 fn default_decoy_gets_interval_cfg() -> u64 {
@@ -100,8 +103,13 @@ impl Default for SavedConfig {
             decoy_gets_interval_secs: default_decoy_gets_interval_cfg(),
             decoy_gets_paths: String::new(),
             pin_cert_pem: String::new(),
+            ui_locale: default_ui_locale(),
         }
     }
+}
+
+fn default_ui_locale() -> String {
+    "auto".to_string()
 }
 
 fn default_use_tcp_mux_cfg() -> bool {
@@ -253,6 +261,13 @@ pub fn normalize_loaded(cfg: &mut SavedConfig) {
     if cfg.max_ws_binary < 1024 {
         cfg.max_ws_binary = DEFAULT_CLIENT_MAX_WS_BINARY;
     }
+    let l = cfg.ui_locale.trim().to_lowercase();
+    cfg.ui_locale = match l.as_str() {
+        "" | "auto" => "auto".to_string(),
+        "ru" | "rus" => "ru".to_string(),
+        "en" | "eng" => "en".to_string(),
+        _ => "auto".to_string(),
+    };
 }
 
 fn default_max_pad_cfg() -> u8 {

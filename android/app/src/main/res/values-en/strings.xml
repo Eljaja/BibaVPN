@@ -6,4 +6,129 @@
     <string name="notification_text">VPN tunnel is active</string>
     <string name="notification_action_disable">Disable</string>
     <string name="notification_action_enable">Enable</string>
+
+    <string name="lang_system">System default</string>
+    <string name="lang_russian">Russian</string>
+    <string name="lang_english">English</string>
+    <string name="lang_persian">Persian (Iran)</string>
+    <string name="section_language">Interface language</string>
+    <string name="section_language_sub">Your choice is saved on the device. The settings screen will reload.</string>
+
+    <string name="toast_invite_need_key_pass">Enter both the biba:// key and passphrase</string>
+    <string name="toast_invite_decode_error">Invalid key</string>
+    <string name="toast_invite_fields_updated">Connection fields updated</string>
+    <string name="toast_connect_need_config">Set the server in settings or provide a biba:// key and passphrase</string>
+    <string name="toast_battery_android6">Available from Android 6</string>
+    <string name="toast_battery_open_failed">Could not open settings</string>
+    <string name="toast_decode_failed">%1$s</string>
+
+    <string name="home_connected">Connected</string>
+    <string name="home_disconnected">Disconnected</string>
+    <string name="home_tunnel_active_line">%1$s · tunnel active</string>
+    <string name="home_tap_vpn">Tap to turn on VPN</string>
+    <string name="home_connect">Connect</string>
+    <string name="home_disconnect">Disconnect</string>
+    <string name="home_cta_protected">Protected · disconnect tunnel</string>
+    <string name="home_cta_traffic">Traffic via system VPN + local SOCKS</string>
+    <string name="home_server_label">SERVER</string>
+    <string name="home_no_server">No server configured</string>
+    <string name="home_biba_key_short">Biba key</string>
+    <string name="home_dash">—</string>
+
+    <string name="settings_title">Settings</string>
+    <string name="tab_connection">Connection</string>
+    <string name="tab_split_tunnel">Split tunnel</string>
+
+    <string name="section_biba_key">Biba key</string>
+    <string name="section_biba_key_sub">Encrypted biba://… and passphrase (same as desktop --from-invite)</string>
+    <string name="field_biba_key">Biba key</string>
+    <string name="placeholder_biba_key">biba://…</string>
+    <string name="field_passphrase">Passphrase</string>
+    <string name="placeholder_passphrase">out-of-band secret</string>
+    <string name="hint_biba_key_override">Tunnel params come from the key; you can override junk_frames, ws_headers and SNI below.</string>
+    <string name="btn_apply_invite">Apply to connection fields</string>
+
+    <string name="section_connection">Connection</string>
+    <string name="section_connection_sub">Server and handshake</string>
+    <string name="field_server">Server</string>
+    <string name="placeholder_server">host:443</string>
+    <string name="field_token">Token</string>
+    <string name="placeholder_token">token</string>
+    <string name="field_sni">SNI / TLS name</string>
+    <string name="placeholder_sni">Auto (empty = host)</string>
+    <string name="hint_sni">Leave empty to use host</string>
+    <string name="field_psk">PSK</string>
+    <string name="toggle_insecure_title">Skip TLS verification (insecure)</string>
+    <string name="toggle_insecure_sub">Lab use only</string>
+
+    <string name="section_network">Network</string>
+    <string name="section_network_sub">Routing</string>
+    <string name="field_routing_mode">Routing mode</string>
+    <string name="value_system_vpn">System VPN</string>
+    <string name="hint_routing_mode">All traffic through the tunnel</string>
+    <string name="field_local_socks">Local SOCKS</string>
+    <string name="hint_socks_empty">Empty = %1$s</string>
+    <string name="toggle_battery_saver_title">Lock-screen battery saver</string>
+    <string name="toggle_battery_saver_sub">Release wake lock when the screen is off. VPN and notification stay; Doze may drop the tunnel — unlocking restores the lock.</string>
+    <string name="battery_row_title">Battery optimization (system)</string>
+    <string name="battery_row_sub">Open Android prompt: don’t optimize BibaVPN — fewer background VPN drops.</string>
+
+    <string name="section_transport">Transport</string>
+    <string name="section_transport_sub">Obfuscation and WebSocket</string>
+    <string name="hint_tls_profile">ClientHello profile (default, chrome70, firefox65, …); can override for invite keys</string>
+    <string name="hint_ws_path">WebSocket path on server (empty = /ws from key)</string>
+    <string name="toggle_tcp_mux_title">TCP multiplex (WSS)</string>
+    <string name="toggle_tcp_mux_sub">Turn off for --no-mux-like mode</string>
+    <string name="hint_pad_mode">Padding mode; empty = from key or random</string>
+    <string name="placeholder_pad_mode">random or http-buckets</string>
+    <string name="hint_max_pad">Packet padding</string>
+    <string name="hint_decoy_max">Fake packets</string>
+    <string name="hint_ws_ping_jitter">0–50</string>
+    <string name="hint_ws_binary_jitter">0–255</string>
+    <string name="hint_udp_max_pad">empty = same as max_pad</string>
+    <string name="hint_udp_max_ws">empty = same as max_ws</string>
+    <string name="hint_udp_mux_to">sec, empty = default</string>
+    <string name="hint_dummy_interval">0 = off; idle WS frames</string>
+    <string name="placeholder_ws_headers">Name: value</string>
+    <string name="toggle_decoy_gets_title">Decoy HTTPS GET</string>
+    <string name="toggle_decoy_gets_sub">Parallel GETs to server (like --decoy-gets)</string>
+    <string name="hint_decoy_interval">≥1 sec</string>
+    <string name="hint_decoy_paths">Comma-separated (like desktop)</string>
+    <string name="placeholder_decoy_paths">/,/favicon.ico</string>
+    <string name="placeholder_pin_cert">-----BEGIN CERTIFICATE-----</string>
+    <string name="hint_pin_cert">One or more PEM blocks; mutually exclusive with insecure</string>
+
+    <string name="split_tunnel_title">Split tunneling</string>
+    <string name="split_tunnel_sub">Selected apps bypass the VPN (your normal IP). Everything else uses BibaVPN.</string>
+    <string name="split_enable_title">Enable per-app bypass</string>
+    <string name="split_enable_sub">Off by default. Reconnect VPN after changing the list.</string>
+    <string name="split_reapply_hint">Disconnect and connect again to apply changes.</string>
+    <string name="split_toggle_groups_hint">Turn on the switch, then pick apps by group.</string>
+    <string name="split_selected_count">%1$d / %2$d selected</string>
+
+    <string name="split_group_government">Government</string>
+    <string name="split_group_banks">Banks</string>
+    <string name="split_group_marketplaces">Marketplaces</string>
+    <string name="split_app_gosuslugi">Public services</string>
+    <string name="split_app_max">MAX</string>
+    <string name="split_app_vk">VK</string>
+    <string name="split_app_tinkoff">Tinkoff</string>
+    <string name="split_app_sber">Sberbank</string>
+    <string name="split_app_yandex_bank">Yandex Bank</string>
+    <string name="split_app_banki">Banki.ru</string>
+    <string name="split_app_bog">Bank of Georgia</string>
+    <string name="split_app_vtb">VTB Online</string>
+    <string name="split_app_alfa">Alfa-Bank</string>
+    <string name="split_app_ozon">Ozon</string>
+    <string name="split_app_beru">Yandex Market</string>
+    <string name="split_app_steam">Steam</string>
+    <string name="split_app_yango">Yandex Go</string>
+    <string name="split_app_vezet">Yandex Vezet</string>
+    <string name="split_app_deliveryclub">Delivery Club</string>
+    <string name="split_app_eda">Yandex Eda</string>
+    <string name="split_app_lavka">Yandex Lavka</string>
+    <string name="split_app_samokat">Samokat</string>
+
+    <string name="vpn_error_tun2socks">tun2socks error</string>
+    <string name="vpn_error_prefix">BibaVPN: %1$s</string>
 </resources>

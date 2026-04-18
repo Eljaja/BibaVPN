@@ -25,6 +25,7 @@ dirs = "5"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sys-locale = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

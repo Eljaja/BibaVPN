@@ -11,8 +11,8 @@
     <div id="app">
       <div id="view-home" class="view view-home">
         <header class="home-header">
-          <button type="button" class="icon-btn" id="btn-settings" aria-label="Настройки">&#9881;</button>
-          <img class="wordmark" src="/wordmark.png" alt="BibaVPN" height="36" />
+          <button type="button" class="icon-btn" id="btn-settings" data-i18n-aria="settings_aria">&#9881;</button>
+          <img class="wordmark" src="/wordmark.png" data-i18n-alt="wordmark_alt" alt="BibaVPN" height="36" />
           <span class="header-spacer" aria-hidden="true"></span>
         </header>
 
@@ -23,7 +23,7 @@
               <span class="status-dot-inner"></span>
             </div>
             <div class="status-text">
-              <h1 class="status-title" id="status-title">Не подключено</h1>
+              <h1 class="status-title" id="status-title" data-i18n="status_disconnected"></h1>
               <p class="status-sub" id="status-sub"></p>
             </div>
           </div>
@@ -32,7 +32,7 @@
         <button type="button" class="cta" id="btn-cta" disabled>
           <span class="cta-inner">
             <span class="cta-copy">
-              <span class="cta-title" id="cta-title">Подключить</span>
+              <span class="cta-title" id="cta-title" data-i18n="cta_connect"></span>
               <span class="cta-sub" id="cta-sub"></span>
             </span>
             <span class="cta-square" aria-hidden="true"><span class="cta-square-dot"></span></span>
@@ -40,7 +40,7 @@
         </button>
 
         <button type="button" class="server-card card" id="btn-server-card">
-          <span class="server-label">SERVER</span>
+          <span class="server-label" data-i18n="server_label"></span>
           <div class="server-row">
             <div class="server-text">
               <span class="server-title" id="server-title">—</span>
@@ -57,57 +57,67 @@
 
       <div id="view-settings" class="view view-settings" hidden>
         <header class="settings-top">
-          <button type="button" class="icon-btn" id="btn-back" aria-label="Назад">←</button>
-          <h2 class="settings-heading">Настройки</h2>
+          <button type="button" class="icon-btn" id="btn-back" data-i18n-aria="back_aria">←</button>
+          <h2 class="settings-heading" data-i18n="settings_heading"></h2>
         </header>
 
         <div class="settings-scroll">
           <section class="settings-card card-dim">
-            <p class="group-label">Ключ Biba (как в Android)</p>
-            <label class="field-label" for="f-from_invite">biba://…</label>
-            <input class="field" id="f-from_invite" name="from_invite" autocomplete="off" />
-            <label class="field-label" for="f-invite_passphrase">Passphrase</label>
-            <input class="field" id="f-invite_passphrase" name="invite_passphrase" type="password" autocomplete="off" />
-            <button type="button" class="btn-invite" id="btn-apply-invite">Применить к полям</button>
+            <p class="group-label" data-i18n="group_lang"></p>
+            <label class="field-label" for="f-ui_locale" data-i18n="lang_label"></label>
+            <select class="field" id="f-ui_locale" name="ui_locale">
+              <option value="auto" data-i18n-opt="lang_auto"></option>
+              <option value="ru" data-i18n-opt="lang_ru"></option>
+              <option value="en" data-i18n-opt="lang_en"></option>
+            </select>
+          </section>
 
-            <p class="group-label spaced">Подключение</p>
-            <label class="field-label" for="f-server">Сервер</label>
+          <section class="settings-card card-dim">
+            <p class="group-label" data-i18n="group_biba_key"></p>
+            <label class="field-label" for="f-from_invite" data-i18n="label_invite_uri"></label>
+            <input class="field" id="f-from_invite" name="from_invite" autocomplete="off" />
+            <label class="field-label" for="f-invite_passphrase" data-i18n="label_passphrase"></label>
+            <input class="field" id="f-invite_passphrase" name="invite_passphrase" type="password" autocomplete="off" />
+            <button type="button" class="btn-invite" id="btn-apply-invite" data-i18n="btn_apply_invite"></button>
+
+            <p class="group-label spaced" data-i18n="group_connection"></p>
+            <label class="field-label" for="f-server" data-i18n="label_server"></label>
             <input class="field" id="f-server" name="server" autocomplete="off" />
 
-            <p class="group-label spaced">Учётные данные</p>
+            <p class="group-label spaced" data-i18n="group_credentials"></p>
             <div class="field-grid-2">
               <div>
-                <label class="field-label" for="f-token">Токен</label>
+                <label class="field-label" for="f-token" data-i18n="label_token"></label>
                 <input class="field" id="f-token" name="token" autocomplete="off" />
               </div>
               <div>
-                <label class="field-label" for="f-sni">SNI</label>
+                <label class="field-label" for="f-sni" data-i18n="label_sni"></label>
                 <input class="field" id="f-sni" name="sni" autocomplete="off" />
               </div>
             </div>
-            <label class="field-label" for="f-psk">PSK</label>
+            <label class="field-label" for="f-psk" data-i18n="label_psk"></label>
             <input class="field" id="f-psk" name="psk" type="password" autocomplete="off" />
             <label class="toggle-row">
               <input type="checkbox" id="f-insecure" name="insecure" />
-              <span>Без проверки TLS (insecure)</span>
+              <span data-i18n="insecure_tls"></span>
             </label>
 
-            <p class="group-label spaced">Локальные порты</p>
+            <p class="group-label spaced" data-i18n="group_local_ports"></p>
             <div class="ports-row">
               <div>
-                <label class="field-label" for="f-local_http_port">HTTP</label>
+                <label class="field-label" for="f-local_http_port" data-i18n="label_http"></label>
                 <input class="field field-num" id="f-local_http_port" name="local_http_port" type="number" min="1024" max="65533" />
               </div>
               <div>
-                <label class="field-label" for="f-local_socks_port">SOCKS</label>
+                <label class="field-label" for="f-local_socks_port" data-i18n="label_socks"></label>
                 <input class="field field-num" id="f-local_socks_port" name="local_socks_port" type="number" min="0" max="65535" />
               </div>
             </div>
-            <p class="field-hint">SOCKS: 0 = автоматически HTTP+1</p>
+            <p class="field-hint" data-i18n="hint_socks"></p>
           </section>
 
           <details class="more-block">
-            <summary class="more-summary">Дополнительно</summary>
+            <summary class="more-summary" data-i18n="more_summary"></summary>
             <section class="settings-card card-dim more-inner">
               <div class="field-grid-2">
                 <div>
@@ -144,9 +154,9 @@
                 <span>TCP multiplex (use_tcp_mux)</span>
               </label>
               <label class="field-label" for="f-ws_path">ws_path</label>
-              <input class="field" id="f-ws_path" name="ws_path" placeholder="/ws" />
+              <input class="field" id="f-ws_path" name="ws_path" data-i18n-placeholder="ws_path_ph" placeholder="/ws" />
               <label class="field-label" for="f-pad_mode">pad_mode</label>
-              <input class="field" id="f-pad_mode" name="pad_mode" placeholder="random / http-buckets" />
+              <input class="field" id="f-pad_mode" name="pad_mode" data-i18n-placeholder="pad_mode_ph" placeholder="random / http-buckets" />
               <div class="field-grid-3">
                 <div>
                   <label class="field-label" for="f-ws_ping_jitter_percent">ping jitter %</label>
@@ -166,12 +176,12 @@
                 <span>Decoy HTTPS GET</span>
               </label>
               <div id="decoy-gets-extra" hidden>
-                <label class="field-label" for="f-decoy_gets_interval_secs">decoy interval (с)</label>
+                <label class="field-label" for="f-decoy_gets_interval_secs" data-i18n="decoy_interval_s"></label>
                 <input class="field field-num" id="f-decoy_gets_interval_secs" name="decoy_gets_interval_secs" type="number" min="1" />
                 <label class="field-label" for="f-decoy_gets_paths">decoy_gets_paths</label>
                 <input class="field" id="f-decoy_gets_paths" name="decoy_gets_paths" />
               </div>
-              <p class="group-label spaced">UDP mux (пусто = по умолчанию)</p>
+              <p class="group-label spaced" data-i18n="group_udp_mux"></p>
               <div class="field-grid-3">
                 <div>
                   <label class="field-label" for="f-udp_max_pad">udp_max_pad</label>
@@ -189,17 +199,9 @@
               <label class="field-label" for="f-pin_cert_pem">pin_cert_pem</label>
               <textarea class="field field-area" id="f-pin_cert_pem" name="pin_cert_pem" rows="4"></textarea>
               <label class="field-label" for="f-ws_headers">ws_headers</label>
-              <textarea class="field field-area" id="f-ws_headers" name="ws_headers" rows="3" placeholder="Header: value"></textarea>
+              <textarea class="field field-area" id="f-ws_headers" name="ws_headers" rows="3" data-i18n-placeholder="ws_headers_ph" placeholder="Header: value"></textarea>
               <label class="field-label" for="f-tls_profile">tls_profile</label>
-              <select class="field" id="f-tls_profile" name="tls_profile">
-                <option value="default">По умолчанию (rustls)</option>
-                <option value="chrome70">Chrome 70</option>
-                <option value="firefox65">Firefox 65</option>
-                <option value="firefox63">Firefox 63</option>
-                <option value="randomized">Randomized</option>
-                <option value="randomized-alpn">Randomized + ALPN</option>
-                <option value="randomized-no-alpn">Randomized без ALPN</option>
-              </select>
+              <select class="field" id="f-tls_profile" name="tls_profile"></select>
             </section>
           </details>
         </div>

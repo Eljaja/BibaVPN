@@ -20,6 +20,7 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
+        android:name=".BibaApplication"
         android:allowBackup="true"
         android:banner="@drawable/tv_banner"
         android:icon="@drawable/ic_launcher"

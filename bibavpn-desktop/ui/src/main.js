@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  applyStaticI18n,
+  refreshTlsProfileOptions,
+  setLanguageFromCfg,
+  t,
+} from "./i18n.js";
 
 /**
  * @typedef {object} StateSnapshot
@@ -45,7 +51,31 @@ const FIELD_IDS = [
   "pin_cert_pem",
   "ws_headers",
   "tls_profile",
+  "ui_locale",
 ];
+
+/** @param {Record<string, unknown> | undefined} cfg */
+function localDisplayHost(cfg) {
+  const server = String(cfg?.server ?? "").trim();
+  const sni = String(cfg?.sni ?? "").trim();
+  const invite = String(cfg?.from_invite ?? "").trim();
+  if (server && sni) return sni;
+  if (server) return server.split(":")[0] || server;
+  if (invite) return t("display_invite");
+  return t("display_dash");
+}
+
+/** @param {Record<string, unknown> | undefined} cfg */
+function localServerSubtitle(cfg) {
+  const server = String(cfg?.server ?? "").trim();
+  const invite = String(cfg?.from_invite ?? "").trim();
+  if (server) return server;
+  if (invite) {
+    const max = 36;
+    return invite.length > max ? `${invite.slice(0, max)}…` : invite;
+  }
+  return t("server_undecided");
+}
 
 /** @param {Partial<Record<string, unknown>>} cfg */
 function formToCfg(cfg) {
@@ -106,12 +136,14 @@ function renderHome(s) {
     home.classList.toggle("is-connected", connected);
   }
 
-  $("status-title").textContent = connected ? "Подключено" : "Не подключено";
+  $("status-title").textContent = connected
+    ? t("status_connected")
+    : t("status_disconnected");
   const subEl = $("status-sub");
   if (subEl) {
     subEl.textContent = connected
-      ? `${s.displayHost} · системный прокси`
-      : "Нажмите «Подключить», чтобы включить прокси";
+      ? `${localDisplayHost(s.cfg)} · ${t("status_via_proxy")}`
+      : t("status_sub_disconnected");
   }
 
   const cta = $("btn-cta");
@@ -121,14 +153,16 @@ function renderHome(s) {
   if (cta) {
     cta.disabled = !ctaEnabled;
     cta.classList.toggle("muted", !ctaEnabled);
-    $("cta-title").textContent = canDisconnect ? "Отключить" : "Подключить";
+    $("cta-title").textContent = canDisconnect
+      ? t("cta_disconnect")
+      : t("cta_connect");
     $("cta-sub").textContent = canDisconnect
-      ? "Защищено · отключить прокси"
-      : "Трафик через локальный HTTP + SOCKS и системный прокси";
+      ? t("cta_sub_connected")
+      : t("cta_sub_disconnected");
   }
 
-  $("server-title").textContent = s.displayHost || "—";
-  $("server-sub").textContent = s.serverSubtitle || "";
+  $("server-title").textContent = localDisplayHost(s.cfg);
+  $("server-sub").textContent = localServerSubtitle(s.cfg);
 
   const warn = $("warn-server-changed");
   const inviteMode =
@@ -142,8 +176,7 @@ function renderHome(s) {
   if (warn) {
     warn.hidden = !serverMismatch;
     if (serverMismatch) {
-      warn.textContent =
-        "Адрес сервера изменился — нажмите «Отключить», затем «Подключить».";
+      warn.textContent = t("warn_server_changed");
     }
   }
 
@@ -151,8 +184,8 @@ function renderHome(s) {
   if (ar) {
     const show = connected && s.tunnelServer;
     ar.hidden = !show;
-    if (show) {
-      ar.textContent = `Активный сервер: ${s.tunnelServer}`;
+    if (show && s.tunnelServer) {
+      ar.textContent = t("active_server", { host: s.tunnelServer });
     }
   }
 
@@ -171,6 +204,9 @@ async function refresh() {
     const s = await invoke("get_state");
     latest = /** @type {StateSnapshot} */ (s);
     if (latest.cfg) {
+      setLanguageFromCfg(latest.cfg);
+      applyStaticI18n();
+      refreshTlsProfileOptions();
       cfgToForm(/** @type {Record<string, unknown>} */ (latest.cfg));
     }
     renderHome(latest);
@@ -190,6 +226,9 @@ function showSettings() {
   $("view-home").hidden = true;
   $("view-settings").hidden = false;
   if (latest?.cfg) {
+    setLanguageFromCfg(latest.cfg);
+    applyStaticI18n();
+    refreshTlsProfileOptions();
     cfgToForm(/** @type {Record<string, unknown>} */ (latest.cfg));
   }
 }
@@ -276,12 +315,31 @@ document.getElementById("error-banner")?.addEventListener("click", async () => {
 
 listen("vpn-state", (ev) => {
   latest = /** @type {StateSnapshot} */ (ev.payload);
+  if (latest.cfg) {
+    setLanguageFromCfg(latest.cfg);
+    applyStaticI18n();
+    refreshTlsProfileOptions();
+  }
   renderHome(latest);
   if (!$("view-settings").hidden && latest.cfg) {
     cfgToForm(/** @type {Record<string, unknown>} */ (latest.cfg));
   }
 }).catch(() => {
   /* dev without tauri */
+});
+
+document.getElementById("f-ui_locale")?.addEventListener("change", (ev) => {
+  const sel = ev.target;
+  const v = sel instanceof HTMLSelectElement ? sel.value : "auto";
+  setLanguageFromCfg({ ui_locale: v });
+  applyStaticI18n();
+  refreshTlsProfileOptions();
+  if (latest) {
+    renderHome({
+      ...latest,
+      cfg: { ...latest.cfg, ui_locale: v },
+    });
+  }
 });
 
 refresh();
