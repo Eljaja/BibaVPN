@@ -11,6 +11,8 @@
     <string name="lang_russian">روسی</string>
     <string name="lang_english">انگلیسی</string>
     <string name="lang_persian">فارسی (ایران)</string>
+    <string name="lang_spanish">اسپانیایی</string>
+    <string name="lang_chinese">چینی (ساده‌شده)</string>
     <string name="section_language">زبان رابط</string>
     <string name="section_language_sub">انتخاب شما روی دستگاه ذخیره می‌شود. صفحهٔ تنظیمات دوباره بارگذاری می‌شود.</string>
 

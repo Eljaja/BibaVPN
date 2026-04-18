@@ -2,6 +2,7 @@ package dev.bibavpn
 
 import androidx.annotation.StringRes
 
+/** Группы для UI раздельного туннеля (прямой IP минуя VPN). */
 enum class SplitTunnelGroup(@StringRes val titleRes: Int) {
     GOVERNMENT(R.string.split_group_government),
     BANKS(R.string.split_group_banks),

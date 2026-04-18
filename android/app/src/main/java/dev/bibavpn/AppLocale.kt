@@ -4,11 +4,12 @@ import android.content.Context
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.os.LocaleListCompat
 
+/** Язык интерфейса: хранится в тех же prefs, что и остальные настройки VPN (`bibavpn`). */
 object AppLocale {
     private const val PREFS = "bibavpn"
     private const val KEY_APP_LANGUAGE = "app_language_tag"
 
-    /** Пусто = системный язык. Иначе: `ru`, `en`, `fa-IR`. */
+    /** Пустая строка = следовать системному языку. Иначе тег: `ru`, `en`, `fa-IR`, `es`, `zh-CN`. */
     fun getSavedLanguageTag(context: Context): String =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_APP_LANGUAGE, "") ?: ""
 

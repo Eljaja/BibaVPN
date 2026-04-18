@@ -11,6 +11,8 @@
     <string name="lang_russian">Русский</string>
     <string name="lang_english">English</string>
     <string name="lang_persian">فارسی (ایران)</string>
+    <string name="lang_spanish">Español</string>
+    <string name="lang_chinese">中文（简体）</string>
     <string name="section_language">Язык интерфейса</string>
     <string name="section_language_sub">Выбор сохраняется на устройстве. Экран настроек перезагрузится.</string>
 

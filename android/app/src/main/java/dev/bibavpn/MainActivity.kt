@@ -585,22 +585,24 @@ private fun HomeScreen(
     onConnectToggle: () -> Unit,
     onServerCardTap: () -> Unit,
 ) {
-    val homeBibaKeyShort = stringResource(R.string.home_biba_key_short)
-    val homeDash = stringResource(R.string.home_dash)
-    val homeNoServer = stringResource(R.string.home_no_server)
-    val displayHost = remember(server, sni, bibaInvite, homeBibaKeyShort, homeDash) {
+    val bibaKeyShort = stringResource(R.string.home_biba_key_short)
+    val dash = stringResource(R.string.home_dash)
+    val noServer = stringResource(R.string.home_no_server)
+    val displayHost = remember(server, sni, bibaInvite, bibaKeyShort, dash) {
         when {
             server.isNotBlank() && sni.isNotBlank() -> sni
             server.isNotBlank() -> server.substringBefore(':').ifBlank { server }
-            bibaInvite.isNotBlank() -> homeBibaKeyShort
-            else -> homeDash
+            bibaInvite.isNotBlank() -> bibaKeyShort
+            else -> dash
         }
     }
-    val subtitle = when {
-        server.isNotBlank() -> server
-        bibaInvite.isNotBlank() ->
-            bibaInvite.take(36).let { if (bibaInvite.length > 36) "$it…" else it }
-        else -> homeNoServer
+    val subtitle = remember(server, bibaInvite, noServer) {
+        when {
+            server.isNotBlank() -> server
+            bibaInvite.isNotBlank() ->
+                bibaInvite.take(36).let { if (bibaInvite.length > 36) "$it…" else it }
+            else -> noServer
+        }
     }
 
     Column(
@@ -639,7 +641,11 @@ private fun HomeScreen(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusDot(active = tunnelUp)
                 Text(
-                    if (tunnelUp) stringResource(R.string.home_connected) else stringResource(R.string.home_disconnected),
+                    if (tunnelUp) {
+                        stringResource(R.string.home_connected)
+                    } else {
+                        stringResource(R.string.home_disconnected)
+                    },
                     color = Color.White,
                     fontSize = 20.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -677,7 +683,11 @@ private fun HomeScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        if (tunnelUp) stringResource(R.string.home_disconnect) else stringResource(R.string.home_connect),
+                        if (tunnelUp) {
+                            stringResource(R.string.home_disconnect)
+                        } else {
+                            stringResource(R.string.home_connect)
+                        },
                         color = Color.White,
                         fontSize = 22.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -1307,7 +1317,7 @@ private fun SettingsScreen(
 @Composable
 private fun LanguageSettingsBlock() {
     val context = LocalContext.current
-    val activity = context as AppCompatActivity
+    val activity = context as ComponentActivity
     var expanded by remember { mutableStateOf(false) }
     var selectedTag by remember {
         mutableStateOf(AppLocale.getSavedLanguageTag(context))
@@ -1319,6 +1329,8 @@ private fun LanguageSettingsBlock() {
             "ru" to R.string.lang_russian,
             "en" to R.string.lang_english,
             "fa-IR" to R.string.lang_persian,
+            "es" to R.string.lang_spanish,
+            "zh-CN" to R.string.lang_chinese,
         )
     val currentLabelRes =
         options.firstOrNull { it.first == selectedTag }?.second ?: R.string.lang_system

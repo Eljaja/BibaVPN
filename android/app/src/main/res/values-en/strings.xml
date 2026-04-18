@@ -11,6 +11,8 @@
     <string name="lang_russian">Russian</string>
     <string name="lang_english">English</string>
     <string name="lang_persian">Persian (Iran)</string>
+    <string name="lang_spanish">Spanish</string>
+    <string name="lang_chinese">Chinese (Simplified)</string>
     <string name="section_language">Interface language</string>
     <string name="section_language_sub">Your choice is saved on the device. The settings screen will reload.</string>
 

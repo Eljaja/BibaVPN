@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BibaVPN</string>
+    <string name="channel_name">代理</string>
+    <string name="notification_title">BibaVPN 运行中</string>
+    <string name="notification_text">VPN 隧道已连接</string>
+    <string name="notification_action_disable">关闭</string>
+    <string name="notification_action_enable">开启</string>
+
+    <string name="lang_system">跟随系统</string>
+    <string name="lang_russian">俄语</string>
+    <string name="lang_english">英语</string>
+    <string name="lang_persian">波斯语（伊朗）</string>
+    <string name="lang_spanish">西班牙语</string>
+    <string name="lang_chinese">简体中文</string>
+    <string name="section_language">界面语言</string>
+    <string name="section_language_sub">选择会保存在本机。设置界面将重新加载。</string>
+
+    <string name="toast_invite_need_key_pass">请同时填写 biba:// 密钥与口令</string>
+    <string name="toast_invite_decode_error">密钥无效</string>
+    <string name="toast_invite_fields_updated">已更新连接字段</string>
+    <string name="toast_connect_need_config">请在设置中填写服务器，或提供 biba:// 密钥与口令</string>
+    <string name="toast_battery_android6">需要 Android 6 及以上</string>
+    <string name="toast_battery_open_failed">无法打开设置</string>
+
+    <string name="home_connected">已连接</string>
+    <string name="home_disconnected">未连接</string>
+    <string name="home_tunnel_active_line">%1$s · 隧道已连接</string>
+    <string name="home_tap_vpn">点按以开启 VPN</string>
+    <string name="home_connect">连接</string>
+    <string name="home_disconnect">断开</string>
+    <string name="home_cta_protected">受保护 · 断开隧道</string>
+    <string name="home_cta_traffic">流量经系统 VPN + 本地 SOCKS</string>
+    <string name="home_server_label">SERVER</string>
+    <string name="home_no_server">未配置服务器</string>
+    <string name="home_biba_key_short">Biba 密钥</string>
+    <string name="home_dash">—</string>
+
+    <string name="settings_title">设置</string>
+    <string name="tab_connection">连接</string>
+    <string name="tab_split_tunnel">分流</string>
+
+    <string name="section_biba_key">Biba 密钥</string>
+    <string name="section_biba_key_sub">加密的 biba://… 与口令（与桌面端 --from-invite 相同）</string>
+    <string name="field_biba_key">Biba 密钥</string>
+    <string name="placeholder_biba_key">biba://…</string>
+    <string name="field_passphrase">口令</string>
+    <string name="placeholder_passphrase">带外共享的密钥</string>
+    <string name="hint_biba_key_override">隧道参数来自密钥；可在下方覆盖 junk_frames、ws_headers 与 SNI。</string>
+    <string name="btn_apply_invite">应用到连接字段</string>
+
+    <string name="section_connection">连接</string>
+    <string name="section_connection_sub">服务器与握手参数</string>
+    <string name="field_server">服务器</string>
+    <string name="placeholder_server">host:443</string>
+    <string name="field_token">令牌</string>
+    <string name="placeholder_token">token</string>
+    <string name="field_sni">SNI / TLS 名称</string>
+    <string name="placeholder_sni">自动（留空则使用主机名）</string>
+    <string name="hint_sni">留空则使用主机名</string>
+    <string name="field_psk">PSK</string>
+    <string name="toggle_insecure_title">跳过 TLS 校验（不安全）</string>
+    <string name="toggle_insecure_sub">仅用于实验环境</string>
+
+    <string name="section_network">网络</string>
+    <string name="section_network_sub">路由</string>
+    <string name="field_routing_mode">路由模式</string>
+    <string name="value_system_vpn">系统 VPN</string>
+    <string name="hint_routing_mode">全部流量走隧道</string>
+    <string name="field_local_socks">本地 SOCKS</string>
+    <string name="hint_socks_empty">留空 = %1$s</string>
+    <string name="toggle_battery_saver_title">锁屏省电</string>
+    <string name="toggle_battery_saver_sub">熄屏时释放唤醒锁。VPN 与通知仍保留；Doze 可能导致中断，解锁后恢复。</string>
+    <string name="battery_row_title">电池优化（系统）</string>
+    <string name="battery_row_sub">打开 Android 提示：请勿限制 BibaVPN 电池 — 减少后台 VPN 掉线。</string>
+
+    <string name="section_transport">传输</string>
+    <string name="section_transport_sub">混淆与 WebSocket</string>
+    <string name="hint_tls_profile">ClientHello 配置（default、chrome70、firefox65 等）；邀请密钥可覆盖</string>
+    <string name="hint_ws_path">服务器 WebSocket 路径（留空则使用密钥中的 /ws）</string>
+    <string name="toggle_tcp_mux_title">TCP 多路复用 (WSS)</string>
+    <string name="toggle_tcp_mux_sub">关闭则类似 --no-mux</string>
+    <string name="hint_pad_mode">填充模式；留空则来自密钥或 random</string>
+    <string name="placeholder_pad_mode">random 或 http-buckets</string>
+    <string name="hint_max_pad">数据包填充</string>
+    <string name="hint_decoy_max">伪装包</string>
+    <string name="hint_ws_ping_jitter">0–50</string>
+    <string name="hint_ws_binary_jitter">0–255</string>
+    <string name="hint_udp_max_pad">留空 = 与 max_pad 相同</string>
+    <string name="hint_udp_max_ws">留空 = 与 max_ws 相同</string>
+    <string name="hint_udp_mux_to">秒，留空 = 默认</string>
+    <string name="hint_dummy_interval">0 = 关闭；空闲 WS 帧</string>
+    <string name="placeholder_ws_headers">名称: 值</string>
+    <string name="toggle_decoy_gets_title">伪装 HTTPS GET</string>
+    <string name="toggle_decoy_gets_sub">并行 GET 至服务器（类似 --decoy-gets）</string>
+    <string name="hint_decoy_interval">≥1 秒</string>
+    <string name="hint_decoy_paths">逗号分隔（与桌面端相同）</string>
+    <string name="placeholder_decoy_paths">/,/favicon.ico</string>
+    <string name="placeholder_pin_cert">-----BEGIN CERTIFICATE-----</string>
+    <string name="hint_pin_cert">一个或多个 PEM；与 insecure 互斥</string>
+
+    <string name="split_tunnel_title">分流隧道</string>
+    <string name="split_tunnel_sub">所选应用绕过 VPN（使用平常 IP），其余流量走 BibaVPN。</string>
+    <string name="split_enable_title">按应用启用绕过</string>
+    <string name="split_enable_sub">默认关闭。更改列表后请重新连接 VPN。</string>
+    <string name="split_reapply_hint">请断开并重新连接以应用更改。</string>
+    <string name="split_toggle_groups_hint">先打开开关，再按分组勾选应用。</string>
+    <string name="split_selected_count">已选 %1$d / %2$d</string>
+
+    <string name="split_group_government">政务</string>
+    <string name="split_group_banks">银行</string>
+    <string name="split_group_marketplaces">电商与本地服务</string>
+    <string name="split_app_gosuslugi">国家服务</string>
+    <string name="split_app_max">MAX</string>
+    <string name="split_app_vk">VK</string>
+    <string name="split_app_tinkoff">Tinkoff</string>
+    <string name="split_app_sber">Sberbank</string>
+    <string name="split_app_yandex_bank">Yandex Bank</string>
+    <string name="split_app_banki">Banki.ru</string>
+    <string name="split_app_bog">格鲁吉亚银行</string>
+    <string name="split_app_vtb">VTB Online</string>
+    <string name="split_app_alfa">Alfa-Bank</string>
+    <string name="split_app_ozon">Ozon</string>
+    <string name="split_app_beru">Yandex Market</string>
+    <string name="split_app_steam">Steam</string>
+    <string name="split_app_yango">Yandex Go</string>
+    <string name="split_app_vezet">Yandex Vezet</string>
+    <string name="split_app_deliveryclub">Delivery Club</string>
+    <string name="split_app_eda">Yandex Eda</string>
+    <string name="split_app_lavka">Yandex Lavka</string>
+    <string name="split_app_samokat">Samokat</string>
+
+    <string name="vpn_error_tun2socks">tun2socks 错误</string>
+    <string name="vpn_error_prefix">BibaVPN：%1$s</string>
+</resources>
