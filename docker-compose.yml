@@ -11,9 +11,9 @@ services:
       - --self-signed-san
       - biba-server
       - --token
-      - docker-compose-biba
+      - __BIBA_TOKEN__
       - --psk
-      - ComposePSK_ChangeMe
+      - __BIBA_PSK__
       - --decoy-max
       - "24"
       - --max-pad
@@ -39,14 +39,14 @@ services:
       - --sni
       - biba-server
       - --token
-      - docker-compose-biba
+      - __BIBA_TOKEN__
       - --insecure
       - --socks5
       - 0.0.0.0:11080
       - --http-proxy
       - 0.0.0.0:18080
       - --psk
-      - ComposePSK_ChangeMe
+      - __BIBA_PSK__
       - --decoy-max
       - "24"
       - --max-pad
