@@ -720,7 +720,11 @@ class BibaVpnService : VpnService() {
 
     private fun abortVpnFromWorker(detail: String?) {
         Handler(Looper.getMainLooper()).post {
-            val msg = detail?.let { "BibaVPN: $it" } ?: "BibaVPN: ошибка tun2socks"
+            val msg =
+                getString(
+                    R.string.vpn_error_prefix,
+                    detail?.takeIf { it.isNotBlank() } ?: getString(R.string.vpn_error_tun2socks),
+                )
             android.widget.Toast.makeText(applicationContext, msg, android.widget.Toast.LENGTH_LONG)
                 .show()
             stopTunnelAndNative()

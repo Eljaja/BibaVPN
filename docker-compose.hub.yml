@@ -1,0 +1,80 @@
+# One-liner quick start using prebuilt images from Docker Hub.
+#
+#   docker compose -f docker-compose.hub.yml up -d
+#
+# This variant does NOT build anything locally — it pulls:
+#   - eljaja/bibavpn-server
+#   - eljaja/bibavpn-client
+#
+# Exposes on the host:
+#   SOCKS5        127.0.0.1:11080
+#   HTTP CONNECT  127.0.0.1:11880
+#
+# The PSK / token below are example values. Change them before trusting this
+# with anything real (both server and client must agree).
+
+services:
+  biba-server:
+    image: eljaja/bibavpn-server:latest
+    pull_policy: always
+    restart: unless-stopped
+    command:
+      - --listen
+      - 0.0.0.0:8443
+      - --self-signed-san
+      - biba-server
+      - --token
+      - ${BIBA_VPN_TOKEN:-docker-compose-biba}
+      - --psk
+      - ${BIBA_VPN_PSK:-ComposePSK_ChangeMe}
+      - --decoy-max
+      - "24"
+      - --max-pad
+      - "64"
+      - --max-ws-binary
+      - "1400"
+      - --ws-ping-secs
+      - "25"
+    ports:
+      - "8443:8443"
+    networks:
+      - bibanet
+
+  biba-client:
+    image: eljaja/bibavpn-client:latest
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      - biba-server
+    command:
+      - --server
+      - biba-server:8443
+      - --sni
+      - biba-server
+      - --token
+      - ${BIBA_VPN_TOKEN:-docker-compose-biba}
+      - --psk
+      - ${BIBA_VPN_PSK:-ComposePSK_ChangeMe}
+      - --insecure
+      - --socks5
+      - 0.0.0.0:11080
+      - --http-proxy
+      - 0.0.0.0:18080
+      - --decoy-max
+      - "24"
+      - --max-pad
+      - "64"
+      - --max-ws-binary
+      - "1400"
+      - --ws-ping-secs
+      - "25"
+      - --early-ws-frames
+      - "1"
+    ports:
+      - "11080:11080"
+      - "11880:18080"
+    networks:
+      - bibanet
+
+networks:
+  bibanet:

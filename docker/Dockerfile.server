@@ -9,6 +9,9 @@ COPY bibavpn-desktop ./bibavpn-desktop
 RUN cargo build --release -p bibavpn --bin bibavpn-server
 
 FROM debian:bookworm-slim
+LABEL org.opencontainers.image.source="https://github.com/Eljaja/BibaVPN" \
+      org.opencontainers.image.description="BibaVPN server — TLS+WebSocket tunnel terminator" \
+      org.opencontainers.image.licenses="MIT"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
