@@ -63,6 +63,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -70,6 +71,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import dev.bibavpn.core.BibaNative
 import androidx.lifecycle.Lifecycle
@@ -93,7 +95,7 @@ private val MainButtonBrush = Brush.verticalGradient(
 )
 private val MainButtonBorder = Color(0x3360A5FA)
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
 
     private val notifPerm = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -306,14 +308,18 @@ private fun BibaRootScreen(
         val uri = bibaInvite.trim()
         val pass = invitePassphrase
         if (uri.isBlank() || pass.isBlank()) {
-            Toast.makeText(context, "Нужны ключ biba:// и passphrase", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.toast_invite_need_key_pass), Toast.LENGTH_SHORT).show()
             return
         }
         try {
             val raw = BibaNative.nativeDecodeInvite(uri, pass)
             val j = JSONObject(raw)
             if (!j.optBoolean("ok")) {
-                Toast.makeText(context, j.optString("error", "Ошибка ключа"), Toast.LENGTH_LONG).show()
+                Toast.makeText(
+                    context,
+                    j.optString("error", context.getString(R.string.toast_invite_decode_error)),
+                    Toast.LENGTH_LONG,
+                ).show()
                 return
             }
             server = j.optString("server", "")
@@ -349,7 +355,7 @@ private fun BibaRootScreen(
                     "0"
                 }
             useTcpMux = true
-            Toast.makeText(context, "Поля подключения обновлены", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.toast_invite_fields_updated), Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(context, e.message ?: "decode", Toast.LENGTH_LONG).show()
         }
@@ -548,7 +554,7 @@ private fun BibaRootScreen(
                     } else if (!canConnectWithSavedFallback()) {
                         Toast.makeText(
                             context,
-                            "Укажите сервер в настройках или задайте ключ biba:// и passphrase",
+                            context.getString(R.string.toast_connect_need_config),
                             Toast.LENGTH_LONG,
                         ).show()
                     } else {
@@ -575,19 +581,24 @@ private fun HomeScreen(
     onConnectToggle: () -> Unit,
     onServerCardTap: () -> Unit,
 ) {
-    val displayHost = remember(server, sni, bibaInvite) {
+    val bibaKeyShort = stringResource(R.string.home_biba_key_short)
+    val dash = stringResource(R.string.home_dash)
+    val noServer = stringResource(R.string.home_no_server)
+    val displayHost = remember(server, sni, bibaInvite, bibaKeyShort, dash) {
         when {
             server.isNotBlank() && sni.isNotBlank() -> sni
             server.isNotBlank() -> server.substringBefore(':').ifBlank { server }
-            bibaInvite.isNotBlank() -> "Ключ Biba"
-            else -> "—"
+            bibaInvite.isNotBlank() -> bibaKeyShort
+            else -> dash
         }
     }
-    val subtitle = when {
-        server.isNotBlank() -> server
-        bibaInvite.isNotBlank() ->
-            bibaInvite.take(36).let { if (bibaInvite.length > 36) "$it…" else it }
-        else -> "Не задан сервер"
+    val subtitle = remember(server, bibaInvite, noServer) {
+        when {
+            server.isNotBlank() -> server
+            bibaInvite.isNotBlank() ->
+                bibaInvite.take(36).let { if (bibaInvite.length > 36) "$it…" else it }
+            else -> noServer
+        }
     }
 
     Column(
@@ -626,7 +637,11 @@ private fun HomeScreen(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusDot(active = tunnelUp)
                 Text(
-                    if (tunnelUp) "Подключено" else "Не подключено",
+                    if (tunnelUp) {
+                        stringResource(R.string.home_connected)
+                    } else {
+                        stringResource(R.string.home_disconnected)
+                    },
                     color = Color.White,
                     fontSize = 20.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -634,7 +649,11 @@ private fun HomeScreen(
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                if (tunnelUp) "$displayHost · туннель активен" else "Нажмите, чтобы включить VPN",
+                if (tunnelUp) {
+                    stringResource(R.string.home_tunnel_active_line, displayHost)
+                } else {
+                    stringResource(R.string.home_tap_vpn)
+                },
                 color = TextSlate200.copy(alpha = 0.85f),
                 fontSize = 14.sp,
             )
@@ -660,7 +679,11 @@ private fun HomeScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        if (tunnelUp) "Отключить" else "Подключить",
+                        if (tunnelUp) {
+                            stringResource(R.string.home_disconnect)
+                        } else {
+                            stringResource(R.string.home_connect)
+                        },
                         color = Color.White,
                         fontSize = 22.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -668,9 +691,9 @@ private fun HomeScreen(
                     Spacer(Modifier.height(8.dp))
                     Text(
                         if (tunnelUp) {
-                            "Защищено · отключить туннель"
+                            stringResource(R.string.home_cta_protected)
                         } else {
-                            "Трафик через System VPN + локальный SOCKS"
+                            stringResource(R.string.home_cta_traffic)
                         },
                         color = LabelSky.copy(alpha = 0.75f),
                         fontSize = 14.sp,
@@ -707,7 +730,7 @@ private fun HomeScreen(
                 .padding(16.dp),
         ) {
             Text(
-                "SERVER",
+                stringResource(R.string.home_server_label),
                 color = TextMuted,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
@@ -862,7 +885,7 @@ private fun SettingsScreen(
         ) {
             RoundIconButton(onClick = onBack, symbol = "‹")
             Text(
-                "Настройки",
+                stringResource(R.string.settings_title),
                 color = TextSlate200,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
@@ -881,27 +904,31 @@ private fun SettingsScreen(
         Spacer(Modifier.height(16.dp))
 
         if (settingsTab == 0) {
+        LanguageSettingsBlock()
+
+        Spacer(Modifier.height(16.dp))
+
         SettingsSection(
-            title = "Ключ Biba",
-            subtitle = "Зашифрованный biba://… и passphrase (как --from-invite у desktop-клиента)",
+            title = stringResource(R.string.section_biba_key),
+            subtitle = stringResource(R.string.section_biba_key_sub),
         ) {
             SettingsTextField(
-                label = "Biba key",
+                label = stringResource(R.string.field_biba_key),
                 value = bibaInvite,
                 onChange = onBibaInviteChange,
-                placeholder = "biba://…",
+                placeholder = stringResource(R.string.placeholder_biba_key),
                 singleLine = false,
                 maxLines = 4,
             )
             SettingsTextField(
-                label = "Passphrase",
+                label = stringResource(R.string.field_passphrase),
                 value = invitePassphrase,
                 onChange = onInvitePassphraseChange,
-                placeholder = "секрет out-of-band",
+                placeholder = stringResource(R.string.placeholder_passphrase),
                 isPassword = true,
             )
             Text(
-                "Параметры туннеля берутся из ключа; junk_frames, ws_headers и SNI ниже можно переопределить.",
+                stringResource(R.string.hint_biba_key_override),
                 color = TextMuted,
                 fontSize = 11.sp,
             )
@@ -915,27 +942,27 @@ private fun SettingsScreen(
                 ),
                 contentPadding = PaddingValues(vertical = 14.dp),
             ) {
-                Text("Применить к полям подключения", fontWeight = FontWeight.SemiBold)
+                Text(stringResource(R.string.btn_apply_invite), fontWeight = FontWeight.SemiBold)
             }
         }
 
         Spacer(Modifier.height(16.dp))
 
         SettingsSection(
-            title = "Подключение",
-            subtitle = "Сервер и параметры рукопожатия",
+            title = stringResource(R.string.section_connection),
+            subtitle = stringResource(R.string.section_connection_sub),
         ) {
             SettingsTextField(
-                label = "Server",
+                label = stringResource(R.string.field_server),
                 value = server,
                 onChange = onServerChange,
-                placeholder = "host:443",
+                placeholder = stringResource(R.string.placeholder_server),
             )
             SettingsTextField(
-                label = "Token",
+                label = stringResource(R.string.field_token),
                 value = token,
                 onChange = onTokenChange,
-                placeholder = "токен",
+                placeholder = stringResource(R.string.placeholder_token),
                 isPassword = !tokenVisible,
                 trailing = {
                     Text(
@@ -948,14 +975,14 @@ private fun SettingsScreen(
                 },
             )
             SettingsTextField(
-                label = "SNI / TLS Name",
+                label = stringResource(R.string.field_sni),
                 value = sni,
                 onChange = onSniChange,
-                placeholder = "Auto (пусто = host)",
-                hint = "Leave empty to use host",
+                placeholder = stringResource(R.string.placeholder_sni),
+                hint = stringResource(R.string.hint_sni),
             )
             SettingsTextField(
-                label = "PSK",
+                label = stringResource(R.string.field_psk),
                 value = psk,
                 onChange = onPskChange,
                 isPassword = !pskVisible,
@@ -975,8 +1002,8 @@ private fun SettingsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column {
-                    Text("Пропуск TLS (insecure)", color = Color.White, fontSize = 14.sp)
-                    Text("Только для лаборатории", color = TextMuted, fontSize = 12.sp)
+                    Text(stringResource(R.string.toggle_insecure_title), color = Color.White, fontSize = 14.sp)
+                    Text(stringResource(R.string.toggle_insecure_sub), color = TextMuted, fontSize = 12.sp)
                 }
                 Switch(
                     checked = insecure,
@@ -994,20 +1021,20 @@ private fun SettingsScreen(
         Spacer(Modifier.height(16.dp))
 
         SettingsSection(
-            title = "Сеть",
-            subtitle = "Маршрутизация",
+            title = stringResource(R.string.section_network),
+            subtitle = stringResource(R.string.section_network_sub),
         ) {
             SettingsStaticField(
-                label = "Routing Mode",
-                value = "System VPN",
-                hint = "Весь трафик через туннель",
+                label = stringResource(R.string.field_routing_mode),
+                value = stringResource(R.string.value_system_vpn),
+                hint = stringResource(R.string.hint_routing_mode),
             )
             SettingsTextField(
-                label = "Локальный SOCKS",
+                label = stringResource(R.string.field_local_socks),
                 value = socksBind,
                 onChange = onSocksBindChange,
                 placeholder = BibaVpnService.SOCKS_LOCAL,
-                hint = "Пусто = ${BibaVpnService.SOCKS_LOCAL}",
+                hint = stringResource(R.string.hint_socks_empty, BibaVpnService.SOCKS_LOCAL),
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1015,9 +1042,9 @@ private fun SettingsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Экономия при блокировке", color = Color.White, fontSize = 14.sp)
+                    Text(stringResource(R.string.toggle_battery_saver_title), color = Color.White, fontSize = 14.sp)
                     Text(
-                        "Снимать wake lock при выкл. экране. VPN и уведомление остаются; в Doze возможны обрывы — разблокировка снова держит CPU.",
+                        stringResource(R.string.toggle_battery_saver_sub),
                         color = TextMuted,
                         fontSize = 12.sp,
                     )
@@ -1052,14 +1079,14 @@ private fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        "Оптимизация батареи (система)",
+                        stringResource(R.string.battery_row_title),
                         color = Color.White,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "Открыть запрос Android: не экономить батарею для BibaVPN — меньше обрывов VPN в фоне.",
+                        stringResource(R.string.battery_row_sub),
                         color = TextMuted,
                         fontSize = 12.sp,
                     )
@@ -1071,22 +1098,22 @@ private fun SettingsScreen(
         Spacer(Modifier.height(16.dp))
 
         SettingsSection(
-            title = "Транспорт",
-            subtitle = "Обфускация и WebSocket",
+            title = stringResource(R.string.section_transport),
+            subtitle = stringResource(R.string.section_transport_sub),
         ) {
             SettingsTextField(
                 label = "tls_profile",
                 value = tlsProfile,
                 onChange = onTlsProfileChange,
                 placeholder = "default",
-                hint = "Профиль ClientHello (default, chrome70, firefox65, …); для ключа можно переопределить",
+                hint = stringResource(R.string.hint_tls_profile),
             )
             SettingsTextField(
                 label = "ws_path",
                 value = wsPath,
                 onChange = onWsPathChange,
                 placeholder = "/ws",
-                hint = "Путь WebSocket на сервере (пусто = /ws после ключа)",
+                hint = stringResource(R.string.hint_ws_path),
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1094,8 +1121,8 @@ private fun SettingsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("TCP multiplex (WSS)", color = Color.White, fontSize = 14.sp)
-                    Text("Выключите для режима как --no-mux", color = TextMuted, fontSize = 12.sp)
+                    Text(stringResource(R.string.toggle_tcp_mux_title), color = Color.White, fontSize = 14.sp)
+                    Text(stringResource(R.string.toggle_tcp_mux_sub), color = TextMuted, fontSize = 12.sp)
                 }
                 Switch(
                     checked = useTcpMux,
@@ -1112,8 +1139,8 @@ private fun SettingsScreen(
                 label = "pad_mode",
                 value = padMode,
                 onChange = onPadModeChange,
-                placeholder = "random или http-buckets",
-                hint = "Режим паддинга; пусто = из ключа или random",
+                placeholder = stringResource(R.string.placeholder_pad_mode),
+                hint = stringResource(R.string.hint_pad_mode),
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1123,14 +1150,14 @@ private fun SettingsScreen(
                     label = "max_pad",
                     value = maxPad,
                     onChange = onMaxPadChange,
-                    hint = "Packet padding",
+                    hint = stringResource(R.string.hint_max_pad),
                     modifier = Modifier.weight(1f),
                 )
                 SettingsMiniField(
                     label = "decoy_max",
                     value = decoyMax,
                     onChange = onDecoyMaxChange,
-                    hint = "Fake packets",
+                    hint = stringResource(R.string.hint_decoy_max),
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1176,14 +1203,14 @@ private fun SettingsScreen(
                     label = "ws_ping_jitter_%",
                     value = wsPingJitter,
                     onChange = onWsPingJitterChange,
-                    hint = "0–50",
+                    hint = stringResource(R.string.hint_ws_ping_jitter),
                     modifier = Modifier.weight(1f),
                 )
                 SettingsMiniField(
                     label = "ws_send_jitter_ms",
                     value = wsBinaryJitter,
                     onChange = onWsBinaryJitterChange,
-                    hint = "0–255",
+                    hint = stringResource(R.string.hint_ws_binary_jitter),
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1195,21 +1222,21 @@ private fun SettingsScreen(
                     label = "udp_max_pad",
                     value = udpMaxPad,
                     onChange = onUdpMaxPadChange,
-                    hint = "пусто = как max_pad",
+                    hint = stringResource(R.string.hint_udp_max_pad),
                     modifier = Modifier.weight(1f),
                 )
                 SettingsMiniField(
                     label = "udp_max_ws",
                     value = udpMaxWsBin,
                     onChange = onUdpMaxWsBinChange,
-                    hint = "пусто = как max_ws",
+                    hint = stringResource(R.string.hint_udp_max_ws),
                     modifier = Modifier.weight(1f),
                 )
                 SettingsMiniField(
                     label = "udp_mux_to",
                     value = udpMuxTimeout,
                     onChange = onUdpMuxTimeoutChange,
-                    hint = "сек, пусто = по умолч.",
+                    hint = stringResource(R.string.hint_udp_mux_to),
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1217,7 +1244,7 @@ private fun SettingsScreen(
                 label = "dummy_interval_secs",
                 value = dummyInterval,
                 onChange = onDummyIntervalChange,
-                hint = "0 = выкл; idle WS кадры",
+                hint = stringResource(R.string.hint_dummy_interval),
                 modifier = Modifier.fillMaxWidth(),
             )
             SettingsTextField(
@@ -1226,7 +1253,7 @@ private fun SettingsScreen(
                 onChange = onWsHeadersChange,
                 singleLine = false,
                 maxLines = 5,
-                placeholder = "Name: value",
+                placeholder = stringResource(R.string.placeholder_ws_headers),
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1234,8 +1261,8 @@ private fun SettingsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Decoy HTTPS GET", color = Color.White, fontSize = 14.sp)
-                    Text("Параллельные GET на сервер (как --decoy-gets)", color = TextMuted, fontSize = 12.sp)
+                    Text(stringResource(R.string.toggle_decoy_gets_title), color = Color.White, fontSize = 14.sp)
+                    Text(stringResource(R.string.toggle_decoy_gets_sub), color = TextMuted, fontSize = 12.sp)
                 }
                 Switch(
                     checked = decoyGets,
@@ -1253,15 +1280,15 @@ private fun SettingsScreen(
                     label = "decoy_gets_interval_secs",
                     value = decoyGetsInterval,
                     onChange = onDecoyGetsIntervalChange,
-                    hint = "≥1 сек",
+                    hint = stringResource(R.string.hint_decoy_interval),
                     modifier = Modifier.fillMaxWidth(),
                 )
                 SettingsTextField(
                     label = "decoy_gets_paths",
                     value = decoyGetsPaths,
                     onChange = onDecoyGetsPathsChange,
-                    placeholder = "/,/favicon.ico",
-                    hint = "Через запятую (как у desktop-клиента)",
+                    placeholder = stringResource(R.string.placeholder_decoy_paths),
+                    hint = stringResource(R.string.hint_decoy_paths),
                 )
             }
             SettingsTextField(
@@ -1270,8 +1297,8 @@ private fun SettingsScreen(
                 onChange = onPinCertPemChange,
                 singleLine = false,
                 maxLines = 8,
-                placeholder = "-----BEGIN CERTIFICATE-----",
-                hint = "Один или несколько PEM; взаимоисключимо с insecure",
+                placeholder = stringResource(R.string.placeholder_pin_cert),
+                hint = stringResource(R.string.hint_pin_cert),
             )
         }
 
@@ -1279,6 +1306,111 @@ private fun SettingsScreen(
         } else {
             SplitTunnelSettingsPanel()
             Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable
+private fun LanguageSettingsBlock() {
+    val context = LocalContext.current
+    val activity = context as ComponentActivity
+    var expanded by remember { mutableStateOf(false) }
+    var selectedTag by remember {
+        mutableStateOf(AppLocale.getSavedLanguageTag(context))
+    }
+
+    val options =
+        listOf(
+            "" to R.string.lang_system,
+            "ru" to R.string.lang_russian,
+            "en" to R.string.lang_english,
+            "es" to R.string.lang_spanish,
+            "zh-CN" to R.string.lang_chinese,
+        )
+    val currentLabelRes =
+        options.firstOrNull { it.first == selectedTag }?.second ?: R.string.lang_system
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(28.dp))
+            .border(1.dp, BorderSubtle, RoundedCornerShape(28.dp))
+            .background(CardBg.copy(alpha = 0.92f))
+            .padding(20.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable { expanded = !expanded }
+                .padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.section_language),
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.height(4.dp))
+                if (expanded) {
+                    Text(
+                        stringResource(R.string.section_language_sub),
+                        color = TextMuted,
+                        fontSize = 14.sp,
+                    )
+                } else {
+                    Text(
+                        stringResource(currentLabelRes),
+                        color = Mint.copy(alpha = 0.92f),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+            Text(
+                if (expanded) "\u25B2" else "\u25BC",
+                color = TextMuted.copy(alpha = 0.75f),
+                fontSize = 14.sp,
+                modifier = Modifier.padding(start = 8.dp),
+            )
+        }
+
+        if (expanded) {
+            Spacer(Modifier.height(16.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                options.forEach { (tag, labelRes) ->
+                    val selected = selectedTag == tag
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(if (selected) Mint.copy(alpha = 0.12f) else Color.Transparent)
+                            .clickable {
+                                if (tag != selectedTag) {
+                                    AppLocale.persist(context, tag)
+                                    selectedTag = tag
+                                    activity.recreate()
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            stringResource(labelRes),
+                            color = if (selected) Mint else Color.White,
+                            fontSize = 15.sp,
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                        )
+                        if (selected) {
+                            Text("\u2713", color = Mint, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1298,8 +1430,8 @@ private fun SettingsTabsRow(
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         listOf(
-            "Подключение" to 0,
-            "Сплит‑туннель" to 1,
+            stringResource(R.string.tab_connection) to 0,
+            stringResource(R.string.tab_split_tunnel) to 1,
         ).forEach { (label, idx) ->
             val selected = selectedIndex == idx
             Box(
@@ -1343,8 +1475,8 @@ private fun SplitTunnelSettingsPanel() {
     }
 
     SettingsSection(
-        title = "Раздельный туннель",
-        subtitle = "Выбранные приложения идут в обход VPN (ваш обычный IP). Остальной трафик — через BibaVPN.",
+        title = stringResource(R.string.split_tunnel_title),
+        subtitle = stringResource(R.string.split_tunnel_sub),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1352,9 +1484,9 @@ private fun SplitTunnelSettingsPanel() {
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Включить обход для приложений", color = Color.White, fontSize = 14.sp)
+                Text(stringResource(R.string.split_enable_title), color = Color.White, fontSize = 14.sp)
                 Text(
-                    "По умолчанию выключено. После изменения списка переподключите VPN.",
+                    stringResource(R.string.split_enable_sub),
                     color = TextMuted,
                     fontSize = 12.sp,
                 )
@@ -1381,7 +1513,7 @@ private fun SplitTunnelSettingsPanel() {
 
         if (BibaVpnService.isTunnelActive) {
             Text(
-                "Чтобы применить изменения, отключите и снова включите туннель.",
+                stringResource(R.string.split_reapply_hint),
                 color = LabelSky.copy(alpha = 0.85f),
                 fontSize = 12.sp,
             )
@@ -1389,7 +1521,7 @@ private fun SplitTunnelSettingsPanel() {
 
         if (!enabled) {
             Text(
-                "Включите переключатель, затем отметьте приложения по группам.",
+                stringResource(R.string.split_toggle_groups_hint),
                 color = TextMuted,
                 fontSize = 12.sp,
             )
@@ -1447,13 +1579,17 @@ private fun SplitTunnelGroupDropdown(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    group.title,
+                    stringResource(group.titleRes),
                     color = Color.White,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    "${entries.count { selected.contains(it.packageName) }} / ${entries.size} выбрано",
+                    stringResource(
+                        R.string.split_selected_count,
+                        entries.count { selected.contains(it.packageName) },
+                        entries.size,
+                    ),
                     color = TextMuted,
                     fontSize = 12.sp,
                 )
@@ -1488,7 +1624,7 @@ private fun SplitTunnelGroupDropdown(
                         )
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                app.label,
+                                stringResource(app.labelRes),
                                 color = TextSlate200,
                                 fontSize = 14.sp,
                             )
@@ -1734,7 +1870,7 @@ private fun buildJson(
 /** Системный экран: разрешить приложению игнорировать оптимизацию батареи (или запасные настройки). */
 private fun openBatteryOptimizationSettings(activity: ComponentActivity) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-        Toast.makeText(activity, "Настройка доступна с Android 6", Toast.LENGTH_SHORT).show()
+        Toast.makeText(activity, activity.getString(R.string.toast_battery_android6), Toast.LENGTH_SHORT).show()
         return
     }
     val pkg = activity.packageName
@@ -1768,7 +1904,7 @@ private fun openBatteryOptimizationFallback(
             )
         } catch (e: Exception) {
             Log.e("BibaMain", "battery optimization settings", e)
-            Toast.makeText(activity, "Не удалось открыть настройки", Toast.LENGTH_SHORT).show()
+            Toast.makeText(activity, activity.getString(R.string.toast_battery_open_failed), Toast.LENGTH_SHORT).show()
         }
     }
 }

@@ -6,4 +6,129 @@
     <string name="notification_text">VPN-туннель активен</string>
     <string name="notification_action_disable">Отключить</string>
     <string name="notification_action_enable">Включить</string>
+
+    <string name="lang_system">Как в системе</string>
+    <string name="lang_russian">Русский</string>
+    <string name="lang_english">English</string>
+    <string name="lang_spanish">Español</string>
+    <string name="lang_chinese">中文（简体）</string>
+    <string name="section_language">Язык интерфейса</string>
+    <string name="section_language_sub">Выбор сохраняется на устройстве. Экран настроек перезагрузится.</string>
+
+    <string name="toast_invite_need_key_pass">Нужны ключ biba:// и passphrase</string>
+    <string name="toast_invite_decode_error">Ошибка ключа</string>
+    <string name="toast_invite_fields_updated">Поля подключения обновлены</string>
+    <string name="toast_connect_need_config">Укажите сервер в настройках или задайте ключ biba:// и passphrase</string>
+    <string name="toast_battery_android6">Настройка доступна с Android 6</string>
+    <string name="toast_battery_open_failed">Не удалось открыть настройки</string>
+
+    <string name="home_connected">Подключено</string>
+    <string name="home_disconnected">Не подключено</string>
+    <string name="home_tunnel_active_line">%1$s · туннель активен</string>
+    <string name="home_tap_vpn">Нажмите, чтобы включить VPN</string>
+    <string name="home_connect">Подключить</string>
+    <string name="home_disconnect">Отключить</string>
+    <string name="home_cta_protected">Защищено · отключить туннель</string>
+    <string name="home_cta_traffic">Трафик через System VPN + локальный SOCKS</string>
+    <string name="home_server_label">SERVER</string>
+    <string name="home_no_server">Не задан сервер</string>
+    <string name="home_biba_key_short">Ключ Biba</string>
+    <string name="home_dash">—</string>
+
+    <string name="settings_title">Настройки</string>
+    <string name="tab_connection">Подключение</string>
+    <string name="tab_split_tunnel">Сплит-туннель</string>
+
+    <string name="section_biba_key">Ключ Biba</string>
+    <string name="section_biba_key_sub">Зашифрованный biba://… и passphrase (как --from-invite у desktop-клиента)</string>
+    <string name="field_biba_key">Biba key</string>
+    <string name="placeholder_biba_key">biba://…</string>
+    <string name="field_passphrase">Passphrase</string>
+    <string name="placeholder_passphrase">секрет out-of-band</string>
+    <string name="hint_biba_key_override">Параметры туннеля берутся из ключа; junk_frames, ws_headers и SNI ниже можно переопределить.</string>
+    <string name="btn_apply_invite">Применить к полям подключения</string>
+
+    <string name="section_connection">Подключение</string>
+    <string name="section_connection_sub">Сервер и параметры рукопожатия</string>
+    <string name="field_server">Server</string>
+    <string name="placeholder_server">host:443</string>
+    <string name="field_token">Token</string>
+    <string name="placeholder_token">токен</string>
+    <string name="field_sni">SNI / TLS Name</string>
+    <string name="placeholder_sni">Auto (пусто = host)</string>
+    <string name="hint_sni">Leave empty to use host</string>
+    <string name="field_psk">PSK</string>
+    <string name="toggle_insecure_title">Пропуск TLS (insecure)</string>
+    <string name="toggle_insecure_sub">Только для лаборатории</string>
+
+    <string name="section_network">Сеть</string>
+    <string name="section_network_sub">Маршрутизация</string>
+    <string name="field_routing_mode">Routing Mode</string>
+    <string name="value_system_vpn">System VPN</string>
+    <string name="hint_routing_mode">Весь трафик через туннель</string>
+    <string name="field_local_socks">Локальный SOCKS</string>
+    <string name="hint_socks_empty">Пусто = %1$s</string>
+    <string name="toggle_battery_saver_title">Экономия при блокировке</string>
+    <string name="toggle_battery_saver_sub">Снимать wake lock при выкл. экране. VPN и уведомление остаются; в Doze возможны обрывы — разблокировка снова держит CPU.</string>
+    <string name="battery_row_title">Оптимизация батареи (система)</string>
+    <string name="battery_row_sub">Открыть запрос Android: не экономить батарею для BibaVPN — меньше обрывов VPN в фоне.</string>
+
+    <string name="section_transport">Транспорт</string>
+    <string name="section_transport_sub">Обфускация и WebSocket</string>
+    <string name="hint_tls_profile">Профиль ClientHello (default, chrome70, firefox65, …); для ключа можно переопределить</string>
+    <string name="hint_ws_path">Путь WebSocket на сервере (пусто = /ws после ключа)</string>
+    <string name="toggle_tcp_mux_title">TCP multiplex (WSS)</string>
+    <string name="toggle_tcp_mux_sub">Выключите для режима как --no-mux</string>
+    <string name="hint_pad_mode">Режим паддинга; пусто = из ключа или random</string>
+    <string name="placeholder_pad_mode">random или http-buckets</string>
+    <string name="hint_max_pad">Packet padding</string>
+    <string name="hint_decoy_max">Fake packets</string>
+    <string name="hint_ws_ping_jitter">0–50</string>
+    <string name="hint_ws_binary_jitter">0–255</string>
+    <string name="hint_udp_max_pad">пусто = как max_pad</string>
+    <string name="hint_udp_max_ws">пусто = как max_ws</string>
+    <string name="hint_udp_mux_to">сек, пусто = по умолч.</string>
+    <string name="hint_dummy_interval">0 = выкл; idle WS кадры</string>
+    <string name="placeholder_ws_headers">Name: value</string>
+    <string name="toggle_decoy_gets_title">Decoy HTTPS GET</string>
+    <string name="toggle_decoy_gets_sub">Параллельные GET на сервер (как --decoy-gets)</string>
+    <string name="hint_decoy_interval">≥1 сек</string>
+    <string name="hint_decoy_paths">Через запятую (как у desktop-клиента)</string>
+    <string name="placeholder_decoy_paths">/,/favicon.ico</string>
+    <string name="placeholder_pin_cert">-----BEGIN CERTIFICATE-----</string>
+    <string name="hint_pin_cert">Один или несколько PEM; взаимоисключимо с insecure</string>
+
+    <string name="split_tunnel_title">Раздельный туннель</string>
+    <string name="split_tunnel_sub">Выбранные приложения идут в обход VPN (ваш обычный IP). Остальной трафик — через BibaVPN.</string>
+    <string name="split_enable_title">Включить обход для приложений</string>
+    <string name="split_enable_sub">По умолчанию выключено. После изменения списка переподключите VPN.</string>
+    <string name="split_reapply_hint">Чтобы применить изменения, отключите и снова включите туннель.</string>
+    <string name="split_toggle_groups_hint">Включите переключатель, затем отметьте приложения по группам.</string>
+    <string name="split_selected_count">%1$d / %2$d выбрано</string>
+
+    <string name="split_group_government">Государственные</string>
+    <string name="split_group_banks">Банки</string>
+    <string name="split_group_marketplaces">Маркетплейсы</string>
+    <string name="split_app_gosuslugi">Госуслуги</string>
+    <string name="split_app_max">MAX</string>
+    <string name="split_app_vk">ВКонтакте</string>
+    <string name="split_app_tinkoff">Тинькофф</string>
+    <string name="split_app_sber">Сбербанк</string>
+    <string name="split_app_yandex_bank">Яндекс Банк</string>
+    <string name="split_app_banki">Банки.ру</string>
+    <string name="split_app_bog">Bank of Georgia</string>
+    <string name="split_app_vtb">ВТБ Онлайн</string>
+    <string name="split_app_alfa">Альфа-Банк</string>
+    <string name="split_app_ozon">Ozon</string>
+    <string name="split_app_beru">Яндекс Маркет</string>
+    <string name="split_app_steam">Steam</string>
+    <string name="split_app_yango">Яндекс Go</string>
+    <string name="split_app_vezet">Яндекс Везёт</string>
+    <string name="split_app_deliveryclub">Delivery Club</string>
+    <string name="split_app_eda">Яндекс Еда</string>
+    <string name="split_app_lavka">Яндекс Лавка</string>
+    <string name="split_app_samokat">Самокат</string>
+
+    <string name="vpn_error_tun2socks">ошибка tun2socks</string>
+    <string name="vpn_error_prefix">BibaVPN: %1$s</string>
 </resources>
