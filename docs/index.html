@@ -345,15 +345,14 @@
         
         <h2>Quick start</h2>
         <p style="font-size: 14px; color: var(--textMuted); margin-bottom: 16px; text-align: center; max-width: 360px; margin-left: auto; margin-right: auto;">
-            Install <strong style="color: var(--textSlate200);">Docker</strong>, clone the repo, run <strong style="color: var(--mint);">start.sh</strong>.
-            Download the <strong style="color: var(--textSlate200);">Android / desktop</strong> apps from Releases and connect with the <strong style="color: var(--textSlate200);">biba://</strong> key + passphrase from the script output.
+            Install <strong style="color: var(--textSlate200);">Docker</strong>, clone the repo, run <strong style="color: var(--mint);">bash start.sh</strong>.
+            It prints a labeled <strong style="color: var(--textSlate200);">Invite URI</strong> (<code style="color: var(--labelSky); font-size: 12px;">biba://…</code>) and <strong style="color: var(--textSlate200);">Passphrase</strong>. Download apps from <strong style="color: var(--textSlate200);">Releases</strong> and paste both.
         </p>
         <div class="code-block">
-            <code>git clone https://github.com/Eljaja/BibaVPN<br>cd BibaVPN<br>./start.sh<br>#Download app from releases</code>
+            <code>git clone https://github.com/Eljaja/BibaVPN<br>cd BibaVPN<br>bash start.sh<br>#Download app from releases</code>
         </div>
         <p style="font-size: 13px; color: var(--textMuted); text-align: center; margin-top: 12px;">
-            First run: <code style="color: var(--labelSky); font-size: 12px;">./start.sh --build</code>
-            · Detached: <code style="color: var(--labelSky); font-size: 12px;">-d</code>
+            First run: <code style="color: var(--labelSky); font-size: 12px;">bash start.sh --build</code>
         </p>
         <div style="text-align: center; margin-top: 20px; display: flex; flex-direction: column; gap: 12px; align-items: center;">
             <a href="https://github.com/Eljaja/BibaVPN/releases" class="github-btn" style="margin-top: 0;">

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot local server: secrets, invite, max-ws-binary 262144, docker compose up -d.
 # Optional before run: BIBA_INVITE_PUBLIC, BIBA_INVITE_SNI, BIBA_INVITE_PASSPHRASE, BIBA_MAX_WS_BINARY
-# Stdout: two lines only — invite URI, then passphrase (for scripting).
+# Run: bash start.sh   (or: bash start.sh --build)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,5 +52,10 @@ if [[ -z "$INVITE_URI" ]]; then
   echo "start.sh: invite URI not found in logs yet (docker compose ... logs biba-server | grep biba://)" >&2
 fi
 
+echo ""
+echo "Invite URI — encrypted one-line config for the client (paste this as the biba:// key / invite field):"
 echo "$INVITE_URI"
+echo ""
+echo "Passphrase — secret key that decrypts the URI; share it only out-of-band, never bundled with the URI in chat or tickets:"
 echo "$BIBA_INVITE_PASSPHRASE"
+echo ""

@@ -22,11 +22,11 @@ wrapper live in the same workspace.
 ```bash
 git clone https://github.com/Eljaja/BibaVPN
 cd BibaVPN
-./start.sh
+bash start.sh
 #Download app from releases
 ```
 
-([Releases](https://github.com/Eljaja/BibaVPN/releases) — Android & desktop. Use the `biba://…` line from the server logs and the passphrase printed by `start.sh`.)
+([Releases](https://github.com/Eljaja/BibaVPN/releases) — Android & desktop. `bash start.sh` prints a labeled **Invite URI** (`biba://…`) and **Passphrase**; paste both into the app.)
 
 - **Docs**
   - [PROTOCOL.md](PROTOCOL.md) — wire formats, session flow, invite URI
@@ -103,10 +103,10 @@ host** to act as the server.
 
 The snippet at the top of this file is enough for a local Docker lab; you need
 **Docker** (e.g. Docker Desktop or WSL2 + Docker on Windows). First run:
-`./start.sh --build`. For a public server, set `BIBA_INVITE_PUBLIC` and
-`BIBA_INVITE_SNI` before `./start.sh`. Full invite / flag details:
+`bash start.sh --build`. For a public server, set `BIBA_INVITE_PUBLIC` and
+`BIBA_INVITE_SNI` before `bash start.sh`. Full invite / flag details:
 [E. Encrypted `biba://` invite](#e-encrypted-biba-invite). Landing page:
-[GitHub Pages](https://eljaja.github.io/BibaVPN/) (`[docs/index.html](docs/index.html)`).
+[GitHub Pages](https://eljaja.github.io/BibaVPN/) (source: [`docs/index.html`](docs/index.html)).
 
 ### A. One-liner from Docker Hub
 
@@ -168,10 +168,10 @@ To build the **server image from this checkout** and run it with the same
 defaults as the quick path (including invite + `262144` WS cap), use:
 
 ```bash
-./start.sh --build
+bash start.sh --build
 ```
 
-(`start.sh` writes `.biba-start.env` and runs `docker compose --env-file … up`.
+(`start.sh` writes `.biba-start.env` and runs `docker compose --env-file … up -d`.
 Plain `docker compose up` without those variables will fail — see
 `[docker-compose.yml](docker-compose.yml)`.)
 
