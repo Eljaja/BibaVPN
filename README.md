@@ -1,5 +1,11 @@
 # BibaVPN
 
+[![GitHub release](https://img.shields.io/github/v/release/eljaja/BibaVPN)](https://github.com/eljaja/BibaVPN/releases)
+[![License: MIT](https://img.shields.io/github/license/eljaja/BibaVPN)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-stable-blue?logo=rust)](https://www.rust-lang.org/)
+[![Docker](https://img.shields.io/badge/Docker-ready-blue?logo=docker)](https://www.docker.com/)
+[![Platforms](https://img.shields.io/badge/Platforms-Android%20%7C%20Desktop%20%7C%20Linux-lightgrey)](#android-and-desktop)
+
 A DPI-resistant **SOCKS5 / HTTP-CONNECT** tunnel that wraps your traffic in
 **TLS + WebSocket** and ships it through a single VPS. Optional shared-PSK
 layer (**BibaV2**), per-frame random padding, browser-ordered upgrade headers,
