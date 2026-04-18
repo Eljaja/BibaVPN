@@ -15,6 +15,7 @@ server.txt
 *.pem
 *.key
 docker-compose.override.yml
+.biba-start.env
 
 # Local deploy helpers created by one-off runs
 scripts/.deploy-run-once.sh

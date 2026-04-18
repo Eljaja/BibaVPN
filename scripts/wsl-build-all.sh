@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Полная сборка в WSL: Rust, libbibavpn_jni.so (все ABI), debug APK.
-# Запуск из WSL:  cd /mnt/c/Users/ilya/biba-vpn/biba-vpn   && bash scripts/wsl-build-all.sh
-# Требуется: сеть, ~8 ГБ места под SDK/NDK при первом запуске.
+# Full WSL build: Rust, libbibavpn_jni.so (all ABIs), debug APK.
+# Run from WSL:  cd /mnt/c/Users/ilya/biba-vpn/biba-vpn   && bash scripts/wsl-build-all.sh
+# Requires: network, ~8 GB disk for SDK/NDK on first run.
 
 set -eu
 export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -18,7 +18,7 @@ NDK_VERSION="26.3.11579264"
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 if ! need_cmd java; then
-  echo "Установите JDK 17, например: sudo apt-get install -y openjdk-17-jdk"
+  echo "Install JDK 17, e.g.: sudo apt-get install -y openjdk-17-jdk"
   exit 1
 fi
 
@@ -28,7 +28,7 @@ fi
 
 SM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 if [[ ! -x "$SM" ]]; then
-  echo "Устанавливаю Android cmdline-tools в $ANDROID_SDK_ROOT ..."
+  echo "Installing Android cmdline-tools to $ANDROID_SDK_ROOT ..."
   mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
   TMP="$(mktemp -d)"
   cd "$TMP"
@@ -41,7 +41,7 @@ if [[ ! -x "$SM" ]]; then
   rm -rf "$TMP"
 fi
 
-echo "SDK: принимаю лицензии и ставлю platform-tools, API 34, build-tools, NDK ..."
+echo "SDK: accepting licenses and installing platform-tools, API 34, build-tools, NDK ..."
 yes | "$SM" --sdk_root="$ANDROID_SDK_ROOT" --licenses 2>/dev/null || true
 "$SM" --sdk_root="$ANDROID_SDK_ROOT" \
   "platform-tools" \
@@ -51,10 +51,10 @@ yes | "$SM" --sdk_root="$ANDROID_SDK_ROOT" --licenses 2>/dev/null || true
 
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_SDK_ROOT/ndk/$NDK_VERSION}"
 if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
-  echo "NDK не найден: $ANDROID_NDK_HOME"
+  echo "NDK not found: $ANDROID_NDK_HOME"
   ls -la "$ANDROID_SDK_ROOT/ndk" || true
   exit 1
 fi
 
-echo "Rust + libbibavpn_jni + Gradle (см. scripts/wsl-build-rust-apk.sh, без cargo-ndk) ..."
+echo "Rust + libbibavpn_jni + Gradle (see scripts/wsl-build-rust-apk.sh, no cargo-ndk) ..."
 bash "$SCRIPT_DIR/wsl-build-rust-apk.sh"

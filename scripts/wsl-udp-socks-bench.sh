@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# UDP через SOCKS5 → bibavpn UDP mux → локальный echo. Запуск из WSL, корень репозитория.
+# UDP over SOCKS5 → bibavpn UDP mux → local echo. Run from WSL, repo root.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 BIN=target/release
@@ -15,7 +15,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# UDP echo (получил — отправил обратно)
+# UDP echo (recv — echo back)
 export BENCH_UDP_PORT="$EPORT"
 python3 -u - <<'PY' &
 import os, socket
@@ -59,7 +59,7 @@ s.set_proxy(socks.SOCKS5, "127.0.0.1", PROXY_PORT)
 s.settimeout(4.0)
 payload = b"x" * SIZE
 
-# Прямой UDP (без SOCKS) — базовая линия localhost
+# Direct UDP (no SOCKS) — localhost baseline
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 u.settimeout(2.0)
 t0 = time.perf_counter()

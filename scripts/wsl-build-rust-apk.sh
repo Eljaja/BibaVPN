@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rust + JNI (.so для всех ABI) + Gradle debug APK. Обход cargo-ndk (на некоторых WSL даёт SIGBUS).
+# Rust + JNI (.so for all ABIs) + Gradle debug APK. Avoids cargo-ndk (SIGBUS on some WSL setups).
 set -eu
 export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
@@ -17,7 +17,7 @@ export ANDROID_HOME="$ANDROID_SDK_ROOT"
 TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
 API="${ANDROID_API_LEVEL:-24}"
 if [[ ! -x "$TOOLCHAIN/bin/aarch64-linux-android${API}-clang" ]]; then
-  echo "Нет clang $TOOLCHAIN/bin/aarch64-linux-android${API}-clang; попробуйте API 21 или 34."
+  echo "Missing clang $TOOLCHAIN/bin/aarch64-linux-android${API}-clang; try API 21 or 34."
   ls "$TOOLCHAIN/bin" | grep -E 'aarch64-linux-android[0-9]+-clang' | head -5 || true
   exit 1
 fi
@@ -42,17 +42,17 @@ export AR_x86_64_linux_android="$TOOLCHAIN/bin/llvm-ar"
 
 rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 
-echo "Сборка bibavpn (release) ..."
+echo "Building bibavpn (release) ..."
 cargo build -p bibavpn --release
 
 echo "tun2socks AAR (gomobile, 16 KB ELF) ..."
 if command -v go >/dev/null 2>&1; then
-  bash "$SCRIPT_DIR/build-tun2socks-gomobile.sh" || echo "Предупреждение: не удалось собрать tun2socks.aar"
+  bash "$SCRIPT_DIR/build-tun2socks-gomobile.sh" || echo "Warning: failed to build tun2socks.aar"
 else
-  echo "Пропуск: нет Go — положите android/app/libs/tun2socks.aar (см. scripts/build-tun2socks-gomobile.sh) или Gradle возьмёт Maven AAR без 16 KB."
+  echo "Skip: no Go — place android/app/libs/tun2socks.aar (see scripts/build-tun2socks-gomobile.sh) or Gradle will use the Maven AAR without 16 KB pages."
 fi
 
-echo "Сборка libbibavpn_jni.so (4 ABI) ..."
+echo "Building libbibavpn_jni.so (4 ABIs) ..."
 OUT="$REPO_ROOT/android/app/src/main/jniLibs"
 mkdir -p "$OUT/arm64-v8a" "$OUT/armeabi-v7a" "$OUT/x86" "$OUT/x86_64"
 

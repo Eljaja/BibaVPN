@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Сборка tun2socks (gomobile) с ELF 16 KB для libgojni.so — см. developer.android.com/guide/practices/page-sizes
+# Build tun2socks (gomobile) with 16 KB ELF for libgojni.so — see developer.android.com/guide/practices/page-sizes
 set -eu
 export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
@@ -13,9 +13,9 @@ export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_SDK_ROOT/ndk/$NDK_VERSION}"
 export ANDROID_HOME="$ANDROID_SDK_ROOT"
 
-command -v go >/dev/null 2>&1 || { echo "Нужен Go (go install ...)"; exit 1; }
+command -v go >/dev/null 2>&1 || { echo "Go is required (go install ...)"; exit 1; }
 command -v gomobile >/dev/null 2>&1 || {
-  echo "Установка gomobile..."
+  echo "Installing gomobile..."
   go install golang.org/x/mobile/cmd/gomobile@latest
   go install golang.org/x/mobile/cmd/gobind@latest
 }
@@ -30,7 +30,7 @@ git clone --depth 1 --branch "$TUN2SOCKS_TAG" https://github.com/xjasonlyu/tun2s
 cd tun2socks
 
 export CGO_LDFLAGS="-Wl,-z,max-page-size=16384"
-# Все ABI, как в приложении (minSdk 29, API 24 достаточно для gomobile).
+# All ABIs as in the app (minSdk 29; API 24 is enough for gomobile).
 gomobile bind -v \
   -target=android/arm,android/arm64,android/386,android/amd64 \
   -androidapi 24 \

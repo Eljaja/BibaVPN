@@ -1,4 +1,5 @@
-# Local lab: docker compose -f docker-compose.yml up --build
+# Local lab: ./start.sh   (writes .biba-start.env and starts server with invite)
+# Or: export BIBA_TOKEN BIBA_PSK BIBA_INVITE_PASSPHRASE && docker compose --env-file … up
 # Client: SOCKS5 localhost:11080, HTTP CONNECT localhost:11880 → biba-server:8443 (PSK + decoy)
 services:
   biba-server:
@@ -11,17 +12,24 @@ services:
       - --self-signed-san
       - biba-server
       - --token
-      - __BIBA_TOKEN__
+      - "${BIBA_TOKEN:?run ./start.sh or set BIBA_TOKEN}"
       - --psk
-      - __BIBA_PSK__
+      - "${BIBA_PSK:?run ./start.sh or set BIBA_PSK}"
       - --decoy-max
       - "24"
       - --max-pad
       - "64"
       - --max-ws-binary
-      - "1400"
+      - "${BIBA_MAX_WS_BINARY:-262144}"
       - --ws-ping-secs
       - "25"
+      - --print-invite-uri
+      - --invite-passphrase
+      - "${BIBA_INVITE_PASSPHRASE:?run ./start.sh or set BIBA_INVITE_PASSPHRASE}"
+      - --invite-public
+      - "${BIBA_INVITE_PUBLIC:-127.0.0.1:8443}"
+      - --invite-sni
+      - "${BIBA_INVITE_SNI:-biba-server}"
     ports:
       - "8443:8443"
     networks:
