@@ -83,6 +83,10 @@ as camouflage (`--camouflage-dir` for a static site, `--camouflage-url` for a
 reverse origin).
 - **BibaV2** shared-PSK layer: HELLO / ACK, ChaCha20-Poly1305 AEAD, per-frame
 random decoy.
+- **Biba v3** (optional, backward compatible): opaque PSK hello/ACK (no ASCII
+wire signatures), **domain-separated** key derivation (`--proto-domain`), and
+**sealed** control frames (AUTH, OPEN, MUX / UDP_MUX, OPEN_OK / OPEN_ERR).
+Default wire mode remains v2 (`--proto 2`).
 - **BibaV2.1** shaping knobs: random / HTTP-bucket padding, WS Ping with
 jitter, binary size cap, configurable upgrade headers per TLS profile
 (Chrome / Firefox), early-session noise, TLS leaf pinning (`--pin-cert`).
@@ -295,6 +299,10 @@ reproducible. Docker images use the same or a newer toolchain.
 Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. The short story:
 
 - **Required for an encrypted tunnel:** `--server`, `--sni`, `--token`, `--psk`.
+- **Protocol version (client):** `--proto 2` (default) or **`--proto 3`** for
+Biba v3. **v3 requires PSK** and a matching **domain string**: server
+`--proto-domain` (default `default`) must match the client’s `--proto-domain`,
+or the **SNI** when the client leaves `--proto-domain` empty.
 - **Shape / anti-DPI:** `--decoy-max`, `--max-pad`, `--pad-mode`,
 `--dummy-interval-secs`, `--ws-ping-secs`, `--junk-frames`,
 `--decoy-gets`* (client-only).
@@ -303,9 +311,17 @@ Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. The short story:
 - **TLS trust (client):** real CA by default, `--pin-cert <pem>` to pin the
 leaf, `--insecure` **lab only**.
 
-Never put secrets in the URL: the token is carried in the `AUTH` binary
-frame, and the WebSocket path (`--ws-path`, default `/ws`) does not
-contain credentials.
+Never put secrets in the URL: the token is carried in the **AUTH** payload
+(v2 cleartext frame or **v3 sealed** opcode), and the WebSocket path
+(`--ws-path`, default `/ws`) does not contain credentials.
+
+**Invites:** JSON may include **`proto`** and **`proto_domain`** (see
+**[PROTOCOL.md](PROTOCOL.md)**). Server **`--print-invite-uri`** still issues
+`proto: 2` invites; for v3 use **`bibavpn-mint-invite`** (`INVITE_PROTO`,
+`INVITE_PROTO_DOMAIN`) or edit the JSON before sealing.
+
+**WSL smoke (v3 then v2):** after `cargo build --release -p bibavpn`, run
+`scripts/wsl-proto-v3-smoke.sh` (see **AGENTS.md**).
 
 ---
 

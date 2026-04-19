@@ -68,6 +68,8 @@ pub static SPLIT_TUNNEL_PRESETS: &[SplitTunnelPreset] = &[
     SplitTunnelPreset {
         id: "steam",
         domains: &[
+            "steamloopback.host",
+            "*.steamloopback.host",
             "steampowered.com",
             "*.steampowered.com",
             "steamcommunity.com",
@@ -88,6 +90,9 @@ pub static SPLIT_TUNNEL_PRESETS: &[SplitTunnelPreset] = &[
             "*.valvesoftware.com",
             "steam-api.com",
             "*.steam-api.com",
+            "client-update.steamstatic.com",
+            "client-update.akamai.steamstatic.com",
+            "client-update.fastly.steamstatic.com",
         ],
     },
     SplitTunnelPreset {

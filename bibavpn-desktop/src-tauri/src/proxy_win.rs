@@ -64,7 +64,20 @@ fn merge_proxy_override(
             parts.push(t.to_string());
         }
     }
-    for req in ["<-loopback>", "localhost", "127.0.0.1", "tauri.localhost"] {
+    // Steam: loopback IPC + client bootstrap CDN. WinInet `*.steamstatic.com` often does NOT match
+    // `client-update.fastly.steamstatic.com` (multi-label); without bypass, bootstrap gets http error 0 and
+    // web UI websocket handshakes fail.
+    for req in [
+        "<-loopback>",
+        "localhost",
+        "127.0.0.1",
+        "tauri.localhost",
+        "steamloopback.host",
+        "*.steamloopback.host",
+        "client-update.steamstatic.com",
+        "client-update.akamai.steamstatic.com",
+        "client-update.fastly.steamstatic.com",
+    ] {
         if !parts.iter().any(|p| p.eq_ignore_ascii_case(req)) {
             parts.push(req.to_string());
         }

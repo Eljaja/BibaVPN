@@ -227,7 +227,17 @@ fn merge_bypass_for_apply(saved: &[String], split_tunnel: &[String]) -> Vec<Stri
             v.push(t.to_string());
         }
     }
-    for req in ["127.0.0.1", "localhost", "*.local", "tauri.localhost"] {
+    for req in [
+        "127.0.0.1",
+        "localhost",
+        "*.local",
+        "tauri.localhost",
+        "steamloopback.host",
+        "*.steamloopback.host",
+        "client-update.steamstatic.com",
+        "client-update.akamai.steamstatic.com",
+        "client-update.fastly.steamstatic.com",
+    ] {
         if !v.iter().any(|x| x.eq_ignore_ascii_case(req)) {
             v.push(req.to_string());
         }
