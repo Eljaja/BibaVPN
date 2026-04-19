@@ -52,6 +52,7 @@ const FIELD_IDS = [
   "ws_headers",
   "tls_profile",
   "ui_locale",
+  "split_tunnel_enabled",
 ];
 
 /** @param {Record<string, unknown> | undefined} cfg */
@@ -97,6 +98,13 @@ function formToCfg(cfg) {
       o[key] = el.value;
     }
   }
+  o.split_tunnel_preset_ids = [
+    ...document.querySelectorAll("input[data-split-preset]:checked"),
+  ]
+    .map((el) =>
+      el instanceof HTMLInputElement ? el.getAttribute("data-split-preset") : null
+    )
+    .filter((x) => typeof x === "string" && x.length > 0);
   return o;
 }
 
@@ -126,6 +134,15 @@ function cfgToForm(cfg) {
   if (decoy && dg instanceof HTMLInputElement) {
     decoy.hidden = !dg.checked;
   }
+  const ids = new Set(
+    Array.isArray(cfg.split_tunnel_preset_ids) ? cfg.split_tunnel_preset_ids : []
+  );
+  document.querySelectorAll("input[data-split-preset]").forEach((el) => {
+    if (el instanceof HTMLInputElement) {
+      const id = el.getAttribute("data-split-preset");
+      el.checked = Boolean(id && ids.has(id));
+    }
+  });
 }
 
 /** @param {StateSnapshot} s */
@@ -269,6 +286,17 @@ document.getElementById("f-decoy_gets")?.addEventListener("change", (ev) => {
   const box = $("decoy-gets-extra");
   if (box && t instanceof HTMLInputElement) {
     box.hidden = !t.checked;
+  }
+});
+
+document.getElementById("f-split_tunnel_enabled")?.addEventListener("change", (ev) => {
+  const t = ev.target;
+  if (!(t instanceof HTMLInputElement) || !t.checked) return;
+  const any = document.querySelector("input[data-split-preset]:checked");
+  if (!any) {
+    document.querySelectorAll("input[data-split-preset]").forEach((el) => {
+      if (el instanceof HTMLInputElement) el.checked = true;
+    });
   }
 });
 
