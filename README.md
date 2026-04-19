@@ -106,14 +106,14 @@ The snippet at the top of this file is enough for a local Docker lab; you need
 `bash start.sh --build`. For a public server, set `BIBA_INVITE_PUBLIC` and
 `BIBA_INVITE_SNI` before `bash start.sh`. Full invite / flag details:
 [E. Encrypted `biba://` invite](#e-encrypted-biba-invite). Landing page:
-[GitHub Pages](https://eljaja.github.io/BibaVPN/) (source: [`docs/index.html`](docs/index.html)).
+[GitHub Pages](https://eljaja.github.io/BibaVPN/) (source: [docs/index.html](docs/index.html)).
 
 ### A. One-liner from Docker Hub
 
 Prebuilt multi-arch (`linux/amd64`, `linux/arm64`) images live on Docker Hub:
 
-- `[eljaja/bibavpn-server](https://hub.docker.com/r/eljaja/bibavpn-server)`
-- `[eljaja/bibavpn-client](https://hub.docker.com/r/eljaja/bibavpn-client)`
+- [eljaja/bibavpn-server](https://hub.docker.com/r/eljaja/bibavpn-server)
+- [eljaja/bibavpn-client](https://hub.docker.com/r/eljaja/bibavpn-client)
 
 The repo ships a ready-made compose file that pulls both images, wires them
 on one Docker network, and exposes the client's SOCKS5 on `localhost:11080`
