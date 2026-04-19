@@ -44,9 +44,11 @@ pub fn read_backup() -> io::Result<ProxyBackup> {
     })
 }
 
-/// WinInet: keep prior user bypass list and always add loopback exclusions so WebView2 / Tauri
-/// (`localhost`, `127.0.0.1`) do not go through the VPN system proxy.
-fn merge_proxy_override_with_loopback(existing: Option<&str>) -> String {
+/// WinInet: prior `ProxyOverride`, обязательный loopback/WebView, плюс split-tunnel домены (прямой выход).
+fn merge_proxy_override(
+    existing: Option<&str>,
+    split_tunnel_hosts: &[String],
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(e) = existing {
         for p in e.split(';') {
@@ -54,6 +56,12 @@ fn merge_proxy_override_with_loopback(existing: Option<&str>) -> String {
             if !t.is_empty() {
                 parts.push(t.to_string());
             }
+        }
+    }
+    for h in split_tunnel_hosts {
+        let t = h.trim();
+        if !t.is_empty() && !parts.iter().any(|p| p.eq_ignore_ascii_case(t)) {
+            parts.push(t.to_string());
         }
     }
     for req in ["<-loopback>", "localhost", "127.0.0.1", "tauri.localhost"] {
@@ -80,14 +88,16 @@ fn notify_changed() -> Result<(), String> {
 /// SOCKS listener with version 4 and fail before the tunnel is even involved.
 ///
 /// `prior_proxy_override` — значение `ProxyOverride` до применения (из [`read_backup`]); сохраняется и дополняется.
+/// `split_tunnel_hosts` — домены в обход прокси (как исключения в Android split-tunnel).
 pub fn apply_proxy(
     http_host_port: &str,
     _socks_host_port: &str,
     prior_proxy_override: Option<&str>,
+    split_tunnel_hosts: &[String],
 ) -> Result<(), String> {
     let proxy_server = format!("http={http_host_port};https={http_host_port}");
     let key = internet_settings_key(true).map_err(|e| e.to_string())?;
-    let merged_override = merge_proxy_override_with_loopback(prior_proxy_override);
+    let merged_override = merge_proxy_override(prior_proxy_override, split_tunnel_hosts);
     key.set_value("ProxyEnable", &1u32)
         .map_err(|e| format!("ProxyEnable: {e}"))?;
     key.set_value("ProxyServer", &proxy_server)

@@ -149,6 +149,8 @@ struct ServiceProxyBackup {
     web: ProxySlot,
     secure: ProxySlot,
     socks: ProxySlot,
+    /// Список обхода прокси до подключения BibaVPN (`networksetup -getproxybypassdomains`).
+    bypass_domains: Vec<String>,
 }
 
 /// Снимок настроек прокси только по тем сервисам, которые мы реально меняем.
@@ -190,14 +192,76 @@ fn parse_proxy_state(get_cmd: &str, service: &str) -> ProxySlot {
     }
 }
 
+fn get_proxy_bypass_domains(service: &str) -> Vec<String> {
+    let out = match run_netsetup(&["-getproxybypassdomains", service]) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let lower = out.to_lowercase();
+    if lower.contains("there aren't any bypass")
+        || lower.contains("there are not any bypass")
+        || lower.contains("no bypass domain")
+    {
+        return Vec::new();
+    }
+    let mut v = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let tl = t.to_lowercase();
+        if tl.starts_with("bypassed domain") || tl == "enabled: yes" || tl == "enabled: no" {
+            continue;
+        }
+        v.push(t.to_string());
+    }
+    v
+}
+
+fn merge_bypass_for_apply(saved: &[String], split_tunnel: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = saved.to_vec();
+    for s in split_tunnel {
+        let t = s.trim();
+        if !t.is_empty() && !v.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+            v.push(t.to_string());
+        }
+    }
+    for req in ["127.0.0.1", "localhost", "*.local", "tauri.localhost"] {
+        if !v.iter().any(|x| x.eq_ignore_ascii_case(req)) {
+            v.push(req.to_string());
+        }
+    }
+    if v.is_empty() {
+        v.extend(
+            ["127.0.0.1", "localhost", "*.local"]
+                .iter()
+                .map(|s| (*s).to_string()),
+        );
+    }
+    v
+}
+
+fn set_proxy_bypass_domains(service: &str, domains: &[String]) -> Result<(), String> {
+    let mut argv: Vec<&str> = vec!["-setproxybypassdomains", service];
+    let owned: Vec<String> = domains.to_vec();
+    for d in &owned {
+        argv.push(d.as_str());
+    }
+    run_netsetup(&argv)?;
+    Ok(())
+}
+
 pub fn read_backup() -> io::Result<ProxyBackup> {
     let services = services_for_proxy().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let mut backups = Vec::with_capacity(services.len());
     for service in services {
+        let bypass_domains = get_proxy_bypass_domains(&service);
         backups.push(ServiceProxyBackup {
             web: parse_proxy_state("-getwebproxy", &service),
             secure: parse_proxy_state("-getsecurewebproxy", &service),
             socks: parse_proxy_state("-getsocksfirewallproxy", &service),
+            bypass_domains,
             service,
         });
     }
@@ -216,13 +280,20 @@ pub fn apply_proxy(
     http_host_port: &str,
     _socks_host_port: &str,
     _prior_proxy_override: Option<&str>,
+    split_tunnel_hosts: &[String],
+    backup: &ProxyBackup,
 ) -> Result<(), String> {
     let (http_host, http_port) = split_host_port(http_host_port)?;
-    let services = services_for_proxy()?;
     let mut ok_any = false;
     let mut last_err = String::new();
-    for service in &services {
-        match apply_to_service(service, &http_host, &http_port) {
+    for sbackup in &backup.services {
+        match apply_to_service(
+            &sbackup.service,
+            &http_host,
+            &http_port,
+            split_tunnel_hosts,
+            &sbackup.bypass_domains,
+        ) {
             Ok(()) => ok_any = true,
             Err(e) => last_err = e,
         }
@@ -240,6 +311,8 @@ fn apply_to_service(
     service: &str,
     http_host: &str,
     http_port: &str,
+    split_tunnel_hosts: &[String],
+    saved_bypass: &[String],
 ) -> Result<(), String> {
     run_netsetup(&["-setwebproxy", service, http_host, http_port])?;
     run_netsetup(&["-setwebproxystate", service, "on"])?;
@@ -248,6 +321,8 @@ fn apply_to_service(
     // Do not advertise SOCKS at the OS level: some clients fall back to SOCKS4-style behavior,
     // while the local BibaVPN listener only speaks SOCKS5.
     run_netsetup(&["-setsocksfirewallproxystate", service, "off"])?;
+    let merged = merge_bypass_for_apply(saved_bypass, split_tunnel_hosts);
+    set_proxy_bypass_domains(service, &merged)?;
     Ok(())
 }
 
@@ -276,6 +351,11 @@ fn restore_service(s: &ServiceProxyBackup) -> Result<(), String> {
         service,
         &s.socks,
     )?;
+    if !s.bypass_domains.is_empty() {
+        set_proxy_bypass_domains(service, &s.bypass_domains)?;
+    } else {
+        let _ = run_netsetup(&["-setproxybypassdomains", service, "127.0.0.1", "localhost", "*.local"]);
+    }
     Ok(())
 }
 

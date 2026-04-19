@@ -3,6 +3,7 @@
 mod config;
 mod locale;
 mod logging;
+mod split_tunnel;
 
 #[cfg(target_os = "macos")]
 mod proxy_mac;
@@ -297,14 +298,19 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     let http_hp = format!("127.0.0.1:{http_port}");
     let socks_hp = format!("127.0.0.1:{socks_port}");
+    let split_hosts = split_tunnel::bypass_domains_for_cfg(&g.cfg);
     #[cfg(windows)]
     let prior_proxy_override = match backup.override_val.as_deref() {
         Some(s) if !s.is_empty() => Some(s),
         _ => None,
     };
-    #[cfg(not(windows))]
-    let prior_proxy_override: Option<&str> = None;
-    if let Err(e) = apply_proxy(&http_hp, &socks_hp, prior_proxy_override) {
+    #[cfg(windows)]
+    let proxy_res = apply_proxy(&http_hp, &socks_hp, prior_proxy_override, &split_hosts);
+    #[cfg(target_os = "macos")]
+    let proxy_res = apply_proxy(&http_hp, &socks_hp, None, &split_hosts, &backup);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let proxy_res = apply_proxy(&http_hp, &socks_hp, None, &split_hosts);
+    if let Err(e) = proxy_res {
         warn!(target: "bibavpn_desktop", "системный прокси: {e}");
         let _ = shutdown_tx.send(true);
         let _ = state.rt.block_on(join);

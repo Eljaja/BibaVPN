@@ -11,6 +11,7 @@ pub fn apply_proxy(
     _http_host_port: &str,
     _socks_host_port: &str,
     _prior_proxy_override: Option<&str>,
+    _split_tunnel_hosts: &[String],
 ) -> Result<(), String> {
     Err(
         "Системный прокси для этого приложения поддерживается только в сборках Windows и macOS."

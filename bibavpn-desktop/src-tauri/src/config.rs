@@ -64,6 +64,11 @@ pub struct SavedConfig {
     /// `auto` | `ru` | `en` — язык UI и меню в трее (десктоп).
     #[serde(default = "default_ui_locale")]
     pub ui_locale: String,
+    /// Раздельный туннель (Windows/macOS): выбранные пресеты идут в обход системного HTTP-прокси.
+    #[serde(default)]
+    pub split_tunnel_enabled: bool,
+    #[serde(default)]
+    pub split_tunnel_preset_ids: Vec<String>,
 }
 
 fn default_decoy_gets_interval_cfg() -> u64 {
@@ -104,6 +109,8 @@ impl Default for SavedConfig {
             decoy_gets_paths: String::new(),
             pin_cert_pem: String::new(),
             ui_locale: default_ui_locale(),
+            split_tunnel_enabled: false,
+            split_tunnel_preset_ids: Vec::new(),
         }
     }
 }
