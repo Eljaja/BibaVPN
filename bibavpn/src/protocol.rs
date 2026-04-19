@@ -304,6 +304,142 @@ pub fn parse_socks5_udp_datagram(data: &[u8]) -> anyhow::Result<(String, u16, Ve
     Ok((h, p, data[3 + n..].to_vec()))
 }
 
+// --- Biba v3 inner control (plaintext inside padded frame, then AEAD on the wire) ---
+
+pub const V3_CTRL_AUTH: u8 = 0x01;
+pub const V3_CTRL_OPEN: u8 = 0x02;
+pub const V3_CTRL_UDP_MUX: u8 = 0x03;
+pub const V3_CTRL_MUX: u8 = 0x04;
+pub const V3_CTRL_OPEN_OK: u8 = 0x10;
+pub const V3_CTRL_OPEN_ERR: u8 = 0x11;
+
+pub fn encode_v3_auth(token: &str) -> anyhow::Result<Vec<u8>> {
+    let t = token.as_bytes();
+    if t.len() > 0xffff {
+        anyhow::bail!("token too long");
+    }
+    let mut v = Vec::with_capacity(1 + 2 + t.len());
+    v.push(V3_CTRL_AUTH);
+    v.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    v.extend_from_slice(t);
+    Ok(v)
+}
+
+pub fn decode_v3_auth(data: &[u8]) -> anyhow::Result<String> {
+    if data.is_empty() || data[0] != V3_CTRL_AUTH {
+        anyhow::bail!("not v3 auth");
+    }
+    if data.len() < 3 {
+        anyhow::bail!("short v3 auth");
+    }
+    let tl = u16::from_be_bytes([data[1], data[2]]) as usize;
+    if data.len() < 3 + tl {
+        anyhow::bail!("truncated v3 auth");
+    }
+    Ok(std::str::from_utf8(&data[3..3 + tl])?.to_string())
+}
+
+pub fn encode_v3_open(host: &str, port: u16) -> anyhow::Result<Vec<u8>> {
+    encode_v3_open_with_flags(host, port, 0)
+}
+
+pub fn encode_v3_open_with_flags(host: &str, port: u16, flags: u8) -> anyhow::Result<Vec<u8>> {
+    let h = host.as_bytes();
+    if h.len() > 0xffff {
+        anyhow::bail!("host too long");
+    }
+    let mut v = Vec::with_capacity(1 + 2 + h.len() + 2 + 2);
+    v.push(V3_CTRL_OPEN);
+    v.extend_from_slice(&(h.len() as u16).to_be_bytes());
+    v.extend_from_slice(h);
+    v.extend_from_slice(&port.to_be_bytes());
+    v.push(OPEN_EXT_V1);
+    v.push(flags);
+    Ok(v)
+}
+
+fn decode_v3_open_inner(data: &[u8]) -> anyhow::Result<(String, u16, u8, &[u8])> {
+    if data.is_empty() || data[0] != V3_CTRL_OPEN {
+        anyhow::bail!("not v3 open");
+    }
+    if data.len() < 1 + 2 + 2 {
+        anyhow::bail!("short v3 open");
+    }
+    let mut i = 1usize;
+    let hl = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+    i += 2;
+    let host = std::str::from_utf8(data.get(i..i + hl).context("host slice")?)?.to_string();
+    i += hl;
+    if data.len() < i + 2 {
+        anyhow::bail!("missing port");
+    }
+    let port = u16::from_be_bytes([data[i], data[i + 1]]);
+    i += 2;
+    let flags = if data.len() >= i + 2 && data[i] == OPEN_EXT_V1 {
+        data[i + 1]
+    } else {
+        0
+    };
+    Ok((host, port, flags, &data[i..]))
+}
+
+pub fn decode_v3_open(data: &[u8]) -> anyhow::Result<(String, u16)> {
+    let (h, p, _, _) = decode_v3_open_inner(data)?;
+    Ok((h, p))
+}
+
+pub fn decode_v3_open_with_flags(data: &[u8]) -> anyhow::Result<(String, u16, u8)> {
+    let (h, p, f, _) = decode_v3_open_inner(data)?;
+    Ok((h, p, f))
+}
+
+pub fn encode_v3_udp_mux_open() -> Vec<u8> {
+    vec![V3_CTRL_UDP_MUX]
+}
+
+pub fn is_v3_udp_mux_open(data: &[u8]) -> bool {
+    data == [V3_CTRL_UDP_MUX]
+}
+
+pub fn encode_v3_mux_open() -> Vec<u8> {
+    vec![V3_CTRL_MUX]
+}
+
+pub fn is_v3_mux_open(data: &[u8]) -> bool {
+    data == [V3_CTRL_MUX]
+}
+
+pub fn encode_v3_open_ok() -> Vec<u8> {
+    vec![V3_CTRL_OPEN_OK]
+}
+
+pub fn is_v3_open_ok(data: &[u8]) -> bool {
+    data == [V3_CTRL_OPEN_OK]
+}
+
+pub fn encode_v3_open_err(reason: &str) -> anyhow::Result<Vec<u8>> {
+    let msg = reason.as_bytes();
+    if msg.len() > 0xffff {
+        anyhow::bail!("open error too long");
+    }
+    let mut v = Vec::with_capacity(1 + 2 + msg.len());
+    v.push(V3_CTRL_OPEN_ERR);
+    v.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    v.extend_from_slice(msg);
+    Ok(v)
+}
+
+pub fn decode_v3_open_err(data: &[u8]) -> anyhow::Result<String> {
+    if data.len() < 3 || data[0] != V3_CTRL_OPEN_ERR {
+        anyhow::bail!("not v3 open err");
+    }
+    let ml = u16::from_be_bytes([data[1], data[2]]) as usize;
+    if data.len() < 3 + ml {
+        anyhow::bail!("truncated v3 open err");
+    }
+    Ok(std::str::from_utf8(&data[3..3 + ml])?.to_string())
+}
+
 #[cfg(test)]
 mod auth_tests {
     use super::*;
