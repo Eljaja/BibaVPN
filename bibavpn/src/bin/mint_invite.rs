@@ -47,11 +47,19 @@ fn main() -> anyhow::Result<()> {
     let ws_path =
         normalize_ws_path(&std::env::var("WS_PATH").unwrap_or_else(|_| "/ws".to_string()));
 
+    let proto: u8 = std::env::var("INVITE_PROTO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let proto_domain = std::env::var("INVITE_PROTO_DOMAIN").ok();
+
     let invite = InviteV1 {
         v: 1,
         server: public,
         sni,
         token,
+        proto,
+        proto_domain,
         psk: Some(psk),
         decoy_max: env_u8("DECOY_MAX", 32),
         max_pad: env_u8("MAX_PAD", 64),
