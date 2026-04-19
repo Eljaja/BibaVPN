@@ -151,6 +151,14 @@ struct Args {
     /// Comma-separated paths for decoy GETs (default: built-in list when empty).
     #[arg(long)]
     decoy_gets_paths: Option<String>,
+
+    /// Biba wire protocol when not using `--from-invite`: `2` or `3` (v3 requires `--psk`).
+    #[arg(long, default_value_t = 2)]
+    proto: u8,
+
+    /// Domain label for v3 PSK KDF (must match server `--proto-domain`). Empty = use SNI.
+    #[arg(long, default_value = "")]
+    proto_domain: String,
 }
 
 #[tokio::main]
@@ -201,6 +209,8 @@ async fn main() -> anyhow::Result<()> {
         udp_max_ws_binary,
         udp_mux_reply_timeout_secs,
         insecure_tls,
+        proto,
+        proto_domain,
     ) = if let Some(ref inv) = inv_opt {
         let (h, p) = parse_host_port(inv.server.trim()).context("invite server")?;
         let sni = args.sni.clone().unwrap_or_else(|| inv.sni.clone());
@@ -222,6 +232,11 @@ async fn main() -> anyhow::Result<()> {
             inv.udp_max_ws_binary,
             inv.udp_mux_reply_timeout_secs,
             args.insecure || inv.insecure,
+            inv.proto,
+            inv
+                .proto_domain
+                .clone()
+                .unwrap_or_default(),
         )
     } else {
         let server = args.server.as_ref().expect("server or from-invite");
@@ -245,6 +260,8 @@ async fn main() -> anyhow::Result<()> {
             args.udp_max_ws_binary,
             args.udp_mux_reply_timeout_secs,
             args.insecure,
+            args.proto,
+            args.proto_domain.clone(),
         )
     };
 
@@ -353,6 +370,8 @@ async fn main() -> anyhow::Result<()> {
         decoy_gets: args.decoy_gets,
         decoy_gets_interval_secs: args.decoy_gets_interval_secs,
         decoy_gets_paths,
+        proto,
+        proto_domain,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

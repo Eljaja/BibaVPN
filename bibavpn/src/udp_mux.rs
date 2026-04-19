@@ -21,7 +21,7 @@ use crate::crypto_layer::{self, SessionCrypto};
 use crate::frame::PadMode;
 use crate::protocol::{
     decode_udp_rep, decode_udp_req, encode_auth, encode_udp_mux_open, encode_udp_rep,
-    encode_udp_req,
+    encode_udp_req, encode_v3_auth, encode_v3_udp_mux_open,
 };
 use crate::retry::{maybe_ws_binary_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period};
 use crate::stealth::{build_websocket_request, WsHandshakeParams};
@@ -60,6 +60,8 @@ pub struct UdpMuxConfig {
     pub tls_profile: TlsClientProfile,
     pub ws_path: String,
     pub pad_mode: PadMode,
+    pub proto: u8,
+    pub proto_domain: String,
 }
 
 pub enum ClientUdpCmd {
@@ -184,8 +186,14 @@ where
         let m = ws.next().await.context("eof before ACK")??;
         match m {
             Message::Binary(b) => {
-                let s_rand = crypto_layer::parse_ack(psk, b.as_ref(), &c_rand)?;
-                return Ok(SessionCrypto::new(psk, &c_rand, &s_rand, decoy_max));
+                let s_rand = crypto_layer::parse_ack(psk, None, b.as_ref(), &c_rand)?;
+                return Ok(SessionCrypto::new(
+                    psk,
+                    None,
+                    &c_rand,
+                    &s_rand,
+                    decoy_max,
+                ));
             }
             Message::Pong(_) => continue,
             Message::Ping(p) => {
@@ -194,6 +202,15 @@ where
             Message::Close(_) => anyhow::bail!("ws closed before ACK"),
             _ => {}
         }
+    }
+}
+
+fn effective_udp_proto_domain(cfg: &UdpMuxConfig) -> String {
+    let t = cfg.proto_domain.trim();
+    if t.is_empty() {
+        cfg.sni.clone()
+    } else {
+        t.to_string()
     }
 }
 
@@ -237,6 +254,66 @@ async fn connect_udp_mux_ws(
     send_noise_binaries(&mut ws, cfg.junk_frames, cfg.max_ws_binary)
         .await
         .context("junk frames")?;
+
+    let is_v3 = cfg.proto >= 3;
+    if is_v3 {
+        anyhow::ensure!(cfg.psk.is_some(), "Biba v3 UDP mux requires PSK");
+        let secret = cfg.psk.as_ref().expect("psk");
+        let dom = effective_udp_proto_domain(cfg);
+        let (c_rand, hello) = crypto_layer::build_hello_v3();
+        ws.send(Message::Binary(Bytes::from(hello)))
+            .await
+            .context("send v3 HELLO (udp mux)")?;
+        loop {
+            let m = ws.next().await.context("eof before ACK (udp mux)")??;
+            match m {
+                Message::Binary(b) => {
+                    let s_rand =
+                        crypto_layer::parse_ack(secret, Some(dom.as_str()), b.as_ref(), &c_rand)?;
+                    let crypto = Arc::new(SessionCrypto::new(
+                        secret,
+                        Some(dom.as_str()),
+                        &c_rand,
+                        &s_rand,
+                        cfg.decoy_max,
+                    ));
+                    let auth_inner =
+                        encode_v3_auth(&cfg.token).context("encode v3 AUTH (udp mux)")?;
+                    let mut wire = Vec::new();
+                    write_padded_frame_with_mode(&mut wire, &auth_inner, cfg.max_pad, cfg.pad_mode)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let blob = crypto
+                        .seal_client_to_server(&wire)
+                        .await
+                        .context("seal v3 AUTH (udp mux)")?;
+                    ws.send(Message::Binary(Bytes::from(blob)))
+                        .await
+                        .context("send v3 AUTH (udp mux)")?;
+                    let open = encode_v3_udp_mux_open();
+                    let mut w2 = Vec::new();
+                    write_padded_frame_with_mode(&mut w2, &open, cfg.max_pad, cfg.pad_mode)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let ob = crypto
+                        .seal_client_to_server(&w2)
+                        .await
+                        .context("seal UDP_MUX v3")?;
+                    if ob.len() > cfg.max_ws_binary {
+                        anyhow::bail!("sealed UDP_MUX_OPEN exceeds cap");
+                    }
+                    ws.send(Message::Binary(Bytes::from(ob)))
+                        .await
+                        .context("send UDP_MUX_OPEN v3")?;
+                    return Ok((ws, Some(crypto)));
+                }
+                Message::Pong(_) => continue,
+                Message::Ping(p) => {
+                    ws.send(Message::Pong(p)).await.context("pong")?;
+                }
+                Message::Close(_) => anyhow::bail!("ws closed before ACK (udp mux)"),
+                _ => {}
+            }
+        }
+    }
 
     let auth = encode_auth(&cfg.token).context("encode AUTH (udp mux)")?;
     if auth.len() > cfg.max_ws_binary {

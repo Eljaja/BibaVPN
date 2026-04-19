@@ -21,14 +21,17 @@ use crate::crypto_layer::{self, SessionCrypto};
 use crate::decoy_traffic::{spawn_decoy_gets, DecoyConfig};
 use crate::frame::{PadMode, DEFAULT_MAX_WS_BINARY};
 use crate::http_connect;
-use crate::protocol::{decode_open_err, encode_auth, encode_open, is_open_ok};
+use crate::protocol::{
+    decode_open_err, decode_v3_open_err, encode_auth, encode_open, encode_v3_auth,
+    encode_v3_mux_open, encode_v3_open_with_flags, is_open_ok, is_v3_open_ok, OPEN_FLAG_STATUS,
+};
 use crate::retry::{sleep_outbound_backoff, OUTBOUND_CONNECT_ATTEMPTS};
 use crate::stealth::{build_websocket_request, default_user_agent_for_profile, WsHandshakeParams};
 use crate::tcp_mux::{self, MuxClientConfig, MuxOpenStreamDropped, TcpMuxClientHandle};
 use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile};
 use crate::udp_mux::{spawn_udp_mux_driver, UdpMuxConfig, UdpMuxHandle};
 use crate::ws_bridge::{self, TunnelEnd};
-use crate::{socks5, socks5::SocksCommand};
+use crate::{read_padded_frame, write_padded_frame_with_mode, socks5, socks5::SocksCommand};
 use bytes::Bytes;
 
 /// SOCKS UDP: limit concurrent in-flight mux requests per datagram worker pool.
@@ -138,6 +141,10 @@ pub struct LocalClientOptions {
     pub decoy_gets: bool,
     pub decoy_gets_interval_secs: u64,
     pub decoy_gets_paths: Vec<String>,
+    /// Wire protocol: `2` default; `3` = opaque PSK + sealed control (requires PSK).
+    pub proto: u8,
+    /// Domain label for v3 PSK KDF; empty = use `sni`.
+    pub proto_domain: String,
 }
 
 #[derive(Clone)]
@@ -173,6 +180,8 @@ struct ClientCfg {
     decoy_gets: bool,
     decoy_gets_interval_secs: u64,
     decoy_gets_paths: Vec<String>,
+    proto: u8,
+    proto_domain: String,
 }
 
 impl ClientCfg {
@@ -200,7 +209,18 @@ impl ClientCfg {
             tls_profile: self.tls_profile,
             ws_path: self.ws_path.clone(),
             pad_mode: self.pad_mode,
+            proto: self.proto,
+            proto_domain: self.proto_domain.clone(),
         }
+    }
+}
+
+fn effective_proto_domain(cfg: &ClientCfg) -> String {
+    let t = cfg.proto_domain.trim();
+    if t.is_empty() {
+        cfg.sni.clone()
+    } else {
+        t.to_string()
     }
 }
 
@@ -220,8 +240,13 @@ type SharedCrypto = Arc<SessionCrypto>;
 
 type ClientWs = WebSocketStream<TlsStream<TcpStream>>;
 
-/// One attempt: TCP + TLS + WS + noise + AUTH + optional BibaV2 preamble (no OPEN / MUX).
-async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Option<SharedCrypto>)> {
+/// One attempt: TCP + TLS + WS + noise + AUTH (v2) or v3 hello + sealed AUTH + optional BibaV2 preamble.
+async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Option<SharedCrypto>, bool)> {
+    let is_v3 = cfg.proto >= 3;
+    if is_v3 {
+        anyhow::ensure!(cfg.psk.is_some(), "Biba v3 requires --psk (or invite psk)");
+    }
+
     let domain = ServerName::try_from(cfg.sni.clone())?;
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
     let path = cfg.ws_path.clone();
@@ -263,13 +288,57 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Optio
         port = cfg.server_port,
         sni = %cfg.sni,
         path = %path,
-        "WSS handshake OK, sending noise + AUTH"
+        proto = cfg.proto,
+        "WSS handshake OK, sending noise + auth / v3 hello"
     );
 
     send_noise_binaries(&mut ws, u32::from(cfg.early_ws_frames), cfg.max_ws_binary).await?;
     send_noise_binaries(&mut ws, cfg.junk_frames, cfg.max_ws_binary)
         .await
         .context("junk frames")?;
+
+    if is_v3 {
+        let secret = cfg.psk.as_ref().expect("psk checked");
+        let dom = effective_proto_domain(cfg);
+        let (c_rand, hello) = crypto_layer::build_hello_v3();
+        ws.send(Message::Binary(Bytes::from(hello)))
+            .await
+            .context("send v3 HELLO")?;
+        loop {
+            let m = ws.next().await.context("eof before ACK")??;
+            match m {
+                Message::Binary(b) => {
+                    let s_rand =
+                        crypto_layer::parse_ack(secret, Some(dom.as_str()), b.as_ref(), &c_rand)?;
+                    let crypto = Arc::new(SessionCrypto::new(
+                        secret,
+                        Some(dom.as_str()),
+                        &c_rand,
+                        &s_rand,
+                        cfg.decoy_max,
+                    ));
+                    let auth_inner = encode_v3_auth(&cfg.token).context("encode v3 AUTH")?;
+                    let mut wire = Vec::new();
+                    write_padded_frame_with_mode(&mut wire, &auth_inner, cfg.max_pad, cfg.pad_mode)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let blob = crypto
+                        .seal_client_to_server(&wire)
+                        .await
+                        .context("seal v3 AUTH")?;
+                    ws.send(Message::Binary(Bytes::from(blob)))
+                        .await
+                        .context("send v3 AUTH")?;
+                    return Ok((ws, Some(crypto), true));
+                }
+                Message::Pong(_) => continue,
+                Message::Ping(p) => {
+                    ws.send(Message::Pong(p)).await.context("pong")?;
+                }
+                Message::Close(_) => anyhow::bail!("ws closed before ACK"),
+                _ => {}
+            }
+        }
+    }
 
     let auth = encode_auth(&cfg.token).context("encode AUTH")?;
     if auth.len() > cfg.max_ws_binary {
@@ -287,10 +356,14 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Optio
         None
     };
 
-    Ok((ws, crypto))
+    Ok((ws, crypto, false))
 }
 
-async fn wait_open_status_or_payload<S>(ws: &mut WebSocketStream<S>) -> anyhow::Result<Vec<Message>>
+async fn wait_open_status_or_payload<S>(
+    ws: &mut WebSocketStream<S>,
+    crypto: Option<&SharedCrypto>,
+    proto_v3: bool,
+) -> anyhow::Result<Vec<Message>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -298,6 +371,21 @@ where
         let m = ws.next().await.context("eof before OPEN result")??;
         match m {
             Message::Binary(b) => {
+                if proto_v3 {
+                    let c = crypto.context("v3 OPEN status")?;
+                    let raw = c
+                        .open_server_to_client(b.as_ref())
+                        .await
+                        .context("decrypt OPEN status")?;
+                    let inner = read_padded_frame(&raw).context("padded OPEN status")?;
+                    if is_v3_open_ok(&inner) {
+                        return Ok(Vec::new());
+                    }
+                    if let Ok(err) = decode_v3_open_err(&inner) {
+                        anyhow::bail!("remote OPEN failed: {err}");
+                    }
+                    return Ok(vec![Message::Binary(Bytes::from(inner))]);
+                }
                 if is_open_ok(b.as_ref()) {
                     return Ok(Vec::new());
                 }
@@ -326,19 +414,49 @@ async fn open_legacy_biba_channel(
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         match one_try_wss_session(cfg).await {
-            Ok((mut ws, crypto)) => {
-                let open = encode_open(host, port)?;
-                if open.len() > cfg.max_ws_binary {
+            Ok((mut ws, crypto, proto_v3)) => {
+                let open = if proto_v3 {
+                    encode_v3_open_with_flags(host, port, OPEN_FLAG_STATUS)?
+                } else {
+                    encode_open(host, port)?
+                };
+                if open.len() > cfg.max_ws_binary && !proto_v3 {
                     anyhow::bail!("OPEN frame larger than --max-ws-binary");
                 }
-                ws.send(Message::Binary(Bytes::from(open)))
-                    .await
-                    .context("send OPEN")?;
-                let prefetched =
-                    match timeout(OPEN_STATUS_WAIT, wait_open_status_or_payload(&mut ws)).await {
-                        Ok(res) => res?,
-                        Err(_) => Vec::new(),
-                    };
+                if let Some(ref c) = crypto {
+                    if proto_v3 {
+                        let mut wire = Vec::new();
+                        write_padded_frame_with_mode(&mut wire, &open, cfg.max_pad, cfg.pad_mode)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let blob = c
+                            .seal_client_to_server(&wire)
+                            .await
+                            .context("seal OPEN v3")?;
+                        if blob.len() > cfg.max_ws_binary {
+                            anyhow::bail!("sealed OPEN exceeds --max-ws-binary");
+                        }
+                        ws.send(Message::Binary(Bytes::from(blob)))
+                            .await
+                            .context("send OPEN v3")?;
+                    } else {
+                        ws.send(Message::Binary(Bytes::from(open)))
+                            .await
+                            .context("send OPEN")?;
+                    }
+                } else {
+                    ws.send(Message::Binary(Bytes::from(open)))
+                        .await
+                        .context("send OPEN")?;
+                }
+                let prefetched = match timeout(
+                    OPEN_STATUS_WAIT,
+                    wait_open_status_or_payload(&mut ws, crypto.as_ref(), proto_v3),
+                )
+                .await
+                {
+                    Ok(res) => res?,
+                    Err(_) => Vec::new(),
+                };
                 return Ok((ws, crypto, prefetched));
             }
             Err(e) => {
@@ -360,14 +478,40 @@ async fn connect_tcp_mux_handle(
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         let res: anyhow::Result<()> = async {
-            let (mut ws, crypto) = one_try_wss_session(cfg).await?;
-            let mo = tcp_mux::encode_mux_open();
-            if mo.len() > cfg.max_ws_binary {
+            let (mut ws, crypto, proto_v3) = one_try_wss_session(cfg).await?;
+            let mo = if proto_v3 {
+                encode_v3_mux_open()
+            } else {
+                tcp_mux::encode_mux_open()
+            };
+            if mo.len() > cfg.max_ws_binary && !proto_v3 {
                 anyhow::bail!("MUX_OPEN larger than --max-ws-binary");
             }
-            ws.send(Message::Binary(Bytes::from(mo)))
-                .await
-                .context("send MUX_OPEN")?;
+            if let Some(ref c) = crypto {
+                if proto_v3 {
+                    let mut wire = Vec::new();
+                    write_padded_frame_with_mode(&mut wire, &mo, cfg.max_pad, cfg.pad_mode)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let blob = c
+                        .seal_client_to_server(&wire)
+                        .await
+                        .context("seal MUX_OPEN v3")?;
+                    if blob.len() > cfg.max_ws_binary {
+                        anyhow::bail!("sealed MUX_OPEN exceeds --max-ws-binary");
+                    }
+                    ws.send(Message::Binary(Bytes::from(blob)))
+                        .await
+                        .context("send MUX_OPEN v3")?;
+                } else {
+                    ws.send(Message::Binary(Bytes::from(mo)))
+                        .await
+                        .context("send MUX_OPEN")?;
+                }
+            } else {
+                ws.send(Message::Binary(Bytes::from(mo)))
+                    .await
+                    .context("send MUX_OPEN")?;
+            }
             let mcfg = MuxClientConfig {
                 max_pad: cfg.max_pad,
                 decoy_max: cfg.decoy_max,
@@ -375,7 +519,7 @@ async fn connect_tcp_mux_handle(
                 ws_ping_secs: cfg.ws_ping_secs,
                 ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
-                transport_v2: false,
+                transport_v2: crypto.is_some(),
                 pad_mode: cfg.pad_mode,
                 dummy_interval_secs: cfg.dummy_interval_secs,
             };
@@ -487,6 +631,8 @@ pub async fn run_local_client(
         decoy_gets: opts.decoy_gets,
         decoy_gets_interval_secs: opts.decoy_gets_interval_secs,
         decoy_gets_paths: opts.decoy_gets_paths.clone(),
+        proto: opts.proto,
+        proto_domain: opts.proto_domain.clone(),
     });
 
     if cfg.decoy_gets {
@@ -884,8 +1030,14 @@ where
         let m = ws.next().await.context("eof before ACK")??;
         match m {
             Message::Binary(b) => {
-                let s_rand = crypto_layer::parse_ack(psk, b.as_ref(), &c_rand)?;
-                return Ok(SessionCrypto::new(psk, &c_rand, &s_rand, decoy_max));
+                let s_rand = crypto_layer::parse_ack(psk, None, b.as_ref(), &c_rand)?;
+                return Ok(SessionCrypto::new(
+                    psk,
+                    None,
+                    &c_rand,
+                    &s_rand,
+                    decoy_max,
+                ));
             }
             Message::Pong(_) => continue,
             Message::Ping(p) => {

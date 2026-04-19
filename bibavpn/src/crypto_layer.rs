@@ -12,6 +12,11 @@ use rand::RngCore;
 pub const HELLO_MAGIC: &[u8] = b"BIBV2HL1";
 pub const ACK_MAGIC: &[u8] = b"BIBV2ACK1";
 
+/// First byte of Biba **v3** opaque client hello (after WS noise/junk). Not an ASCII signature.
+pub const V3_HELLO_TAG: u8 = 0x03;
+pub const V3_HELLO_WIRE_LEN: usize = 1 + 32;
+pub const V3_ACK_WIRE_LEN: usize = 32 + 16;
+
 const MAC_LEN: usize = 16;
 pub const HELLO_LEN: usize = HELLO_MAGIC.len() + 32;
 pub const ACK_LEN: usize = ACK_MAGIC.len() + 32 + MAC_LEN;
@@ -20,8 +25,26 @@ fn mac_psk_key(psk: &[u8]) -> [u8; 32] {
     derive_key("bibavpn.v2.mac.psk", psk)
 }
 
-fn compute_mac(psk: &[u8], client_random: &[u8; 32], server_random: &[u8; 32]) -> [u8; MAC_LEN] {
-    let key = mac_psk_key(psk);
+fn mac_psk_key_v3(psk: &[u8], domain: &str) -> [u8; 32] {
+    let d = domain.as_bytes();
+    let mut buf = Vec::with_capacity(4 + psk.len() + 4 + d.len());
+    buf.extend_from_slice(&(psk.len() as u32).to_be_bytes());
+    buf.extend_from_slice(psk);
+    buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
+    buf.extend_from_slice(d);
+    derive_key("bibavpn.v3.mac.psk", &buf)
+}
+
+fn compute_mac(
+    psk: &[u8],
+    domain: Option<&str>,
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+) -> [u8; MAC_LEN] {
+    let key = match domain {
+        None => mac_psk_key(psk),
+        Some(d) => mac_psk_key_v3(psk, d),
+    };
     let mut h = blake3::Hasher::new_keyed(&key);
     h.update(client_random);
     h.update(server_random);
@@ -33,16 +56,34 @@ fn compute_mac(psk: &[u8], client_random: &[u8; 32], server_random: &[u8; 32]) -
 
 fn transport_keys(
     psk: &[u8],
+    domain: Option<&str>,
     client_random: &[u8; 32],
     server_random: &[u8; 32],
 ) -> ([u8; 32], [u8; 32]) {
-    let mut ctx = Vec::with_capacity(psk.len() + 64);
-    ctx.extend_from_slice(psk);
-    ctx.extend_from_slice(client_random);
-    ctx.extend_from_slice(server_random);
-    let k_up = derive_key("bibavpn.v2.c2s", &ctx);
-    let k_dn = derive_key("bibavpn.v2.s2c", &ctx);
-    (k_up, k_dn)
+    match domain {
+        None => {
+            let mut ctx = Vec::with_capacity(psk.len() + 64);
+            ctx.extend_from_slice(psk);
+            ctx.extend_from_slice(client_random);
+            ctx.extend_from_slice(server_random);
+            let k_up = derive_key("bibavpn.v2.c2s", &ctx);
+            let k_dn = derive_key("bibavpn.v2.s2c", &ctx);
+            (k_up, k_dn)
+        }
+        Some(domain) => {
+            let d = domain.as_bytes();
+            let mut ctx = Vec::with_capacity(4 + psk.len() + 4 + d.len() + 64);
+            ctx.extend_from_slice(&(psk.len() as u32).to_be_bytes());
+            ctx.extend_from_slice(psk);
+            ctx.extend_from_slice(&(d.len() as u32).to_be_bytes());
+            ctx.extend_from_slice(d);
+            ctx.extend_from_slice(client_random);
+            ctx.extend_from_slice(server_random);
+            let k_up = derive_key("bibavpn.v3.c2s", &ctx);
+            let k_dn = derive_key("bibavpn.v3.s2c", &ctx);
+            (k_up, k_dn)
+        }
+    }
 }
 
 struct ChaHalf {
@@ -125,13 +166,15 @@ pub struct SessionCrypto {
 }
 
 impl SessionCrypto {
+    /// `domain`: `None` = BibaV2 key schedule; `Some` = v3 domain-separated schedule.
     pub fn new(
         psk: &str,
+        domain: Option<&str>,
         client_random: &[u8; 32],
         server_random: &[u8; 32],
         decoy_max: u8,
     ) -> Self {
-        let (k_up, k_dn) = transport_keys(psk.as_bytes(), client_random, server_random);
+        let (k_up, k_dn) = transport_keys(psk.as_bytes(), domain, client_random, server_random);
         Self {
             c2s: tokio::sync::Mutex::new(ChaHalf::new(&k_up)),
             s2c: tokio::sync::Mutex::new(ChaHalf::new(&k_dn)),
@@ -169,6 +212,16 @@ pub fn build_hello() -> ([u8; 32], Vec<u8>) {
     (c, v)
 }
 
+/// Biba v3 opaque hello: `[V3_HELLO_TAG][client_random 32]`.
+pub fn build_hello_v3() -> ([u8; 32], Vec<u8>) {
+    let mut c = [0u8; 32];
+    OsRng.fill_bytes(&mut c);
+    let mut v = Vec::with_capacity(V3_HELLO_WIRE_LEN);
+    v.push(V3_HELLO_TAG);
+    v.extend_from_slice(&c);
+    (c, v)
+}
+
 pub fn parse_hello(buf: &[u8]) -> anyhow::Result<[u8; 32]> {
     if buf.len() != HELLO_LEN || !buf.starts_with(HELLO_MAGIC) {
         bail!("bad HELLO");
@@ -178,30 +231,75 @@ pub fn parse_hello(buf: &[u8]) -> anyhow::Result<[u8; 32]> {
     Ok(c)
 }
 
-pub fn build_ack(psk: &str, client_random: &[u8; 32]) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
+pub fn parse_hello_v3(buf: &[u8]) -> anyhow::Result<[u8; 32]> {
+    if buf.len() != V3_HELLO_WIRE_LEN || buf[0] != V3_HELLO_TAG {
+        bail!("bad v3 HELLO");
+    }
+    let mut c = [0u8; 32];
+    c.copy_from_slice(&buf[1..]);
+    Ok(c)
+}
+
+pub fn build_ack(
+    psk: &str,
+    domain: Option<&str>,
+    client_random: &[u8; 32],
+) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
     let mut s = [0u8; 32];
     OsRng.fill_bytes(&mut s);
-    let mac = compute_mac(psk.as_bytes(), client_random, &s);
-    let mut v = Vec::with_capacity(ACK_LEN);
-    v.extend_from_slice(ACK_MAGIC);
-    v.extend_from_slice(&s);
-    v.extend_from_slice(&mac);
+    let mac = compute_mac(psk.as_bytes(), domain, client_random, &s);
+    let mut v = Vec::new();
+    match domain {
+        None => {
+            v.reserve(ACK_LEN);
+            v.extend_from_slice(ACK_MAGIC);
+            v.extend_from_slice(&s);
+            v.extend_from_slice(&mac);
+        }
+        Some(_) => {
+            v.reserve(V3_ACK_WIRE_LEN);
+            v.extend_from_slice(&s);
+            v.extend_from_slice(&mac);
+        }
+    }
     Ok((v, s))
 }
 
-pub fn parse_ack(psk: &str, buf: &[u8], client_random: &[u8; 32]) -> anyhow::Result<[u8; 32]> {
-    if buf.len() != ACK_LEN || !buf.starts_with(ACK_MAGIC) {
-        bail!("bad ACK");
+pub fn parse_ack(
+    psk: &str,
+    domain: Option<&str>,
+    buf: &[u8],
+    client_random: &[u8; 32],
+) -> anyhow::Result<[u8; 32]> {
+    match domain {
+        None => {
+            if buf.len() != ACK_LEN || !buf.starts_with(ACK_MAGIC) {
+                bail!("bad ACK");
+            }
+            let body = &buf[ACK_MAGIC.len()..];
+            let (srv, tag) = body.split_at(32);
+            let mut s = [0u8; 32];
+            s.copy_from_slice(srv);
+            let expected = compute_mac(psk.as_bytes(), None, client_random, &s);
+            if tag != expected.as_slice() {
+                bail!("ACK mac mismatch");
+            }
+            Ok(s)
+        }
+        Some(_) => {
+            if buf.len() != V3_ACK_WIRE_LEN {
+                bail!("bad v3 ACK length");
+            }
+            let (srv, tag) = buf.split_at(32);
+            let mut s = [0u8; 32];
+            s.copy_from_slice(srv);
+            let expected = compute_mac(psk.as_bytes(), domain, client_random, &s);
+            if tag != expected.as_slice() {
+                bail!("ACK mac mismatch");
+            }
+            Ok(s)
+        }
     }
-    let body = &buf[ACK_MAGIC.len()..];
-    let (srv, tag) = body.split_at(32);
-    let mut s = [0u8; 32];
-    s.copy_from_slice(srv);
-    let expected = compute_mac(psk.as_bytes(), client_random, &s);
-    if tag != expected.as_slice() {
-        bail!("ACK mac mismatch");
-    }
-    Ok(s)
 }
 
 #[cfg(test)]
@@ -213,8 +311,8 @@ mod tests {
         let psk = "unit-test-psk";
         let c = [1u8; 32];
         let s = [2u8; 32];
-        let enc = SessionCrypto::new(psk, &c, &s, 8);
-        let dec = SessionCrypto::new(psk, &c, &s, 8);
+        let enc = SessionCrypto::new(psk, None, &c, &s, 8);
+        let dec = SessionCrypto::new(psk, None, &c, &s, 8);
         let inner = b"padded-frame-blob".to_vec();
         let wire = enc.seal_client_to_server(&inner).await.unwrap();
         let out = dec.open_client_to_server(&wire).await.unwrap();
@@ -224,5 +322,17 @@ mod tests {
         let w2 = dec.seal_server_to_client(&back).await.unwrap();
         let out2 = enc.open_server_to_client(&w2).await.unwrap();
         assert_eq!(out2, back);
+    }
+
+    #[tokio::test]
+    async fn v3_domain_changes_keys() {
+        let psk = "same-psk";
+        let c = [3u8; 32];
+        let s = [4u8; 32];
+        let a = SessionCrypto::new(psk, Some("a.example"), &c, &s, 0);
+        let b = SessionCrypto::new(psk, Some("b.example"), &c, &s, 0);
+        let inner = b"payload".to_vec();
+        let w = a.seal_client_to_server(&inner).await.unwrap();
+        assert!(b.open_client_to_server(&w).await.is_err());
     }
 }

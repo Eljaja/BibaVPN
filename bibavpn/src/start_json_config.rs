@@ -76,6 +76,10 @@ struct StartJson {
     decoy_gets_interval_secs: u64,
     #[serde(default)]
     decoy_gets_paths: Option<String>,
+    #[serde(default)]
+    proto: Option<u8>,
+    #[serde(default)]
+    proto_domain: Option<String>,
 }
 
 fn default_token() -> String {
@@ -305,6 +309,15 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         })
         .unwrap_or_default();
 
+    let proto = j
+        .proto
+        .unwrap_or_else(|| invite_pair.as_ref().map(|i| i.proto).unwrap_or(2));
+    let proto_domain = j
+        .proto_domain
+        .clone()
+        .or_else(|| invite_pair.as_ref().and_then(|i| i.proto_domain.clone()))
+        .unwrap_or_default();
+
     Ok(LocalClientOptions {
         server_host,
         server_port,
@@ -339,5 +352,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         decoy_gets: j.decoy_gets,
         decoy_gets_interval_secs: j.decoy_gets_interval_secs,
         decoy_gets_paths,
+        proto,
+        proto_domain,
     })
 }

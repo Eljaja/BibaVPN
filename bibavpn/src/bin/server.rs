@@ -10,10 +10,12 @@ use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use bibavpn::protocol::{
-    decode_open_with_flags, encode_open_err, encode_open_ok, is_udp_mux_open, OPEN_FLAG_STATUS,
+    decode_auth, decode_open_with_flags, decode_v3_auth, decode_v3_open_with_flags, encode_open_err,
+    encode_open_ok, encode_v3_open_err, encode_v3_open_ok, is_auth_frame, is_udp_mux_open,
+    is_v3_mux_open, is_v3_udp_mux_open, OPEN_FLAG_STATUS,
 };
+use bibavpn::{read_padded_frame, write_padded_frame_with_mode};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
-use bibavpn::ws_auth::server_wait_token_auth;
 use bibavpn::ws_bridge::TunnelEnd;
 use bytes::Bytes;
 use clap::Parser;
@@ -22,7 +24,7 @@ use rustls::ServerConfig;
 use std::str::FromStr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::Duration;
+use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -131,6 +133,10 @@ struct Args {
     /// Send idle padded empty frames on TCP tunnels (0 = off). Matches client `--dummy-interval-secs`.
     #[arg(long, default_value_t = 0)]
     dummy_interval_secs: u64,
+
+    /// Biba v3 domain string for PSK key separation (must match client / invite). Default `default`.
+    #[arg(long, default_value = "default")]
+    proto_domain: String,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -196,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
             server: public.clone(),
             sni,
             token: args.token.clone(),
+            proto: 2,
+            proto_domain: None,
             psk: args.psk.clone(),
             decoy_max: args.decoy_max,
             max_pad: args.max_pad,
@@ -246,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
             reverse_proxy: camouflage_url.clone(),
         };
         let psk_conn = psk.clone();
+        let proto_domain = args.proto_domain.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_one(
                 stream,
@@ -266,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
                 pad_mode,
                 dummy_interval_secs,
                 camo,
+                proto_domain,
             )
             .await
             {
@@ -294,6 +304,7 @@ async fn handle_one(
     pad_mode: PadMode,
     dummy_interval_secs: u64,
     camo: CamouflageServeConfig,
+    proto_domain: String,
 ) -> anyhow::Result<()> {
     let tls = acceptor.accept(tcp).await.context("tls accept")?;
 
@@ -303,22 +314,37 @@ async fn handle_one(
         return Ok(());
     };
 
-    if accept_kind == WsHandshakeKind::NewPath {
-        server_wait_token_auth(&mut ws, &token, Duration::from_secs(5))
-            .await
-            .context("AUTH")?;
+    let domain_trim = proto_domain.trim();
+    if domain_trim.is_empty() {
+        anyhow::bail!("--proto-domain must not be empty");
     }
 
-    let crypto: Option<SharedCrypto> = if let Some(ref secret) = psk {
-        info!("BibaV2 PSK mode, decoy_max={decoy_max}");
-        Some(Arc::new(
-            v2_server_preamble(&mut ws, secret, decoy_max).await?,
-        ))
-    } else {
-        None
+    let (crypto, proto_v3) = match accept_kind {
+        WsHandshakeKind::NewPath => {
+            server_handshake_newpath(
+                &mut ws,
+                &token,
+                psk.as_deref(),
+                decoy_max,
+                domain_trim,
+            )
+            .await
+            .context("handshake")?
+        }
+        WsHandshakeKind::LegacyPath => {
+            let crypto = if let Some(ref secret) = psk {
+                info!("BibaV2 PSK mode (legacy path), decoy_max={decoy_max}");
+                Some(Arc::new(
+                    v2_server_preamble(&mut ws, secret, decoy_max).await?,
+                ))
+            } else {
+                None
+            };
+            (crypto, false)
+        }
     };
 
-    match wait_first_channel(ws).await? {
+    match wait_first_channel(ws, crypto.as_ref(), proto_v3).await? {
         FirstChannel::Tcp {
             host,
             port,
@@ -330,11 +356,35 @@ async fn handle_one(
                 Ok(remote) => remote,
                 Err(e) => {
                     if supports_open_status {
-                        let payload = encode_open_err(&format!("connect {host}:{port}: {e:#}"))
-                            .unwrap_or_else(|_| {
-                                encode_open_err("connect failed").expect("static open error")
-                            });
-                        let _ = ws.send(Message::Binary(Bytes::from(payload))).await;
+                        if proto_v3 {
+                            if let Some(c) = &crypto {
+                                if let Ok(inner) = encode_v3_open_err(&format!(
+                                    "connect {host}:{port}: {e:#}"
+                                )) {
+                                    let mut wire = Vec::new();
+                                    if write_padded_frame_with_mode(
+                                        &mut wire,
+                                        &inner,
+                                        max_pad,
+                                        pad_mode,
+                                    )
+                                    .is_ok()
+                                    {
+                                        if let Ok(blob) = c.seal_server_to_client(&wire).await {
+                                            let _ = ws
+                                                .send(Message::Binary(Bytes::from(blob)))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            let payload = encode_open_err(&format!("connect {host}:{port}: {e:#}"))
+                                .unwrap_or_else(|_| {
+                                    encode_open_err("connect failed").expect("static open error")
+                                });
+                            let _ = ws.send(Message::Binary(Bytes::from(payload))).await;
+                        }
                         return Ok(());
                     }
                     return Err(e).with_context(|| format!("connect {host}:{port}"));
@@ -342,9 +392,24 @@ async fn handle_one(
             };
             let _ = remote.set_nodelay(true);
             if supports_open_status {
-                ws.send(Message::Binary(Bytes::from(encode_open_ok())))
-                    .await
-                    .context("send OPEN_OK")?;
+                if proto_v3 {
+                    let c = crypto.as_ref().context("v3 OPEN_OK needs crypto")?;
+                    let inner = encode_v3_open_ok();
+                    let mut wire = Vec::new();
+                    write_padded_frame_with_mode(&mut wire, &inner, max_pad, pad_mode)
+                        .context("pack OPEN_OK v3")?;
+                    let blob = c
+                        .seal_server_to_client(&wire)
+                        .await
+                        .context("seal OPEN_OK v3")?;
+                    ws.send(Message::Binary(Bytes::from(blob)))
+                        .await
+                        .context("send OPEN_OK v3")?;
+                } else {
+                    ws.send(Message::Binary(Bytes::from(encode_open_ok())))
+                        .await
+                        .context("send OPEN_OK")?;
+                }
             }
             bibavpn::ws_bridge::bridge_ws_tcp_padded(
                 ws,
@@ -418,7 +483,11 @@ where
     },
 }
 
-async fn wait_first_channel<S>(mut ws: WebSocketStream<S>) -> anyhow::Result<FirstChannel<S>>
+async fn wait_first_channel<S>(
+    mut ws: WebSocketStream<S>,
+    crypto: Option<&SharedCrypto>,
+    proto_v3: bool,
+) -> anyhow::Result<FirstChannel<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -426,19 +495,46 @@ where
         let m = m.context("ws read")?;
         match m {
             Message::Binary(b) => {
-                if let Ok((h, p, flags)) = decode_open_with_flags(b.as_ref()) {
-                    return Ok(FirstChannel::Tcp {
-                        host: h,
-                        port: p,
-                        supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
-                        ws,
-                    });
-                }
-                if is_udp_mux_open(b.as_ref()) {
-                    return Ok(FirstChannel::UdpMux { ws });
-                }
-                if bibavpn::tcp_mux::is_mux_open(b.as_ref()) {
-                    return Ok(FirstChannel::Mux { ws });
+                let inner: Vec<u8> = if proto_v3 {
+                    let c = crypto.context("v3 requires session crypto")?;
+                    let raw = c
+                        .open_client_to_server(b.as_ref())
+                        .await
+                        .context("decrypt v3 control")?;
+                    read_padded_frame(&raw).context("padded v3 control")?
+                } else {
+                    b.to_vec()
+                };
+                if proto_v3 {
+                    if let Ok((h, p, flags)) = decode_v3_open_with_flags(&inner) {
+                        return Ok(FirstChannel::Tcp {
+                            host: h,
+                            port: p,
+                            supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
+                            ws,
+                        });
+                    }
+                    if is_v3_udp_mux_open(&inner) {
+                        return Ok(FirstChannel::UdpMux { ws });
+                    }
+                    if is_v3_mux_open(&inner) {
+                        return Ok(FirstChannel::Mux { ws });
+                    }
+                } else {
+                    if let Ok((h, p, flags)) = decode_open_with_flags(inner.as_slice()) {
+                        return Ok(FirstChannel::Tcp {
+                            host: h,
+                            port: p,
+                            supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
+                            ws,
+                        });
+                    }
+                    if is_udp_mux_open(inner.as_slice()) {
+                        return Ok(FirstChannel::UdpMux { ws });
+                    }
+                    if bibavpn::tcp_mux::is_mux_open(inner.as_slice()) {
+                        return Ok(FirstChannel::Mux { ws });
+                    }
                 }
             }
             Message::Ping(p) => {
@@ -451,6 +547,114 @@ where
         }
     }
     anyhow::bail!("eof before OPEN / UDP_MUX / MUX")
+}
+
+async fn server_handshake_newpath<S>(
+    ws: &mut WebSocketStream<S>,
+    token: &str,
+    psk: Option<&str>,
+    decoy_max: u8,
+    proto_domain: &str,
+) -> anyhow::Result<(Option<SharedCrypto>, bool)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let domain = proto_domain.to_string();
+    let fut = async {
+        loop {
+            let m = ws
+                .next()
+                .await
+                .context("eof during handshake")?
+                .context("ws error")?;
+            match m {
+                Message::Binary(b) => {
+                    if is_auth_frame(b.as_ref()) {
+                        let tok = decode_auth(b.as_ref())?;
+                        if tok != token {
+                            anyhow::bail!("auth token mismatch");
+                        }
+                        let crypto = if let Some(secret) = psk {
+                            info!("BibaV2 PSK mode, decoy_max={decoy_max}");
+                            Some(Arc::new(
+                                v2_server_preamble(ws, secret, decoy_max).await?,
+                            ))
+                        } else {
+                            None
+                        };
+                        return Ok((crypto, false));
+                    }
+                    if b.len() == crypto_layer::V3_HELLO_WIRE_LEN
+                        && b.as_ref()[0] == crypto_layer::V3_HELLO_TAG
+                    {
+                        let secret = psk.context("Biba v3 requires server --psk")?;
+                        info!("Biba v3 PSK mode, decoy_max={decoy_max}");
+                        let c = crypto_layer::parse_hello_v3(b.as_ref())?;
+                        let (ack, s_rand) =
+                            crypto_layer::build_ack(secret, Some(domain.as_str()), &c)?;
+                        ws.send(Message::Binary(Bytes::from(ack)))
+                            .await
+                            .context("send v3 ACK")?;
+                        let crypto = Arc::new(SessionCrypto::new(
+                            secret,
+                            Some(domain.as_str()),
+                            &c,
+                            &s_rand,
+                            decoy_max,
+                        ));
+                        server_wait_v3_auth(ws, &crypto, token).await?;
+                        return Ok((Some(crypto), true));
+                    }
+                }
+                Message::Ping(p) => {
+                    ws.send(Message::Pong(p)).await.context("pong")?;
+                }
+                Message::Pong(_) => {}
+                Message::Close(_) => anyhow::bail!("closed during handshake"),
+                _ => {}
+            }
+        }
+    };
+    timeout(Duration::from_secs(15), fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("handshake timeout"))?
+}
+
+async fn server_wait_v3_auth<S>(
+    ws: &mut WebSocketStream<S>,
+    crypto: &SharedCrypto,
+    expected_token: &str,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        let m = ws
+            .next()
+            .await
+            .context("eof before v3 AUTH")?
+            .context("ws read")?;
+        match m {
+            Message::Binary(b) => {
+                let raw = crypto
+                    .open_client_to_server(b.as_ref())
+                    .await
+                    .context("v3 open auth")?;
+                let inner = read_padded_frame(&raw).context("v3 auth frame")?;
+                let tok = decode_v3_auth(&inner).context("decode v3 auth")?;
+                if tok != expected_token {
+                    anyhow::bail!("v3 auth token mismatch");
+                }
+                return Ok(());
+            }
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await.context("pong")?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => anyhow::bail!("closed before v3 AUTH"),
+            _ => {}
+        }
+    }
 }
 
 async fn v2_server_preamble<S>(
@@ -481,11 +685,11 @@ where
         };
         if b.len() == crypto_layer::HELLO_LEN && b.as_ref().starts_with(crypto_layer::HELLO_MAGIC) {
             let c = crypto_layer::parse_hello(b.as_ref())?;
-            let (ack, s_rand) = crypto_layer::build_ack(psk, &c)?;
+            let (ack, s_rand) = crypto_layer::build_ack(psk, None, &c)?;
             ws.send(Message::Binary(Bytes::from(ack)))
                 .await
                 .context("send ACK")?;
-            return Ok(SessionCrypto::new(psk, &c, &s_rand, decoy_max));
+            return Ok(SessionCrypto::new(psk, None, &c, &s_rand, decoy_max));
         }
     }
 }
