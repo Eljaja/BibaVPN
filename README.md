@@ -7,8 +7,9 @@
 [Platforms](#android-and-desktop)
 
 A DPI-resistant **SOCKS5 / HTTP-CONNECT** tunnel that wraps your traffic in
-**TLS + WebSocket** and ships it through a single VPS. Optional shared-PSK
-layer (**BibaV2**), per-frame random padding, browser-ordered upgrade headers,
+**TLS + WebSocket** and ships it through a single VPS. The inner wire uses the
+**Biba v3** shared-PSK layer (opaque HELLO/ACK, ChaCha20-Poly1305, per-frame
+random decoy), plus per-frame random padding, browser-ordered upgrade headers,
 and HTTP camouflage on the same TLS port.
 
 Pure Rust server and client; Android app (Jetpack Compose) and a Tauri desktop
@@ -81,12 +82,11 @@ For the full wire format, frame layout and session setup see
 - **TLS + WebSocket** transport; the server serves plain HTTP on the same port
 as camouflage (`--camouflage-dir` for a static site, `--camouflage-url` for a
 reverse origin).
-- **BibaV2** shared-PSK layer: HELLO / ACK, ChaCha20-Poly1305 AEAD, per-frame
-random decoy.
-- **Biba v3** (optional, backward compatible): opaque PSK hello/ACK (no ASCII
-wire signatures), **domain-separated** key derivation (`--proto-domain`), and
-**sealed** control frames (AUTH, OPEN, MUX / UDP_MUX, OPEN_OK / OPEN_ERR).
-Default wire mode remains v2 (`--proto 2`).
+- **Biba v3** shared-PSK wire: variable-length opaque HELLO/ACK (no fixed
+33/48-byte signatures), **domain-separated** key derivation (`--proto-domain`),
+and **sealed** control frames (AUTH, OPEN, MUX / UDP_MUX, OPEN_OK / OPEN_ERR).
+UDP datagrams use **v3 single-byte opcodes** (`0x05` / `0x06` for REQ/REP) inside
+the AEAD plaintext, not legacy ASCII magics.
 - **BibaV2.1** shaping knobs: random / HTTP-bucket padding, WS Ping with
 jitter, binary size cap, configurable upgrade headers per TLS profile
 (Chrome / Firefox), early-session noise, TLS leaf pinning (`--pin-cert`).
@@ -299,10 +299,9 @@ reproducible. Docker images use the same or a newer toolchain.
 Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. The short story:
 
 - **Required for an encrypted tunnel:** `--server`, `--sni`, `--token`, `--psk`.
-- **Protocol version (client):** `--proto 2` (default) or **`--proto 3`** for
-Biba v3. **v3 requires PSK** and a matching **domain string**: server
-`--proto-domain` (default `default`) must match the client’s `--proto-domain`,
-or the **SNI** when the client leaves `--proto-domain` empty.
+The client wire is **Biba v3 only** (`--proto` defaults to **`3`**). Server
+`--proto-domain` (default `default`) must match the client’s `--proto-domain`, or
+the **SNI** when the client leaves `--proto-domain` empty.
 - **Shape / anti-DPI:** `--decoy-max`, `--max-pad`, `--pad-mode`,
 `--dummy-interval-secs`, `--ws-ping-secs`, `--junk-frames`,
 `--decoy-gets`* (client-only).
@@ -311,17 +310,17 @@ or the **SNI** when the client leaves `--proto-domain` empty.
 - **TLS trust (client):** real CA by default, `--pin-cert <pem>` to pin the
 leaf, `--insecure` **lab only**.
 
-Never put secrets in the URL: the token is carried in the **AUTH** payload
-(v2 cleartext frame or **v3 sealed** opcode), and the WebSocket path
-(`--ws-path`, default `/ws`) does not contain credentials.
+Never put secrets in the URL: the token is carried in the **v3 sealed AUTH**
+opcode after HELLO/ACK, and the WebSocket path (`--ws-path`, default `/ws`) does
+not contain credentials.
 
-**Invites:** JSON may include **`proto`** and **`proto_domain`** (see
-**[PROTOCOL.md](PROTOCOL.md)**). Server **`--print-invite-uri`** still issues
-`proto: 2` invites; for v3 use **`bibavpn-mint-invite`** (`INVITE_PROTO`,
-`INVITE_PROTO_DOMAIN`) or edit the JSON before sealing.
+**Invites:** JSON includes **`proto`** (default **`3`**) and optional
+**`proto_domain`** (see **[PROTOCOL.md](PROTOCOL.md)**). **`--print-invite-uri`**
+and **`bibavpn-mint-invite`** both target v3 by default.
 
-**WSL smoke (v3 then v2):** after `cargo build --release -p bibavpn`, run
-`scripts/wsl-proto-v3-smoke.sh` (see **AGENTS.md**).
+**WSL smoke:** after `cargo build --release -p bibavpn`, you can run
+`scripts/wsl-proto-v3-smoke.sh` for a quick local SOCKS + `curl` check (see
+**AGENTS.md**).
 
 ---
 
@@ -355,7 +354,7 @@ long-lived HTTPS WebSocket to a reasonable camouflage site. It is not
 anonymity software; the server operator sees every byte you send, and
 active probing with the right keys recovers the inner protocol.
 - **Token path:** `--legacy-path-auth` accepts an old `/b/{token}` URL
-form without the AUTH frame. It is only there for old clients and is
+form without the sealed AUTH step. It is only there for old clients and is
 strictly weaker than the default.
 - **Report security issues** privately — see [SECURITY.md](SECURITY.md).
 

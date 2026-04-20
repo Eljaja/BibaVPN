@@ -12,7 +12,7 @@ This document specifies the on-wire layers. For install / run instructions see
 ## Contents
 
 - [Stack at a glance](#stack-at-a-glance)
-- [Biba v2 vs v3 (handshake and control)](#biba-v2-vs-v3-handshake-and-control)
+- [Biba v3 (PSK wire)](#biba-v3-psk-wire)
 - [TCP vs UDP paths](#tcp-vs-udp-paths)
 - [Wire formats (packets and frames)](#wire-formats-packets-and-frames)
 - [End-to-end picture (session flow)](#end-to-end-picture-session-flow)
@@ -34,7 +34,7 @@ flowchart LR
     F["ver 1B | len u24 | pad_len | pad | payload"]
   end
 
-  subgraph L5["BibaV2 (optional)"]
+  subgraph L5["Biba v3 PSK"]
     V2["decoy_len | random decoy | padded frame"]
     AEAD["ChaCha20-Poly1305 to ciphertext"]
     NONCE["12-byte nonce"]
@@ -58,48 +58,76 @@ flowchart LR
   WS --> TLS
 ```
 
-Without PSK, **L5** is skipped: the WebSocket Binary payload **is** the padded frame from **L6**. Padding length can follow **uniform random** or **HTTP-like size buckets** (`--pad-mode`).
-
-With PSK, **L5** uses ChaCha20-Poly1305 in both **v2** and **v3**; they differ in how the session keys and handshake bytes are derived (see next section).
+The tunnel expects a **PSK** on both ends. **L5** uses ChaCha20-Poly1305 with
+**Biba v3** key derivation and handshake (opaque HELLO/ACK, domain-separated
+KDF). Padding length for **L6** can follow **uniform random** or **HTTP-like size
+buckets** (`--pad-mode`).
 
 ---
 
-## Biba v2 vs v3 (handshake and control)
+## Biba v3 (PSK wire)
 
-Both versions share the **same outer record shape**: optional decoy, then padded inner payload, inside **12-byte nonce + AEAD ciphertext** per WebSocket Binary (see §2). **v3** changes only the **PSK handshake** and **how cleartext control messages are encoded before encryption**.
+The implementation is **v3-only**: there is no alternate v2 preamble on the
+wire. Session setup and control messages differ from older experiments by using
+**variable-length** handshake bytes and **single-byte inner opcodes** (carried
+inside padded frames, then encrypted — never as bare cleartext on the WebSocket).
 
-### Negotiation (NewPath — default WebSocket entry)
+### Handshake (after HTTP Upgrade)
 
-After the HTTP Upgrade, the client may send optional **noise** (`--junk-frames`, `--early-ws-frames`). The server then inspects the first meaningful **client → server** Binary:
+After optional **noise** (`--junk-frames`, `--early-ws-frames`), the first
+meaningful client → server **Binary** is the v3 **HELLO**:
 
-1. If it parses as legacy **AUTH** (`BIBA\x01AUTH\x00` …), the session follows **v2**: optional **BIBV2HL1** / **BIBV2ACK1** PSK handshake if PSK is enabled, with v2 KDF labels (`bibavpn.v2.*`).
-2. If it is **33 bytes** and starts with byte **`0x03`**, the session follows **v3**: opaque client random (32 B). The server must have **PSK** configured; it replies with **32 B server random ∥ 16 B MAC** (no ASCII magic). MAC and directional keys use **domain-separated** derivation (`bibavpn.v3.mac.psk`, `bibavpn.v3.c2s`, `bibavpn.v3.s2c`) with a shared **domain string** (server `--proto-domain`, client `--proto-domain` or invite `proto_domain`; if the client string is empty, the **SNI** is used).
+```text
+[V3_HELLO_TAG=0x03][client_random:32][pad_len:u8][random padding 0..pad_len]
+```
 
-Mismatching domain strings break the MAC and the session. **v3 requires PSK** on the client when `proto == 3`.
+- `pad_len` is at most **64**; total HELLO length is therefore **not** fixed
+  (minimum 34 bytes: tag + random + `pad_len` byte with zero trailing pad).
 
-### v3 inner control opcodes (plaintext *inside* AEAD, not on the wire bare)
+The server replies with **ACK**:
 
-These replace the ASCII `BIBA\x01…` **control** magics for v3 paths. The client seals them with **c2s** keys; the server uses **s2c** for **OPEN_OK** / **OPEN_ERR**.
+```text
+[server_random:32][mac:16][pad_len:u8][random padding 0..pad_len]
+```
+
+- `mac` is a 16-byte tag derived with BLAKE3 over PSK, the shared **domain
+  string**, `client_random`, and `server_random` (see `crypto_layer.rs`).
+- Trailing padding is also bounded (at most **64** bytes); total ACK length is
+  not fixed.
+
+The **domain string** must match on both sides: server `--proto-domain`
+(default `default`), client `--proto-domain`, or **SNI** when the client omits
+`--proto-domain` / invite `proto_domain`.
+
+### Inner control opcodes (plaintext *inside* the padded frame, then inside AEAD)
+
+After HELLO/ACK, the client sends **AUTH** and channel setup using these
+**single-byte** opcodes (see `encode_v3_*` / `decode_v3_*` in `protocol.rs`):
 
 | Opcode (hex) | Meaning |
 | ------------ | ------- |
-| `0x01` | AUTH — token length + UTF-8 token |
-| `0x02` | TCP OPEN — host, port, flags (incl. status bit for legacy-style status channel) |
-| `0x03` | UDP channel open (UDP_MUX) |
-| `0x04` | TCP mux channel open (MUX) |
+| `0x01` | AUTH — token length `u16` BE + UTF-8 token |
+| `0x02` | TCP OPEN — host, port, flags (see `encode_v3_open_with_flags`) |
+| `0x03` | UDP channel open (UDP_MUX) — body is exactly this one byte |
+| `0x04` | TCP mux channel open (MUX) — body is exactly this one byte |
 | `0x10` | OPEN_OK |
 | `0x11` | OPEN_ERR — UTF-8 reason |
 
-Exact field layouts are implemented in `protocol.rs` (`encode_v3_*` / `decode_v3_*`).
+These replace legacy ASCII `BIBA\x01…` **control** magics for the live protocol.
 
-### What stays v2-style inside the tunnel
+### UDP inner records (inside AEAD, after UDP_MUX is open)
 
-- **Padded tunnel frames** (§1) and **TCP mux records** (§5) are unchanged.
-- **UDP_REQ / UDP_REP** (§7–8) still begin with **`BIBA\x01UDPR\x00`** / **`BIBA\x01UDPQ\x00`** in the **inner** plaintext; for v3 they are simply encrypted by the v3 session keys like any other payload. Only the **handshake and channel-open control** use the v3 opcodes above.
+| Opcode (hex) | Meaning |
+| ------------ | ------- |
+| `0x05` | UDP_REQ — `xid: u64` BE, SOCKS-like ATYP host/port, payload |
+| `0x06` | UDP_REP — same layout; `xid` correlates reply to request |
+
+**ATYP** encoding matches the SOCKS helpers in `protocol.rs` (`encode_atyp_host_port` / `decode_atyp_host_port`).
 
 ### UDP mux WebSocket
 
-The **second** TLS+WSS (UDP mux) uses the same **v2 vs v3** rules: with `--proto 3`, the client runs the **opaque hello + sealed AUTH + sealed UDP_MUX** sequence on that socket; datagrams remain **UDP_REQ / UDP_REP** inside AEAD.
+The **second** TLS+WSS (UDP mux) repeats the same **HELLO → ACK → sealed AUTH →
+sealed UDP_MUX (`0x03`)** sequence; datagrams use **`0x05` / `0x06`** as above.
 
 ---
 
@@ -115,20 +143,20 @@ flowchart TB
 
   subgraph path_tcp["TCP channel (default)"]
     TUN_TCP --> WSS1[TLS + WebSocket]
-    WSS1 --> MUXO2[First logical: MUX_OPEN magic]
+    WSS1 --> MUXO2[First logical: sealed MUX open\ninner opcode 0x04]
     MUXO2 --> STREAMS[Per-stream mux records\nOPEN target / DATA / CLOSE / WIN]
   end
 
   subgraph path_tcp_legacy["TCP legacy (--no-mux)"]
     TUN_TCP -.-> WSSL[1 WSS per SOCKS CONNECT]
-    WSSL -.-> OPENL[First Binary: OPEN host:port]
+    WSSL -.-> OPENL[Sealed v3 OPEN host:port]
     OPENL -.-> LOOPL[Padded / sealed payloads]
   end
 
   subgraph path_udp["UDP channel"]
     TUN_UDP --> WSS2[TLS + WebSocket]
-    WSS2 --> MUXO[First Binary: UDP_MUX_OPEN]
-    MUXO --> UDPR[UDP_REQ / UDP_REP datagrams]
+    WSS2 --> MUXO[Sealed UDP_MUX open\ninner opcode 0x03]
+    MUXO --> UDPR[UDP_REQ / UDP_REP\ninner 0x05 / 0x06]
   end
 
   subgraph server["bibavpn-server"]
@@ -142,9 +170,9 @@ flowchart TB
 
 ## Wire formats (packets and frames)
 
-### 1) Padded TCP tunnel frame (plaintext inside crypto, or plain mode)
+### 1) Padded TCP tunnel frame (plaintext inside crypto)
 
-This is what `frame::write_padded_frame` / `write_padded_frame_with_mode` emits. It is the **payload** of a WebSocket **Binary** message in plain mode; in PSK mode it sits **after** decoy inside the ChaCha plaintext (see section 2).
+This is what `frame::write_padded_frame` / `write_padded_frame_with_mode` emits. It is the **payload** of a WebSocket **Binary** message inside the ChaCha plaintext (after optional decoy).
 
 **Layout (byte-aligned):**
 
@@ -152,11 +180,11 @@ This is what `frame::write_padded_frame` / `write_padded_frame_with_mode` emits.
  offset | 0      | 1 2 3   | 4       | 5 .. 5+pad_len-1 | 5+pad_len .. end |
  +----------+--------+---------+------------------+------------------+
  | field    | ver=1  | len u24 | pad_len | random pad       | payload (len B)  |
- | width    | 1 B    | BE      | 1 B     | 0 .. max_pad     | TCP chunk / OPEN |
+ | width    | 1 B    | BE      | 1 B     | 0 .. max_pad     | TCP chunk / inner ctrl |
  +----------+--------+---------+------------------+------------------+
 ```
 
-### 2) BibaV2 outer wrapper (inside one WebSocket Binary)
+### 2) Biba v3 outer wrapper (inside one WebSocket Binary)
 
 After HELLO/ACK, each direction uses **ChaCha20-Poly1305** with a **12-byte nonce** (see `crypto_layer.rs`).
 
@@ -172,35 +200,24 @@ After HELLO/ACK, each direction uses **ChaCha20-Poly1305** with a **12-byte nonc
 
 ```text
  +----+--------------+----------------------------------------------+
- | N  | N B decoy    | inner: padded frame, OPEN, mux record, UDP_… |
+ | N  | N B decoy    | inner: padded frame, mux record, UDP_REQ/REP … |
  |    | (optional)   |                                              |
  +----+--------------+----------------------------------------------+
       N <= decoy_max
 ```
 
-### 3) AUTH (after WS upgrade; token not in URL) — **v2 cleartext control**
+### 3) AUTH (token not in URL)
 
-On **v3**, the same token is sent as opcode **`0x01`** + fields **inside the first sealed client frame** after ACK, not as this bare `BIBA…` blob.
+On v3, the token is **`0x01`** + fields **inside the first sealed client frame**
+after ACK (not a bare `BIBA…` blob on the WebSocket).
 
-```text
- "BIBA\x01AUTH\x00"  |  token_len u16 BE  |  token UTF-8
- +---- 9 bytes -----+
-```
+### 4) TCP OPEN (`--no-mux` first logical payload)
 
-### 4) TCP OPEN (legacy single-stream mode, first logical binary after optional junk / HELLO)
-
-```text
- "BIBA\x01OPEN\x00"  |  host_len u16 BE  |  host UTF-8  |  port u16 BE
- +---- 9 bytes -----+
-```
+Sealed inner **`0x02`** + host/port/flags (see `encode_v3_open_with_flags`).
 
 ### 5) TCP mux: capability and stream records
 
-**Channel open (client → server), fixed magic:**
-
-```text
- "BIBA\x01MUXO\x00"     (9 bytes)
-```
+**Channel open (client → server):** sealed inner payload **`[0x04]`** (single byte).
 
 **Mux record (inside one padded inner payload):**
 
@@ -210,26 +227,20 @@ On **v3**, the same token is sent as opcode **`0x01`** + fields **inside the fir
 
 Flags include stream open, data, close, RST, and window update (flow control). See `tcp_mux.rs`.
 
-### 6) UDP mux: channel open — **v2 cleartext control**
+### 6) UDP mux: channel open
 
-On **v3**, the UDP mux channel is opened with inner opcode **`0x03`** (single byte) **inside AEAD**, not this bare magic.
-
-```text
- "BIBA\x01UDPM\x00"     (9 bytes, fixed)
-```
+**Channel open:** sealed inner **`[0x03]`** (single byte), after HELLO/ACK and AUTH.
 
 ### 7) UDP_REQ (client to server)
 
 ```text
- "BIBA\x01UDPR\x00"  |  xid u64 BE  |  ATYP | address | port u16 BE  |  payload
+ 0x05  |  xid u64 BE  |  ATYP | address | port u16 BE  |  payload
 ```
-
-**ATYP** (SOCKS-like): `1` + IPv4 (4 B) + port; `3` + len + hostname + port; `4` + IPv6 (16 B) + port.
 
 ### 8) UDP_REP (server to client)
 
 ```text
- "BIBA\x01UDPQ\x00"  |  xid u64 BE  |  ATYP | src_addr | port u16 BE  |  payload
+ 0x06  |  xid u64 BE  |  ATYP | src_addr | port u16 BE  |  payload
 ```
 
 ---
@@ -255,34 +266,30 @@ flowchart TB
   subgraph setup [Order within one WSS session]
     WFR --> U[1 GET Upgrade to configured path e.g. /ws — no token in URL]
     U --> N[2 optional Binary noise / junk BibaV2.1]
-    N --> FB[3 First client Binary after noise]
-    FB -->|v2 NewPath: BIBA AUTH| Q2{BibaV2 PSK?}
-    FB -->|v3: 0x03 + 32B random| H3[v3 opaque ACK 32+16 B]
-    Q2 -->|yes| HA[v2 HELLO / ACK]
-    Q2 -->|no| MX[4 MUX_OPEN or OPEN…]
-    HA --> MX
-    H3 --> AU3[4 sealed v3 AUTH + MUX/OPEN…]
-    AU3 --> MX2[5 mux/data phase]
-    MX --> MX2
-    MX2 --> ST[6 Stream OPEN + DATA mux records to target]
+    N --> FB[3 First client Binary: v3 HELLO]
+    FB --> H3[4 v3 ACK variable length]
+    H3 --> AU3[5 sealed v3 AUTH + MUX/OPEN…]
+    AU3 --> MX2[6 mux/data phase]
+    MX2 --> ST[7 Stream OPEN + DATA mux records to target]
     ST --> SV[bibavpn-server connects per stream]
-    SV --> LOOP[7 Binary loop: padded / sealed payloads]
+    SV --> LOOP[8 Binary loop: padded / sealed payloads]
   end
 
   subgraph payload [One tunnel WebSocket Binary in data phase]
     LOOP --> R{mode}
-    R -->|no PSK| PF[padded frame as payload]
     R -->|PSK| AE[12 B nonce + ChaCha20-Poly1305 ciphertext]
-    PF --> PF1["version 1B | payload len u24 BE | pad_len | pad | inner"]
-    AE --> AE1["after decrypt: dlen 1B | decoy 0..decoy_max | same inner"]
+    AE --> AE1["after decrypt: dlen 1B | decoy 0..decoy_max | padded inner"]
   end
 
   SV --> DST[(Target host:port)]
 ```
 
-**Legacy TCP (`--no-mux`):** each SOCKS CONNECT opens a **new** WSS; step 5 is **OPEN host:port** instead of MUX_OPEN + stream records.
+**Legacy TCP (`--no-mux`):** each SOCKS CONNECT opens a **new** WSS; step 6 uses
+sealed **OPEN** (`0x02`) instead of MUX + stream records.
 
-DPI on the outside sees **TLS** and **WebSocket**; **inside** Binary is either **padded** data or **nonce + AEAD**. BibaV2.1 may send **WebSocket Ping** and optional **idle dummy** padded frames.
+DPI on the outside sees **TLS** and **WebSocket**; **inside** Binary is
+**nonce + AEAD**. BibaV2.1 may send **WebSocket Ping** and optional **idle dummy**
+padded frames.
 
 ---
 
@@ -290,7 +297,7 @@ DPI on the outside sees **TLS** and **WebSocket**; **inside** Binary is either *
 
 The server can print a **single-line encrypted config** after it binds: JSON (`InviteV1`) sealed with **ChaCha20-Poly1305** and a key derived from a **passphrase** (BLAKE3 KDF). Clients and Android JNI can consume the same blob instead of spelling out `--server`, `--token`, and matching tunnel options by hand.
 
-Invite JSON (`InviteV1`) includes **`proto`** (default **`2`**; use **`3`** for v3), optional **`proto_domain`** (omit to let the client default the KDF label to **SNI** — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, and other tunnel fields. **`--print-invite-uri`** on the server currently emits **`proto: 2`** without `proto_domain`; for v3 invites use **`bibavpn-mint-invite`** with `INVITE_PROTO=3` and optional `INVITE_PROTO_DOMAIN`, or build JSON manually. **Do not** paste real invites or passphrases into tickets or public logs.
+Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`proto_domain`** (omit to let the client default the KDF label to **SNI** — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, and other tunnel fields. **`--print-invite-uri`** on the server embeds the same defaults as hand-written JSON. **`bibavpn-mint-invite`** uses environment variables (`INVITE_PROTO`, `INVITE_PROTO_DOMAIN`, …) with the same v3-first defaults. **Do not** paste real invites or passphrases into tickets or public logs.
 
 **Server** (stdout = only the URI; passphrase must stay secret — share out-of-band):
 
@@ -316,25 +323,17 @@ Invite JSON (`InviteV1`) includes **`proto`** (default **`2`**; use **`3`** for 
 
 ---
 
-## BibaV2 summary
-
-- Enabled with matching `--psk` and `--decoy-max` on client and server.
-- HELLO: magic `BIBV2HL1` + 32-byte client random.
-- ACK: `BIBV2ACK1` + server random + 16-byte keyed MAC (BLAKE3 over PSK).
-- Directional keys: `bibavpn.v2.c2s` / `bibavpn.v2.s2c`.
-- On the wire: 12-byte nonce + ciphertext; plaintext is optional decoy `0..N` bytes then **inner payload** (padded frame or mux record, etc.).
-
 ## Biba v3 summary
 
-- **PSK required.** Client **`--proto 3`** (or invite); server uses the same PSK and **`--proto-domain`** (default string `default`).
-- **Handshake:** `0x03` ∥ `client_random` → `server_random` ∥ `MAC` (see § [Biba v2 vs v3](#biba-v2-vs-v3-handshake-and-control)).
+- **PSK required** on client and server. **`--proto`** is **`3`** (only supported value).
+- **Handshake:** variable-length HELLO (`0x03` …) and ACK (32 + 16 MAC + padding); see [Handshake](#handshake-after-http-upgrade).
 - **Session keys:** `bibavpn.v3.c2s` / `bibavpn.v3.s2c` with PSK + domain + both randoms.
-- **Control:** single-byte opcodes (`0x01`…`0x04`, `0x10`/`0x11`) **only inside AEAD** after the handshake.
-- **UDP datagrams:** still **`BIBA…` UDP_REQ/REP** inner layout; only encryption keys differ from v2.
+- **Control:** single-byte opcodes `0x01`…`0x04`, `0x10`/`0x11` **inside AEAD** after the handshake.
+- **UDP datagrams:** inner **`0x05` / `0x06`** records with SOCKS-like addressing.
 
 ## BibaV2.1 transport knobs
 
-Compatible with the same BibaV2 PSK/decoy when both ends match.
+These options shape TLS/WebSocket timing and framing; they apply on top of the v3 tunnel.
 
 - `--ws-ping-secs`, `--ws-ping-jitter-percent`, `--ws-binary-send-jitter-ms`
 - `--max-ws-binary` — cap outgoing WS binary; mux code reserves **9 bytes** for the mux record header when chunking TCP.
@@ -342,8 +341,8 @@ Compatible with the same BibaV2 PSK/decoy when both ends match.
 - `--ws-host`, `--ws-origin`, `--ws-user-agent`, `--ws-accept-language`, `--ws-header`
 - `--early-ws-frames`, `--junk-frames`
 - `--pin-cert` (client) — incompatible with `--insecure`
-- `--ws-path` — WebSocket path; token via **AUTH** (default `/ws`)
-- `--legacy-path-auth` (server) — accept old `/b/{token}` without AUTH (less safe)
+- `--ws-path` — WebSocket path; token via sealed **AUTH** (default `/ws`)
+- `--legacy-path-auth` (server) — accept old `/b/{token}` without sealed AUTH (less safe)
 - `--pad-mode random|http-buckets`
 - `--dummy-interval-secs` — idle empty padded frames (`0` = off)
 - `--decoy-gets`, `--decoy-gets-interval-secs`, `--decoy-gets-paths` — client-only decoy HTTPS fetches

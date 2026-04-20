@@ -14,8 +14,7 @@ walkthroughs see **[README.md](README.md)**. For contributor etiquette see
 - [What the project is](#what-the-project-is)
 - [Repository layout](#repository-layout)
 - [`bibavpn` crate modules](#bibavpn-crate-modules)
-- [BibaV2 (short)](#bibav2-short)
-- [Biba v3 (short)](#biba-v3-short)
+- [Biba v3 wire (short)](#biba-v3-wire-short)
 - [BibaV2.1 and transport knobs](#bibav21-and-transport-knobs)
 - [Build and run (local)](#build-and-run-local)
 - [Docker / Compose gotcha](#docker--compose-gotcha)
@@ -30,21 +29,22 @@ walkthroughs see **[README.md](README.md)**. For contributor etiquette see
 
 **BibaVPN** is a proxy stack: local **SOCKS5** (TCP `CONNECT` and
 `UDP ASSOCIATE`) and optional **HTTP CONNECT** → **TLS + WebSocket** → remote
-entry server → outbound **TCP or UDP** to the Internet. Optionally **BibaV2**
-(PSK, AEAD, decoy), **Biba v3** (opaque PSK hello/ACK, domain-separated KDF,
-sealed control frames — backward compatible with v2), and **BibaV2.1**
-transport knobs (WS ping, frame-size cap, custom headers, early noise) sit on
-top of the transport.
+entry server → outbound **TCP or UDP** to the Internet. The tunnel crypto is
+**Biba v3** only: shared **PSK**, opaque variable-length HELLO/ACK, ChaCha20-Poly1305,
+domain-separated KDF, sealed control opcodes, and v3-style inner UDP records.
+**BibaV2.1** transport knobs (WS ping, frame-size cap, custom headers, early noise)
+sit on top of the same WebSocket.
 
 **TCP — default:** many SOCKS connections share **one** TLS+WSS session
-(**TCP mux** in `tcp_mux.rs`). After `AUTH` and the optional BibaV2 preamble,
-the client sends `MUX_OPEN`; per-target opens use mux records (stream id,
+(**TCP mux** in `tcp_mux.rs`). After v3 HELLO/ACK and sealed **AUTH**, the
+client sends `MUX_OPEN`; per-target opens use mux records (stream id,
 flags, payload) inside padded frames, with window-based flow control. Use
 `--no-mux` for legacy **one WSS per SOCKS CONNECT** (`OPEN` + binary loop).
 
 **UDP** (e.g. DNS via SOCKS5 UDP) uses a **separate** shared WSS:
-`UDP_MUX_OPEN` (`protocol.rs`), then `UDP_REQ` / `UDP_REP` (`udp_mux.rs`).
-Same TLS/WebSocket fingerprint class as TCP from the client to the VPS.
+`UDP_MUX_OPEN` (`protocol.rs`), then v3 **`0x05` UDP_REQ** / **`0x06` UDP_REP**
+records (`udp_mux.rs`). Same TLS/WebSocket fingerprint class as TCP from the
+client to the VPS.
 
 **HTTP on the TLS port:** non-WebSocket requests are served as **camouflage**
 (`incoming.rs`, `camouflage.rs`): nginx-style responses, optional
@@ -61,9 +61,9 @@ Typical traffic path (TCP, mux):
 
 1. Application → **SOCKS5** (plain local hop).
 2. Client opens **WSS** to the configured `--ws-path` (default `/ws`); the
-   **token** travels in the `AUTH` binary (`protocol.rs`, `ws_auth.rs`), not
-   in the URL.
-3. Optional **BibaV2** HELLO/ACK and AEAD on frames.
+   **token** is sent in a **sealed v3 AUTH** frame after HELLO/ACK (`protocol.rs`,
+   `local_client.rs` / `server.rs`), not in the URL.
+3. **Biba v3** HELLO/ACK, then ChaCha20-Poly1305 on frames.
 4. `MUX_OPEN`, then stream `OPEN` / `DATA` / close; the server dispatches to
    per-stream TCP (`bridge_ws_tcp_mux_server`).
 
@@ -95,8 +95,8 @@ dedicated WSS.
 | `bibavpn/src/lib.rs`                                | Module exports                                                                                                         |
 | `bibavpn/src/bin/server.rs`                         | TLS accept; **first-byte HTTP vs WS** via `incoming`; AUTH; `wait_first_channel` → TCP bridge, TCP mux, or UDP mux     |
 | `bibavpn/src/bin/client.rs`                         | Client CLI; invite merge for `ws_path`, `pad_mode`, `dummy_interval_secs`, decoy flags                                 |
-| `bibavpn/src/bin/mint_invite.rs`                    | `bibavpn-mint-invite`: print `biba://` with `INVITE_PROTO` / `INVITE_PROTO_DOMAIN` for v3 invites                      |
-| `bibavpn/src/crypto_layer.rs`                       | BibaV2 + v3: BLAKE3 derive, v2 HELLO/ACK + v3 opaque hello/ACK, MAC, domain-aware `SessionCrypto`, decoy               |
+| `bibavpn/src/bin/mint_invite.rs`                    | `bibavpn-mint-invite`: print `biba://` (`INVITE_PROTO` / `INVITE_PROTO_DOMAIN`; defaults match v3)                    |
+| `bibavpn/src/crypto_layer.rs`                       | Biba v3: BLAKE3 derive, opaque HELLO/ACK (variable trailing padding), MAC, domain-aware `SessionCrypto`, decoy        |
 | `bibavpn/src/incoming.rs`                           | Read HTTP request on TLS; WebSocket 101 + `WebSocketStream::from_partially_read`; or serve camouflage GET/HEAD         |
 | `bibavpn/src/camouflage.rs`                         | Shared HTML / 404 bodies for rejects and static fallbacks                                                              |
 | `bibavpn/src/ws_auth.rs`                            | Server waits for `AUTH` frame (timeout, skip noise)                                                                    |
@@ -106,55 +106,40 @@ dedicated WSS.
 | `bibavpn/src/socks5.rs`                             | SOCKS5 frontend (`CONNECT` + `UDP ASSOCIATE` replies)                                                                  |
 | `bibavpn/src/local_client.rs`                       | SOCKS dispatch, mux slot, UDP mux, decoy spawn, `LocalClientOptions`                                                   |
 | `bibavpn/src/udp_mux.rs`                            | Client driver + `bridge_ws_udp_mux_server`; padded frames + optional `pad_mode`                                        |
-| `bibavpn/src/protocol.rs`                           | `OPEN`, `AUTH`, `UDP_MUX_OPEN`, `UDP_REQ`/`UDP_REP`, ATYP helpers                                                      |
+| `bibavpn/src/protocol.rs`                           | v3 sealed opcodes, `UDP_MUX_OPEN`, v3 `UDP_REQ`/`UDP_REP` (`0x05`/`0x06`), ATYP helpers                                 |
 | `bibavpn/src/tls_util.rs`, `frame.rs`, `stealth.rs` | TLS profiles, `PadMode`, WS upgrade (ordered headers, UA / Sec-CH)                                                     |
 | `bibavpn/src/ws_bridge.rs`                          | WebSocket ↔ TCP bridge (legacy per-connection TCP); ping + dummy task; `pad_mode`                                      |
 | `bibavpn/src/http_connect.rs`                       | HTTP `CONNECT` on a separate listen port                                                                               |
-| `bibavpn/src/invite_uri.rs`                         | `InviteV1`: `proto` (default `2`), optional `proto_domain`, plus `ws_path`, `pad_mode`, `dummy_interval_secs`          |
+| `bibavpn/src/invite_uri.rs`                         | `InviteV1`: `proto` (default `3`), optional `proto_domain`, plus `ws_path`, `pad_mode`, `dummy_interval_secs`            |
 | `bibavpn/src/start_json_config.rs`                  | JSON start config (same shape used by Android `nativeStart` / `bibavpn-jni`)                                           |
 | `bibavpn/src/retry.rs`                              | Exponential backoff between outbound TCP+TLS+WSS attempts and optional WS timing jitter                                |
 | `bibavpn/src/outbound_protect.rs`                   | Hook for marking outbound TCP sockets before `connect` (Android `VpnService.protect`)                                  |
 
-## BibaV2 (short)
+## Biba v3 wire (short)
 
-- Enabled with matching `--psk` and `--decoy-max` on client and server.
-- HELLO: magic `BIBV2HL1` + 32-byte client random.
-- ACK: `BIBV2ACK1` + server random + 16-byte keyed MAC (BLAKE3 over PSK).
-- Directional keys: `bibavpn.v2.c2s` / `bibavpn.v2.s2c`.
-- On the wire: 12-byte nonce + ciphertext; plaintext is optional decoy
-  `0..N` bytes followed by the **inner payload** (padded frame or mux record,
-  etc.).
-- Unit tests in `crypto_layer`, `frame`, `protocol` (AUTH); wire-format
-  changes need client **and** server updates.
-
-## Biba v3 (short)
-
-- **Requires PSK** on both ends. Client selects v3 with `--proto 3` or
-  invite `proto: 3`.
-- **Handshake (NewPath):** the first meaningful client Binary after optional
-  noise is either legacy `AUTH` (v2 token path) or `0x03` + 32 B client
-  random (opaque hello). Server answers v3 with 32 B server random + 16 B
-  MAC (no ASCII ACK magic). MAC and session keys use a **domain string**
-  mixed into the KDF (`bibavpn.v3.mac.psk`, `bibavpn.v3.c2s`,
-  `bibavpn.v3.s2c`).
+- **Requires PSK** on both ends. Client **`--proto`** defaults to **`3`**; invites
+  default to **`proto: 3`**.
+- **Handshake:** after optional noise, the first client Binary is v3 **HELLO**:
+  `0x03` ∥ 32 B client random ∥ `pad_len` ∥ up to 64 B random padding (total
+  length is **not** fixed). Server **ACK**: 32 B server random ∥ 16 B MAC ∥
+  `pad_len` ∥ up to 64 B padding. MAC and session keys use a **domain string**
+  in the KDF (`bibavpn.v3.mac.psk`, `bibavpn.v3.c2s`, `bibavpn.v3.s2c`).
 - **Server:** `--proto-domain <label>` (default `default`; must not be empty
-  after trim). **Client / invite:** `--proto-domain` or `proto_domain` in
-  JSON; if the client field is empty, the effective domain is the **SNI**
-  string — it must match what the server uses.
-- **Control plane** (`AUTH`, TCP `OPEN` / `OPEN_OK` / `OPEN_ERR`,
-  `MUX_OPEN`, `UDP_MUX_OPEN`): inner **single-byte opcodes** + payloads,
-  carried **inside AEAD** after the handshake — not the plaintext
-  `BIBA\x01…` magics used in v2 for those steps.
-- **Data plane:** same padded inner frames and mux/UDP records as v2.
-  `UDP_REQ` / `UDP_REP` still use the legacy `BIBA…` inner layout inside the
-  ciphertext (handshake is v3; datagram magics not yet migrated).
-- `--print-invite-uri` today still emits `proto: 2` and omits `proto_domain`.
-  For v3 invites use `bibavpn-mint-invite` with `INVITE_PROTO=3` and optional
-  `INVITE_PROTO_DOMAIN`, or hand-edit JSON before sealing.
+  after trim). **Client / invite:** `--proto-domain` or `proto_domain` in JSON;
+  if empty, the effective domain is the **SNI** — it must match the server.
+- **Control plane** (`AUTH`, TCP `OPEN` / `OPEN_OK` / `OPEN_ERR`, `MUX_OPEN`,
+  `UDP_MUX_OPEN`): inner **single-byte opcodes** + payloads, **inside AEAD**
+  after the handshake (see `encode_v3_*` / `decode_v3_*` in `protocol.rs`).
+- **UDP datagrams:** inner layout starts with **`0x05` (REQ)** or **`0x06` (REP)**,
+  then `xid`, SOCKS-like ATYP host/port, payload — not ASCII `BIBA…` magics.
+- **`--print-invite-uri`** embeds **`proto: 3`** (same defaults as
+  `bibavpn-mint-invite`).
+- Unit tests in `crypto_layer`, `frame`, `protocol`; wire-format changes need
+  client **and** server updates.
 
 ## BibaV2.1 and transport knobs
 
-Compatible with the same BibaV2 PSK/decoy when both ends match.
+Compatible with the same PSK/decoy settings when both ends match.
 
 - `--ws-ping-secs`, `--ws-ping-jitter-percent`, `--ws-binary-send-jitter-ms`
 - `--max-ws-binary` — cap outgoing WS binary (see
@@ -168,8 +153,8 @@ Compatible with the same BibaV2 PSK/decoy when both ends match.
 - `--pin-cert` (client) — incompatible with `--insecure`
 - `--ws-path` / server `--ws-path` — WebSocket path; token via `AUTH`
   (default `/ws`)
-- Client `--proto` (`2` default, `3` = v3) and `--proto-domain` (v3 KDF
-  label; empty → SNI)
+- Client `--proto` (only **`3`** is supported) and `--proto-domain` (KDF label;
+  empty → SNI)
 - Server `--proto-domain` — v3 KDF label (default `default`); must match
   clients using v3
 - Server `--legacy-path-auth` — accept the old `/b/{token}` URL without
@@ -185,7 +170,7 @@ Compatible with the same BibaV2 PSK/decoy when both ends match.
 `rust-toolchain.toml` pins a stable Rust version for reproducible builds.
 Docker images use a matching or newer toolchain.
 
-Wire layouts (padded frame, BibaV2, `AUTH`, `OPEN`, mux, UDP mux) are in
+Wire layouts (padded frame, v3 crypto, sealed `AUTH`, `OPEN`, mux, v3 UDP) are in
 **[PROTOCOL.md](PROTOCOL.md)**.
 
 ## Build and run (local)
@@ -245,7 +230,7 @@ BibaVPN:
 | `scripts/docker-smoke.sh`          | `docker compose up`, `curl` via SOCKS and HTTP proxy, `down`                                            |
 | `scripts/udp-socks-smoke.sh`       | TCP via SOCKS + UDP DNS over SOCKS                                                                      |
 | `scripts/wsl-test.sh`              | Local smoke (plain / PSK) on WSL                                                                        |
-| `scripts/wsl-proto-v3-smoke.sh`    | WSL: v3 then v2 TCP via SOCKS + `curl` (needs release binaries + `openssl`, `python3`, `fuser`)         |
+| `scripts/wsl-proto-v3-smoke.sh`    | WSL: local SOCKS + `curl` smoke (release binaries + `openssl`, `python3`, `fuser`; script name is legacy) |
 | `scripts/wsl-local-bench.sh`       | 64 MiB HTTP direct vs SOCKS+WSS throughput (run in WSL from repo root)                                  |
 | `scripts/wsl-udp-socks-bench.sh`   | SOCKS UDP throughput bench on WSL                                                                       |
 | `scripts/remote-deploy.sh`         | Sync + build + `Dockerfile.server.binary` deploy                                                        |
@@ -277,9 +262,9 @@ The server keeps a **pending map** (by destination `SocketAddr`) to correlate
 
 - `scripts/docker-smoke.sh` is the cheapest end-to-end check that nothing
   regressed at the TLS+WSS layer.
-- `scripts/wsl-proto-v3-smoke.sh` exercises both v3 and v2 handshakes on
-  release binaries — run it after any change to `crypto_layer.rs`,
-  `ws_auth.rs`, `protocol.rs`, or the `--proto*` CLI flags.
+- `scripts/wsl-proto-v3-smoke.sh` is a quick local handshake + SOCKS check on
+  release binaries — run it after changes to `crypto_layer.rs`, `protocol.rs`,
+  or invite / CLI defaults.
 - `scripts/wsl-local-bench.sh` is a quick sanity check for throughput after
   changes to `frame.rs`, `tcp_mux.rs`, or `ws_bridge.rs`.
 
@@ -317,8 +302,8 @@ See **[SECURITY.md](SECURITY.md)** for the disclosure policy.
 - SOCKS UDP (DNS) via UDP mux (`scripts/udp-socks-smoke.sh`).
 - WSL local bench: direct HTTP vs SOCKS+WSS 64 MiB
   (`scripts/wsl-local-bench.sh`).
-- WSL v3 + v2 regression (`scripts/wsl-proto-v3-smoke.sh`): release
-  server/client, SOCKS `curl` over v3 then v2.
+- WSL v3 smoke (`scripts/wsl-proto-v3-smoke.sh`): release server/client, SOCKS
+  `curl` over localhost.
 - Speedtest via SOCKS (`scripts/speedtest-via-socks.py` in a venv).
 - Server/client images and slim remote image via
   `docker/Dockerfile.server.binary`.
