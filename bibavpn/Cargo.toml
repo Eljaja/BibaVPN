@@ -54,3 +54,5 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hex = "0.4"

@@ -14,6 +14,7 @@ use bibavpn::local_client::{
 };
 use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile};
 use clap::Parser;
+use base64::Engine;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::info;
@@ -159,6 +160,18 @@ struct Args {
     /// Domain label for v3 PSK KDF (must match server `--proto-domain`). Empty = use SNI.
     #[arg(long, default_value = "")]
     proto_domain: String,
+
+    /// REALITY mode: server's public key (base64, 32-byte X25519).
+    #[arg(long)]
+    reality_public_key: Option<String>,
+
+    /// REALITY mode: short ID (hex, 16 hex chars = 8 bytes). Omit for random.
+    #[arg(long)]
+    reality_short_id: Option<String>,
+
+    /// REALITY mode: front domain for SNI (e.g. wikipedia.org); must match server target SNI.
+    #[arg(long)]
+    reality_target: Option<String>,
 }
 
 #[tokio::main]
@@ -174,6 +187,16 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     if args.from_invite.is_some() != args.invite_passphrase.is_some() {
         anyhow::bail!("use --from-invite and --invite-passphrase together");
+    }
+
+    let reality_any = args.reality_target.is_some()
+        || args.reality_public_key.is_some()
+        || args.reality_short_id.is_some();
+    if reality_any {
+        anyhow::ensure!(
+            args.reality_target.is_some() && args.reality_public_key.is_some(),
+            "REALITY mode requires both --reality-target and --reality-public-key"
+        );
     }
 
     let mut extra = Vec::new();
@@ -336,6 +359,30 @@ async fn main() -> anyhow::Result<()> {
         Some(buf)
     };
 
+    let reality_public_key: Option<[u8; 32]> = match args.reality_public_key.as_ref() {
+        None => None,
+        Some(pubkey_b64) => {
+            let pubkey_bytes = base64::engine::general_purpose::STANDARD
+                .decode(pubkey_b64.trim())
+                .context("decode --reality-public-key (base64)")?;
+            anyhow::ensure!(pubkey_bytes.len() == 32, "reality public key must be 32 bytes");
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&pubkey_bytes);
+            Some(arr)
+        }
+    };
+
+    let reality_short_id: Option<[u8; 8]> = match args.reality_short_id.as_ref() {
+        None => None,
+        Some(s) => {
+            let bytes = hex::decode(s.trim()).context("decode --reality-short-id (hex)")?;
+            anyhow::ensure!(bytes.len() == 8, "short id must be 8 bytes (16 hex digits)");
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&bytes);
+            Some(arr)
+        }
+    };
+
     let opts = LocalClientOptions {
         server_host,
         server_port,
@@ -372,6 +419,9 @@ async fn main() -> anyhow::Result<()> {
         decoy_gets_paths,
         proto,
         proto_domain,
+        reality_target: args.reality_target,
+        reality_public_key,
+        reality_short_id,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

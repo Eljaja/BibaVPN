@@ -19,6 +19,7 @@ pub mod stealth;
 pub mod tcp_mux;
 mod tcp_mux_roadmap;
 pub mod tls_util;
+pub mod reality;
 pub mod udp_mux;
 pub mod ws_auth;
 pub mod ws_bridge;
@@ -27,6 +28,12 @@ pub use frame::{
     read_padded_frame, write_padded_frame, write_padded_frame_with_mode, FrameError, PadMode,
 };
 pub use invite_uri::{decode_invite_v1, encode_invite_v1, InviteV1};
+pub use reality::{
+    RealityClientConfig, RealityServerConfig, TlsFingerprint, RealitySession,
+    bridge_reality_server, encode_client_hello, decode_server_hello,
+    extract_sni, is_short_id_allowed, REALITY_MAGIC, REALITY_VERSION,
+    spiderx_fetch, spawn_spiderx, parse_target, create_tls_connector,
+};
 pub use start_json_config::{
     local_client_options_from_json_str, local_client_options_from_json_str_with_binds,
 };

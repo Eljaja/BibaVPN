@@ -354,5 +354,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         decoy_gets_paths,
         proto,
         proto_domain,
+        reality_target: None,
+        reality_public_key: None,
+        reality_short_id: None,
     })
 }

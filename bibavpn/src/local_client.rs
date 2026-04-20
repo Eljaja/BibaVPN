@@ -145,6 +145,12 @@ pub struct LocalClientOptions {
     pub proto: u8,
     /// Domain label for v3 PSK KDF; empty = use `sni`.
     pub proto_domain: String,
+    /// REALITY: front domain / SNI (e.g. wikipedia.org).
+    pub reality_target: Option<String>,
+    /// REALITY: server's public key (32 bytes).
+    pub reality_public_key: Option<[u8; 32]>,
+    /// REALITY: short ID (8 bytes).
+    pub reality_short_id: Option<[u8; 8]>,
 }
 
 #[derive(Clone)]
@@ -182,6 +188,9 @@ struct ClientCfg {
     decoy_gets_paths: Vec<String>,
     proto: u8,
     proto_domain: String,
+    reality_target: Option<String>,
+    reality_public_key: Option<[u8; 32]>,
+    reality_short_id: Option<[u8; 8]>,
 }
 
 impl ClientCfg {
@@ -234,6 +243,67 @@ pub fn normalize_ws_path(s: &str) -> String {
     } else {
         format!("/{t}")
     }
+}
+
+/// REALITY handshake: send client hello with public key + short ID, receive server hello
+async fn reality_client_handshake(
+    ws: &mut ClientWs,
+    cfg: &ClientCfg,
+) -> anyhow::Result<([u8; 32], [u8; 8])> {
+    use crate::reality::encode_client_hello;
+    use crate::reality::decode_server_hello;
+    use x25519_dalek::{PublicKey, EphemeralSecret};
+    use rand::rngs::OsRng;
+
+    // Get server's expected public key from config
+    let server_expected_pubkey = cfg.reality_public_key
+        .ok_or_else(|| anyhow::anyhow!("REALITY: no server public key configured"))?;
+
+    // Generate ephemeral keypair for this session
+    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+    let ephemeral_public = PublicKey::from(&ephemeral_secret);
+
+    let short_id = cfg.reality_short_id.unwrap_or_else(|| {
+        let mut id = [0u8; 8];
+        let bytes = rand::random::<[u8; 8]>();
+        id.copy_from_slice(&bytes);
+        id
+    });
+
+    // Build client HELLO: [version:1][pubkey:32][short_id:8]
+    let client_hello = encode_client_hello(&short_id, ephemeral_public.as_bytes());
+
+    // Send client hello
+    ws.send(Message::Binary(bytes::Bytes::from(client_hello)))
+        .await
+        .context("send REALITY client hello")?;
+
+    // Wait for server hello
+    let msg = ws
+        .next()
+        .await
+        .context("server closed during REALITY handshake")??
+        .into_binary()
+        .context("expected binary server hello")?;
+
+    let server_pubkey = decode_server_hello(&msg)?;
+
+    // Verify server's public key matches expected
+    if server_pubkey != server_expected_pubkey {
+        anyhow::bail!("REALITY: server public key mismatch - possible MITM attack!");
+    }
+
+    // Compute shared secret
+    let server_public = PublicKey::from(server_pubkey);
+    let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+    let mut session_key = [0u8; 32];
+    session_key.copy_from_slice(shared_secret.as_bytes());
+
+    info!(
+        "REALITY handshake complete, session key derived, server verified"
+    );
+
+    Ok((session_key, short_id))
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -475,6 +545,11 @@ async fn connect_tcp_mux_handle(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
 ) -> anyhow::Result<()> {
+    // Check if REALITY mode is enabled
+    if cfg.reality_target.is_some() {
+        return connect_reality_tcp_mux_handle(cfg, tcp_mux_slot).await;
+    }
+
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         let res: anyhow::Result<()> = async {
@@ -547,6 +622,113 @@ async fn connect_tcp_mux_handle(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tcp mux: connect failed")))
+}
+
+/// REALITY mode: connect to server and perform REALITY handshake
+async fn connect_reality_tcp_mux_handle(
+    cfg: &Arc<ClientCfg>,
+    tcp_mux_slot: &TcpMuxSlot,
+) -> anyhow::Result<()> {
+    use rustls::pki_types::ServerName;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::client_async;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
+        let res: anyhow::Result<()> = async {
+            let _target = cfg.reality_target.as_ref().expect("reality target");
+            let domain = ServerName::try_from(cfg.sni.clone())?;
+            let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
+            let tcp = crate::outbound_protect::tcp_connect_host_protected(
+                &cfg.server_host,
+                cfg.server_port,
+            )
+            .await
+            .context("connect server")?;
+            let _ = tcp.set_nodelay(true);
+            let tls = connector.connect(domain, tcp).await.context("tls")?;
+
+            let path = cfg.ws_path.clone();
+            let ws_host = cfg.ws_host.as_deref();
+            let ws_origin = cfg.ws_origin.as_deref();
+            let ws_ua = cfg.ws_user_agent.as_deref();
+            let ws_al = cfg.ws_accept_language.as_deref();
+            let extra = cfg.ws_extra_headers.as_ref().clone();
+            let req = build_websocket_request(WsHandshakeParams {
+                host_for_tcp: &cfg.server_host,
+                port: cfg.server_port,
+                path: &path,
+                sni: &cfg.sni,
+                host_header: ws_host,
+                origin: ws_origin,
+                user_agent: ws_ua,
+                accept_language: ws_al,
+                extra_headers: &extra,
+                tls_profile: cfg.tls_profile,
+            });
+
+            let mut ws = client_async(req, tls)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+                .context("websocket")?
+                .0;
+
+            info!(
+                target: "bibavpn_client",
+                server = %cfg.server_host,
+                port = cfg.server_port,
+                "REALITY: WSS up, key exchange"
+            );
+
+            let (_session_key, short_id) = reality_client_handshake(&mut ws, cfg).await?;
+
+            info!(
+                "REALITY: handshake complete, short_id={:02x?}",
+                &short_id[..4]
+            );
+
+            let open = tcp_mux::encode_mux_open();
+            ws.send(Message::Binary(Bytes::from(open)))
+                .await
+                .context("send MUX_OPEN")?;
+
+            let mcfg = MuxClientConfig {
+                max_pad: cfg.max_pad,
+                decoy_max: cfg.decoy_max,
+                max_ws_binary: cfg.max_ws_binary,
+                ws_ping_secs: cfg.ws_ping_secs,
+                ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
+                transport_v2: false,
+                pad_mode: cfg.pad_mode,
+                dummy_interval_secs: cfg.dummy_interval_secs,
+            };
+
+            let (sid, h) = tcp_mux::spawn_tcp_mux_client(ws, None, mcfg, tcp_mux_slot.clone());
+
+            info!(
+                target: "bibavpn_client",
+                session_id = sid,
+                server = %cfg.server_host,
+                "REALITY tunnel ready"
+            );
+            *tcp_mux_slot.lock().await = Some((sid, h));
+            Ok(())
+        }
+        .await;
+
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
+                    break;
+                }
+                sleep_outbound_backoff(attempt).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("REALITY tcp mux: connect failed")))
 }
 
 /// Build TLS config and run SOCKS5 (+ optional HTTP CONNECT) until `shutdown` becomes `true`.
@@ -633,6 +815,9 @@ pub async fn run_local_client(
         decoy_gets_paths: opts.decoy_gets_paths.clone(),
         proto: opts.proto,
         proto_domain: opts.proto_domain.clone(),
+        reality_target: opts.reality_target.clone(),
+        reality_public_key: opts.reality_public_key,
+        reality_short_id: opts.reality_short_id,
     });
 
     if cfg.decoy_gets {

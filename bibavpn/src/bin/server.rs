@@ -17,6 +17,8 @@ use bibavpn::protocol::{
 use bibavpn::{read_padded_frame, write_padded_frame_with_mode};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
+use bibavpn::reality::{bridge_reality_server, extract_sni, RealityServerConfig};
+use base64::Engine;
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -137,6 +139,22 @@ struct Args {
     /// Biba v3 domain string for PSK key separation (must match client / invite). Default `default`.
     #[arg(long, default_value = "default")]
     proto_domain: String,
+
+    /// REALITY mode: target to steal TLS from (e.g., wikipedia.org:443)
+    #[arg(long)]
+    reality_target: Option<String>,
+
+    /// REALITY mode: server private key (base64 encoded X25519)
+    #[arg(long)]
+    reality_private_key: Option<String>,
+
+    /// REALITY mode: allowed short IDs (hex, comma-separated). Empty = any.
+    #[arg(long)]
+    reality_short_ids: Option<String>,
+
+    /// REALITY mode: server names for SNI (comma-separated). Default: extracted from target.
+    #[arg(long)]
+    reality_server_names: Option<String>,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -244,6 +262,81 @@ async fn main() -> anyhow::Result<()> {
     let camouflage_dir = args.camouflage_dir.clone();
     let camouflage_url = args.camouflage_url.clone();
 
+    // ===== REALITY Mode Setup =====
+    let reality_config: Option<RealityServerConfig> = if let (Some(target), Some(privkey_b64)) = (
+        args.reality_target.as_ref(),
+        args.reality_private_key.as_ref(),
+    ) {
+        let privkey = base64::engine::general_purpose::STANDARD
+            .decode(privkey_b64)
+            .context("decode reality private key")?;
+
+        if privkey.len() != 32 {
+            anyhow::bail!("reality private key must be 32 bytes");
+        }
+
+        let mut privkey_arr = [0u8; 32];
+        privkey_arr.copy_from_slice(&privkey);
+
+        let server_names = args
+            .reality_server_names
+            .as_ref()
+            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_else(|| vec![extract_sni(target)]);
+
+        let short_ids: Vec<[u8; 8]> = args
+            .reality_short_ids
+            .as_ref()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|hex_str| {
+                        let hex_str = hex_str.trim();
+                        if hex_str.is_empty() {
+                            return Some([0u8; 8]); // empty = allow any
+                        }
+                        let bytes = hex::decode(hex_str).ok()?;
+                        if bytes.len() != 8 {
+                            return None;
+                        }
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&bytes);
+                        Some(arr)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        info!(
+            "REALITY mode: target={}, server_names={:?}, short_ids={} entries",
+            target,
+            server_names,
+            short_ids.len()
+        );
+
+        Some(RealityServerConfig {
+            private_key: privkey_arr,
+            target: target.clone(),
+            server_names,
+            short_ids,
+            min_client_ver: None,
+            max_client_ver: None,
+            max_time_diff: 0,
+        })
+    } else {
+        None
+    };
+
+    // Start SpiderX background crawler if REALITY is enabled
+    if let Some(ref cfg) = reality_config {
+        let target = cfg.target.clone();
+        let spiderx_interval = 30u64; // Fetch every 30 seconds
+        tokio::spawn(async move {
+            use bibavpn::reality::spawn_spiderx;
+            spawn_spiderx(target, spiderx_interval).await;
+        });
+        info!("SpiderX background crawler started for {}", cfg.target);
+    }
+
     loop {
         let (stream, peer) = listener.accept().await?;
         let acceptor = acceptor.clone();
@@ -255,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let psk_conn = psk.clone();
         let proto_domain = args.proto_domain.clone();
+        let reality_cfg = reality_config.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_one(
                 stream,
@@ -276,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
                 dummy_interval_secs,
                 camo,
                 proto_domain,
+                reality_cfg,
             )
             .await
             {
@@ -305,6 +400,7 @@ async fn handle_one(
     dummy_interval_secs: u64,
     camo: CamouflageServeConfig,
     proto_domain: String,
+    reality_config: Option<RealityServerConfig>,
 ) -> anyhow::Result<()> {
     let tls = acceptor.accept(tcp).await.context("tls accept")?;
 
@@ -313,6 +409,21 @@ async fn handle_one(
     else {
         return Ok(());
     };
+
+    if let Some(ref reality_cfg) = reality_config {
+        info!("REALITY mode: forwarding to {}", reality_cfg.target);
+        return bridge_reality_server(
+            ws,
+            reality_cfg.clone(),
+            max_pad,
+            decoy_max,
+            pad_mode,
+            ws_ping_secs,
+            ws_ping_jitter_percent,
+        )
+        .await
+        .context("REALITY bridge");
+    }
 
     let domain_trim = proto_domain.trim();
     if domain_trim.is_empty() {
