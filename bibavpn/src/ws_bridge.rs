@@ -20,7 +20,7 @@ use crate::crypto_layer::SessionCrypto;
 use crate::frame::PadMode;
 use crate::protocol::{decode_open_err, is_open_ok};
 use crate::retry::{maybe_ws_binary_send_jitter, ws_ping_period_duration};
-use crate::{read_padded_frame, write_padded_frame_with_mode};
+use crate::{read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode};
 
 pub type SharedCrypto = Arc<SessionCrypto>;
 
@@ -187,20 +187,32 @@ where
                             max_ws_binary.saturating_mul(4)
                         );
                     }
-                    let raw = match (&crypto_up, end) {
-                        (Some(c), TunnelEnd::Client) => c
-                            .open_server_to_client(b.as_ref())
-                            .await
-                            .context("v2 open s2c")?,
-                        (Some(c), TunnelEnd::Server) => c
-                            .open_client_to_server(b.as_ref())
-                            .await
-                            .context("v2 open c2s")?,
-                        (None, _) => b.to_vec(),
-                    };
-                    let payload = read_padded_frame(&raw).context("padded frame")?;
-                    if !payload.is_empty() {
-                        tcp_write.write_all(&payload).await?;
+                    match (&crypto_up, end) {
+                        (Some(c), TunnelEnd::Client) => {
+                            let raw = c
+                                .open_server_to_client(b.as_ref())
+                                .context("v2 open s2c")?;
+                            let payload = read_padded_frame_into(raw).context("padded frame")?;
+                            if !payload.is_empty() {
+                                tcp_write.write_all(&payload).await?;
+                            }
+                        }
+                        (Some(c), TunnelEnd::Server) => {
+                            let raw = c
+                                .open_client_to_server(b.as_ref())
+                                .context("v2 open c2s")?;
+                            let payload = read_padded_frame_into(raw).context("padded frame")?;
+                            if !payload.is_empty() {
+                                tcp_write.write_all(&payload).await?;
+                            }
+                        }
+                        (None, _) => {
+                            let payload =
+                                read_padded_frame_borrow(b.as_ref()).context("padded frame")?;
+                            if !payload.is_empty() {
+                                tcp_write.write_all(payload).await?;
+                            }
+                        }
                     }
                 }
                 Message::Ping(p) => {
@@ -233,12 +245,10 @@ where
                 let blob = match (&crypto_dn, end) {
                     (Some(c), TunnelEnd::Client) => bytes::Bytes::from(
                         c.seal_client_to_server(&wire)
-                            .await
                             .context("v2 seal c2s")?,
                     ),
                     (Some(c), TunnelEnd::Server) => bytes::Bytes::from(
                         c.seal_server_to_client(&wire)
-                            .await
                             .context("v2 seal s2c")?,
                     ),
                     (None, _) => bytes::Bytes::from(std::mem::take(&mut wire)),
@@ -282,11 +292,11 @@ where
                 continue;
             }
             let blob = match (&crypto_dum, end) {
-                (Some(c), TunnelEnd::Client) => match c.seal_client_to_server(&wire).await {
+                (Some(c), TunnelEnd::Client) => match c.seal_client_to_server(&wire) {
                     Ok(b) => bytes::Bytes::from(b),
                     Err(_) => continue,
                 },
-                (Some(c), TunnelEnd::Server) => match c.seal_server_to_client(&wire).await {
+                (Some(c), TunnelEnd::Server) => match c.seal_server_to_client(&wire) {
                     Ok(b) => bytes::Bytes::from(b),
                     Err(_) => continue,
                 },

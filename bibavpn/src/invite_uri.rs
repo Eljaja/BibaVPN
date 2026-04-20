@@ -24,7 +24,7 @@ pub struct InviteV1 {
     /// TLS SNI and default WS trust name.
     pub sni: String,
     pub token: String,
-    /// Wire protocol: `2` = classic AUTH + optional BibaV2; `3` = opaque PSK hello + sealed control.
+    /// Wire protocol: only `3` (opaque PSK hello + sealed control).
     #[serde(default = "default_invite_proto")]
     pub proto: u8,
     /// Domain label for v3 PSK KDF (omit to let client default to SNI).
@@ -62,7 +62,7 @@ pub struct InviteV1 {
 }
 
 fn default_invite_proto() -> u8 {
-    2
+    3
 }
 
 fn default_tls_profile() -> String {
@@ -136,7 +136,7 @@ mod tests {
             server: "203.0.113.7:8443".into(),
             sni: "vpn.example.com".into(),
             token: "tok".into(),
-            proto: 2,
+            proto: 3,
             proto_domain: None,
             psk: Some("sec".into()),
             decoy_max: 8,

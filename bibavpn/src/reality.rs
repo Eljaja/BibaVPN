@@ -2,35 +2,28 @@
 //! Based on: https://github.com/XTLS/REALITY
 //!
 //! REALITY is a protocol that "steals" TLS from a target website.
-//! The server relays TLS handshake to a target (e.g., wikipedia.org:443)
+//! The server relays TLS handshake to a target (e.g., vk.com:443)
 //! and the client receives the REAL certificate from that target.
 //! To DPI, the traffic looks like normal HTTPS to the target website.
 
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
-use rustls::crypto::{CryptoProvider, Ring};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::{DigitallySignedStruct, RootCertStore, ServerConfig};
+use rustls::DigitallySignedStruct;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use tracing::{info, warn};
+use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::crypto_layer::SessionCrypto;
 use crate::frame::PadMode;
-use crate::ws_bridge::TunnelEnd;
 
 /// REALITY protocol magic bytes
 pub const REALITY_MAGIC: &[u8] = b"REAL1";
@@ -39,7 +32,7 @@ pub const REALITY_VERSION: u8 = 1;
 /// REALITY server configuration
 #[derive(Debug, Clone)]
 pub struct RealityServerConfig {
-    /// Target website to steal TLS from (e.g., "wikipedia.org:443")
+    /// Target website to steal TLS from (e.g., "vk.com:443")
     pub target: String,
     /// Accepted server names (SNI) - must include target's SNI
     pub server_names: Vec<String>,
@@ -65,13 +58,15 @@ impl RealityServerConfig {
 
     /// Get public key as hex string (for client config)
     pub fn public_key_hex(&self) -> String {
-        let public = PublicKey::from(StaticSecret::from(self.private_key));
+        let secret = StaticSecret::from(self.private_key);
+        let public = PublicKey::from(&secret);
         hex::encode(public.to_bytes())
     }
 
     /// Generate short ID from public key (first 8 bytes)
     pub fn generate_short_id(&self) -> [u8; 8] {
-        let public = PublicKey::from(StaticSecret::from(self.private_key));
+        let secret = StaticSecret::from(self.private_key);
+        let public = PublicKey::from(&secret);
         let mut sid = [0u8; 8];
         sid.copy_from_slice(&public.to_bytes()[..8]);
         sid
@@ -126,6 +121,7 @@ pub enum CertVerifyResult {
 }
 
 /// REALITY TLS server that forwards to target
+#[allow(dead_code)]
 pub struct RealityTlsServer {
     target: String,
     server_names: Vec<String>,
@@ -144,7 +140,7 @@ impl RealityTlsServer {
     }
 
     /// Handle incoming TLS connection and forward to target
-    pub async fn handle_connection<S>(&self, stream: S) -> anyhow::Result<()>
+    pub async fn handle_connection<S>(&self, _stream: S) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
@@ -161,8 +157,9 @@ impl RealityTlsServer {
         let connector = create_tls_connector(&target_host)?;
         
         // Do TLS handshake with target
-        let target_tls = connector
-            .connect(target_host.parse().unwrap(), target_stream)
+        let sn = ServerName::try_from(target_host.clone())?;
+        let _target_tls = connector
+            .connect(sn, target_stream)
             .await
             .context("TLS handshake with target")?;
 
@@ -175,7 +172,7 @@ impl RealityTlsServer {
     }
 }
 
-/// Parse target string like "wikipedia.org:443" into host and port
+/// Parse target string like "vk.com:443" into host and port
 pub fn parse_target(target: &str) -> anyhow::Result<(String, u16)> {
     let parts: Vec<&str> = target.rsplitn(2, ':').collect();
     if parts.len() != 2 {
@@ -187,14 +184,7 @@ pub fn parse_target(target: &str) -> anyhow::Result<(String, u16)> {
 }
 
 /// Create TLS connector for target
-pub fn create_tls_connector(server_name: &str) -> anyhow::Result<TlsConnector> {
-    // Load system root certs
-    let mut root_store = RootCertStore::empty();
-    let loaded = rustls_native_certs::load_native_certs()?;
-    for cert in loaded.certs {
-        let _ = root_store.add(cert);
-    }
-
+pub fn create_tls_connector(_server_name: &str) -> anyhow::Result<TlsConnector> {
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
@@ -204,6 +194,7 @@ pub fn create_tls_connector(server_name: &str) -> anyhow::Result<TlsConnector> {
 }
 
 /// Insecure verifier - we verify based on REALITY logic, not standard TLS
+#[derive(Debug)]
 struct InsecureVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
@@ -255,10 +246,11 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 }
 
 /// REALITY Session - holds state for one client connection
+#[allow(dead_code)]
 pub struct RealitySession {
     /// Server private key
     private_key: [u8; 32],
-    /// Target to forward to (e.g., "wikipedia.org:443")
+    /// Target to forward to (e.g., "vk.com:443")
     target: String,
     /// Allowed server names
     server_names: Vec<String>,
@@ -297,12 +289,12 @@ impl RealitySession {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         // Wait for client HELLO with short ID and public key
-        let msg = ws
-            .next()
-            .await
-            .context("ws closed before REALITY HELLO")??
-            .into_binary()
-            .context("expected binary")?;
+        let msg = match ws.next().await {
+            Some(Ok(Message::Binary(b))) => b,
+            Some(Ok(_)) => bail!("expected binary REALITY HELLO"),
+            Some(Err(e)) => Err(e).context("websocket recv")?,
+            None => bail!("ws closed before REALITY HELLO"),
+        };
 
         if msg.len() < 1 + 32 + 8 {
             bail!("short REALITY HELLO");
@@ -329,7 +321,8 @@ impl RealitySession {
 
         // Perform X25519 key exchange
         let server_secret = StaticSecret::from(self.private_key);
-        let client_public = PublicKey::from(client_pubkey);
+        let client_public = PublicKey::try_from(client_pubkey)
+            .map_err(|_| anyhow::anyhow!("invalid REALITY client public key"))?;
         let shared_secret = server_secret.diffie_hellman(&client_public);
         
         let mut session_key = [0u8; 32];
@@ -354,13 +347,13 @@ impl RealitySession {
 
 /// Bridge WebSocket to REALITY TLS target (server side)
 pub async fn bridge_reality_server<S>(
-    mut ws: WebSocketStream<S>,
+    ws: WebSocketStream<S>,
     config: RealityServerConfig,
-    max_pad: u8,
-    decoy_max: u8,
-    pad_mode: PadMode,
-    ws_ping_secs: u64,
-    ws_ping_jitter_percent: u8,
+    _max_pad: u8,
+    _decoy_max: u8,
+    _pad_mode: PadMode,
+    _ws_ping_secs: u64,
+    _ws_ping_jitter_percent: u8,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -374,71 +367,46 @@ where
         .context("connect to REALITY target")?;
 
     let connector = create_tls_connector(&target_host)?;
+    let sn = ServerName::try_from(target_host.clone())?;
     let target_tls = connector
-        .connect(target_host.parse().unwrap(), target_tcp)
+        .connect(sn, target_tcp)
         .await
         .context("TLS handshake with target")?;
 
-    let (mut target_read, mut target_write) = target_tls.split();
-
-    // Split WebSocket
+    let (mut target_read, mut target_write) = tokio::io::split(target_tls);
     let (mut ws_sink, mut ws_stream) = ws.split();
 
-    // Channel for forwarding
-    let (tx, mut rx) = mpsc::channel::<Bytes>(100);
-
-    // Client -> Target
-    let tx_clone = tx.clone();
-    let ws_to_target = async move {
-        let mut ws_stream = ws_stream;
-        while let Some(msg) = ws_stream.next().await {
-            let msg = match msg {
-                Ok(Message::Binary(b)) => b,
-                Ok(Message::Ping(p)) => {
-                    ws_sink.send(Message::Pong(p)).await.ok();
-                    continue;
+    let mut buf = [0u8; 65536];
+    loop {
+        tokio::select! {
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(b))) => {
+                        if target_write.write_all(&b).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws_sink.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
                 }
-                Ok(Message::Close(_)) => break,
-                Ok(_) => continue,
-                Err(_) => break,
-            };
-
-            // Strip REALITY framing and forward to target
-            if tx_clone.send(msg).await.is_err() {
-                break;
+            }
+            n = target_read.read(&mut buf) => {
+                match n {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = Bytes::copy_from_slice(&buf[..n]);
+                        if ws_sink.send(Message::Binary(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
         }
-    };
-
-    // Target -> Client  
-    let target_to_ws = async move {
-        let mut buf = [0u8; 65536];
-        loop {
-            let n = target_read.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            let data = Bytes::copy_from_slice(&buf[..n]);
-            if ws_sink.send(Message::Binary(data)).await.is_err() {
-                break;
-            }
-        }
-    };
-
-    // Forward client data to target
-    let client_to_target = async move {
-        while let Some(data) = rx.recv().await {
-            if target_write.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    };
-
-    // Run all three tasks
-    tokio::select! {
-        _ = ws_to_target => {}
-        _ = target_to_ws => {}
-        _ = client_to_target => {}
     }
 
     Ok(())
@@ -448,31 +416,50 @@ where
 pub async fn connect_reality_client(
     server_addr: &str,
     config: &RealityClientConfig,
-    target: &str,
-) -> anyhow::Result<WebSocketStream<tokio_rustls::TlsStream<TcpStream>>> {
-    // Generate client keypair
-    let (client_priv, client_pub) = RealityServerConfig::generate_keys();
+    _target: &str,
+) -> anyhow::Result<WebSocketStream<TlsStream<TcpStream>>> {
+    use crate::stealth::{build_websocket_request, WsHandshakeParams};
+    use crate::tls_util::TlsClientProfile;
 
-    // Connect to server
-    let tcp = TcpStream::connect(server_addr).await.context("connect to server")?;
-
-    // Do TLS handshake with server (will be proxied to target)
-    let connector = create_tls_connector(&config.server_name)?;
-    let tls = connector
-        .connect(config.server_name.parse().unwrap(), tcp)
+    let (host, port) = parse_target(server_addr)?;
+    let tcp = TcpStream::connect(format!("{host}:{port}"))
         .await
-        .context("TLS handshake")?;
+        .context("connect to server")?;
+    let _ = tcp.set_nodelay(true);
 
-    // Now upgrade to WebSocket with REALITY handshake
-    let (ws, _) = tokio_tungstenite::connect_async_tls(
-        format!("wss://{}:443/", server_addr),
-        config.server_name.as_str(),
-        false,
-        connector.into(),
-    )
-    .await
-    .context("WebSocket upgrade")?;
+    let connector = create_tls_connector(&config.server_name)?;
+    let sn = ServerName::try_from(config.server_name.clone())?;
+    let tls = connector.connect(sn, tcp).await.context("TLS handshake")?;
 
+    let tls_profile = match config.fingerprint {
+        TlsFingerprint::Firefox => TlsClientProfile::Firefox65,
+        TlsFingerprint::Randomized => TlsClientProfile::Randomized,
+        TlsFingerprint::Chrome | TlsFingerprint::Safari => TlsClientProfile::default(),
+    };
+
+    let path = if config.spider_path.starts_with('/') {
+        config.spider_path.clone()
+    } else {
+        format!("/{}", config.spider_path)
+    };
+
+    let req = build_websocket_request(WsHandshakeParams {
+        host_for_tcp: &host,
+        port,
+        path: &path,
+        sni: &config.server_name,
+        host_header: None,
+        origin: None,
+        user_agent: None,
+        accept_language: None,
+        extra_headers: &[],
+        tls_profile,
+    });
+
+    let (ws, _) = tokio_tungstenite::client_async(req, tls)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("websocket upgrade")?;
     Ok(ws)
 }
 
@@ -501,7 +488,7 @@ pub fn decode_server_hello(data: &[u8]) -> anyhow::Result<[u8; 32]> {
 /// SpiderX: Fetch content from target to simulate real browser behavior
 /// This makes traffic look more like normal HTTPS browsing
 pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (host, port) = parse_target(target)?;
     let addr = format!("{}:{}", host, port);
@@ -509,21 +496,27 @@ pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u
     // Create simple TLS connector
     let connector = create_tls_connector(&host)?;
     let tcp = TcpStream::connect(&addr).await.context("connect to target")?;
-    let tls = connector.connect(host.parse().unwrap(), tcp).await.context("TLS")?;
+    let sn = ServerName::try_from(host.clone())?;
+    let tls = connector.connect(sn, tcp).await.context("TLS")?;
 
-    let (mut read, mut write) = tls.split();
+    let (mut read, mut write) = tokio::io::split(tls);
 
     // Build HTTP request for a common path
     let path = paths.first().unwrap_or(&"/");
+    let accept_language = if is_vk_host(&host) {
+        "ru-RU,ru;q=0.9,en-US;q=0.5,en;q=0.4"
+    } else {
+        "en-US,en;q=0.5"
+    };
     let request = format!(
         "GET {} HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n\
          Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
-         Accept-Language: en-US,en;q=0.5\r\n\
+         Accept-Language: {}\r\n\
          Connection: close\r\n\
          \r\n",
-        path, host
+        path, host, accept_language
     );
 
     write.write_all(request.as_bytes()).await.context("send request")?;
@@ -547,15 +540,24 @@ pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u
     Ok(response)
 }
 
+fn is_vk_host(host: &str) -> bool {
+    host == "vk.com"
+        || host.ends_with(".vk.com")
+        || host == "vk.ru"
+        || host.ends_with(".vk.ru")
+        || host == "m.vk.com"
+}
+
 /// SpiderX background task: periodically fetch content from target
 /// This simulates browser behavior and makes traffic pattern less suspicious
 pub async fn spawn_spiderx(target: String, interval_secs: u64) {
-    let paths = [
-        "/",
-        "/wiki/Main_Page",
-        "/static/images/project-logos/",
-        "/api/rest_v1/page/summary/",
-    ];
+    let sni = extract_sni(&target);
+    // Wikipedia-specific paths break on other fronts; VK uses these entry points.
+    let paths: &[&str] = if is_vk_host(&sni) {
+        &["/", "/video", "/audio", "/clips"]
+    } else {
+        &["/"]
+    };
 
     info!("SpiderX: starting background crawler for {}", target);
 
@@ -583,15 +585,12 @@ pub async fn spawn_spiderx(target: String, interval_secs: u64) {
     }
 }
 
-/// Install ring crypto provider
+/// Install ring crypto provider (delegates to shared rustls setup).
 pub fn install_ring_crypto() {
-    // Only install if not already installed
-    if CryptoProvider::get_default().is_none() {
-        let _ = CryptoProvider::install_default(Ring);
-    }
+    crate::tls_util::install_ring_crypto();
 }
 
-/// Helper: parse server name from target (e.g., "wikipedia.org:443" -> "wikipedia.org")
+/// Helper: parse server name from target (e.g., "vk.com:443" -> "vk.com")
 pub fn extract_sni(target: &str) -> String {
     target.split(':').next().unwrap_or(target).to_string()
 }
@@ -609,8 +608,8 @@ mod tests {
 
     #[test]
     fn test_parse_target() {
-        let (host, port) = parse_target("wikipedia.org:443").unwrap();
-        assert_eq!(host, "wikipedia.org");
+        let (host, port) = parse_target("vk.com:443").unwrap();
+        assert_eq!(host, "vk.com");
         assert_eq!(port, 443);
     }
 

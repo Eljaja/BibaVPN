@@ -311,7 +311,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
 
     let proto = j
         .proto
-        .unwrap_or_else(|| invite_pair.as_ref().map(|i| i.proto).unwrap_or(2));
+        .unwrap_or_else(|| invite_pair.as_ref().map(|i| i.proto).unwrap_or(3));
     let proto_domain = j
         .proto_domain
         .clone()

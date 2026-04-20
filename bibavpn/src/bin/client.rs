@@ -153,8 +153,8 @@ struct Args {
     #[arg(long)]
     decoy_gets_paths: Option<String>,
 
-    /// Biba wire protocol when not using `--from-invite`: `2` or `3` (v3 requires `--psk`).
-    #[arg(long, default_value_t = 2)]
+    /// Biba wire protocol when not using `--from-invite`: only `3` (requires `--psk`).
+    #[arg(long, default_value_t = 3)]
     proto: u8,
 
     /// Domain label for v3 PSK KDF (must match server `--proto-domain`). Empty = use SNI.
@@ -169,7 +169,7 @@ struct Args {
     #[arg(long)]
     reality_short_id: Option<String>,
 
-    /// REALITY mode: front domain for SNI (e.g. wikipedia.org); must match server target SNI.
+    /// REALITY mode: front domain for SNI (e.g. vk.com); must match server target SNI.
     #[arg(long)]
     reality_target: Option<String>,
 }

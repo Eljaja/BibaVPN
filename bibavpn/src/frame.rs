@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
 
 const FRAME_VER: u8 = 1;
@@ -89,11 +90,11 @@ pub fn write_padded_frame_with_mode(
     if len > 0xFF_FFFF {
         return Err(FrameError::TooLarge);
     }
-    let mut rng = rand::thread_rng();
     let base = 5usize.saturating_add(len);
     let pad_len: u8 = if max_pad == 0 {
         0
     } else {
+        let mut rng = rand::thread_rng();
         match mode {
             PadMode::Random => rng.gen_range(0..=max_pad),
             PadMode::HttpBuckets => {
@@ -121,14 +122,14 @@ pub fn write_padded_frame_with_mode(
         let pl = usize::from(pad_len);
         let start = buf.len();
         buf.resize(start + pl, 0);
-        rng.fill_bytes(&mut buf[start..]);
+        OsRng.fill_bytes(&mut buf[start..]);
     }
     buf.extend_from_slice(payload);
     Ok(())
 }
 
-/// Returns payload bytes (allocated) from full WS binary message.
-pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
+/// Byte offset where inner payload starts (after `ver|len|pad_len|pad`).
+fn padded_frame_payload_start(raw: &[u8]) -> Result<usize, FrameError> {
     if raw.len() < 4 {
         return Err(FrameError::Proto("short frame".into()));
     }
@@ -151,7 +152,26 @@ pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
             need
         )));
     }
-    Ok(raw[5 + pad_len..].to_vec())
+    Ok(5 + pad_len)
+}
+
+/// Borrow inner payload slice (no copy). Hot-path friendly after decrypt.
+pub fn read_padded_frame_borrow(raw: &[u8]) -> Result<&[u8], FrameError> {
+    let start = padded_frame_payload_start(raw)?;
+    Ok(&raw[start..])
+}
+
+/// Consume `raw` and return only payload bytes (reuse buffer; no `to_vec` of payload).
+pub fn read_padded_frame_into(mut raw: Vec<u8>) -> Result<Vec<u8>, FrameError> {
+    let start = padded_frame_payload_start(&raw)?;
+    raw.drain(..start);
+    Ok(raw)
+}
+
+/// Returns payload bytes (allocated copy). Prefer [`read_padded_frame_borrow`] or
+/// [`read_padded_frame_into`] on hot paths.
+pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
+    read_padded_frame_borrow(raw).map(|s| s.to_vec())
 }
 
 #[cfg(test)]
@@ -163,6 +183,8 @@ mod tests {
         let mut v = Vec::new();
         write_padded_frame(&mut v, b"hello", 0).unwrap();
         assert_eq!(read_padded_frame(&v).unwrap(), b"hello");
+        assert_eq!(read_padded_frame_borrow(&v).unwrap(), b"hello");
+        assert_eq!(read_padded_frame_into(v).unwrap(), b"hello");
     }
 
     #[test]
@@ -170,6 +192,8 @@ mod tests {
         let mut v = Vec::new();
         write_padded_frame(&mut v, b"x", 20).unwrap();
         assert_eq!(read_padded_frame(&v).unwrap(), b"x");
+        assert_eq!(read_padded_frame_borrow(&v).unwrap(), b"x");
+        assert_eq!(read_padded_frame_into(v).unwrap(), b"x");
     }
 
     #[test]

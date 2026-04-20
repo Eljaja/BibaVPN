@@ -25,7 +25,8 @@ pub mod ws_auth;
 pub mod ws_bridge;
 
 pub use frame::{
-    read_padded_frame, write_padded_frame, write_padded_frame_with_mode, FrameError, PadMode,
+    read_padded_frame, read_padded_frame_borrow, read_padded_frame_into, write_padded_frame,
+    write_padded_frame_with_mode, FrameError, PadMode,
 };
 pub use invite_uri::{decode_invite_v1, encode_invite_v1, InviteV1};
 pub use reality::{

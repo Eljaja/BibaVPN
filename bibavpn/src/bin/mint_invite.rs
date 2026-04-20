@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
     let proto: u8 = std::env::var("INVITE_PROTO")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(3);
     let proto_domain = std::env::var("INVITE_PROTO_DOMAIN").ok();
 
     let invite = InviteV1 {

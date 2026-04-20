@@ -25,7 +25,7 @@ use crate::frame::PadMode;
 use crate::protocol::encode_atyp_host_port;
 use crate::retry::{maybe_ws_binary_send_jitter, ws_ping_period_duration};
 use crate::ws_bridge::TunnelEnd;
-use crate::{read_padded_frame, write_padded_frame_with_mode};
+use crate::{read_padded_frame_into, write_padded_frame_with_mode};
 
 pub type SharedCrypto = Arc<SessionCrypto>;
 
@@ -197,11 +197,10 @@ where
                     let raw = match (&crypto_in, TunnelEnd::Server) {
                         (Some(c), _) => c
                             .open_client_to_server(b.as_ref())
-                            .await
                             .context("v2 open c2s mux")?,
                         (None, _) => b.to_vec(),
                     };
-                    let inner = read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let inner = read_padded_frame_into(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
                     if inner.is_empty() {
                         continue;
                     }
@@ -435,7 +434,6 @@ async fn mux_server_send_record(
     let blob: Bytes = match crypto {
         Some(c) => Bytes::from(
             c.seal_server_to_client(&wire)
-                .await
                 .context("v2 seal s2c mux")?,
         ),
         None => Bytes::from(std::mem::take(&mut wire)),
@@ -702,7 +700,7 @@ where
                             break;
                         }
                         let blob: Bytes = match &crypto_w {
-                            Some(c) => match c.seal_client_to_server(&wire).await {
+                            Some(c) => match c.seal_client_to_server(&wire) {
                                 Ok(b) => {
                                     wire.clear();
                                     Bytes::from(b)
@@ -781,13 +779,13 @@ async fn mux_client_reader_loop<S>(
                     continue;
                 }
                 let raw = match &crypto {
-                    Some(c) => match c.open_server_to_client(b.as_ref()).await {
+                    Some(c) => match c.open_server_to_client(b.as_ref()) {
                         Ok(x) => x,
                         Err(_) => continue,
                     },
                     None => b.to_vec(),
                 };
-                let inner = match read_padded_frame(&raw) {
+                let inner = match read_padded_frame_into(raw) {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
@@ -919,7 +917,7 @@ async fn mux_client_dummy_task(
             continue;
         }
         let blob: Bytes = match &crypto {
-            Some(c) => match c.seal_client_to_server(&wire).await {
+            Some(c) => match c.seal_client_to_server(&wire) {
                 Ok(b) => Bytes::from(b),
                 Err(_) => continue,
             },
@@ -961,7 +959,7 @@ async fn mux_server_dummy_task(
             continue;
         }
         let blob: Bytes = match &crypto {
-            Some(c) => match c.seal_server_to_client(&wire).await {
+            Some(c) => match c.seal_server_to_client(&wire) {
                 Ok(b) => Bytes::from(b),
                 Err(_) => continue,
             },
