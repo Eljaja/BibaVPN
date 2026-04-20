@@ -44,3 +44,6 @@ __pycache__/
 # Desktop UI build artifacts
 /bibavpn-desktop/ui/node_modules
 /bibavpn-desktop/ui/dist
+
+# Design mock (static HTML / JSX prototype)
+bibavpn-desktop/design-mock/
