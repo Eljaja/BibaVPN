@@ -1,0 +1,13 @@
+BibaVPN local bench (scripts/wsl-local-bench.sh), WSL, release build.
+Date: 2026-04-20 (run after v1.2.0 adaptive padding + ws jitter wiring).
+
+Environment: 64 MiB payload, python http.server :18080, bibavpn-server :18443, bibavpn-client SOCKS5 :11080,
+--ws-ping-secs 0 on both; default pad_mode adaptive; ws jitter 0 (defaults).
+
+=== Direct HTTP (no tunnel), 64 MiB ===
+speed_download=932067555.000 B/s  time_total=0.072993s
+
+=== Via Biba SOCKS5 + WSS, 64 MiB ===
+speed_download=310689185.000 B/s  time_total=0.216045s
+
+Done.

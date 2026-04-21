@@ -1,0 +1,14 @@
+scripts/wsl-local-bench.sh: line 3: set: -: invalid option
+set: usage: set [-abefhkmnptuvxBCHP] [-o option-name] [--] [arg ...]
+error: unexpected argument '-' found
+
+Usage: cargo build [OPTIONS]
+
+For more information, try '--help'.
+dd: invalid status level: ‘none\r’
+Try 'dd --help' for more information.
+scripts/wsl-local-bench.sh: line 8: $'\r': command not found
+scripts/wsl-local-bench.sh: line 9: $'\r': command not found
+scripts/wsl-local-bench.sh: line 11: $'\r': command not found
+scripts/wsl-local-bench.sh: line 12: syntax error near unexpected token `$'{\r''
+scripts/wsl-local-bench.sh: line 12: `cleanup() {'
