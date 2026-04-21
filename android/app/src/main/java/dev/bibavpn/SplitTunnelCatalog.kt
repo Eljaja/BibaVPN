@@ -7,6 +7,7 @@ enum class SplitTunnelGroup(@StringRes val titleRes: Int) {
     GOVERNMENT(R.string.split_group_government),
     BANKS(R.string.split_group_banks),
     MARKETPLACES(R.string.split_group_marketplaces),
+    OPERATORS(R.string.split_group_operators),
 }
 
 data class SplitTunnelApp(
@@ -37,6 +38,11 @@ object SplitTunnelCatalog {
             SplitTunnelApp("ru.yandex.eda", R.string.split_app_eda, SplitTunnelGroup.MARKETPLACES),
             SplitTunnelApp("com.yandex.lavka", R.string.split_app_lavka, SplitTunnelGroup.MARKETPLACES),
             SplitTunnelApp("ru.sbcs.store", R.string.split_app_samokat, SplitTunnelGroup.MARKETPLACES),
+            SplitTunnelApp("ru.megafon.mlk", R.string.split_app_megafon_mlk, SplitTunnelGroup.OPERATORS),
+            SplitTunnelApp("com.megalabs.megafon.tv", R.string.split_app_megafon_tv, SplitTunnelGroup.OPERATORS),
+            SplitTunnelApp("com.equeo.megafondraiv", R.string.split_app_megafon_drive, SplitTunnelGroup.OPERATORS),
+            SplitTunnelApp("ru.yota.android", R.string.split_app_yota, SplitTunnelGroup.OPERATORS),
+            SplitTunnelApp("ru.yotabit.lk", R.string.split_app_yotabit, SplitTunnelGroup.OPERATORS),
         )
 
     fun allPackageNames(): Set<String> = all.map { it.packageName }.toSet()

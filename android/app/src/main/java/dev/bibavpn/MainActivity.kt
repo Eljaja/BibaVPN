@@ -1524,6 +1524,9 @@ private fun SplitTunnelSettingsPanel() {
             )
         }
 
+        Spacer(Modifier.height(8.dp))
+        SplitTunnelOperatorDomainsPanel()
+
         if (!enabled) {
             Text(
                 stringResource(R.string.split_toggle_groups_hint),
@@ -1553,6 +1556,63 @@ private fun SplitTunnelSettingsPanel() {
                 },
             )
             Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun SplitTunnelOperatorDomainsPanel() {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
+            .background(Color(0xFF020617).copy(alpha = 0.55f))
+            .padding(16.dp),
+    ) {
+        Text(
+            stringResource(R.string.split_operator_domains_title),
+            color = Color.White,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            stringResource(R.string.split_operator_domains_sub),
+            color = TextMuted,
+            fontSize = 12.sp,
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            stringResource(R.string.split_operator_domains_megafon),
+            color = Mint.copy(alpha = 0.9f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        Spacer(Modifier.height(4.dp))
+        SplitTunnelOperatorDomains.megafonHosts.forEach { host ->
+            Text(
+                host,
+                color = TextMuted.copy(alpha = 0.85f),
+                fontSize = 11.sp,
+                modifier = Modifier.padding(vertical = 1.dp),
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            stringResource(R.string.split_operator_domains_yota),
+            color = Mint.copy(alpha = 0.9f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        Spacer(Modifier.height(4.dp))
+        SplitTunnelOperatorDomains.yotaHosts.forEach { host ->
+            Text(
+                host,
+                color = TextMuted.copy(alpha = 0.85f),
+                fontSize = 11.sp,
+                modifier = Modifier.padding(vertical = 1.dp),
+            )
         }
     }
 }

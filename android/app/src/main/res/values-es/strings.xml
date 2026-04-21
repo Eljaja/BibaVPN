@@ -110,6 +110,11 @@
     <string name="split_group_government">Gubernamentales</string>
     <string name="split_group_banks">Bancos</string>
     <string name="split_group_marketplaces">Marketplaces</string>
+    <string name="split_group_operators">Operadores (Yota, MegaFon)</string>
+    <string name="split_operator_domains_title">Dominios del operador (referencia)</string>
+    <string name="split_operator_domains_sub">Sitios y API oficiales. La exclusión de VPN aplica a las apps de la lista; el navegador sigue usando el túnel salvo que desconectes o configures el navegador aparte.</string>
+    <string name="split_operator_domains_megafon">MegaFon</string>
+    <string name="split_operator_domains_yota">Yota</string>
     <string name="split_app_gosuslugi">Servicios públicos</string>
     <string name="split_app_max">MAX</string>
     <string name="split_app_vk">VK</string>
@@ -129,6 +134,11 @@
     <string name="split_app_eda">Yandex Eda</string>
     <string name="split_app_lavka">Yandex Lavka</string>
     <string name="split_app_samokat">Samokat</string>
+    <string name="split_app_megafon_mlk">MegaFon</string>
+    <string name="split_app_megafon_tv">MegaFon TV</string>
+    <string name="split_app_megafon_drive">MegaFon Drive</string>
+    <string name="split_app_yota">Yota</string>
+    <string name="split_app_yotabit">Yotabit (cable)</string>
 
     <string name="vpn_error_tun2socks">error de tun2socks</string>
     <string name="vpn_error_prefix">BibaVPN: %1$s</string>

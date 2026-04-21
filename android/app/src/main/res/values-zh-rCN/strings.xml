@@ -110,6 +110,11 @@
     <string name="split_group_government">政务</string>
     <string name="split_group_banks">银行</string>
     <string name="split_group_marketplaces">电商与本地服务</string>
+    <string name="split_group_operators">运营商（Yota、MegaFon）</string>
+    <string name="split_operator_domains_title">运营商域名（参考）</string>
+    <string name="split_operator_domains_sub">以下为官方网站与 API。VPN 绕行仅对列表中的应用生效；浏览器流量仍会走隧道，除非断开 VPN 或为浏览器单独设置。</string>
+    <string name="split_operator_domains_megafon">MegaFon</string>
+    <string name="split_operator_domains_yota">Yota</string>
     <string name="split_app_gosuslugi">国家服务</string>
     <string name="split_app_max">MAX</string>
     <string name="split_app_vk">VK</string>
@@ -129,6 +134,11 @@
     <string name="split_app_eda">Yandex Eda</string>
     <string name="split_app_lavka">Yandex Lavka</string>
     <string name="split_app_samokat">Samokat</string>
+    <string name="split_app_megafon_mlk">MegaFon</string>
+    <string name="split_app_megafon_tv">MegaFon TV</string>
+    <string name="split_app_megafon_drive">MegaFon Drive</string>
+    <string name="split_app_yota">Yota</string>
+    <string name="split_app_yotabit">Yotabit（有线）</string>
 
     <string name="vpn_error_tun2socks">tun2socks 错误</string>
     <string name="vpn_error_prefix">BibaVPN：%1$s</string>
