@@ -134,6 +134,8 @@
     <string name="split_app_eda">Yandex Eda</string>
     <string name="split_app_lavka">Yandex Lavka</string>
     <string name="split_app_samokat">Samokat</string>
+    <string name="split_app_2gis">2GIS</string>
+    <string name="split_app_yandex_maps">Yandex 地图</string>
     <string name="split_app_megafon_mlk">MegaFon</string>
     <string name="split_app_megafon_tv">MegaFon TV</string>
     <string name="split_app_megafon_drive">MegaFon Drive</string>

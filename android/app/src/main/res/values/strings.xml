@@ -135,6 +135,8 @@
     <string name="split_app_eda">Яндекс Еда</string>
     <string name="split_app_lavka">Яндекс Лавка</string>
     <string name="split_app_samokat">Самокат</string>
+    <string name="split_app_2gis">2ГИС</string>
+    <string name="split_app_yandex_maps">Яндекс Карты</string>
     <string name="split_app_megafon_mlk">МегаФон</string>
     <string name="split_app_megafon_tv">МегаФон ТВ</string>
     <string name="split_app_megafon_drive">МегаФон Драйв</string>
