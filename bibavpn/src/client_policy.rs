@@ -1,6 +1,7 @@
 //! Single place for **TLS profile resolution** and related priority rules (CLI / JSON / invite / presets).
 //! Keep this in sync with `client.rs` and `start_json_config.rs`.
 
+use crate::invite_uri::InviteV1;
 use crate::stealth_v12::{preset, StealthProfile};
 use crate::tls_util::TlsClientProfile;
 
@@ -25,6 +26,23 @@ pub fn resolve_tls_client_profile(
         return Ok(t);
     }
     Ok(TlsClientProfile::Chrome132)
+}
+
+/// TLS client profile from `biba://` fields: `fingerprint` wins over `tls_profile` when set.
+pub fn tls_profile_from_invite(inv: &InviteV1) -> anyhow::Result<Option<TlsClientProfile>> {
+    if let Some(f) = inv
+        .fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(Some(TlsClientProfile::from_fingerprint_str(f)?));
+    }
+    let t = inv.tls_profile.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(t.parse()?))
 }
 
 #[cfg(test)]

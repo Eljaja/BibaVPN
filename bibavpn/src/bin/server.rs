@@ -239,13 +239,45 @@ async fn main() -> anyhow::Result<()> {
             .invite_passphrase
             .as_deref()
             .expect("clap requires invite_passphrase");
+        let (reality_target, reality_public_key, reality_short_id) = match (
+            args.reality_target.as_ref(),
+            args.reality_private_key.as_ref(),
+        ) {
+            (Some(t), Some(priv_b64)) => {
+                let privkey = base64::engine::general_purpose::STANDARD
+                    .decode(priv_b64)
+                    .context("invite: decode reality private key")?;
+                if privkey.len() != 32 {
+                    anyhow::bail!("invite: reality private key must be 32 bytes");
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&privkey);
+                use x25519_dalek::{PublicKey, StaticSecret};
+                let public = PublicKey::from(&StaticSecret::from(a));
+                let pk_b64 = base64::engine::general_purpose::STANDARD.encode(public.to_bytes());
+                let sid = args
+                    .reality_short_ids
+                    .as_deref()
+                    .and_then(|s| {
+                        s.split(',')
+                            .map(|h| h.trim())
+                            .find(|h| !h.is_empty())
+                    })
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| hex::encode(&public.to_bytes()[..8]));
+                (Some(t.clone()), Some(pk_b64), Some(sid))
+            }
+            _ => (None, None, None),
+        };
+        let proto_domain = (args.proto_domain.trim() != "default" && !args.proto_domain.is_empty())
+            .then_some(args.proto_domain.clone());
         let invite = InviteV1 {
             v: 1,
             server: public.clone(),
             sni,
             token: args.token.clone(),
             proto: 3,
-            proto_domain: None,
+            proto_domain,
             psk: args.psk.clone(),
             decoy_max: args.decoy_max,
             max_pad: args.max_pad,
@@ -267,6 +299,38 @@ async fn main() -> anyhow::Result<()> {
                 PadMode::Adaptive => "adaptive".into(),
             }),
             dummy_interval_secs: Some(args.dummy_interval_secs).filter(|&x| x > 0),
+            http_proxy: None,
+            socks_bind: None,
+            socks_auth_user: None,
+            socks_auth_password: None,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_headers: vec![],
+            use_tcp_mux: true,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 30,
+            decoy_gets_paths: None,
+            fingerprint: None,
+            stealth_profile: None,
+            decoy_mode: None,
+            desync_mode: None,
+            tcp_fooling: None,
+            tls_fragment: false,
+            ws_parallel: 1,
+            idle_decoy_secs: None,
+            tls_stack: "rustls".to_string(),
+            reality_target,
+            reality_public_key,
+            reality_short_id,
+            pin_cert_pem: None,
+            server_ack_delay_min_ms: Some(args.server_ack_delay_min_ms),
+            server_ack_delay_max_ms: Some(args.server_ack_delay_max_ms),
+            rtt_mask_jitter_ms: Some(args.rtt_mask_jitter_ms),
+            ack_profile: args.ack_profile.clone(),
         };
         let uri = encode_invite_v1(&invite, passphrase).context("build invite URI")?;
         println!("{}", uri);

@@ -17,6 +17,7 @@ use bibavpn::stealth_v12::{
     preset,
 };
 use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile, TlsStack};
+use bibavpn::client_policy::tls_profile_from_invite;
 use clap::Parser;
 use base64::Engine;
 use tokio::signal;
@@ -236,21 +237,6 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("use --from-invite and --invite-passphrase together");
     }
 
-    let reality_any = args.reality_target.is_some()
-        || args.reality_public_key.is_some()
-        || args.reality_short_id.is_some();
-    if reality_any {
-        anyhow::ensure!(
-            args.reality_target.is_some() && args.reality_public_key.is_some(),
-            "REALITY mode requires both --reality-target and --reality-public-key"
-        );
-    }
-
-    let mut extra = Vec::new();
-    for line in &args.ws_headers {
-        extra.push(parse_ws_header(line)?);
-    }
-
     let inv_opt = if let Some(uri) = args.from_invite.as_ref() {
         let pass = args
             .invite_passphrase
@@ -292,8 +278,8 @@ async fn main() -> anyhow::Result<()> {
             sni,
             inv.token.clone(),
             inv.max_pad,
-            args.junk_frames,
-            args.early_ws_frames,
+            inv.junk_frames,
+            inv.early_ws_frames,
             inv.psk.clone(),
             inv.decoy_max,
             inv.max_ws_binary,
@@ -341,14 +327,28 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    let stealth_for_merge: Option<StealthProfile> = args
-        .stealth_profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(StealthProfile::from_str)
-        .transpose()
-        .context("--stealth-profile")?;
+    let stealth_for_merge: Option<StealthProfile> = (|| {
+        let a = args
+            .stealth_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(s) = a {
+            return StealthProfile::from_str(s);
+        }
+        if let Some(ref inv) = inv_opt {
+            if let Some(s) = inv
+                .stealth_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return StealthProfile::from_str(s);
+            }
+        }
+        Ok(None)
+    })()
+    .context("stealth profile")?;
     let pr_opt = stealth_for_merge.map(preset);
     let (ws_jitter_min_ms, ws_jitter_max_ms) = apply_preset_ws_jitter(
         pr_opt.as_ref(),
@@ -357,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let invite_tls: Option<TlsClientProfile> = if let Some(ref inv) = inv_opt {
-        Some(inv.tls_profile.parse().context("invite tls_profile")?)
+        tls_profile_from_invite(inv).context("invite TLS profile")?
     } else {
         None
     };
@@ -376,7 +376,14 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or("/ws"),
     );
 
-    let use_tcp_mux = !args.no_mux;
+    let use_tcp_mux = if args.no_mux {
+        false
+    } else {
+        inv_opt
+            .as_ref()
+            .map(|i| i.use_tcp_mux)
+            .unwrap_or(true)
+    };
 
     let pad_mode: PadMode = match args
         .pad_mode
@@ -410,20 +417,35 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| pr_opt.as_ref().map(|p| p.dummy_interval_secs))
         .unwrap_or(0);
 
-    let decoy_gets_paths: Vec<String> = args
-        .decoy_gets_paths
-        .as_ref()
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let decoy_gets_paths: Vec<String> = {
+        let from_args: Vec<String> = args
+            .decoy_gets_paths
+            .as_ref()
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !from_args.is_empty() {
+            from_args
+        } else if let Some(ref inv) = inv_opt {
+            inv.decoy_gets_paths
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    };
 
-    let pinned_certs_pem = if args.pin_cert.is_empty() {
-        None
-    } else {
+    let pinned_certs_pem = if !args.pin_cert.is_empty() {
         let mut buf = Vec::new();
         for p in &args.pin_cert {
             buf.extend(
@@ -432,84 +454,237 @@ async fn main() -> anyhow::Result<()> {
             buf.push(b'\n');
         }
         Some(buf)
+    } else {
+        inv_opt
+            .as_ref()
+            .and_then(|i| {
+                i.pin_cert_pem
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.as_bytes().to_vec())
+            })
     };
 
-    let reality_public_key: Option<[u8; 32]> = match args.reality_public_key.as_ref() {
-        None => None,
-        Some(pubkey_b64) => {
-            let pubkey_bytes = base64::engine::general_purpose::STANDARD
-                .decode(pubkey_b64.trim())
-                .context("decode --reality-public-key (base64)")?;
-            anyhow::ensure!(pubkey_bytes.len() == 32, "reality public key must be 32 bytes");
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&pubkey_bytes);
-            Some(arr)
-        }
+    let reality_public_key: Option<[u8; 32]> = if let Some(pubkey_b64) = args.reality_public_key.as_ref() {
+        let pubkey_bytes = base64::engine::general_purpose::STANDARD
+            .decode(pubkey_b64.trim())
+            .context("decode --reality-public-key (base64)")?;
+        anyhow::ensure!(pubkey_bytes.len() == 32, "reality public key must be 32 bytes");
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&pubkey_bytes);
+        Some(arr)
+    } else if let Some(ref inv) = inv_opt {
+        inv.reality_public_key_parsed()
+            .context("invite reality_public_key")?
+    } else {
+        None
     };
 
-    let reality_short_id: Option<[u8; 8]> = match args.reality_short_id.as_ref() {
-        None => None,
-        Some(s) => {
-            let bytes = hex::decode(s.trim()).context("decode --reality-short-id (hex)")?;
-            anyhow::ensure!(bytes.len() == 8, "short id must be 8 bytes (16 hex digits)");
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&bytes);
-            Some(arr)
-        }
+    let reality_short_id: Option<[u8; 8]> = if let Some(s) = args.reality_short_id.as_ref() {
+        let bytes = hex::decode(s.trim()).context("decode --reality-short-id (hex)")?;
+        anyhow::ensure!(bytes.len() == 8, "short id must be 8 bytes (16 hex digits)");
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        Some(arr)
+    } else if let Some(ref inv) = inv_opt {
+        inv.reality_short_id_parsed()
+            .context("invite reality_short_id")?
+    } else {
+        None
     };
+
+    let reality_target: Option<String> = args
+        .reality_target
+        .clone()
+        .or_else(|| inv_opt.as_ref().and_then(|i| i.reality_target.clone()));
+    {
+        let reality_any = reality_target.is_some() || reality_public_key.is_some() || reality_short_id.is_some();
+        if reality_any {
+            anyhow::ensure!(
+                reality_target.is_some() && reality_public_key.is_some(),
+                "REALITY mode requires both target and public key (CLI or biba://)"
+            );
+        }
+    }
 
     let decoy_gets = if let Some(ref pr) = pr_opt {
         pr.decoy_gets
+    } else if let Some(ref inv) = inv_opt {
+        inv.decoy_gets
     } else {
         args.decoy_gets
     };
-    let decoy_mode: DecoyMode = args
-        .decoy_mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(DecoyMode::from_str)
-        .transpose()
-        .context("--decoy-mode")?
-        .or_else(|| pr_opt.as_ref().map(|p| p.decoy_mode))
-        .unwrap_or_default();
-    let desync_mode: DesyncMode = args
-        .desync_mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(DesyncMode::from_str)
-        .transpose()
-        .context("--desync-mode")?
-        .unwrap_or_default();
-    let tcp_fooling: TcpFooling = args
-        .tcp_fooling
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(TcpFooling::from_str)
-        .transpose()
-        .context("--tcp-fooling")?
-        .unwrap_or_default();
-    let tls_stack: TlsStack = args.tls_stack.parse().context("--tls-stack")?;
+    let decoy_gets_interval_secs = if let Some(ref inv) = inv_opt {
+        inv.decoy_gets_interval_secs
+    } else {
+        args.decoy_gets_interval_secs
+    };
+    let decoy_mode: DecoyMode = (|| -> anyhow::Result<DecoyMode> {
+        if let Some(s) = args
+            .decoy_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return DecoyMode::from_str(s).context("--decoy-mode");
+        }
+        if let Some(ref inv) = inv_opt {
+            if let Some(s) = inv
+                .decoy_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return DecoyMode::from_str(s).context("invite decoy_mode");
+            }
+        }
+        Ok(pr_opt.as_ref().map(|p| p.decoy_mode).unwrap_or_default())
+    })()?;
+    let desync_mode: DesyncMode = (|| -> anyhow::Result<DesyncMode> {
+        if let Some(s) = args
+            .desync_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return DesyncMode::from_str(s).context("--desync-mode");
+        }
+        if let Some(ref inv) = inv_opt {
+            if let Some(s) = inv
+                .desync_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return DesyncMode::from_str(s).context("invite desync_mode");
+            }
+        }
+        Ok(DesyncMode::default())
+    })()?;
+    let tcp_fooling: TcpFooling = (|| -> anyhow::Result<TcpFooling> {
+        if let Some(s) = args
+            .tcp_fooling
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return TcpFooling::from_str(s).context("--tcp-fooling");
+        }
+        if let Some(ref inv) = inv_opt {
+            if let Some(s) = inv
+                .tcp_fooling
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return TcpFooling::from_str(s).context("invite tcp_fooling");
+            }
+        }
+        Ok(TcpFooling::default())
+    })()?;
+    let tls_stack: TlsStack = if let Some(ref inv) = inv_opt {
+        inv.tls_stack
+            .parse()
+            .context("invite tls_stack")?
+    } else {
+        args.tls_stack.parse().context("--tls-stack")?
+    };
+    let tls_fragment = inv_opt
+        .as_ref()
+        .map(|i| i.tls_fragment)
+        .unwrap_or(args.tls_fragment);
+    let ws_parallel = inv_opt
+        .as_ref()
+        .map(|i| i.ws_parallel)
+        .unwrap_or(args.ws_parallel);
+
+    let socks_auth: Option<(String, String)> = if let Some(ref inv) = inv_opt {
+        let u = inv
+            .socks_auth_user
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let p = inv
+            .socks_auth_password
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match (u, p) {
+            (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+            (None, None) => None,
+            _ => anyhow::bail!("invite: set both socks_auth_user and socks_auth_password, or neither"),
+        }
+    } else {
+        None
+    };
+
+    let mut extra = Vec::new();
+    if let Some(ref inv) = inv_opt {
+        for line in &inv.ws_headers {
+            extra.push(
+                parse_ws_header(line)
+                    .with_context(|| format!("invite ws header {line:?}"))?,
+            );
+        }
+    }
+    for line in &args.ws_headers {
+        extra.push(parse_ws_header(line)?);
+    }
+
+    let socks_bind = inv_opt
+        .as_ref()
+        .and_then(|i| {
+            i.socks_bind
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| args.socks5.clone());
+    let http_proxy_bind: Option<String> = args
+        .http_proxy
+        .clone()
+        .or_else(|| inv_opt.as_ref().and_then(|i| i.http_proxy.clone()));
+    let ws_host = args
+        .ws_host
+        .clone()
+        .or_else(|| inv_opt.as_ref().and_then(|i| i.ws_host.clone()));
+    let ws_origin = args
+        .ws_origin
+        .clone()
+        .or_else(|| inv_opt.as_ref().and_then(|i| i.ws_origin.clone()));
+    let ws_user_agent = args
+        .ws_user_agent
+        .clone()
+        .or_else(|| inv_opt.as_ref().and_then(|i| i.ws_user_agent.clone()));
+    let ws_accept_language = args
+        .ws_accept_language
+        .clone()
+        .or_else(|| inv_opt.as_ref().and_then(|i| i.ws_accept_language.clone()));
+    let idle_merged = args
+        .idle_decoy_secs
+        .or(inv_opt.as_ref().and_then(|i| i.idle_decoy_secs));
+    let idle_decoy_secs = merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
+
     let opts = LocalClientOptions {
         server_host,
         server_port,
         sni: sni_owned,
         token,
-        socks_bind: args.socks5,
-        socks_auth: None,
-        http_proxy_bind: args.http_proxy,
+        socks_bind,
+        socks_auth,
+        http_proxy_bind,
         insecure_tls,
         max_pad,
         junk_frames,
         early_ws_frames,
         psk,
         decoy_max,
-        ws_host: args.ws_host,
-        ws_origin: args.ws_origin,
-        ws_user_agent: args.ws_user_agent,
-        ws_accept_language: args.ws_accept_language,
+        ws_host,
+        ws_origin,
+        ws_user_agent,
+        ws_accept_language,
         ws_extra_headers: Arc::new(extra),
         max_ws_binary,
         ws_ping_secs,
@@ -527,19 +702,19 @@ async fn main() -> anyhow::Result<()> {
         pad_mode,
         dummy_interval_secs,
         decoy_gets,
-        decoy_gets_interval_secs: args.decoy_gets_interval_secs,
+        decoy_gets_interval_secs,
         decoy_gets_paths,
         proto,
         proto_domain,
-        reality_target: args.reality_target,
+        reality_target,
         reality_public_key,
         reality_short_id,
         decoy_mode,
         desync_mode,
         tcp_fooling,
-        tls_fragment: args.tls_fragment,
-        ws_parallel: args.ws_parallel,
-        idle_decoy_secs: merge_idle_decoy_secs(args.idle_decoy_secs, pr_opt.as_ref()),
+        tls_fragment,
+        ws_parallel,
+        idle_decoy_secs,
         stealth_profile: stealth_for_merge,
         tls_stack,
     };

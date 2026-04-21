@@ -11,6 +11,7 @@ use crate::local_client::{
     DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
+use crate::client_policy::tls_profile_from_invite;
 use crate::tls_util::{TlsClientProfile, TlsStack};
 use crate::{decode_invite_v1, InviteV1, PadMode};
 
@@ -110,6 +111,9 @@ struct StartJson {
     /// `rustls` (default) or `boring` (Boring build + feature on client).
     #[serde(default)]
     tls_stack: Option<String>,
+    /// Same as client `--fingerprint` (e.g. `chrome-132`); takes precedence over `tls_profile` and invite.
+    #[serde(default)]
+    fingerprint: Option<String>,
 }
 
 fn default_token() -> String {
@@ -194,28 +198,30 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         _ => anyhow::bail!("invite: set both from_invite and invite_passphrase, or neither"),
     };
 
-    let stealth_for_merge: Option<StealthProfile> = j
-        .stealth_profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(StealthProfile::from_str)
-        .transpose()
-        .context("stealth_profile")?;
+    let stealth_for_merge: Option<StealthProfile> = (|| {
+        if let Some(s) = j
+            .stealth_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return StealthProfile::from_str(s);
+        }
+        if let Some(ref inv) = invite_pair {
+            if let Some(s) = inv
+                .stealth_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return StealthProfile::from_str(s);
+            }
+        }
+        Ok(None)
+    })()
+    .context("stealth_profile")?;
     let pr_opt: Option<crate::stealth_v12::StealthPreset> =
         stealth_for_merge.map(crate::stealth_v12::preset);
-
-    let mut extra = Vec::new();
-    for line in &j.ws_headers {
-        extra.push(parse_ws_header(line)?);
-    }
-
-    let pinned_certs_pem = j
-        .pin_cert_pem
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.as_bytes().to_vec());
 
     let (
         server_host,
@@ -244,8 +250,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             sni,
             inv.token.clone(),
             inv.max_pad,
-            j.junk_frames,
-            j.early_ws_frames,
+            inv.junk_frames,
+            inv.early_ws_frames,
             inv.psk.clone(),
             inv.decoy_max,
             inv.max_ws_binary,
@@ -284,10 +290,40 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         )
     };
 
-    let (base_jmin, base_jmax) = if let Some(ref inv) = invite_pair {
-        (inv.ws_jitter_min_ms, inv.ws_jitter_max_ms)
-    } else {
-        (j.ws_jitter_min_ms, j.ws_jitter_max_ms)
+    let mut extra = Vec::new();
+    if let Some(ref inv) = invite_pair {
+        for line in &inv.ws_headers {
+            extra.push(
+                parse_ws_header(line)
+                    .with_context(|| format!("invite ws header {line:?}"))?,
+            );
+        }
+    }
+    for line in &j.ws_headers {
+        extra.push(parse_ws_header(line)?);
+    }
+
+    let pinned_certs_pem = j
+        .pin_cert_pem
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_bytes().to_vec())
+        .or_else(|| {
+            invite_pair
+                .as_ref()
+                .and_then(|i| {
+                    i.pin_cert_pem
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.as_bytes().to_vec())
+                })
+        });
+
+    let (base_jmin, base_jmax) = match invite_pair.as_ref() {
+        Some(inv) => (inv.ws_jitter_min_ms, inv.ws_jitter_max_ms),
+        None => (j.ws_jitter_min_ms, j.ws_jitter_max_ms),
     };
     let (ws_jitter_min_ms, ws_jitter_max_ms) = crate::stealth_v12::apply_preset_ws_jitter(
         pr_opt.as_ref(),
@@ -302,7 +338,10 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             .unwrap_or("/ws"),
     );
 
-    let use_tcp_mux = j.use_tcp_mux;
+    let use_tcp_mux = invite_pair
+        .as_ref()
+        .map(|i| i.use_tcp_mux)
+        .unwrap_or(j.use_tcp_mux);
 
     let pad_mode: PadMode = match j
         .pad_mode
@@ -336,16 +375,33 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         .or_else(|| pr_opt.as_ref().map(|p| p.dummy_interval_secs))
         .unwrap_or(0);
 
-    let decoy_gets_paths: Vec<String> = j
-        .decoy_gets_paths
-        .as_ref()
-        .map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let decoy_gets_paths: Vec<String> = {
+        let from_j: Vec<String> = j
+            .decoy_gets_paths
+            .as_ref()
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !from_j.is_empty() {
+            from_j
+        } else if let Some(ref inv) = invite_pair {
+            inv.decoy_gets_paths
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    };
 
     let proto = j
         .proto
@@ -356,13 +412,15 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         .or_else(|| invite_pair.as_ref().and_then(|i| i.proto_domain.clone()))
         .unwrap_or_default();
 
-    let invite_tls: Option<TlsClientProfile> = if let Some(ref inv) = invite_pair {
-        Some(inv.tls_profile.parse().context("invite tls_profile")?)
-    } else {
-        None
+    let invite_tls: Option<TlsClientProfile> = match invite_pair.as_ref() {
+        Some(inv) => tls_profile_from_invite(inv).context("invite tls")?,
+        None => None,
     };
     let tls_profile: TlsClientProfile = crate::client_policy::resolve_tls_client_profile(
-        None,
+        j.fingerprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
         j.tls_profile.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         stealth_for_merge,
         invite_tls,
@@ -371,48 +429,109 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
 
     let decoy_gets = if let Some(ref pr) = pr_opt {
         pr.decoy_gets
+    } else if let Some(ref inv) = invite_pair {
+        inv.decoy_gets
     } else {
         j.decoy_gets
     };
+    let decoy_gets_interval_secs = if let Some(ref inv) = invite_pair {
+        inv.decoy_gets_interval_secs
+    } else {
+        j.decoy_gets_interval_secs
+    };
 
-    let decoy_mode: DecoyMode = j
-        .decoy_mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(DecoyMode::from_str)
-        .transpose()
-        .context("decoy_mode")?
-        .or_else(|| pr_opt.as_ref().map(|p| p.decoy_mode))
-        .unwrap_or_default();
-    let desync_mode: DesyncMode = j
-        .desync_mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(DesyncMode::from_str)
-        .transpose()
-        .context("desync_mode")?
-        .unwrap_or_default();
-    let tcp_fooling: TcpFooling = j
-        .tcp_fooling
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(TcpFooling::from_str)
-        .transpose()
-        .context("tcp_fooling")?
-        .unwrap_or_default();
+    let decoy_mode: DecoyMode = (|| -> anyhow::Result<DecoyMode> {
+        if let Some(s) = j
+            .decoy_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return DecoyMode::from_str(s).context("decoy_mode");
+        }
+        if let Some(ref inv) = invite_pair {
+            if let Some(s) = inv
+                .decoy_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return DecoyMode::from_str(s).context("invite decoy_mode");
+            }
+        }
+        Ok(pr_opt.as_ref().map(|p| p.decoy_mode).unwrap_or_default())
+    })()?;
+    let desync_mode: DesyncMode = (|| -> anyhow::Result<DesyncMode> {
+        if let Some(s) = j
+            .desync_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return DesyncMode::from_str(s).context("desync_mode");
+        }
+        if let Some(ref inv) = invite_pair {
+            if let Some(s) = inv
+                .desync_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return DesyncMode::from_str(s).context("invite desync_mode");
+            }
+        }
+        Ok(DesyncMode::default())
+    })()?;
+    let tcp_fooling: TcpFooling = (|| -> anyhow::Result<TcpFooling> {
+        if let Some(s) = j
+            .tcp_fooling
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return TcpFooling::from_str(s).context("tcp_fooling");
+        }
+        if let Some(ref inv) = invite_pair {
+            if let Some(s) = inv
+                .tcp_fooling
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return TcpFooling::from_str(s).context("invite tcp_fooling");
+            }
+        }
+        Ok(TcpFooling::default())
+    })()?;
 
-    let tls_stack: TlsStack = j
-        .tls_stack
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(TlsStack::from_str)
-        .transpose()
-        .context("tls_stack")?
-        .unwrap_or(TlsStack::Rustls);
+    let tls_stack: TlsStack = (|| -> anyhow::Result<TlsStack> {
+        if let Some(s) = j
+            .tls_stack
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return TlsStack::from_str(s);
+        }
+        if let Some(ref inv) = invite_pair {
+            return inv
+                .tls_stack
+                .parse()
+                .context("invite tls_stack");
+        }
+        Ok(TlsStack::Rustls)
+    })()?;
+
+    let tls_fragment = if let Some(ref inv) = invite_pair {
+        inv.tls_fragment
+    } else {
+        j.tls_fragment
+    };
+    let ws_parallel = if let Some(ref inv) = invite_pair {
+        inv.ws_parallel
+    } else {
+        j.ws_parallel.unwrap_or(1).max(1)
+    };
 
     let socks_auth: Option<(String, String)> = {
         let u = j
@@ -427,31 +546,117 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             .filter(|s| !s.is_empty());
         match (u, p) {
             (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
-            (None, None) => None,
+            (None, None) => {
+                if let Some(ref inv) = invite_pair {
+                    let u = inv
+                        .socks_auth_user
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let p = inv
+                        .socks_auth_password
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    match (u, p) {
+                        (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+                        (None, None) => None,
+                        _ => anyhow::bail!(
+                            "invite: set both socks_auth_user and socks_auth_password, or neither"
+                        ),
+                    }
+                } else {
+                    None
+                }
+            }
             _ => anyhow::bail!(
                 "socks_auth: set both socks_auth_user and socks_auth_password, or omit both"
             ),
         }
     };
 
+    let reality_target: Option<String> = invite_pair
+        .as_ref()
+        .and_then(|i| i.reality_target.clone());
+    let reality_public_key: Option<[u8; 32]> = if let Some(ref inv) = invite_pair {
+        inv.reality_public_key_parsed()
+            .context("invite reality_public_key")?
+    } else {
+        None
+    };
+    let reality_short_id: Option<[u8; 8]> = if let Some(ref inv) = invite_pair {
+        inv.reality_short_id_parsed()
+            .context("invite reality_short_id")?
+    } else {
+        None
+    };
+    {
+        let r_any = reality_target.is_some()
+            || reality_public_key.is_some()
+            || reality_short_id.is_some();
+        if r_any {
+            anyhow::ensure!(
+                reality_target.is_some() && reality_public_key.is_some(),
+                "REALITY mode requires both target and public key in invite (or in JSON, when added)"
+            );
+        }
+    }
+
+    let socks_bind = invite_pair
+        .as_ref()
+        .and_then(|i| {
+            i.socks_bind
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .unwrap_or(j.socks_bind);
+
+    let http_proxy_bind = j
+        .http_proxy
+        .clone()
+        .or_else(|| invite_pair.as_ref().and_then(|i| i.http_proxy.clone()));
+    let ws_host = j
+        .ws_host
+        .clone()
+        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_host.clone()));
+    let ws_origin = j
+        .ws_origin
+        .clone()
+        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_origin.clone()));
+    let ws_user_agent = j
+        .ws_user_agent
+        .clone()
+        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_user_agent.clone()));
+    let ws_accept_language = j
+        .ws_accept_language
+        .clone()
+        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_accept_language.clone()));
+    let idle_merged = j
+        .idle_decoy_secs
+        .or(invite_pair.as_ref().and_then(|i| i.idle_decoy_secs));
+    let idle_decoy_secs =
+        crate::stealth_v12::merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
+
     Ok(LocalClientOptions {
         server_host,
         server_port,
         sni,
         token,
-        socks_bind: j.socks_bind,
+        socks_bind,
         socks_auth,
-        http_proxy_bind: j.http_proxy,
+        http_proxy_bind,
         insecure_tls,
         max_pad,
         junk_frames,
         early_ws_frames,
         psk,
         decoy_max,
-        ws_host: j.ws_host,
-        ws_origin: j.ws_origin,
-        ws_user_agent: j.ws_user_agent,
-        ws_accept_language: j.ws_accept_language,
+        ws_host,
+        ws_origin,
+        ws_user_agent,
+        ws_accept_language,
         ws_extra_headers: Arc::new(extra),
         max_ws_binary,
         ws_ping_secs,
@@ -469,22 +674,19 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         pad_mode,
         dummy_interval_secs,
         decoy_gets,
-        decoy_gets_interval_secs: j.decoy_gets_interval_secs,
+        decoy_gets_interval_secs,
         decoy_gets_paths,
         proto,
         proto_domain,
-        reality_target: None,
-        reality_public_key: None,
-        reality_short_id: None,
+        reality_target,
+        reality_public_key,
+        reality_short_id,
         decoy_mode,
         desync_mode,
         tcp_fooling,
-        tls_fragment: j.tls_fragment,
-        ws_parallel: j.ws_parallel.unwrap_or(1).max(1),
-        idle_decoy_secs: crate::stealth_v12::merge_idle_decoy_secs(
-            j.idle_decoy_secs,
-            pr_opt.as_ref(),
-        ),
+        tls_fragment,
+        ws_parallel,
+        idle_decoy_secs,
         stealth_profile: stealth_for_merge,
         tls_stack,
     })
