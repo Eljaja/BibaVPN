@@ -59,3 +59,25 @@ Out of scope:
 - Keep the Docker image up to date (`docker compose build --pull`).
 - Do not commit `server.txt`, `.env*`, `*.pem`, `*.key` — the repo's
   `.gitignore` already covers these.
+
+## BibaV4 / v1.2.0 stealth modes and PSK hygiene
+
+The **v1.2.0** line adds **DPI-oriented** controls (TLS fingerprint mimicry,
+timing masks, adaptive padding, optional **userspace packet desync**). Treat
+these as **defensive hardening** against classification on the path — **not**
+as undetectability from the **VPS operator**, and **not** as authorization to
+break local or national law.
+
+- **PSK and tokens** remain the cryptographic core: use a **strong, unique PSK**,
+  rotate on compromise, and never reuse invite passphrases as PSKs.
+- **Raw sockets**, low-TTL **fake** handshakes, and **modified TCP options** (when
+  implemented) typically require **administrator / root** (or `CAP_NET_RAW` on
+  Linux) and can disrupt unrelated traffic if misconfigured. Only enable
+  desync / fooling options on devices you own and on networks where that is
+  **explicitly** permitted.
+- **Third-party tests** (zapret, TSPU, GoodbyeDPI, commercial DPI boxes) are
+  **environment-specific**; maintainers cannot guarantee a “pass” in your
+  country, ISP, or year. Document results as best-effort.
+
+See also [PROTOCOL.md — BibaV4](PROTOCOL.md#bibav4-v120-target-specification) and
+[AGENTS.md — stealth checklist](AGENTS.md#v120-bibav4-stealth-checklist).

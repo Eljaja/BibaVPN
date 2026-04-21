@@ -23,17 +23,27 @@ walkthroughs see **[README.md](README.md)**. For contributor etiquette see
 - [Testing and benchmarks](#testing-and-benchmarks)
 - [Security](#security)
 - [Guidelines for agents](#guidelines-for-agents)
+- [v1.2.0 BibaV4 stealth (checklist)](#v120-bibav4-stealth-checklist)
 - [Scenarios that were validated](#scenarios-that-were-validated)
 
 ## What the project is
 
 **BibaVPN** is a proxy stack: local **SOCKS5** (TCP `CONNECT` and
 `UDP ASSOCIATE`) and optional **HTTP CONNECT** → **TLS + WebSocket** → remote
-entry server → outbound **TCP or UDP** to the Internet. The tunnel crypto is
-**Biba v3** only: shared **PSK**, opaque variable-length HELLO/ACK, ChaCha20-Poly1305,
-domain-separated KDF, sealed control opcodes, and v3-style inner UDP records.
+entry server → outbound **TCP or UDP** to the Internet.
+
+On **`main` and pre-1.2.0 tags**, the tunnel crypto is **Biba v3** only: shared
+**PSK**, opaque variable-length HELLO/ACK, ChaCha20-Poly1305, domain-separated
+KDF, sealed control opcodes, and v3-style inner UDP records.
+
+On the **`v1.2.0` branch**, the product target is **BibaV4** (see
+[PROTOCOL.md — BibaV4](PROTOCOL.md#bibav4-v120-target-specification)): the wire,
+handshake, and flags may **break** v3. Implement work **only** on `v1.2.0` until
+the maintainers say otherwise.
+
 **BibaV2.1** transport knobs (WS ping, frame-size cap, custom headers, early noise)
-sit on top of the same WebSocket.
+sit on the WebSocket path; BibaV4 adds or replaces them with adaptive padding,
+multi-session mux, timing masks, and optional desync.
 
 **TCP — default:** many SOCKS connections share **one** TLS+WSS session
 (**TCP mux** in `tcp_mux.rs`). After v3 HELLO/ACK and sealed **AUTH**, the
@@ -279,6 +289,32 @@ The server keeps a **pending map** (by destination `SocketAddr`) to correlate
 - Do not embed real credentials in docs or examples.
 
 See **[SECURITY.md](SECURITY.md)** for the disclosure policy.
+
+## v1.2.0 BibaV4 stealth (checklist)
+
+Use this as the working checklist for **DPI** work in the `v1.2.0` branch. Full
+byte-level spec: **[PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification)**.
+Release history: **[CHANGELOG.md](CHANGELOG.md)**.
+
+| Area | What to build | Notes |
+| --- | --- | --- |
+| **TLS** | BoringSSL-class CH builder, `--fingerprint`, GREASE, `--tls-fragment` | `rustls` path cannot fake JA3; new stack or sidecar. |
+| **RTT** | Delayed-ACK on server; 2–4 WSS + RR balancer in mux; `--rtt-mask` | Touch `tcp_mux`, `local_client`, `server` accept path. |
+| **Padding** | `PadMode::Adaptive`, burst heuristics, default switch | `frame.rs` + per-stream state. |
+| **Jitter** | `--ws-jitter` on all outbound WS frames | Every `SinkExt::send` / write path. |
+| **Decoy** | `--decoy-mode browser`, idle micro-sessions | `decoy_traffic` or new module; mind battery on Android. |
+| **Desync** | `--desync-mode`, raw socket, optional fake CH + TCP games | **Privileged**; guard with capability checks + docs. |
+| **CI** | docker-compose + **zapret** + pcap | Fail build or warn if pcap regresses. |
+| **UI** | Tauri + Android expose new toggles / advanced JSON | `bibavpn-jni` + `start_json_config` + Compose. |
+
+**Testing:** add unit tests beside each feature; add integration test that runs
+`scripts/wsl-local-bench.sh` (or a headless equivalent) in CI and compares to a
+stored baseline (≤ **10%** throughput drop target).
+
+**Stealth ≠ legal bypass:** document jurisdiction; do not ship defaults that
+require root without explicit opt-in.
+
+---
 
 ## Guidelines for agents
 

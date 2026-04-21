@@ -18,6 +18,13 @@ wrapper live in the same workspace.
 > **Status:** experimental. Protocol is not frozen — treat any deployment as a
 > personal lab, not a production service. See [Security](#security).
 
+> **v1.2.0 (branch) — breaking / BibaV4:** this line targets a **full DPI-hardening
+> redesign** (handshake, framing, padding, TLS fingerprinting, optional
+> desync / timing masks). It is **not** wire-compatible with older Biba v3
+> servers or clients. See [BibaV4 section below](#v120--bibav4-breaking-changes),
+> [PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification), and
+> [CHANGELOG.md](CHANGELOG.md).
+
 **Quick start**
 
 ```bash
@@ -30,8 +37,9 @@ bash start.sh
 ([Releases](https://github.com/Eljaja/BibaVPN/releases) — Android & desktop. `bash start.sh` prints a labeled **Invite URI** (`biba://…`) and **Passphrase**; paste both into the app.)
 
 - **Docs**
-  - [PROTOCOL.md](PROTOCOL.md) — wire formats, session flow, invite URI
-  - [AGENTS.md](AGENTS.md) — architecture, CLI flags, deploy notes, scripts
+  - [PROTOCOL.md](PROTOCOL.md) — wire formats, session flow, invite URI, **BibaV4 target spec**
+  - [AGENTS.md](AGENTS.md) — architecture, CLI flags, deploy notes, scripts, **stealth checklist**
+  - [CHANGELOG.md](CHANGELOG.md) — v1.2.0 / BibaV4 release notes
   - [DESIGN.md](DESIGN.md) — brand / UI design system for ports
 
 ---
@@ -49,6 +57,8 @@ bash start.sh
 - [Using the tunnel](#using-the-tunnel)
 - [Build from source](#build-from-source)
 - [Configuration](#configuration)
+- [v1.2.0 — BibaV4 breaking changes](#v120--bibav4-breaking-changes)
+- [Comparison (at a glance)](#comparison-at-a-glance)
 - [Android and desktop](#android-and-desktop)
 - [Security](#security)
 - [License](#license)
@@ -291,6 +301,39 @@ cargo test --workspace
 
 A `rust-toolchain.toml` pins the compiler version so CI and local builds stay
 reproducible. Docker images use the same or a newer toolchain.
+
+---
+
+## v1.2.0 — BibaV4 breaking changes
+
+The **`v1.2.0` git branch** and the **1.2.x** crate / app releases implement the
+**BibaV4** DPI focus: single-VPS, Rust core, **TLS + WebSocket** transport,
+**Android** + **Tauri** UIs, with **no obligation** to stay compatible with
+Biba v3 wire or older apps. Operators should upgrade **client and server
+together** and re-issue invites / configs.
+
+Design goals (see [PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification)) include
+uTLS-class ClientHello control, cross-layer RTT mitigation, adaptive padding,
+browser-like decoy sessions, and optional userspace desync — subject to
+legitimate use and [SECURITY.md](SECURITY.md) cautions.
+
+---
+
+## Comparison (at a glance)
+
+Rough positioning only; details depend on version and network path. BibaV4
+features in this branch land incrementally; check the crate version and
+[CHANGELOG.md](CHANGELOG.md).
+
+| | **BibaVPN (v1.2.0 target)** | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (e.g. Xray) |
+| --- | --- | --- | --- | --- |
+| **Primary transport** | TLS + WSS, PSK inner | TLS + WSS, generic | QUIC | TLS fronting / proxy protocol |
+| **DPI focus** | Explicit (fingerprints, timing, padding, decoys) | General tunneling | Brutal throughput / quic | Site mimicry |
+| **Typical role** | Single small VPS, SOCKS/CONNECT | Port forwarding / WSS | High perf | Domain fronting style |
+| **Ecosystem** | Rust + mobile/desktop in-repo | many | Go server | V2Ray / Xray family |
+
+BibaVPN does not claim a security or anonymity property beyond “harder to
+classify on the wire” — see [Security](#security).
 
 ---
 

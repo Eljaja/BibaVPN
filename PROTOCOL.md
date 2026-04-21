@@ -17,6 +17,7 @@ This document specifies the on-wire layers. For install / run instructions see
 - [Wire formats (packets and frames)](#wire-formats-packets-and-frames)
 - [End-to-end picture (session flow)](#end-to-end-picture-session-flow)
 - [Encrypted invite `biba://`](#encrypted-invite-biba)
+- [BibaV4 (v1.2.0) target specification](#bibav4-v120-target-specification)
 
 ---
 
@@ -349,3 +350,89 @@ These options shape TLS/WebSocket timing and framing; they apply on top of the v
 - `--camouflage-dir`, `--camouflage-url` (`http://` upstream only) — server camouflage
 
 Wire-format changes require **both** client and server updates.
+
+---
+
+## BibaV4 (v1.2.0) target specification
+
+This section is the **normative product spec** for the `v1.2.0` / BibaV4 line.
+**Backward compatibility is not required:** BibaV4 may replace the Biba v3
+handshake, inner opcodes, padding, mux layout, and invite fields. The
+**on-the-wire byte layout** will be documented here as subsystems merge; until
+then, treat v3 sections above as the **current** implementation and this section
+as the **target**.
+
+**Design goal:** position BibaVPN among the stronger **single-VPS,
+DPI-resistant** tunnels in 2026 (Rust core, TLS + WebSocket, Android app), with
+focus on **DPI bypass** (not anonymity against the VPS operator).
+
+### P0 — TLS fingerprint mimicry + randomized ClientHello
+
+- Move or add a **BoringSSL-class** TLS path (e.g. `tokio-boring` / similar) or
+  an approved alternative that exposes **full ClientHello construction** (GREASE,
+  randomized extension order, custom extensions).
+- CLI: `--fingerprint chrome-132 | firefox-136 | safari-18 | random` (default:
+  Chrome 132+ class profile for 2026).
+- Optional **record fragmentation:** `--tls-fragment` splits **ClientHello** and
+  (where applicable) **TLS application data** across **2–4** TCP segments.
+
+**Note:** Today’s `rustls`-only path can at best align cipher order and ALPN;
+true JA3/JA4 parity requires byte-level control (see `tls_util.rs` comments).
+
+### P0 — Cross-layer RTT fingerprint (mitigation)
+
+- **Server:** configurable **delayed ACK buffer** (e.g. 40–500 ms) in the async
+  runtime.
+- **Client + server:** **2–4 parallel WebSocket** sessions with a **round-robin**
+  balancer feeding the same logical mux.
+- **Flags:** `--rtt-mask` (artificial jitter on ACK / timing paths).
+- **Decoy targets** chosen for **high natural RTT variance** to dilute
+  cross-layer timing classifiers (per NDSS-class threat models).
+
+### P0 — Adaptive burst padding + traffic shaping
+
+- New default: `--pad-mode adaptive` — mimic **HTTP/2 Chrome/Firefox burst
+  patterns** (e.g. first **5–7** frames in a **900–1400** byte band, then
+  smaller deferred packets).
+- **All** WebSocket outbound frames: `--ws-jitter` in a **5–25 ms** band
+  (uniform or distribution TBD in implementation).
+
+### P0 — Browser-like decoy simulator
+
+- `--decoy-mode browser`: built-in list of real sites + matching **User-Agent**,
+  **Referer**, cookie-like headers.
+- On **idle > N seconds** (default target **10 s**), run **short** background
+  sessions (**2–4** requests with **100–300 ms** pauses).
+
+### P0 — Client-side packet desync (userspace)
+
+- `--desync-mode split2 | fakedsplit | disorder`
+- Optional **fake ClientHello** injection with **low TTL** (1–5).
+- TCP segmentation + **junk TCP options** (`--fooling md5sig | badseq | badsum`
+  — exact set TBD).
+- Implemented in **userspace** (`tokio` + **raw/raw-like** sockets where the OS
+  allows). **Requires elevated privileges** on most platforms; see
+  [SECURITY.md](SECURITY.md).
+
+### P1 (v1.2.0 or v1.2.1)
+
+- WebSocket upgrade over **HTTP/2** (`--transport http2`) with **HTTP/1.1**
+  fallback.
+- Adaptive host/header spoofing (`--hostspell`, `--hostcase`, random
+  subdomains).
+- **IP ID** + **TTL** randomization (`--ip-id rnd | seqgroup`, `autottl`).
+- UDP mux: length desync and fake **QUIC/DHT**-like patterns.
+
+### Acceptance (product)
+
+- CI: **docker-compose** lab with **zapret** (`nfqws` / `tpws`) and captured
+  pcaps for regression.
+- Manual: **TSPU** (RU) and **GoodbyeDPI**-class paths where legally and safely
+  testable.
+- **Benchmarks:** throughput must not regress more than **~10%** vs baseline on
+  the project’s local bench scripts.
+- **Tests:** unit + integration for each new subsystem; **Changelog** + **release
+  notes** at ship time.
+
+Invite / JSON / `proto` field will move to a **BibaV4** identifier when the wire
+lands (exact value and migration are implementation-defined in this branch).
