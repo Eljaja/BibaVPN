@@ -18,11 +18,14 @@ wrapper live in the same workspace.
 > **Status:** experimental. Protocol is not frozen — treat any deployment as a
 > personal lab, not a production service. See [Security](#security).
 
-> **v1.2.0 (branch) — breaking / BibaV4:** this line targets a **full DPI-hardening
-> redesign** (handshake, framing, padding, TLS fingerprinting, optional
-> desync / timing masks). It is **not** wire-compatible with older Biba v3
-> servers or clients. See [BibaV4 section below](#v120--bibav4-breaking-changes),
-> [PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification), and
+> **v1.2.x (stealth on v3) —** current releases still speak the **Biba v3** PSK
+> wire, with optional **BibaV1.2** layers (Boring or rustls outer TLS, adaptive
+> padding, WS jitter, multi-WSS + RR, decoys, server ACK/RTT masks). A future
+> **BibaV4** inner protocol may break compatibility — that target spec is
+> [PROTOCOL.md — BibaV4](PROTOCOL.md#bibav4-v120-target-specification) and
+> [AGENTS — status vs BibaV4](AGENTS.md#bibav12-stealth-status-vs-bibav4). Until
+> then, **upgrade client and server together** for any given checkout or release
+> build; do not mix binaries from different eras without checking
 > [CHANGELOG.md](CHANGELOG.md).
 
 **Quick start**
@@ -37,8 +40,8 @@ bash start.sh
 ([Releases](https://github.com/Eljaja/BibaVPN/releases) — Android & desktop. `bash start.sh` prints a labeled **Invite URI** (`biba://…`) and **Passphrase**; paste both into the app.)
 
 - **Docs**
-  - [PROTOCOL.md](PROTOCOL.md) — wire formats, session flow, invite URI, **BibaV4 target spec**
-  - [AGENTS.md](AGENTS.md) — architecture, CLI flags, deploy notes, scripts, **stealth checklist**
+  - [PROTOCOL.md](PROTOCOL.md) — wire formats, session flow, invite URI, **BibaV4 roadmap** + **v3 + implementation status**
+  - [AGENTS.md](AGENTS.md) — architecture, CLI flags, deploy notes, scripts, **stealth vs BibaV4**
   - [CHANGELOG.md](CHANGELOG.md) — v1.2.0 / BibaV4 release notes
   - [DESIGN.md](DESIGN.md) — brand / UI design system for ports
 
@@ -78,8 +81,9 @@ bash start.sh
 HTTP CONNECT) endpoint.
 - **Server** runs on a VPS, terminates TLS + WebSocket, and dials the target
 TCP / UDP destination.
-- Many logical streams are multiplexed over **one** persistent WebSocket —
-fewer TLS handshakes, less distinctive traffic shape.
+- Many logical streams are multiplexed over **one to four** outer WebSocket
+**sessions** (client `--ws-parallel`, round-robin stream placement) or **one**
+when `ws_parallel=1` — trading extra handshakes for more natural parallelism.
 
 For the full wire format, frame layout and session setup see
 **[PROTOCOL.md](PROTOCOL.md)**.
@@ -97,11 +101,18 @@ reverse origin).
 and **sealed** control frames (AUTH, OPEN, MUX / UDP_MUX, OPEN_OK / OPEN_ERR).
 UDP datagrams use **v3 single-byte opcodes** (`0x05` / `0x06` for REQ/REP) inside
 the AEAD plaintext, not legacy ASCII magics.
-- **BibaV2.1** shaping knobs: random / HTTP-bucket padding, WS Ping with
-jitter, binary size cap, configurable upgrade headers per TLS profile
-(Chrome / Firefox), early-session noise, TLS leaf pinning (`--pin-cert`).
-- **TCP mux** over one WSS (stream open / data / window / close) + a separate
-UDP mux.
+- **BibaV2.1** shaping knobs: **adaptive** / random / HTTP-bucket padding, WS
+Ping with jitter, binary size cap, **per-frame WS jitter (min–max ms)**,
+configurable upgrade headers per **TLS client profile** (default **Chrome
+132+** when nothing else is selected), early-session noise, **TLS** via **rustls**
+(default) or **BoringSSL** (`--features boring-tls`, client `--tls-stack boring`
+— **`--pin-cert` + Boring** is not supported yet), TLS leaf pinning on **rustls**
+(`--pin-cert`).
+- **TCP mux** over **1–4** outer WSS sessions (round-robin when `--ws-parallel` is
+2–4) + a separate **single** WSS for UDP mux.
+- **BibaV1.2 extras:** optional `--stealth-profile`, `fingerprint` / `tls_profile`
+merge rules (`client_policy`), parallel decoys plus **idle** decoys, server
+**delayed ACK** + **ACK profile** and RTT mask — see [AGENTS.md](AGENTS.md).
 - **Encrypted invite URIs** (`biba://…`) so you can ship one line of config
 instead of a wall of flags.
 - **Android** app (Jetpack Compose, JNI core) and **Tauri desktop** wrapper.
@@ -306,26 +317,26 @@ reproducible. Docker images use the same or a newer toolchain.
 
 ## v1.2.0 — BibaV4 breaking changes
 
-The **`v1.2.0` git branch** and the **1.2.x** crate / app releases implement the
-**BibaV4** DPI focus: single-VPS, Rust core, **TLS + WebSocket** transport,
-**Android** + **Tauri** UIs, with **no obligation** to stay compatible with
-Biba v3 wire or older apps. Operators should upgrade **client and server
-together** and re-issue invites / configs.
+The **1.2.x** line ships **Biba v3** on the wire today and implements many
+**BibaV1.2** anti-DPI behaviors as optional layers. The long-term **BibaV4**
+product spec in [PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification) may
+still **replace** inner opcodes or KDF/invite fields — that would be a true
+**breaking** wire change. Until such a cutover, treat releases as “**v3 + stealth**”
+and keep **client, server, and app builds** on the same version line.
 
-Design goals (see [PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification)) include
-uTLS-class ClientHello control, cross-layer RTT mitigation, adaptive padding,
-browser-like decoy sessions, and optional userspace desync — subject to
-legitimate use and [SECURITY.md](SECURITY.md) cautions.
+[PROTOCOL — Implementation status](PROTOCOL.md#implementation-status-12x-on-v3)
+lists what is already in code versus what remains **roadmap** relative to the
+BibaV4 bullet list. Always follow [SECURITY.md](SECURITY.md) and local law.
 
 ---
 
 ## Comparison (at a glance)
 
-Rough positioning only; details depend on version and network path. BibaV4
-features in this branch land incrementally; check the crate version and
+Rough positioning only; details depend on version and network path. Stealth
+features land incrementally on top of v3; check the crate version and
 [CHANGELOG.md](CHANGELOG.md).
 
-| | **BibaVPN (v1.2.0 target)** | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (e.g. Xray) |
+| | **BibaVPN (1.2.x, v3 wire)** | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (e.g. Xray) |
 | --- | --- | --- | --- | --- |
 | **Primary transport** | TLS + WSS, PSK inner | TLS + WSS, generic | QUIC | TLS fronting / proxy protocol |
 | **DPI focus** | Explicit (fingerprints, timing, padding, decoys) | General tunneling | Brutal throughput / quic | Site mimicry |
@@ -347,7 +358,11 @@ The client wire is **Biba v3 only** (`--proto` defaults to **`3`**). Server
 the **SNI** when the client leaves `--proto-domain` empty.
 - **Shape / anti-DPI:** `--decoy-max`, `--max-pad`, `--pad-mode`,
 `--dummy-interval-secs`, `--ws-ping-secs`, `--junk-frames`,
-`--decoy-gets`* (client-only).
+`--stealth-profile`, `--fingerprint` / effective TLS client profile, `--ws-jitter-min-ms` /
+`--ws-jitter-max-ms`, `--ws-parallel`, `--decoy-gets`*, `--idle-decoy-secs`
+(client), `--tls-stack` (with `boring-tls` build if needed), `--tls-fragment`.
+- **Server timing:** `--ack-profile`, `--server-ack-delay-*-ms`, `--rtt-mask-jitter-ms`
+(see [AGENTS.md](AGENTS.md) for when profiles apply).
 - **Camouflage on the TLS port (server):** `--camouflage-dir <path>` or
 `--camouflage-url http://…`.
 - **TLS trust (client):** real CA by default, `--pin-cert <pem>` to pin the

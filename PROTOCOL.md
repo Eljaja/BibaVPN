@@ -18,6 +18,7 @@ This document specifies the on-wire layers. For install / run instructions see
 - [End-to-end picture (session flow)](#end-to-end-picture-session-flow)
 - [Encrypted invite `biba://`](#encrypted-invite-biba)
 - [BibaV4 (v1.2.0) target specification](#bibav4-v120-target-specification)
+  - [Implementation status (1.2.x on v3)](#implementation-status-12x-on-v3)
 
 ---
 
@@ -47,7 +48,7 @@ flowchart LR
   end
 
   subgraph L3["TLS"]
-    TLS["Encrypted records\n(whole WS stream)"]
+    TLS["Encrypted records\n(whole WS stream;\n rustls or BoringSSL build)"]
   end
 
   P --> F
@@ -61,8 +62,10 @@ flowchart LR
 
 The tunnel expects a **PSK** on both ends. **L5** uses ChaCha20-Poly1305 with
 **Biba v3** key derivation and handshake (opaque HELLO/ACK, domain-separated
-KDF). Padding length for **L6** can follow **uniform random** or **HTTP-like size
-buckets** (`--pad-mode`).
+KDF). Padding length for **L6** can follow **adaptive**, **uniform random**, or
+**HTTP-like size buckets** (`--pad-mode`). The **outer** TLS handshake uses
+**rustls** by default, or **BoringSSL** when the client is built with Cargo
+feature **`boring-tls`** and `--tls-stack boring` (see `tls_util`, `AGENTS.md`).
 
 ---
 
@@ -138,7 +141,7 @@ sealed UDP_MUX (`0x03`)** sequence; datagrams use **`0x05` / `0x06`** as above.
 flowchart TB
   subgraph client["bibavpn-client"]
     APP[Apps] --> SOCKS[SOCKS5 / HTTP CONNECT]
-    SOCKS --> TUN_TCP[TCP: mux driver\n1 shared WSS default]
+    SOCKS --> TUN_TCP[TCP: mux driver\n1–4 outer WSS (RR)]
     SOCKS --> TUN_UDP[UDP mux driver\n1 shared WSS]
   end
 
@@ -250,7 +253,9 @@ Flags include stream open, data, close, RST, and window update (flow control). S
 
 Top to bottom: **from the app to bytes inside one tunnel frame**. The hop from the app to `bibavpn-client` is **not** BibaVPN-encrypted — plain SOCKS5/CONNECT.
 
-**Default TCP (multiplexed):** one **TLS + WSS** per client process; many SOCKS connections become **mux streams** on that socket.
+**Default TCP (multiplexed):** **one to four** **TLS + WSS** sessions per client
+process (round-robin assignment of new streams when `--ws-parallel` is 2–4); many
+SOCKS connections become **mux streams** on those sockets.
 
 ```mermaid
 flowchart TB
@@ -337,34 +342,80 @@ Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`pro
 These options shape TLS/WebSocket timing and framing; they apply on top of the v3 tunnel.
 
 - `--ws-ping-secs`, `--ws-ping-jitter-percent`, `--ws-binary-send-jitter-ms`
+- `--ws-jitter-min-ms` / `--ws-jitter-max-ms` — per-frame send delay range (replaces
+  uniform `--ws-binary-send-jitter-ms` when min/max are set); presets may fill
+  these when both min and max are left at **0** (`stealth_v12` / `apply_preset_ws_jitter`)
 - `--max-ws-binary` — cap outgoing WS binary; mux code reserves **9 bytes** for the mux record header when chunking TCP.
 - `--udp-max-pad`, `--udp-max-ws-binary`, `--udp-mux-reply-timeout-secs`
 - `--ws-host`, `--ws-origin`, `--ws-user-agent`, `--ws-accept-language`, `--ws-header`
 - `--early-ws-frames`, `--junk-frames`
-- `--pin-cert` (client) — incompatible with `--insecure`
+- `--pin-cert` (client) — incompatible with `--insecure`; **not** supported on the
+  **BoringSSL** path (client rejects the combination)
+- `--tls-stack rustls|boring` (client) — build with `cargo build -p bibavpn --features boring-tls` for Boring
+- `--tls-fragment` — record-size hint where the TLS stack supports it (see `tls_util`)
 - `--ws-path` — WebSocket path; token via sealed **AUTH** (default `/ws`)
 - `--legacy-path-auth` (server) — accept old `/b/{token}` without sealed AUTH (less safe)
-- `--pad-mode random|http-buckets`
+- `--pad-mode adaptive|random|http-buckets`
+- `--stealth-profile default|balanced|aggressive` — fills padding/jitter/decoy/idle
+  defaults when explicit CLI values are unset (see `stealth_v12`)
+- `--fingerprint` / TLS profile — resolved with `tls_profile` and invite in a
+  fixed order (`client_policy`); final default client label is **Chrome 132+**
+- `--ws-parallel` **1..=4** — parallel outer WSS + mux stream round-robin (REALITY: single WSS in this build)
 - `--dummy-interval-secs` — idle empty padded frames (`0` = off)
 - `--decoy-gets`, `--decoy-gets-interval-secs`, `--decoy-gets-paths` — client-only decoy HTTPS fetches
+- `--idle-decoy-secs` — when the mux is idle longer than this threshold, run short
+  background HTTPS decoys (merged with `--stealth-profile` defaults)
+- **Server:** `--server-ack-delay-min-ms` / `max`, `--rtt-mask-jitter-ms`, optional
+  `--ack-profile balanced|aggressive` when the explicit millisecond args are all zero
 - `--camouflage-dir`, `--camouflage-url` (`http://` upstream only) — server camouflage
 
-Wire-format changes require **both** client and server updates.
+Wire-format changes require **both** client and server updates. Pure client-side
+or server-side **timing / TLS engine** options do not change the v3 opcodes
+above, but all peers must use compatible `bibavpn` versions when new flags are required.
 
 ---
 
 ## BibaV4 (v1.2.0) target specification
 
 This section is the **normative product spec** for the `v1.2.0` / BibaV4 line.
-**Backward compatibility is not required:** BibaV4 may replace the Biba v3
-handshake, inner opcodes, padding, mux layout, and invite fields. The
-**on-the-wire byte layout** will be documented here as subsystems merge; until
-then, treat v3 sections above as the **current** implementation and this section
-as the **target**.
+**Backward compatibility is not required** for a *future* BibaV4 wire: BibaV4
+may still replace the Biba v3 handshake, inner opcodes, padding, mux layout, and
+invite fields. The **on-the-wire byte layout** will be documented here as
+subsystems merge; **today’s releases** in this repository still use the **Biba
+v3** opcodes in the sections above and implement many BibaV4 *behaviors* as
+client/server layers on that wire (see **Implementation status** below).
 
 **Design goal:** position BibaVPN among the stronger **single-VPS,
 DPI-resistant** tunnels in 2026 (Rust core, TLS + WebSocket, Android app), with
 focus on **DPI bypass** (not anonymity against the VPS operator).
+
+### Implementation status (1.2.x on v3)
+
+Rough mapping from the P0 / P1 bullets below to the **current tree** (not an
+exhaustive changelog):
+
+- **P0 TLS:** optional **BoringSSL** build (`boring-tls` + `--tls-stack boring`)
+  for byte-level `SslConnector` control; **`rustls` remains the default** and does
+  not provide full JA3 parity by itself. **`--pin-cert` + Boring** is rejected
+  until implemented.
+- **P0 RTT:** **delayed ACK** and **RTT mask jitter** on the server; **2–4 WSS** +
+  **round-robin** in `tcp_mux` (not used for REALITY in this build).
+- **P0 padding / jitter:** `PadMode::Adaptive`; WebSocket **min/max ms** jitter;
+  **stealth presets** (`stealth_v12`) align defaults.
+- **P0 decoys:** **idle** decoys after a configurable **idle** threshold
+  (defaults merged from presets, often **10 s** for balanced/aggressive) plus
+  existing **parallel** `decoy_gets` — a full “browser” catalog per spec is not
+  guaranteed here.
+- **P0 desync:** `DesyncConfig` and parsing exist; most raw-socket modes need OS
+  support and remain **aspirational** until hooked up.
+- **P1 HTTP/2 WebSocket, IP ID, UDP length games:** **not** implemented as
+  described in the bullets below — still **roadmap** relative to this tree.
+
+**Benchmarks (example):** on one WSL loopback run (64 MiB, `scripts/bench-wsl-2026-04-20.txt`)
+direct HTTP reached ~**932** MB/s vs SOCKS+WSS ~**311** MB/s; use
+`scripts/wsl-local-bench.sh` for before/after comparisons, not as an absolute
+ceiling. Target **≤ ~10%** regression vs your baseline when changing the hot path
+(see **Acceptance**).
 
 ### P0 — TLS fingerprint mimicry + randomized ClientHello
 

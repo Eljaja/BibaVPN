@@ -23,7 +23,7 @@ walkthroughs see **[README.md](README.md)**. For contributor etiquette see
 - [Testing and benchmarks](#testing-and-benchmarks)
 - [Security](#security)
 - [Guidelines for agents](#guidelines-for-agents)
-- [v1.2.0 BibaV4 stealth (checklist)](#v120-bibav4-stealth-checklist)
+- [BibaV1.2 stealth (status vs BibaV4)](#bibav12-stealth-status-vs-bibav4)
 - [Scenarios that were validated](#scenarios-that-were-validated)
 
 ## What the project is
@@ -32,24 +32,31 @@ walkthroughs see **[README.md](README.md)**. For contributor etiquette see
 `UDP ASSOCIATE`) and optional **HTTP CONNECT** → **TLS + WebSocket** → remote
 entry server → outbound **TCP or UDP** to the Internet.
 
-On **`main` and pre-1.2.0 tags**, the tunnel crypto is **Biba v3** only: shared
-**PSK**, opaque variable-length HELLO/ACK, ChaCha20-Poly1305, domain-separated
-KDF, sealed control opcodes, and v3-style inner UDP records.
+The tunnel crypto on supported release lines is **Biba v3**: shared **PSK**,
+opaque variable-length HELLO/ACK, ChaCha20-Poly1305, domain-separated KDF, sealed
+control opcodes, and v3-style inner UDP records.
 
-On the **`v1.2.0` branch**, the product target is **BibaV4** (see
-[PROTOCOL.md — BibaV4](PROTOCOL.md#bibav4-v120-target-specification)): the wire,
-handshake, and flags may **break** v3. Implement work **only** on `v1.2.0` until
-the maintainers say otherwise.
+The **1.2.x** line still uses the **Biba v3** PSK wire on the inside; layered on
+top are **BibaV1.2 “stealth”** options (TLS profile labels, padding modes, timing,
+decoys, optional multi-WSS, optional BoringSSL outer TLS). The long-term product
+spec **BibaV4** (see [PROTOCOL.md — BibaV4](PROTOCOL.md#bibav4-v120-target-specification))
+may still change inner opcodes or framing — treat that section as roadmap where
+it goes beyond current v3.
 
 **BibaV2.1** transport knobs (WS ping, frame-size cap, custom headers, early noise)
-sit on the WebSocket path; BibaV4 adds or replaces them with adaptive padding,
-multi-session mux, timing masks, and optional desync.
+sit on the WebSocket path. **BibaV1.2** adds `PadMode::Adaptive`, `--stealth-profile`,
+`--fingerprint` / TLS resolution order, WebSocket jitter ranges, parallel outer
+WSS sessions (`--ws-parallel`), idle-triggered decoys, server delayed-ACK / RTT
+mask, and an optional **BoringSSL** build (`--features boring-tls`, `--tls-stack boring`).
 
-**TCP — default:** many SOCKS connections share **one** TLS+WSS session
-(**TCP mux** in `tcp_mux.rs`). After v3 HELLO/ACK and sealed **AUTH**, the
-client sends `MUX_OPEN`; per-target opens use mux records (stream id,
-flags, payload) inside padded frames, with window-based flow control. Use
-`--no-mux` for legacy **one WSS per SOCKS CONNECT** (`OPEN` + binary loop).
+**TCP — default:** many SOCKS connections share **one or more** TLS+WSS sessions
+(**TCP mux** in `tcp_mux.rs`). With `--ws-parallel 2..=4`, the client opens that
+many full v3 sessions (each with `MUX_OPEN`) and **round-robins** new streams
+across them (`TcpMuxSessionPool::pick`). After v3 HELLO/ACK and sealed **AUTH**,
+the client sends `MUX_OPEN`; per-target opens use mux records (stream id, flags,
+payload) inside padded frames, with window-based flow control. Use `--no-mux` for
+legacy **one WSS per SOCKS CONNECT** (`OPEN` + binary loop). REALITY mode does
+not use multi-WSS in this build.
 
 **UDP** (e.g. DNS via SOCKS5 UDP) uses a **separate** shared WSS:
 `UDP_MUX_OPEN` (`protocol.rs`), then v3 **`0x05` UDP_REQ** / **`0x06` UDP_REP**
@@ -61,11 +68,25 @@ client to the VPS.
 `--camouflage-dir` static files, or `--camouflage-url` (`http://host:port`
 only — plaintext to origin).
 
-**DPI-oriented options:** `--pad-mode random|http-buckets`,
-`--dummy-interval-secs` (idle empty padded frames on the tunnel; mux shares
-one outer connection), client-only decoy `--decoy-gets` (+ interval and
-comma-separated paths), `stealth.rs` WebSocket upgrade header order per TLS
-profile (Chrome / Firefox).
+**DPI-oriented options:** `--pad-mode adaptive|random|http-buckets`,
+`--dummy-interval-secs` (idle empty padded frames on the tunnel; mux may share
+several outer connections when `--ws-parallel` is between 2 and 4), **TLS profile** via
+`--fingerprint` / `--tls-profile` (priority rules in `client_policy.rs` —
+default client label **Chrome 132+** when nothing else applies), optional
+`--stealth-profile default|balanced|aggressive` (fills pad/jitter/decoy/idle
+thresholds when explicit flags are absent), **WebSocket send jitter** (`--ws-jitter-min/max-ms`
+or legacy uniform delay), **idle decoy** HTTPS GETs when the mux is quiet longer
+than `--idle-decoy-secs` (merged with preset; **10 s** in balanced/aggressive
+presets unless overridden) — `activity.rs` + `decoy_traffic.rs`, client-only
+parallel decoy `--decoy-gets` (+ interval and paths), `stealth_v12` decoy modes,
+`stealth.rs` WebSocket upgrade header shape per `TlsClientProfile`. **Server:**
+`--server-ack-delay-*-ms`, `--rtt-mask-jitter-ms`, and optional `--ack-profile
+balanced|aggressive` when the explicit millisecond args are all zero
+(`ServerRttDefaults` in `stealth_v12.rs`). **Outer TLS engine:** `rustls` (default,
+`biba` cipher/ALPN hints) or **BoringSSL** (`cargo build -p bibavpn --features boring-tls`,
+client `--tls-stack boring`); **certificate pinning** is not supported on the
+Boring path yet. **Raw desync** (`desync.rs`): modes are mostly advisory until
+platform hooks exist.
 
 Typical traffic path (TCP, mux):
 
@@ -110,8 +131,13 @@ dedicated WSS.
 | `bibavpn/src/incoming.rs`                           | Read HTTP request on TLS; WebSocket 101 + `WebSocketStream::from_partially_read`; or serve camouflage GET/HEAD         |
 | `bibavpn/src/camouflage.rs`                         | Shared HTML / 404 bodies for rejects and static fallbacks                                                              |
 | `bibavpn/src/ws_auth.rs`                            | Server waits for `AUTH` frame (timeout, skip noise)                                                                    |
-| `bibavpn/src/tcp_mux.rs`                            | Mux wire format, client handle, server bridge, optional idle dummy on the mux                                          |
+| `bibavpn/src/tcp_mux.rs`                            | Mux wire format, client handle, server bridge, optional idle dummy, multi-WSS pool + RR                                  |
 | `bibavpn/src/tcp_mux_roadmap.rs`                    | Long-form design notes for the TCP-mux evolution (no runtime code)                                                     |
+| `bibavpn/src/client_tls_stream.rs`, `tls_boring.rs` | `TlsStack` paths: `rustls` (default) vs `boring` (`--features boring-tls`); REALITY + Boring generic handshake         |
+| `bibavpn/src/tls_util.rs`                           | Cipher/ALPN hints, `TlsStack`, record-fragment helper (rustls; Boring logs if set)                                     |
+| `bibavpn/src/client_policy.rs`                      | TLS client label resolution: `fingerprint` → `tls_profile` → invite → `stealth` → default **Chrome 132+**              |
+| `bibavpn/src/stealth_v12.rs`                        | `StealthProfile` / presets (pad, jitter, decoys, idle threshold, server RTT defaults)                                  |
+| `bibavpn/src/activity.rs`                           | Idle detection for idle-decoy scheduling                                                                               |
 | `bibavpn/src/decoy_traffic.rs`                      | Optional parallel short HTTPS GETs (same TLS profile as the tunnel)                                                    |
 | `bibavpn/src/socks5.rs`                             | SOCKS5 frontend (`CONNECT` + `UDP ASSOCIATE` replies)                                                                  |
 | `bibavpn/src/local_client.rs`                       | SOCKS dispatch, mux slot, UDP mux, decoy spawn, `LocalClientOptions`                                                   |
@@ -169,12 +195,22 @@ Compatible with the same PSK/decoy settings when both ends match.
   clients using v3
 - Server `--legacy-path-auth` — accept the old `/b/{token}` URL without
   `AUTH` (less safe)
-- `--pad-mode random|http-buckets` — padding distribution (invite may carry
-  `pad_mode` string)
+- `--pad-mode adaptive|random|http-buckets` — padding distribution (invite may carry
+  `pad_mode` string); `--stealth-profile` can choose defaults when explicit
+  `pad_mode` / jitter / decoy args are unset
 - `--dummy-interval-secs` — idle empty padded frames (`0` = off); invite may
   set `dummy_interval_secs`
 - Client `--decoy-gets`, `--decoy-gets-interval-secs`,
   `--decoy-gets-paths` — not part of invite JSON (client-only)
+- `--ws-parallel` **1..=4** — parallel outer WSS sessions + mux RR (`2..=4` only
+  for plain/mux, not REALITY in this build)
+- `--ws-jitter-min-ms` / `--ws-jitter-max-ms` (or legacy `--ws-binary-send-jitter-ms`)
+- `--idle-decoy-secs` — background HTTPS when mux idle (merged with preset;
+  balanced/aggressive default **10 s** unless overridden)
+- `--tls-stack rustls|boring` — build with `cargo build -p bibavpn --features boring-tls`
+  for Boring; **`--pin-cert` + Boring** is rejected
+- **Server:** `--ack-profile balanced|aggressive` if explicit `--server-ack-*` /
+  `--rtt-mask-jitter-ms` are all zero; else set delays in milliseconds directly
 - Server `--camouflage-dir`, `--camouflage-url` (`http://` upstream only)
 
 `rust-toolchain.toml` pins a stable Rust version for reproducible builds.
@@ -277,6 +313,10 @@ The server keeps a **pending map** (by destination `SocketAddr`) to correlate
   or invite / CLI defaults.
 - `scripts/wsl-local-bench.sh` is a quick sanity check for throughput after
   changes to `frame.rs`, `tcp_mux.rs`, or `ws_bridge.rs`.
+- **Example baseline (WSL, 2026-04-20, 64 MiB,** `scripts/bench-wsl-2026-04-20.txt`**):**
+  direct HTTP ~**932** MB/s vs SOCKS+WSS ~**311** MB/s on loopback — **not** a
+  universal speed; use the same script before/after changes and keep regression
+  within **≤ ~10%** vs your stored baseline (see [PROTOCOL.md](PROTOCOL.md) acceptance).
 
 ## Security
 
@@ -284,32 +324,35 @@ The server keeps a **pending map** (by destination `SocketAddr`) to correlate
   `.gitignore`).
 - Treat PSK, token, and invite passphrase as **secrets**.
 - `--pin-cert` narrows trust; do not combine with `--insecure` on the
-  client.
+  client. **BoringSSL** (`--tls-stack boring`) does not support pinning in this
+  build — the client rejects `--pin-cert` with that stack.
 - Prefer **SSH keys** for `remote-deploy.sh`.
 - Do not embed real credentials in docs or examples.
 
 See **[SECURITY.md](SECURITY.md)** for the disclosure policy.
 
-## v1.2.0 BibaV4 stealth (checklist)
+## BibaV1.2 stealth (status vs BibaV4)
 
-Use this as the working checklist for **DPI** work in the `v1.2.0` branch. Full
-byte-level spec: **[PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification)**.
-Release history: **[CHANGELOG.md](CHANGELOG.md)**.
+**Normative long-term spec:** [PROTOCOL.md — BibaV4](PROTOCOL.md#bibav4-v120-target-specification).
+**Release history:** [CHANGELOG.md](CHANGELOG.md).
 
-| Area | What to build | Notes |
+This table tracks **BibaV4** goals against what the **current tree** (Biba v3
+**wire** + stealth layers) already ships, so new work does not duplicate effort.
+
+| Area | In code today (1.2.x) | Still target / gaps (see PROTOCOL) |
 | --- | --- | --- |
-| **TLS** | BoringSSL-class CH builder, `--fingerprint`, GREASE, `--tls-fragment` | `rustls` path cannot fake JA3; new stack or sidecar. |
-| **RTT** | Delayed-ACK on server; 2–4 WSS + RR balancer in mux; `--rtt-mask` | Touch `tcp_mux`, `local_client`, `server` accept path. |
-| **Padding** | `PadMode::Adaptive`, burst heuristics, default switch | `frame.rs` + per-stream state. |
-| **Jitter** | `--ws-jitter` on all outbound WS frames | Every `SinkExt::send` / write path. |
-| **Decoy** | `--decoy-mode browser`, idle micro-sessions | `decoy_traffic` or new module; mind battery on Android. |
-| **Desync** | `--desync-mode`, raw socket, optional fake CH + TCP games | **Privileged**; guard with capability checks + docs. |
-| **CI** | docker-compose + **zapret** + pcap | Fail build or warn if pcap regresses. |
-| **UI** | Tauri + Android expose new toggles / advanced JSON | `bibavpn-jni` + `start_json_config` + Compose. |
+| **TLS / fingerprint** | `TlsClientProfile` labels; `--fingerprint` + `client_policy` merge; **Boring** behind `--features boring-tls` + `--tls-stack boring`; `rustls` default | Full GREASE / extension-order parity; **`--pin-cert` with Boring**; HTTP/2 transport |
+| **Record fragmentation** | `--tls-fragment` on **rustls**; Boring: debug-only note (no `set_max_send_fragment` in current `boring` API) | Full CH + app-data split on both stacks if required |
+| **RTT** | Server delayed ACK, `--rtt-mask-jitter-ms`, `--ack-profile` defaults; **2–4 WSS** + `TcpMuxSessionPool` RR (not REALITY) | Broader “cross-layer” story + CI zapret/pcap (see spec) |
+| **Padding** | `PadMode::Adaptive` + `stealth` / presets | BibaV4 may redefine burst heuristics / budgets on a future wire |
+| **Jitter** | Min/max MS on WS sends; preset merge | Spec band (e.g. 5–25 ms) as product default |
+| **Decoys** | Parallel `--decoy-gets`; **idle** decoys after `--idle-decoy-secs` (`activity` + `decoy_traffic`); `stealth_v12` decoy fields | Full `--decoy-mode browser` catalog (UA/Referer parity) per spec |
+| **Desync** | `DesyncConfig` on wire + `desync` module | Raw-socket / OS hook paths; privilege guards |
+| **UI / JNI** | `start_json_config` fields for new options where wired | Expose all toggles in Tauri + Android as they stabilize |
 
-**Testing:** add unit tests beside each feature; add integration test that runs
-`scripts/wsl-local-bench.sh` (or a headless equivalent) in CI and compares to a
-stored baseline (≤ **10%** throughput drop target).
+**Testing:** keep unit tests beside each subsystem; for throughput, compare
+`scripts/wsl-local-bench.sh` (or equivalent) to a saved baseline — **≤ ~10%**
+regression target vs [PROTOCOL.md](PROTOCOL.md) acceptance.
 
 **Stealth ≠ legal bypass:** document jurisdiction; do not ship defaults that
 require root without explicit opt-in.
