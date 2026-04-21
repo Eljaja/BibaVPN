@@ -12,26 +12,36 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
-use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{error, info};
 
+use crate::client_tls_stream::ClientTlsStream;
 use crate::crypto_layer::{self, SessionCrypto};
-use crate::decoy_traffic::{spawn_decoy_gets, DecoyConfig};
-use crate::frame::{PadMode, DEFAULT_MAX_WS_BINARY};
+use crate::decoy_traffic::{run_one_decoy_get, spawn_decoy_gets, DecoyConfig};
+use crate::desync;
+use crate::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
 use crate::http_connect;
 use crate::protocol::{
     decode_v3_open_err, encode_v3_auth, encode_v3_mux_open, encode_v3_open_with_flags,
     is_v3_open_ok, OPEN_FLAG_STATUS,
 };
 use crate::retry::{sleep_outbound_backoff, OUTBOUND_CONNECT_ATTEMPTS};
+use crate::ServerWsOutTiming;
 use crate::stealth::{build_websocket_request, default_user_agent_for_profile, WsHandshakeParams};
-use crate::tcp_mux::{self, MuxClientConfig, MuxOpenStreamDropped, TcpMuxClientHandle};
-use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile};
+use crate::activity::ActivityTracker;
+use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
+use crate::tcp_mux::{
+    self, MuxClientConfig, MuxOpenStreamDropped, TcpMuxClientSlot,
+    TcpMuxSessionPool,
+};
+use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile, TlsStack};
 use crate::udp_mux::{spawn_udp_mux_driver, UdpMuxConfig, UdpMuxHandle};
 use crate::ws_bridge::{self, TunnelEnd};
-use crate::{read_padded_frame_into, write_padded_frame_with_mode, socks5, socks5::SocksCommand};
+use crate::{
+    read_padded_frame_into, write_padded_frame_with_mode_state, socks5,
+    socks5::SocksCommand,
+};
 use bytes::Bytes;
 
 /// SOCKS UDP: limit concurrent in-flight mux requests per datagram worker pool.
@@ -50,7 +60,7 @@ fn tcp_mux_writer_gone(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("tcp mux writer stopped")
 }
 
-type TcpMuxSlot = Arc<Mutex<Option<(u64, TcpMuxClientHandle)>>>;
+type TcpMuxSlot = TcpMuxClientSlot;
 
 async fn tcp_mux_open_stream_with_retry(
     mut local: TcpStream,
@@ -68,7 +78,10 @@ async fn tcp_mux_open_stream_with_retry(
                 connect_tcp_mux_handle(&cfg, &tcp_mux_slot).await?;
                 slot = tcp_mux_slot.lock().await;
             }
-            slot.as_ref().expect("mux set").1.clone()
+            slot.as_ref()
+                .expect("mux set")
+                .pick()
+                .await
         };
         match h
             .open_stream(local, host.clone(), port, tcp_uplink_prefix.clone())
@@ -101,6 +114,8 @@ pub struct LocalClientOptions {
     pub sni: String,
     pub token: String,
     pub socks_bind: String,
+    /// When set, SOCKS5 listener requires RFC 1929 username/password (no no-auth).
+    pub socks_auth: Option<(String, String)>,
     pub http_proxy_bind: Option<String>,
     /// Passed through for decoy GETs and logging.
     pub insecure_tls: bool,
@@ -120,6 +135,9 @@ pub struct LocalClientOptions {
     pub ws_ping_jitter_percent: u8,
     /// Random 0..=N ms before each outbound WS binary (TCP tunnel + UDP mux client path).
     pub ws_binary_send_jitter_ms: u8,
+    /// If both non-zero and `min <= max`, delay each outbound WS binary by a random ms in this range.
+    pub ws_jitter_min_ms: u8,
+    pub ws_jitter_max_ms: u8,
     /// Padding cap for UDP mux only (default: same as `max_pad`).
     pub udp_max_pad: Option<u8>,
     /// MTU cap for UDP mux only (default: same as `max_ws_binary`).
@@ -151,6 +169,21 @@ pub struct LocalClientOptions {
     pub reality_public_key: Option<[u8; 32]>,
     /// REALITY: short ID (8 bytes).
     pub reality_short_id: Option<[u8; 8]>,
+    /// Richer decoy HTTP (see `decoy_traffic`).
+    pub decoy_mode: DecoyMode,
+    /// Raw-socket desync modes: mostly logged until a platform hook exists.
+    pub desync_mode: DesyncMode,
+    pub tcp_fooling: TcpFooling,
+    /// Log-only: TLS record fragmentation is not implemented for rustls.
+    pub tls_fragment: bool,
+    /// Parallel full mux sessions to the same server (round-robin new SOCKS streams); 1–4.
+    pub ws_parallel: u8,
+    /// After this many seconds without main decoy activity, emit an extra browser-style decoy (0 = off).
+    pub idle_decoy_secs: u64,
+    /// When set (e.g. from CLI), overrides individual knob defaults for stealth presets.
+    pub stealth_profile: Option<StealthProfile>,
+    /// `rustls` (default) or `boring` (BoringSSL; build with `boring-tls` feature).
+    pub tls_stack: TlsStack,
 }
 
 #[derive(Clone)]
@@ -175,6 +208,8 @@ struct ClientCfg {
     ws_ping_secs: u64,
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
     udp_mux_max_pad: u8,
     udp_mux_max_ws_binary: usize,
     udp_mux_reply_timeout_secs: u64,
@@ -191,6 +226,18 @@ struct ClientCfg {
     reality_target: Option<String>,
     reality_public_key: Option<[u8; 32]>,
     reality_short_id: Option<[u8; 8]>,
+    decoy_mode: DecoyMode,
+    desync_mode: DesyncMode,
+    tcp_fooling: TcpFooling,
+    tls_fragment: bool,
+    ws_parallel: u8,
+    idle_decoy_secs: u64,
+    /// Mux read/write activity for `idle_decoy_secs` (only set when that feature is on).
+    activity: Option<Arc<ActivityTracker>>,
+    socks_auth: Option<(String, String)>,
+    tls_stack: TlsStack,
+    /// Used to reject Boring + pin until that combination is supported.
+    pinned_certs_pem: Option<Vec<u8>>,
 }
 
 impl ClientCfg {
@@ -215,6 +262,8 @@ impl ClientCfg {
             ws_ping_secs: self.ws_ping_secs,
             ws_ping_jitter_percent: self.ws_ping_jitter_percent,
             ws_binary_send_jitter_ms: self.ws_binary_send_jitter_ms,
+            ws_jitter_min_ms: self.ws_jitter_min_ms,
+            ws_jitter_max_ms: self.ws_jitter_max_ms,
             tls_profile: self.tls_profile,
             ws_path: self.ws_path.clone(),
             pad_mode: self.pad_mode,
@@ -246,10 +295,13 @@ pub fn normalize_ws_path(s: &str) -> String {
 }
 
 /// REALITY handshake: send client hello with public key + short ID, receive server hello
-async fn reality_client_handshake(
-    ws: &mut ClientWs,
+async fn reality_client_handshake<S>(
+    ws: &mut WebSocketStream<S>,
     cfg: &ClientCfg,
-) -> anyhow::Result<([u8; 32], [u8; 8])> {
+) -> anyhow::Result<([u8; 32], [u8; 8])>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     use crate::reality::encode_client_hello;
     use crate::reality::decode_server_hello;
     use x25519_dalek::{PublicKey, EphemeralSecret};
@@ -308,23 +360,57 @@ async fn reality_client_handshake(
 
 type SharedCrypto = Arc<SessionCrypto>;
 
-type ClientWs = WebSocketStream<TlsStream<TcpStream>>;
+type ClientWs = WebSocketStream<ClientTlsStream>;
 
 /// One attempt: TCP + TLS + WS + noise + v3 hello + sealed AUTH.
 async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, SharedCrypto)> {
     anyhow::ensure!(cfg.proto >= 3, "only Biba protocol v3 is supported (use --proto 3)");
     anyhow::ensure!(cfg.psk.is_some(), "Biba v3 requires --psk (or invite psk)");
+    if matches!(cfg.tls_stack, TlsStack::Boring) && cfg.pinned_certs_pem.is_some() {
+        anyhow::bail!("--tls-stack boring does not support --pin-cert yet; use the default rustls stack for pinning");
+    }
 
-    let domain = ServerName::try_from(cfg.sni.clone())?;
-    let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
     let path = cfg.ws_path.clone();
 
     let tcp =
         crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
             .await
             .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
+    desync::after_tcp_connect(&tcp, cfg.desync_mode, cfg.tcp_fooling).await?;
+    desync::note_tls_fragment_requested(cfg.tls_fragment);
     let _ = tcp.set_nodelay(true);
-    let tls = connector.connect(domain, tcp).await.context("tls")?;
+
+    let tls: ClientTlsStream = match cfg.tls_stack {
+        TlsStack::Rustls => {
+            let domain = ServerName::try_from(cfg.sni.clone())?;
+            let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
+            let t = connector
+                .connect(domain, tcp)
+                .await
+                .context("tls (rustls)")?;
+            ClientTlsStream::Rustls(t)
+        }
+        TlsStack::Boring => {
+            #[cfg(feature = "boring-tls")]
+            {
+                let t = crate::tls_boring::upgrade_tcp_boring(
+                    tcp,
+                    &cfg.sni,
+                    cfg.insecure_tls,
+                    cfg.tls_fragment,
+                )
+                .await
+                .context("tls (boring)")?;
+                ClientTlsStream::Boring(t)
+            }
+            #[cfg(not(feature = "boring-tls"))]
+            {
+                return Err(anyhow::anyhow!(
+                    "Boring stack not compiled: build with `cargo build -p bibavpn --features boring-tls`"
+                ));
+            }
+        }
+    };
 
     let ws_host = cfg.ws_host.as_deref();
     let ws_origin = cfg.ws_origin.as_deref();
@@ -384,10 +470,17 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
                     &s_rand,
                     cfg.decoy_max,
                 ));
+                let mut pad_st = AdaptivePadState::default();
                 let auth_inner = encode_v3_auth(&cfg.token).context("encode v3 AUTH")?;
                 let mut wire = Vec::new();
-                write_padded_frame_with_mode(&mut wire, &auth_inner, cfg.max_pad, cfg.pad_mode)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &auth_inner,
+                    cfg.max_pad,
+                    cfg.pad_mode,
+                    Some(&mut pad_st),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let blob = crypto
                     .seal_client_to_server(&wire)
                     .context("seal v3 AUTH")?;
@@ -452,8 +545,15 @@ async fn open_legacy_biba_channel(
             Ok((mut ws, crypto)) => {
                 let open = encode_v3_open_with_flags(host, port, OPEN_FLAG_STATUS)?;
                 let mut wire = Vec::new();
-                write_padded_frame_with_mode(&mut wire, &open, cfg.max_pad, cfg.pad_mode)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let mut pad_st = AdaptivePadState::default();
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &open,
+                    cfg.max_pad,
+                    cfg.pad_mode,
+                    Some(&mut pad_st),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let blob = crypto
                     .seal_client_to_server(&wire)
                     .context("seal OPEN v3")?;
@@ -492,53 +592,83 @@ async fn connect_tcp_mux_handle(
 ) -> anyhow::Result<()> {
     // Check if REALITY mode is enabled
     if cfg.reality_target.is_some() {
+        if cfg.ws_parallel > 1 {
+            anyhow::bail!("--ws-parallel > 1 is not supported with REALITY in this build");
+        }
         return connect_reality_tcp_mux_handle(cfg, tcp_mux_slot).await;
     }
 
+    let n = cfg.ws_parallel.max(1).min(4) as usize;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         let res: anyhow::Result<()> = async {
-            let (mut ws, crypto) = one_try_wss_session(cfg).await?;
-            let mo = encode_v3_mux_open();
-            let mut wire = Vec::new();
-            write_padded_frame_with_mode(&mut wire, &mo, cfg.max_pad, cfg.pad_mode)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let blob = crypto
-                .seal_client_to_server(&wire)
-                .context("seal MUX_OPEN v3")?;
-            if blob.len() > cfg.max_ws_binary {
-                anyhow::bail!("sealed MUX_OPEN exceeds --max-ws-binary");
-            }
-            ws.send(Message::Binary(Bytes::from(blob)))
-                .await
-                .context("send MUX_OPEN v3")?;
-            let mcfg = MuxClientConfig {
-                max_pad: cfg.max_pad,
-                decoy_max: cfg.decoy_max,
-                max_ws_binary: cfg.max_ws_binary,
-                ws_ping_secs: cfg.ws_ping_secs,
-                ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
-                ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
-                transport_v2: true,
-                pad_mode: cfg.pad_mode,
-                dummy_interval_secs: cfg.dummy_interval_secs,
+            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::new_empty());
+            let pool_sessions = {
+                let g = tcp_mux_slot.lock().await;
+                g.as_ref()
+                    .expect("pool just set")
+                    .sessions
+                    .clone()
             };
-            let (sid, h) =
-                tcp_mux::spawn_tcp_mux_client(ws, Some(crypto), mcfg, tcp_mux_slot.clone());
-            info!(
-                target: "bibavpn_client",
-                session_id = sid,
-                server = %cfg.server_host,
-                port = cfg.server_port,
-                "TCP mux tunnel ready"
-            );
-            *tcp_mux_slot.lock().await = Some((sid, h));
+            for _ in 0..n {
+                let (mut ws, crypto) = one_try_wss_session(cfg).await?;
+                let mo = encode_v3_mux_open();
+                let mut wire = Vec::new();
+                let mut pad_st = AdaptivePadState::default();
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &mo,
+                    cfg.max_pad,
+                    cfg.pad_mode,
+                    Some(&mut pad_st),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let blob = crypto
+                    .seal_client_to_server(&wire)
+                    .context("seal MUX_OPEN v3")?;
+                if blob.len() > cfg.max_ws_binary {
+                    anyhow::bail!("sealed MUX_OPEN exceeds --max-ws-binary");
+                }
+                ws.send(Message::Binary(Bytes::from(blob)))
+                    .await
+                    .context("send MUX_OPEN v3")?;
+                let mcfg = MuxClientConfig {
+                    max_pad: cfg.max_pad,
+                    decoy_max: cfg.decoy_max,
+                    max_ws_binary: cfg.max_ws_binary,
+                    ws_ping_secs: cfg.ws_ping_secs,
+                    ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
+                    ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
+                    ws_jitter_min_ms: cfg.ws_jitter_min_ms,
+                    ws_jitter_max_ms: cfg.ws_jitter_max_ms,
+                    transport_v2: true,
+                    pad_mode: cfg.pad_mode,
+                    dummy_interval_secs: cfg.dummy_interval_secs,
+                    activity: cfg.activity.clone(),
+                };
+                let (sid, h) = tcp_mux::spawn_tcp_mux_client(
+                    ws,
+                    Some(crypto),
+                    mcfg,
+                    tcp_mux_slot.clone(),
+                );
+                pool_sessions.lock().await.push((sid, h));
+                info!(
+                    target: "bibavpn_client",
+                    session_id = sid,
+                    server = %cfg.server_host,
+                    port = cfg.server_port,
+                    parallel = n,
+                    "TCP mux WSS ready"
+                );
+            }
             Ok(())
         }
         .await;
         match res {
             Ok(()) => return Ok(()),
             Err(e) => {
+                *tcp_mux_slot.lock().await = None;
                 last_err = Some(e);
                 if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
                     break;
@@ -625,20 +755,30 @@ async fn connect_reality_tcp_mux_handle(
                 ws_ping_secs: cfg.ws_ping_secs,
                 ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
+                ws_jitter_min_ms: cfg.ws_jitter_min_ms,
+                ws_jitter_max_ms: cfg.ws_jitter_max_ms,
                 transport_v2: false,
                 pad_mode: cfg.pad_mode,
                 dummy_interval_secs: cfg.dummy_interval_secs,
+                activity: cfg.activity.clone(),
             };
 
+            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::new_empty());
+            let pool_sessions = {
+                let g = tcp_mux_slot.lock().await;
+                g.as_ref()
+                    .expect("reality pool")
+                    .sessions
+                    .clone()
+            };
             let (sid, h) = tcp_mux::spawn_tcp_mux_client(ws, None, mcfg, tcp_mux_slot.clone());
-
             info!(
                 target: "bibavpn_client",
                 session_id = sid,
                 server = %cfg.server_host,
                 "REALITY tunnel ready"
             );
-            *tcp_mux_slot.lock().await = Some((sid, h));
+            pool_sessions.lock().await.push((sid, h));
             Ok(())
         }
         .await;
@@ -646,6 +786,7 @@ async fn connect_reality_tcp_mux_handle(
         match res {
             Ok(()) => return Ok(()),
             Err(e) => {
+                *tcp_mux_slot.lock().await = None;
                 last_err = Some(e);
                 if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
                     break;
@@ -674,6 +815,17 @@ pub async fn run_local_client(
     if opts.pinned_certs_pem.is_some() {
         info!("TLS: certificate pinning enabled (leaf must match PEM)");
     }
+    if opts.socks_auth.is_some() {
+        info!("SOCKS5: username/password required on local listener");
+    }
+
+    let ws_parallel = opts.ws_parallel.max(1).min(4);
+    let activity = if opts.use_tcp_mux && opts.idle_decoy_secs > 0 {
+        Some(Arc::new(ActivityTracker::new()))
+    } else {
+        None
+    };
+
     let tls = client_tls_config(&ClientTlsParams {
         insecure: opts.insecure_tls,
         profile: opts.tls_profile,
@@ -690,9 +842,18 @@ pub async fn run_local_client(
         );
     }
     if opts.use_tcp_mux {
-        info!("TCP mode: multiplexed WSS (one outer connection)");
+        if ws_parallel > 1 {
+            info!(
+                "TCP mode: multiplexed WSS, {ws_parallel} parallel outer connection(s) (round-robin new streams)"
+            );
+        } else {
+            info!("TCP mode: multiplexed WSS (one outer connection)");
+        }
     } else {
         info!("TCP mode: legacy per-connection WSS (--no-mux)");
+    }
+    if opts.tls_stack != TlsStack::Rustls {
+        info!("outer TLS stack: {:?}", opts.tls_stack);
     }
 
     info!(
@@ -728,6 +889,8 @@ pub async fn run_local_client(
         ws_ping_secs: opts.ws_ping_secs,
         ws_ping_jitter_percent: opts.ws_ping_jitter_percent,
         ws_binary_send_jitter_ms: opts.ws_binary_send_jitter_ms,
+        ws_jitter_min_ms: opts.ws_jitter_min_ms,
+        ws_jitter_max_ms: opts.ws_jitter_max_ms,
         udp_mux_max_pad,
         udp_mux_max_ws_binary,
         udp_mux_reply_timeout_secs: opts.udp_mux_reply_timeout_secs,
@@ -744,6 +907,16 @@ pub async fn run_local_client(
         reality_target: opts.reality_target.clone(),
         reality_public_key: opts.reality_public_key,
         reality_short_id: opts.reality_short_id,
+        decoy_mode: opts.decoy_mode,
+        desync_mode: opts.desync_mode,
+        tcp_fooling: opts.tcp_fooling,
+        tls_fragment: opts.tls_fragment,
+        ws_parallel,
+        idle_decoy_secs: opts.idle_decoy_secs,
+        activity,
+        socks_auth: opts.socks_auth.clone(),
+        tls_stack: opts.tls_stack,
+        pinned_certs_pem: opts.pinned_certs_pem.clone(),
     });
 
     if cfg.decoy_gets {
@@ -759,9 +932,50 @@ pub async fn run_local_client(
                 interval_secs: cfg.decoy_gets_interval_secs.max(5),
                 paths: cfg.decoy_gets_paths.clone(),
                 user_agent: ua,
+                mode: cfg.decoy_mode,
             },
             shutdown.clone(),
         );
+    }
+
+    if let Some(ref act) = cfg.activity {
+        if cfg.idle_decoy_secs > 0 {
+            let idle_s = cfg.idle_decoy_secs;
+            let decoy = DecoyConfig {
+                server_host: cfg.server_host.clone(),
+                server_port: cfg.server_port,
+                sni: cfg.sni.clone(),
+                insecure: cfg.insecure_tls,
+                tls_profile: cfg.tls_profile,
+                pinned_certs_pem: opts.pinned_certs_pem.clone(),
+                interval_secs: idle_s.max(5),
+                paths: cfg.decoy_gets_paths.clone(),
+                user_agent: default_user_agent_for_profile(cfg.tls_profile).to_string(),
+                mode: cfg.decoy_mode,
+            };
+            let act = act.clone();
+            let mut sd = shutdown.clone();
+            info!(
+                "idle decoy: after {} s without tunneled traffic, issue HTTPS GET (mode {:?})",
+                idle_s, cfg.decoy_mode
+            );
+            tokio::spawn(async move {
+                loop {
+                    if *sd.borrow() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = sd.changed() => { if *sd.borrow() { break; } }
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                            if act.idle_secs() >= idle_s {
+                                run_one_decoy_get(&decoy).await;
+                                tokio::time::sleep(Duration::from_secs(idle_s.max(5))).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     let udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>> = Arc::new(Mutex::new(None));
@@ -858,7 +1072,7 @@ async fn handle_socks_peer(
     udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
     tcp_mux_slot: TcpMuxSlot,
 ) -> anyhow::Result<()> {
-    match socks5::socks5_read_command(&mut local).await? {
+    match socks5::socks5_read_command(&mut local, cfg.socks_auth.as_ref()).await? {
         SocksCommand::Connect { host, port } => {
             if cfg.use_tcp_mux {
                 socks5::socks5_reply_ok(&mut local).await?;
@@ -886,9 +1100,12 @@ async fn handle_socks_peer(
                     cfg.ws_ping_secs,
                     cfg.ws_ping_jitter_percent,
                     cfg.ws_binary_send_jitter_ms,
+                    cfg.ws_jitter_min_ms,
+                    cfg.ws_jitter_max_ms,
                     TunnelEnd::Client,
                     cfg.pad_mode,
                     cfg.dummy_interval_secs,
+                    ServerWsOutTiming::default(),
                 )
                 .await
             }
@@ -1040,9 +1257,12 @@ async fn handle_http_peer(
                     cfg.ws_ping_secs,
                     cfg.ws_ping_jitter_percent,
                     cfg.ws_binary_send_jitter_ms,
+                    cfg.ws_jitter_min_ms,
+                    cfg.ws_jitter_max_ms,
                     TunnelEnd::Client,
                     cfg.pad_mode,
                     cfg.dummy_interval_secs,
+                    ServerWsOutTiming::default(),
                 )
                 .await
             }
@@ -1117,9 +1337,12 @@ async fn tunnel_to_biba(
         cfg.ws_ping_secs,
         cfg.ws_ping_jitter_percent,
         cfg.ws_binary_send_jitter_ms,
+        cfg.ws_jitter_min_ms,
+        cfg.ws_jitter_max_ms,
         TunnelEnd::Client,
         cfg.pad_mode,
         cfg.dummy_interval_secs,
+        ServerWsOutTiming::default(),
     )
     .await
 }

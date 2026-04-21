@@ -1,10 +1,77 @@
-//! Minimal SOCKS5 (no auth, CONNECT and UDP ASSOCIATE, IPv4 / domain / IPv6).
+//! Minimal SOCKS5 (optional RFC 1929 user/pass, CONNECT and UDP ASSOCIATE, IPv4 / domain / IPv6).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{bail, Context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+const SOCKS5_AUTH_NONE: u8 = 0;
+const SOCKS5_AUTH_USERPASS: u8 = 2;
+
+async fn socks5_negotiate_method(local: &mut TcpStream, require_userpass: bool) -> anyhow::Result<()> {
+    let mut buf = [0u8; 2];
+    local.read_exact(&mut buf).await.context("socks version")?;
+    if buf[0] != 5 {
+        bail!("unsupported socks version {}", buf[0]);
+    }
+    let nmethods = buf[1] as usize;
+    if nmethods == 0 {
+        bail!("socks nmethods=0");
+    }
+    let mut methods = vec![0u8; nmethods];
+    local.read_exact(&mut methods).await.context("methods")?;
+
+    let method = if require_userpass {
+        if !methods.contains(&SOCKS5_AUTH_USERPASS) {
+            let _ = local.write_all(&[5u8, 0xFF]).await;
+            bail!("socks client did not offer username/password (method 2)");
+        }
+        SOCKS5_AUTH_USERPASS
+    } else if methods.contains(&SOCKS5_AUTH_NONE) {
+        SOCKS5_AUTH_NONE
+    } else {
+        let _ = local.write_all(&[5u8, 0xFF]).await;
+        bail!("socks client did not offer no-auth (method 0)");
+    };
+
+    local
+        .write_all(&[5u8, method])
+        .await
+        .context("socks method reply")?;
+    Ok(())
+}
+
+async fn socks5_userpass_verify(
+    local: &mut TcpStream,
+    expected_user: &str,
+    expected_pass: &str,
+) -> anyhow::Result<()> {
+    let mut ver = [0u8; 1];
+    local.read_exact(&mut ver).await.context("rfc1929 ver")?;
+    if ver[0] != 1 {
+        bail!("RFC1929 version {} (expected 1)", ver[0]);
+    }
+    let mut ulen = [0u8; 1];
+    local.read_exact(&mut ulen).await.context("ulen")?;
+    let ulen = ulen[0] as usize;
+    let mut uname = vec![0u8; ulen];
+    local.read_exact(&mut uname).await.context("uname")?;
+    let mut plen = [0u8; 1];
+    local.read_exact(&mut plen).await.context("plen")?;
+    let plen = plen[0] as usize;
+    let mut passwd = vec![0u8; plen];
+    local.read_exact(&mut passwd).await.context("passwd")?;
+
+    let ok = uname == expected_user.as_bytes() && passwd == expected_pass.as_bytes();
+    if ok {
+        local.write_all(&[1u8, 0u8]).await.context("rfc1929 ok")?;
+        Ok(())
+    } else {
+        let _ = local.write_all(&[1u8, 1u8]).await;
+        bail!("SOCKS5 username/password rejected");
+    }
+}
 
 /// SOCKS5 command after method negotiation.
 #[derive(Debug)]
@@ -20,20 +87,7 @@ pub enum SocksCommand {
     },
 }
 
-pub async fn socks5_read_command(local: &mut TcpStream) -> anyhow::Result<SocksCommand> {
-    let mut buf = [0u8; 2];
-    local.read_exact(&mut buf).await.context("socks version")?;
-    if buf[0] != 5 {
-        bail!("unsupported socks version {}", buf[0]);
-    }
-    let nmethods = buf[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    local.read_exact(&mut methods).await.context("methods")?;
-    local
-        .write_all(&[5u8, 0u8])
-        .await
-        .context("socks no auth")?;
-
+async fn socks5_read_connect_request(local: &mut TcpStream) -> anyhow::Result<SocksCommand> {
     let mut hdr = [0u8; 4];
     local.read_exact(&mut hdr).await.context("request hdr")?;
     if hdr[0] != 5 {
@@ -78,9 +132,26 @@ pub async fn socks5_read_command(local: &mut TcpStream) -> anyhow::Result<SocksC
     }
 }
 
+/// Full SOCKS5 handshake: method negotiation, optional RFC 1929, then CONNECT / UDP ASSOCIATE request.
+///
+/// `auth`: when `Some((user, pass))` with non-empty strings, only username/password auth is accepted
+/// (method 2); no-auth is not offered by the server path.
+pub async fn socks5_read_command(
+    local: &mut TcpStream,
+    auth: Option<&(String, String)>,
+) -> anyhow::Result<SocksCommand> {
+    let creds = auth.filter(|(u, p)| !u.is_empty() && !p.is_empty());
+    let require_userpass = creds.is_some();
+    socks5_negotiate_method(local, require_userpass).await?;
+    if let Some((u, p)) = creds {
+        socks5_userpass_verify(local, u, p).await?;
+    }
+    socks5_read_connect_request(local).await
+}
+
 /// Backward-compatible: CONNECT only, same as before.
 pub async fn socks5_handshake(local: &mut TcpStream) -> anyhow::Result<(String, u16)> {
-    match socks5_read_command(local).await? {
+    match socks5_read_command(local, None).await? {
         SocksCommand::Connect { host, port } => Ok((host, port)),
         SocksCommand::UdpAssociate { .. } => bail!("UDP ASSOCIATE requires socks5_read_command"),
     }

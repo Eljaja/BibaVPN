@@ -18,16 +18,21 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{error, trace, warn};
 
 use crate::crypto_layer::{self, SessionCrypto};
-use crate::frame::PadMode;
+use crate::frame::{AdaptivePadState, PadMode};
 use crate::protocol::{
     decode_udp_rep, decode_udp_req, encode_udp_rep, encode_udp_req, encode_v3_auth,
     encode_v3_udp_mux_open,
 };
-use crate::retry::{maybe_ws_binary_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period};
+use crate::retry::{
+    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period,
+    ServerWsOutTiming, WsSendJitter,
+};
 use crate::stealth::{build_websocket_request, WsHandshakeParams};
 use crate::tls_util::TlsClientProfile;
 use crate::ws_bridge::SharedCrypto;
-use crate::{read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode};
+use crate::{
+    read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode_state,
+};
 
 /// Max concurrent server-side UDP request tasks per mux session.
 const UDP_MUX_SERVER_MAX_INFLIGHT: usize = 512;
@@ -57,11 +62,23 @@ pub struct UdpMuxConfig {
     pub ws_ping_secs: u64,
     pub ws_ping_jitter_percent: u8,
     pub ws_binary_send_jitter_ms: u8,
+    pub ws_jitter_min_ms: u8,
+    pub ws_jitter_max_ms: u8,
     pub tls_profile: TlsClientProfile,
     pub ws_path: String,
     pub pad_mode: PadMode,
     pub proto: u8,
     pub proto_domain: String,
+}
+
+impl UdpMuxConfig {
+    fn send_jitter(&self) -> WsSendJitter {
+        WsSendJitter {
+            min_ms: self.ws_jitter_min_ms,
+            max_ms: self.ws_jitter_max_ms,
+            legacy_0_to_max: self.ws_binary_send_jitter_ms,
+        }
+    }
 }
 
 pub enum ClientUdpCmd {
@@ -243,10 +260,17 @@ async fn connect_udp_mux_ws(
                     &s_rand,
                     cfg.decoy_max,
                 ));
+                let mut udp_adaptive = AdaptivePadState::default();
                 let auth_inner = encode_v3_auth(&cfg.token).context("encode v3 AUTH (udp mux)")?;
                 let mut wire = Vec::new();
-                write_padded_frame_with_mode(&mut wire, &auth_inner, cfg.max_pad, cfg.pad_mode)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &auth_inner,
+                    cfg.max_pad,
+                    cfg.pad_mode,
+                    Some(&mut udp_adaptive),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let blob = crypto
                     .seal_client_to_server(&wire)
                     .context("seal v3 AUTH (udp mux)")?;
@@ -255,8 +279,14 @@ async fn connect_udp_mux_ws(
                     .context("send v3 AUTH (udp mux)")?;
                 let open = encode_v3_udp_mux_open();
                 let mut w2 = Vec::new();
-                write_padded_frame_with_mode(&mut w2, &open, cfg.max_pad, cfg.pad_mode)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                write_padded_frame_with_mode_state(
+                    &mut w2,
+                    &open,
+                    cfg.max_pad,
+                    cfg.pad_mode,
+                    Some(&mut udp_adaptive),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let ob = crypto
                     .seal_client_to_server(&w2)
                     .context("seal UDP_MUX v3")?;
@@ -284,9 +314,17 @@ fn pack_tunnel_out(
     pad_mode: PadMode,
     max_ws_binary: usize,
     body: &[u8],
+    adaptive: &mut AdaptivePadState,
 ) -> anyhow::Result<Vec<u8>> {
     let mut wire = Vec::new();
-    write_padded_frame_with_mode(&mut wire, body, max_pad, pad_mode).context("pack frame")?;
+    write_padded_frame_with_mode_state(
+        &mut wire,
+        body,
+        max_pad,
+        pad_mode,
+        Some(adaptive),
+    )
+    .context("pack frame")?;
     let blob: Vec<u8> = crypto
         .seal_client_to_server(&wire)
         .context("seal c2s (udp mux)")?;
@@ -314,6 +352,7 @@ async fn run_udp_mux_one_session(
     cfg: &UdpMuxConfig,
     cmd_rx: &mut mpsc::UnboundedReceiver<ClientUdpCmd>,
 ) -> anyhow::Result<bool> {
+    let mut udp_adaptive = AdaptivePadState::default();
     let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>> =
         HashMap::new();
     let (ws_tx, mut ws_rx) = ws.split();
@@ -369,6 +408,7 @@ async fn run_udp_mux_one_session(
                             cfg.pad_mode,
                             cfg.max_ws_binary,
                             &req,
+                            &mut udp_adaptive,
                         ) {
                             Ok(b) => b,
                             Err(e) => {
@@ -378,7 +418,7 @@ async fn run_udp_mux_one_session(
                                 continue;
                             }
                         };
-                        maybe_ws_binary_send_jitter(cfg.ws_binary_send_jitter_ms).await;
+                        maybe_ws_send_jitter(cfg.send_jitter()).await;
                         let mut g = ws_tx.lock().await;
                         if let Err(e) = g.send(Message::Binary(Bytes::from(blob))).await {
                             if let Some(tx) = pending.remove(&xid) {
@@ -446,12 +486,21 @@ pub async fn bridge_ws_udp_mux_server<S>(
     ws_ping_secs: u64,
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
     recv_timeout: Duration,
     pad_mode: PadMode,
+    server_out_timing: ServerWsOutTiming,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let udp_adaptive = Arc::new(std::sync::Mutex::new(AdaptivePadState::default()));
+    let ws_send_j = WsSendJitter {
+        min_ms: ws_jitter_min_ms,
+        max_ms: ws_jitter_max_ms,
+        legacy_0_to_max: ws_binary_send_jitter_ms,
+    };
     let sem = Arc::new(Semaphore::new(UDP_MUX_SERVER_MAX_INFLIGHT));
     let (ws_sink, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_sink));
@@ -507,6 +556,9 @@ where
                     .map_err(|_| anyhow::anyhow!("udp mux sem closed"))?;
                 let ws_tx = ws_tx.clone();
                 let crypto = crypto.clone();
+                let udp_ad = udp_adaptive.clone();
+                let wsj = ws_send_j;
+                let server_out = server_out_timing;
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(e) = (async {
@@ -531,15 +583,27 @@ where
                         let rep_plain =
                             encode_udp_rep(xid, &src.ip().to_string(), src.port(), &rbuf[..n])?;
                         let mut wire = Vec::new();
-                        write_padded_frame_with_mode(&mut wire, &rep_plain, max_pad, pad_mode)
+                        {
+                            let mut g = udp_ad
+                                .lock()
+                                .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
+                            write_padded_frame_with_mode_state(
+                                &mut wire,
+                                &rep_plain,
+                                max_pad,
+                                pad_mode,
+                                Some(&mut *g),
+                            )
                             .context("pad rep")?;
+                        }
                         let blob: Vec<u8> = crypto
                             .seal_server_to_client(&wire)
                             .context("seal s2c (udp mux)")?;
                         if blob.len() > max_ws_binary {
                             anyhow::bail!("udp rep ws frame too large");
                         }
-                        maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
+                        maybe_server_ack_and_rtt_mask(server_out).await;
+                        maybe_ws_send_jitter(wsj).await;
                         let mut g = ws_tx.lock().await;
                         g.send(Message::Binary(Bytes::from(blob)))
                             .await

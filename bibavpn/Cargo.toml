@@ -56,3 +56,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hex = "0.4"
+boring = { version = "5.1.0", optional = true }
+tokio-boring = { version = "5.0.0", optional = true }
+
+[features]
+default = []
+# BoringSSL + tokio (optional build; `cmake` + `nasm` on Windows may be required for boring-sys).
+boring-tls = ["dep:boring", "dep:tokio-boring"]

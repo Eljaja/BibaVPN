@@ -67,6 +67,8 @@ fn main() -> anyhow::Result<()> {
         ws_ping_secs: env_u64("WS_PING_SECS", 25),
         ws_ping_jitter_percent: env_u8("WS_PING_JITTER_PERCENT", 0),
         ws_binary_send_jitter_ms: env_u8("WS_BINARY_SEND_JITTER_MS", 0),
+        ws_jitter_min_ms: env_u8("WS_JITTER_MIN_MS", 0),
+        ws_jitter_max_ms: env_u8("WS_JITTER_MAX_MS", 0),
         udp_max_pad: None,
         udp_max_ws_binary: None,
         udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,

@@ -40,6 +40,11 @@ pub struct InviteV1 {
     pub ws_ping_jitter_percent: u8,
     #[serde(default)]
     pub ws_binary_send_jitter_ms: u8,
+    /// Outbound WS send delay: random ms in `min..=max` when both set; else `ws_binary_send_jitter_ms` only.
+    #[serde(default)]
+    pub ws_jitter_min_ms: u8,
+    #[serde(default)]
+    pub ws_jitter_max_ms: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_max_pad: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +150,8 @@ mod tests {
             ws_ping_secs: 25,
             ws_ping_jitter_percent: 0,
             ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
             udp_max_pad: None,
             udp_max_ws_binary: None,
             udp_mux_reply_timeout_secs: 130,

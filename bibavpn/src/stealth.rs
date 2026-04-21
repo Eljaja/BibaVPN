@@ -7,15 +7,22 @@ use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 
 use crate::tls_util::TlsClientProfile;
 
-const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 
 const DEFAULT_AL: &str = "en-US,en;q=0.9";
+
+const UA_CHROME132: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+
+const UA_SAFARI18: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
 
 const UA_FIREFOX65: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 const UA_FIREFOX63: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0";
+
+const UA_FIREFOX136: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0";
 
 const ACCEPT_ENCODING: &str = "gzip, deflate, br, zstd";
 
@@ -24,15 +31,25 @@ pub fn default_user_agent_for_profile(profile: TlsClientProfile) -> &'static str
     match profile {
         TlsClientProfile::Firefox65 => UA_FIREFOX65,
         TlsClientProfile::Firefox63 => UA_FIREFOX63,
-        _ => DEFAULT_UA,
+        TlsClientProfile::Firefox136 => UA_FIREFOX136,
+        TlsClientProfile::Safari18 => UA_SAFARI18,
+        TlsClientProfile::Chrome70 | TlsClientProfile::Chrome132 => UA_CHROME132,
+        TlsClientProfile::Default
+        | TlsClientProfile::Randomized
+        | TlsClientProfile::RandomizedAlpn
+        | TlsClientProfile::RandomizedNoAlpn => DEFAULT_UA,
     }
 }
 
 fn is_firefox_profile(profile: TlsClientProfile) -> bool {
     matches!(
         profile,
-        TlsClientProfile::Firefox65 | TlsClientProfile::Firefox63
+        TlsClientProfile::Firefox65 | TlsClientProfile::Firefox63 | TlsClientProfile::Firefox136
     )
+}
+
+fn is_safari_profile(profile: TlsClientProfile) -> bool {
+    profile == TlsClientProfile::Safari18
 }
 
 /// Parameters for the outbound WebSocket HTTP upgrade (BibaV2.1 configurable fingerprint).
@@ -96,6 +113,23 @@ pub fn build_websocket_request(p: WsHandshakeParams<'_>) -> Request<()> {
             .header("Upgrade", "websocket")
             .header("Pragma", "no-cache")
             .header("Cache-Control", "no-cache")
+    } else if is_safari_profile(p.tls_profile) {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Host", host_h)
+            .header("User-Agent", ua)
+            .header("Accept", "*/*")
+            .header("Accept-Language", al)
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Origin", origin)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Key", &key)
+            .header("Sec-WebSocket-Extensions", "permessage-deflate")
+            .header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache")
     } else {
         Request::builder()
             .method("GET")
@@ -117,7 +151,7 @@ pub fn build_websocket_request(p: WsHandshakeParams<'_>) -> Request<()> {
             )
             .header(
                 "Sec-CH-UA",
-                "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+                "\"Google Chrome\";v=\"132\", \"Chromium\";v=\"132\", \"Not_A Brand\";v=\"24\"",
             )
             .header("Sec-CH-UA-Mobile", "?0")
             .header("Sec-CH-UA-Platform", "\"Windows\"")

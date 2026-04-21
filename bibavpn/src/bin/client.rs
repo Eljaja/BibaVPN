@@ -12,7 +12,11 @@ use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, parse_ws_header, LocalClientOptions,
     DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
-use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile};
+use bibavpn::stealth_v12::{
+    apply_preset_ws_jitter, merge_idle_decoy_secs, DecoyMode, DesyncMode, StealthProfile, TcpFooling,
+    preset,
+};
+use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile, TlsStack};
 use clap::Parser;
 use base64::Engine;
 use tokio::signal;
@@ -109,6 +113,13 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     ws_binary_send_jitter_ms: u8,
 
+    /// Random delay in `min..=max` ms for each outbound WS binary (0,0 = use `ws_binary_send_jitter_ms` only).
+    #[arg(long, default_value_t = 0)]
+    ws_jitter_min_ms: u8,
+
+    #[arg(long, default_value_t = 0)]
+    ws_jitter_max_ms: u8,
+
     /// `max_pad` for UDP mux only (default: same as `--max-pad`).
     #[arg(long)]
     udp_max_pad: Option<u8>,
@@ -134,7 +145,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_mux: bool,
 
-    /// Padding: `random` or `http-buckets`.
+    /// Padding: `adaptive` (default), `random`, or `http-buckets`.
     #[arg(long)]
     pad_mode: Option<String>,
 
@@ -172,6 +183,42 @@ struct Args {
     /// REALITY mode: front domain for SNI (e.g. vk.com); must match server target SNI.
     #[arg(long)]
     reality_target: Option<String>,
+
+    /// TLS / JA3-style ClientHello label (same as `--tls-profile`); e.g. `chrome-132`, `firefox-136`, `safari-18`, `random`. If set, overrides `--tls-profile` and invite.
+    #[arg(long)]
+    fingerprint: Option<String>,
+
+    /// Stealth bundle: `default` (v1.1.x-like), `balanced`, `aggressive` — fills pad/jitter/decoy when explicit flags are absent.
+    #[arg(long)]
+    stealth_profile: Option<String>,
+
+    /// `simple` or `browser` (richer decoy headers). Omitted: from `--stealth-profile` or `simple`.
+    #[arg(long)]
+    decoy_mode: Option<String>,
+
+    /// `off`, `split2`, `fakedsplit`, `disorder` (advisory on most platforms).
+    #[arg(long)]
+    desync_mode: Option<String>,
+
+    /// `off`, `md5sig`, `badseq`, `badsum` (advisory; raw TCP options are not applied here).
+    #[arg(long)]
+    tcp_fooling: Option<String>,
+
+    /// Request TLS record-level fragmentation (full support requires a different TLS stack / hook).
+    #[arg(long, default_value_t = false)]
+    tls_fragment: bool,
+
+    /// Target parallel WSS sessions (this build: only 1; higher values are rejected on connect).
+    #[arg(long, default_value_t = 1)]
+    ws_parallel: u8,
+
+    /// After N seconds without mux data, run an extra HTTPS decoy. Omit to use `--stealth-profile` (balanced/aggressive: 10s); `0` = off.
+    #[arg(long)]
+    idle_decoy_secs: Option<u64>,
+
+    /// Outer WSS transport: `rustls` (default) or `boring` (BoringSSL, optional record splitting with `--tls-fragment`). Build: `--features boring-tls`.
+    #[arg(long, default_value = "rustls")]
+    tls_stack: String,
 }
 
 #[tokio::main]
@@ -228,6 +275,8 @@ async fn main() -> anyhow::Result<()> {
         ws_ping_secs,
         ws_ping_jitter_percent,
         ws_binary_send_jitter_ms,
+        ws_jitter_min_ms,
+        ws_jitter_max_ms,
         udp_max_pad,
         udp_max_ws_binary,
         udp_mux_reply_timeout_secs,
@@ -251,6 +300,8 @@ async fn main() -> anyhow::Result<()> {
             inv.ws_ping_secs,
             inv.ws_ping_jitter_percent,
             inv.ws_binary_send_jitter_ms,
+            inv.ws_jitter_min_ms,
+            inv.ws_jitter_max_ms,
             inv.udp_max_pad,
             inv.udp_max_ws_binary,
             inv.udp_mux_reply_timeout_secs,
@@ -279,6 +330,8 @@ async fn main() -> anyhow::Result<()> {
             args.ws_ping_secs,
             args.ws_ping_jitter_percent,
             args.ws_binary_send_jitter_ms,
+            args.ws_jitter_min_ms,
+            args.ws_jitter_max_ms,
             args.udp_max_pad,
             args.udp_max_ws_binary,
             args.udp_mux_reply_timeout_secs,
@@ -288,18 +341,33 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    let tls_profile: TlsClientProfile = if let Some(s) = args
-        .tls_profile
-        .as_ref()
-        .map(|x| x.trim())
-        .filter(|x| !x.is_empty())
-    {
-        s.parse().context("tls-profile")?
-    } else if let Some(ref inv) = inv_opt {
-        inv.tls_profile.parse().context("invite tls_profile")?
+    let stealth_for_merge: Option<StealthProfile> = args
+        .stealth_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(StealthProfile::from_str)
+        .transpose()
+        .context("--stealth-profile")?;
+    let pr_opt = stealth_for_merge.map(preset);
+    let (ws_jitter_min_ms, ws_jitter_max_ms) = apply_preset_ws_jitter(
+        pr_opt.as_ref(),
+        ws_jitter_min_ms,
+        ws_jitter_max_ms,
+    );
+
+    let invite_tls: Option<TlsClientProfile> = if let Some(ref inv) = inv_opt {
+        Some(inv.tls_profile.parse().context("invite tls_profile")?)
     } else {
-        TlsClientProfile::default()
+        None
     };
+    let tls_profile = bibavpn::client_policy::resolve_tls_client_profile(
+        args.fingerprint.as_deref(),
+        args.tls_profile.as_deref(),
+        stealth_for_merge,
+        invite_tls,
+    )
+    .context("tls profile resolution")?;
 
     let ws_path = normalize_ws_path(
         args.ws_path
@@ -322,10 +390,16 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(ref ps) = inv.pad_mode {
                     PadMode::from_str(ps).context("invite pad_mode")?
                 } else {
-                    PadMode::Random
+                    pr_opt
+                        .as_ref()
+                        .map(|p| p.pad_mode)
+                        .unwrap_or_default()
                 }
             } else {
-                PadMode::Random
+                pr_opt
+                    .as_ref()
+                    .map(|p| p.pad_mode)
+                    .unwrap_or_default()
             }
         }
     };
@@ -333,6 +407,7 @@ async fn main() -> anyhow::Result<()> {
     let dummy_interval_secs = args
         .dummy_interval_secs
         .or(inv_opt.as_ref().and_then(|i| i.dummy_interval_secs))
+        .or_else(|| pr_opt.as_ref().map(|p| p.dummy_interval_secs))
         .unwrap_or(0);
 
     let decoy_gets_paths: Vec<String> = args
@@ -383,12 +458,47 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let decoy_gets = if let Some(ref pr) = pr_opt {
+        pr.decoy_gets
+    } else {
+        args.decoy_gets
+    };
+    let decoy_mode: DecoyMode = args
+        .decoy_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(DecoyMode::from_str)
+        .transpose()
+        .context("--decoy-mode")?
+        .or_else(|| pr_opt.as_ref().map(|p| p.decoy_mode))
+        .unwrap_or_default();
+    let desync_mode: DesyncMode = args
+        .desync_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(DesyncMode::from_str)
+        .transpose()
+        .context("--desync-mode")?
+        .unwrap_or_default();
+    let tcp_fooling: TcpFooling = args
+        .tcp_fooling
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(TcpFooling::from_str)
+        .transpose()
+        .context("--tcp-fooling")?
+        .unwrap_or_default();
+    let tls_stack: TlsStack = args.tls_stack.parse().context("--tls-stack")?;
     let opts = LocalClientOptions {
         server_host,
         server_port,
         sni: sni_owned,
         token,
         socks_bind: args.socks5,
+        socks_auth: None,
         http_proxy_bind: args.http_proxy,
         insecure_tls,
         max_pad,
@@ -405,6 +515,8 @@ async fn main() -> anyhow::Result<()> {
         ws_ping_secs,
         ws_ping_jitter_percent,
         ws_binary_send_jitter_ms,
+        ws_jitter_min_ms,
+        ws_jitter_max_ms,
         udp_max_pad,
         udp_max_ws_binary,
         udp_mux_reply_timeout_secs,
@@ -414,7 +526,7 @@ async fn main() -> anyhow::Result<()> {
         use_tcp_mux,
         pad_mode,
         dummy_interval_secs,
-        decoy_gets: args.decoy_gets,
+        decoy_gets,
         decoy_gets_interval_secs: args.decoy_gets_interval_secs,
         decoy_gets_paths,
         proto,
@@ -422,6 +534,14 @@ async fn main() -> anyhow::Result<()> {
         reality_target: args.reality_target,
         reality_public_key,
         reality_short_id,
+        decoy_mode,
+        desync_mode,
+        tcp_fooling,
+        tls_fragment: args.tls_fragment,
+        ws_parallel: args.ws_parallel,
+        idle_decoy_secs: merge_idle_decoy_secs(args.idle_decoy_secs, pr_opt.as_ref()),
+        stealth_profile: stealth_for_merge,
+        tls_stack,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

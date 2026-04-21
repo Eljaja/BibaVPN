@@ -8,6 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, Duration};
 use tracing::warn;
 
+use crate::desync::sleep_decoy_rtt_variance;
+use crate::stealth_v12::DecoyMode;
 use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile};
 
 pub struct DecoyConfig {
@@ -20,6 +22,7 @@ pub struct DecoyConfig {
     pub interval_secs: u64,
     pub paths: Vec<String>,
     pub user_agent: String,
+    pub mode: DecoyMode,
 }
 
 /// Background task: periodic tiny GETs (same TLS stack as the tunnel).
@@ -47,11 +50,21 @@ pub async fn run_decoy_gets_loop(
     };
     let connector = tokio_rustls::TlsConnector::from(tls);
     let paths = if cfg.paths.is_empty() {
-        vec![
-            "/favicon.ico".into(),
-            "/robots.txt".into(),
-            "/manifest.json".into(),
-        ]
+        match cfg.mode {
+            DecoyMode::Simple => vec![
+                "/favicon.ico".into(),
+                "/robots.txt".into(),
+                "/manifest.json".into(),
+            ],
+            DecoyMode::Browser => vec![
+                "/".into(),
+                "/favicon.ico".into(),
+                "/robots.txt".into(),
+                "/manifest.json".into(),
+                "/.well-known/security.txt".into(),
+                "/sitemap.xml".into(),
+            ],
+        }
     } else {
         cfg.paths.clone()
     };
@@ -82,12 +95,28 @@ pub async fn run_decoy_gets_loop(
         } else {
             format!("{}:{}", cfg.sni, cfg.server_port)
         };
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n\r\n",
-            path = path,
-            host_hdr = host_hdr,
-            ua = cfg.user_agent.as_str(),
-        );
+        if cfg.mode == DecoyMode::Browser {
+            sleep_decoy_rtt_variance().await;
+        }
+
+        let req = match cfg.mode {
+            DecoyMode::Simple => format!(
+                "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n\r\n",
+                path = path,
+                host_hdr = host_hdr,
+                ua = cfg.user_agent.as_str(),
+            ),
+            DecoyMode::Browser => {
+                let origin = format!("https://{}", cfg.sni);
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.5\r\nAccept-Encoding: gzip, deflate, br\r\nReferer: {origin}/\r\nDNT: 1\r\nConnection: close\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-User: ?1\r\nUpgrade-Insecure-Requests: 1\r\n\r\n",
+                    path = path,
+                    host_hdr = host_hdr,
+                    ua = cfg.user_agent.as_str(),
+                    origin = origin,
+                )
+            }
+        };
 
         let run = async {
             let tcp = crate::outbound_protect::tcp_connect_host_protected(
@@ -114,4 +143,91 @@ pub async fn run_decoy_gets_loop(
 /// Spawn decoy loop; returns shutdown sender to stop with the main client shutdown channel.
 pub fn spawn_decoy_gets(cfg: DecoyConfig, shutdown: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(run_decoy_gets_loop(cfg, shutdown));
+}
+
+/// Single HTTPS GET (used for idle-triggered decoy, same stack as `run_decoy_gets_loop`).
+pub async fn run_one_decoy_get(cfg: &DecoyConfig) {
+    let tls = match client_tls_config(&ClientTlsParams {
+        insecure: cfg.insecure,
+        profile: cfg.tls_profile,
+        pinned_certs_pem: cfg.pinned_certs_pem.clone(),
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("idle decoy: tls: {e:#}");
+            return;
+        }
+    };
+    let domain = match ServerName::try_from(cfg.sni.clone()) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("idle decoy: sni: {e:#}");
+            return;
+        }
+    };
+    let connector = tokio_rustls::TlsConnector::from(tls);
+    let paths: Vec<String> = if cfg.paths.is_empty() {
+        match cfg.mode {
+            DecoyMode::Simple => vec![
+                "/favicon.ico".into(),
+                "/robots.txt".into(),
+            ],
+            DecoyMode::Browser => vec![
+                "/".into(),
+                "/favicon.ico".into(),
+                "/robots.txt".into(),
+            ],
+        }
+    } else {
+        cfg.paths.clone()
+    };
+    let path = paths
+        .choose(&mut rand::thread_rng())
+        .map(|s| s.as_str())
+        .unwrap_or("/favicon.ico");
+    let host_hdr = if cfg.server_port == 443 {
+        cfg.sni.clone()
+    } else {
+        format!("{}:{}", cfg.sni, cfg.server_port)
+    };
+    if cfg.mode == DecoyMode::Browser {
+        sleep_decoy_rtt_variance().await;
+    }
+    let req = match cfg.mode {
+        DecoyMode::Simple => format!(
+            "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            path = path,
+            host_hdr = host_hdr,
+            ua = cfg.user_agent.as_str(),
+        ),
+        DecoyMode::Browser => {
+            let origin = format!("https://{}", cfg.sni);
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.5\r\nAccept-Encoding: gzip, deflate, br\r\nReferer: {origin}/\r\nConnection: close\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n",
+                path = path,
+                host_hdr = host_hdr,
+                ua = cfg.user_agent.as_str(),
+                origin = origin,
+            )
+        }
+    };
+    let run = async {
+        let tcp = crate::outbound_protect::tcp_connect_host_protected(
+            &cfg.server_host,
+            cfg.server_port,
+        )
+        .await
+        .context("idle decoy tcp")?;
+        let mut tls = connector
+            .connect(domain, tcp)
+            .await
+            .context("idle decoy tls")?;
+        tls.write_all(req.as_bytes()).await.context("idle decoy write")?;
+        let mut buf = [0u8; 2048];
+        let _ = tls.read(&mut buf).await;
+        Ok::<_, anyhow::Error>(())
+    };
+    if let Err(e) = run.await {
+        warn!("idle decoy GET: {e:#}");
+    }
 }

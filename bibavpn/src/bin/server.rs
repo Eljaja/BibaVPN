@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
-use bibavpn::frame::{PadMode, DEFAULT_MAX_WS_BINARY};
+use bibavpn::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
 use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig};
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
@@ -13,7 +13,8 @@ use bibavpn::protocol::{
     decode_v3_auth, decode_v3_open_with_flags, encode_v3_open_err, encode_v3_open_ok, is_v3_mux_open,
     is_v3_udp_mux_open, OPEN_FLAG_STATUS,
 };
-use bibavpn::{read_padded_frame_into, write_padded_frame_with_mode};
+use bibavpn::ServerWsOutTiming;
+use bibavpn::{read_padded_frame_into, write_padded_frame_with_mode_state};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
 use bibavpn::reality::{bridge_reality_server, extract_sni, RealityServerConfig};
@@ -23,6 +24,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
 use std::str::FromStr;
+use bibavpn::stealth_v12::StealthProfile;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
@@ -87,6 +89,29 @@ struct Args {
     #[arg(long, default_value = "0")]
     ws_binary_send_jitter_ms: u8,
 
+    /// Outbound WS send delay: random ms in `min..=max` when both set; else use `--ws-binary-send-jitter-ms`.
+    #[arg(long, default_value = "0")]
+    ws_jitter_min_ms: u8,
+
+    #[arg(long, default_value = "0")]
+    ws_jitter_max_ms: u8,
+
+    /// BibaV1.2: server→client “delayed ACK buffer”: min delay (ms) per outbound binary; use with `--server-ack-delay-max-ms` (0 = off).
+    #[arg(long, default_value_t = 0)]
+    server_ack_delay_min_ms: u16,
+
+    /// BibaV1.2: max delay (ms) for that buffer (0 = off). Typical stealth range 40–500; must be >= min when min > 0.
+    #[arg(long, default_value_t = 0)]
+    server_ack_delay_max_ms: u16,
+
+    /// BibaV1.2: extra RTT-mask jitter 0..=N ms after ack delay, before WS send jitter (0 = off).
+    #[arg(long, default_value_t = 0)]
+    rtt_mask_jitter_ms: u16,
+
+    /// BibaV1.2: when all explicit server ACK / RTT args above are 0, apply preset: `balanced` or `aggressive` (see `stealth_v12::StealthProfile::server_rtt_defaults`). `default` leaves delays off.
+    #[arg(long)]
+    ack_profile: Option<String>,
+
     /// Padding cap for UDP mux replies only (default: same as `--max-pad`).
     #[arg(long)]
     udp_max_pad: Option<u8>,
@@ -127,8 +152,8 @@ struct Args {
     #[arg(long)]
     camouflage_url: Option<String>,
 
-    /// Inner frame padding mode: `random` or `http-buckets`.
-    #[arg(long, default_value = "random")]
+    /// Inner frame padding mode: `adaptive` (default), `random`, or `http-buckets`.
+    #[arg(long, default_value = "adaptive")]
     pad_mode: String,
 
     /// Send idle padded empty frames on TCP tunnels (0 = off). Matches client `--dummy-interval-secs`.
@@ -228,6 +253,8 @@ async fn main() -> anyhow::Result<()> {
             ws_ping_secs: args.ws_ping_secs,
             ws_ping_jitter_percent: args.ws_ping_jitter_percent,
             ws_binary_send_jitter_ms: args.ws_binary_send_jitter_ms,
+            ws_jitter_min_ms: args.ws_jitter_min_ms,
+            ws_jitter_max_ms: args.ws_jitter_max_ms,
             udp_max_pad: args.udp_max_pad,
             udp_max_ws_binary: args.udp_max_ws_binary,
             udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
@@ -237,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
             pad_mode: Some(match pad_mode {
                 PadMode::Random => "random".into(),
                 PadMode::HttpBuckets => "http-buckets".into(),
+                PadMode::Adaptive => "adaptive".into(),
             }),
             dummy_interval_secs: Some(args.dummy_interval_secs).filter(|&x| x > 0),
         };
@@ -253,6 +281,38 @@ async fn main() -> anyhow::Result<()> {
     let ws_ping_secs = args.ws_ping_secs;
     let ws_ping_jitter_percent = args.ws_ping_jitter_percent;
     let ws_binary_send_jitter_ms = args.ws_binary_send_jitter_ms;
+    let ws_jitter_min_ms = args.ws_jitter_min_ms;
+    let ws_jitter_max_ms = args.ws_jitter_max_ms;
+    let mut s_ack_lo = args.server_ack_delay_min_ms;
+    let mut s_ack_hi = args.server_ack_delay_max_ms;
+    if s_ack_lo > 0 && s_ack_hi < s_ack_lo {
+        std::mem::swap(&mut s_ack_lo, &mut s_ack_hi);
+    }
+    let mut server_ws_out = ServerWsOutTiming {
+        ack_delay_min_ms: s_ack_lo,
+        ack_delay_max_ms: s_ack_hi,
+        rtt_mask_jitter_ms: args.rtt_mask_jitter_ms,
+    };
+    if s_ack_lo == 0
+        && s_ack_hi == 0
+        && args.rtt_mask_jitter_ms == 0
+    {
+        if let Some(s) = args.ack_profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let p = StealthProfile::from_str(s).context("--ack-profile")?;
+            if let Some(d) = p.server_rtt_defaults() {
+                let mut a = d.ack_delay_min_ms;
+                let mut b = d.ack_delay_max_ms;
+                if a > 0 && b < a {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                server_ws_out = ServerWsOutTiming {
+                    ack_delay_min_ms: a,
+                    ack_delay_max_ms: b,
+                    rtt_mask_jitter_ms: d.rtt_mask_jitter_ms,
+                };
+            }
+        }
+    }
     let udp_mux_pad = args.udp_max_pad.unwrap_or(max_pad);
     let udp_mux_ws = args.udp_max_ws_binary.unwrap_or(max_ws_binary);
     let udp_mux_recv = Duration::from_secs(args.udp_mux_recv_timeout_secs.clamp(1, 600));
@@ -348,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
         let psk_conn = psk.clone();
         let proto_domain = args.proto_domain.clone();
         let reality_cfg = reality_config.clone();
+        let server_ws_out = server_ws_out;
         tokio::spawn(async move {
             if let Err(e) = handle_one(
                 stream,
@@ -362,11 +423,14 @@ async fn main() -> anyhow::Result<()> {
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 udp_mux_pad,
                 udp_mux_ws,
                 udp_mux_recv,
                 pad_mode,
                 dummy_interval_secs,
+                server_ws_out,
                 camo,
                 proto_domain,
                 reality_cfg,
@@ -392,11 +456,14 @@ async fn handle_one(
     ws_ping_secs: u64,
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
     udp_mux_max_pad: u8,
     udp_mux_max_ws_binary: usize,
     udp_mux_recv_timeout: Duration,
     pad_mode: PadMode,
     dummy_interval_secs: u64,
+    server_out: ServerWsOutTiming,
     camo: CamouflageServeConfig,
     proto_domain: String,
     reality_config: Option<RealityServerConfig>,
@@ -447,6 +514,7 @@ async fn handle_one(
             supports_open_status,
         } => {
             info!("OPEN {host}:{port}");
+            let mut pad_st = AdaptivePadState::default();
             let remote = match TcpStream::connect((host.as_str(), port)).await {
                 Ok(remote) => remote,
                 Err(e) => {
@@ -455,8 +523,14 @@ async fn handle_one(
                             encode_v3_open_err(&format!("connect {host}:{port}: {e:#}"))
                         {
                             let mut wire = Vec::new();
-                            if write_padded_frame_with_mode(&mut wire, &inner, max_pad, pad_mode)
-                                .is_ok()
+                            if write_padded_frame_with_mode_state(
+                                &mut wire,
+                                &inner,
+                                max_pad,
+                                pad_mode,
+                                Some(&mut pad_st),
+                            )
+                            .is_ok()
                             {
                                 if let Ok(blob) = crypto.seal_server_to_client(&wire) {
                                     let _ = ws.send(Message::Binary(Bytes::from(blob))).await;
@@ -472,8 +546,14 @@ async fn handle_one(
             if supports_open_status {
                 let inner = encode_v3_open_ok();
                 let mut wire = Vec::new();
-                write_padded_frame_with_mode(&mut wire, &inner, max_pad, pad_mode)
-                    .context("pack OPEN_OK v3")?;
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &inner,
+                    max_pad,
+                    pad_mode,
+                    Some(&mut pad_st),
+                )
+                .context("pack OPEN_OK v3")?;
                 let blob = crypto
                     .seal_server_to_client(&wire)
                     .context("seal OPEN_OK v3")?;
@@ -493,9 +573,12 @@ async fn handle_one(
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 TunnelEnd::Server,
                 pad_mode,
                 dummy_interval_secs,
+                server_out,
             )
             .await?;
         }
@@ -510,8 +593,11 @@ async fn handle_one(
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 udp_mux_recv_timeout,
                 pad_mode,
+                server_out,
             )
             .await?;
         }
@@ -526,8 +612,11 @@ async fn handle_one(
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 pad_mode,
                 dummy_interval_secs,
+                server_out,
             )
             .await?;
         }
