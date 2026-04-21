@@ -16,21 +16,34 @@ pub enum ClientHelloId {
     Chrome62,
     Chrome70,
     Chrome72,
+    /// Same wire spec as `Chrome70` in this build (BibaV1.2+ alias; refine when CH bytes match M132+).
+    Chrome132,
     Firefox63,
     Firefox65,
     Firefox99,
+    /// Same as Firefox 63/65 spec (alias for BibaV1.2+).
+    Firefox136,
+    /// WebKit/Safari-like: currently maps to the Chrome spec (tune separately when needed).
+    Safari18,
 }
 
 /// Maps a [`ClientHelloId`] to a [`ClientHelloSpec`] (uTLS `utlsIdToSpec`).
 pub fn utls_id_to_spec(id: ClientHelloId) -> Result<ClientHelloSpec> {
     match id {
         ClientHelloId::HelloCustom => Ok(ClientHelloSpec::default()),
-        ClientHelloId::Chrome70 => Ok(chrome_70()),
-        ClientHelloId::Firefox63 | ClientHelloId::Firefox65 => Ok(firefox_63_65()),
+        ClientHelloId::Chrome70
+        | ClientHelloId::Chrome58
+        | ClientHelloId::Chrome62
+        | ClientHelloId::Chrome72
+        | ClientHelloId::Chrome132
+        | ClientHelloId::Safari18 => Ok(chrome_70()),
+        ClientHelloId::Firefox63
+        | ClientHelloId::Firefox65
+        | ClientHelloId::Firefox99
+        | ClientHelloId::Firefox136 => Ok(firefox_63_65()),
         ClientHelloId::HelloRandomized
         | ClientHelloId::HelloRandomizedAlpn
         | ClientHelloId::HelloRandomizedNoAlpn => crate::randomized::generate_randomized_spec(id),
-        _ => Err(Error::UnknownClientHelloId),
     }
 }
 
