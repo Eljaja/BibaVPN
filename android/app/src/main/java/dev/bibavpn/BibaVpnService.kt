@@ -21,6 +21,7 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
+import java.security.SecureRandom
 import androidx.core.app.NotificationCompat
 import dev.bibavpn.core.BibaNative
 import dev.bibavpn.core.VpnProtect
@@ -370,10 +371,7 @@ class BibaVpnService : VpnService() {
         reason: String,
         json: String,
     ) {
-        val socks =
-            runCatching {
-                JSONObject(json).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
-            }.getOrDefault(SOCKS_LOCAL)
+        val sessionJson = configJsonWithSessionSocksAuth(json)
         Thread(
             {
                 try {
@@ -383,7 +381,7 @@ class BibaVpnService : VpnService() {
                         allowScreenOnStackRestart = false
                         val err =
                             try {
-                                BibaNative.nativeStart(json)
+                                BibaNative.nativeStart(sessionJson)
                             } catch (e: Throwable) {
                                 Log.e(TAG, "$reason: nativeStart", e)
                                 e.message ?: e.javaClass.simpleName
@@ -402,7 +400,7 @@ class BibaVpnService : VpnService() {
                             return@Thread
                         }
                     }
-                    if (!startVpnTunnel(socks)) {
+                    if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
                         isTunnelActive = false
                         synchronized(nativeLifecycleLock) {
                             BibaNative.nativeStop()
@@ -470,13 +468,14 @@ class BibaVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        val sessionJson = configJsonWithSessionSocksAuth(json)
         val socks = runCatching {
-            JSONObject(json).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
+            JSONObject(sessionJson).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
         }.getOrDefault(SOCKS_LOCAL)
 
         Log.i(
             TAG,
-            "bootstrap ${configFingerprint(json)} socks=$socks fromIntentExtra=" +
+            "bootstrap ${configFingerprint(sessionJson)} socks=$socks fromIntentExtra=" +
                 "${fromExtra != null && intent?.action != ACTION_ENABLE} action=${intent?.action}",
         )
 
@@ -494,7 +493,7 @@ class BibaVpnService : VpnService() {
                 requestFullStackRestart("ACTION_ENABLE", json)
                 return START_STICKY
             }
-            enqueueBootstrapWorker(json, socks)
+            enqueueBootstrapWorker(sessionJson)
             return START_STICKY
         }
 
@@ -505,7 +504,7 @@ class BibaVpnService : VpnService() {
             }
         }
 
-        enqueueBootstrapWorker(json, socks)
+        enqueueBootstrapWorker(sessionJson)
         return START_STICKY
     }
 
@@ -523,19 +522,16 @@ class BibaVpnService : VpnService() {
     }
 
     /** nativeStart ждёт bind SOCKS в Rust — не блокируем main thread (ANR). */
-    private fun enqueueBootstrapWorker(
-        json: String,
-        socks: String,
-    ) {
+    private fun enqueueBootstrapWorker(sessionJson: String) {
         val worker =
             Thread(
                 {
                     val self = Thread.currentThread()
                     try {
-                        Log.i(TAG, "worker: nativeStart begin ${configFingerprint(json)}")
+                        Log.i(TAG, "worker: nativeStart begin ${configFingerprint(sessionJson)}")
                         val err = try {
                             synchronized(nativeLifecycleLock) {
-                                BibaNative.nativeStart(json)
+                                BibaNative.nativeStart(sessionJson)
                             }
                         } catch (e: Throwable) {
                             Log.e(TAG, "native start", e)
@@ -560,7 +556,7 @@ class BibaVpnService : VpnService() {
                         }
 
                         Log.i(TAG, "worker: nativeStart OK — startVpnTunnel")
-                        if (!startVpnTunnel(socks)) {
+                        if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
                             Log.e(TAG, "startVpnTunnel returned false — nativeStop + stopSelf")
                             isTunnelActive = false
                             synchronized(nativeLifecycleLock) {
@@ -609,7 +605,8 @@ class BibaVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startVpnTunnel(socksBind: String): Boolean {
+    /** @param proxyUrl полный URL для tun2socks, например `socks5://user:pass@127.0.0.1:1080`. */
+    private fun startVpnTunnel(proxyUrl: String): Boolean {
         synchronized(tunLock) {
             stopTun2socksOnly()
             val builder = Builder()
@@ -664,10 +661,7 @@ class BibaVpnService : VpnService() {
             runCatching { tunParcelOrphan?.close() }
             tunParcelOrphan = javaOwnedTun
 
-            val proxy =
-                socksBind.trim().let { b ->
-                    if (b.startsWith("socks5://", ignoreCase = true)) b else "socks5://$b"
-                }
+            val proxy = proxyUrl.trim()
             tun2socksThread = Thread(
                 {
                     try {
@@ -698,7 +692,7 @@ class BibaVpnService : VpnService() {
                 },
                 "biba-tun2socks",
             ).also { it.start() }
-            Log.i(TAG, "VPN up, tun2socks -> $proxy")
+            Log.i(TAG, "VPN up, tun2socks -> ${proxyUrlForLog(proxy)}")
             return true
         }
     }
@@ -830,6 +824,50 @@ class BibaVpnService : VpnService() {
 
     private fun loadSavedConfigJson(): String? =
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_LAST_JSON, null)
+
+    private val socksRandom = SecureRandom()
+
+    private fun randomSocksCredential(length: Int): String {
+        val alphabet = ('a'..'z') + ('A'..'Z') + ('0'..'9')
+        return buildString(length) {
+            repeat(length) { append(alphabet[socksRandom.nextInt(alphabet.size)]) }
+        }
+    }
+
+    /**
+     * Случайный логин/пароль для локального SOCKS5 на эту сессию (Rust listener + tun2socks).
+     * В хранилище профиля не попадает.
+     */
+    private fun configJsonWithSessionSocksAuth(baseJson: String): String {
+        val o = JSONObject(baseJson)
+        o.remove("socks_auth_user")
+        o.remove("socks_auth_password")
+        o.put("socks_auth_user", randomSocksCredential(16))
+        o.put("socks_auth_password", randomSocksCredential(24))
+        return o.toString()
+    }
+
+    private fun tun2socksProxyFromSessionJson(sessionJson: String): String {
+        val o = JSONObject(sessionJson)
+        val raw = o.optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
+        val hostPort = raw.removePrefix("socks5://").removePrefix("SOCKS5://")
+        val u = o.optString("socks_auth_user", "")
+        val p = o.optString("socks_auth_password", "")
+        check(u.isNotEmpty() && p.isNotEmpty()) { "session SOCKS auth missing after inject" }
+        return "socks5://$u:$p@$hostPort"
+    }
+
+    private fun proxyUrlForLog(proxy: String): String {
+        val s = proxy.trim()
+        val schemeEnd = s.indexOf("://")
+        if (schemeEnd < 0) return s
+        val scheme = s.substring(0, schemeEnd)
+        val rest = s.substring(schemeEnd + 3)
+        val at = rest.lastIndexOf('@')
+        if (at <= 0) return s
+        val host = rest.substring(at + 1)
+        return "$scheme://***@$host"
+    }
 
     /** См. [Companion.isScreenOffBatterySaverEnabled]. */
     private fun screenOffBatterySaverEnabled(): Boolean =
