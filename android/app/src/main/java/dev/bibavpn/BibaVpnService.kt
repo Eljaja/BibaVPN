@@ -22,6 +22,9 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
 import java.security.SecureRandom
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import androidx.core.app.NotificationCompat
 import dev.bibavpn.core.BibaNative
 import dev.bibavpn.core.VpnProtect
@@ -609,20 +612,18 @@ class BibaVpnService : VpnService() {
     private fun startVpnTunnel(proxyUrl: String): Boolean {
         synchronized(tunLock) {
             stopTun2socksOnly()
+            // MTU ниже 1500: запас под Encapsulation (TUN → SOCKS → WSS); иначе фрагментация/чёрные дыры на LTE.
+            val tunMtu = 1400
             val builder = Builder()
                 .setSession("BibaVPN")
-                .setMtu(1500)
+                .setMtu(tunMtu)
                 .addAddress(VPN_LOCAL_IP, 32)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
             builder.addDisallowedApplication(packageName)
             builder.applySplitTunnelBypasses()
-            try {
-                builder.addRoute("::", 0)
-            } catch (_: Throwable) {
-                /* IPv6 маршрут необязателен */
-            }
+            // Не добавляем ::/0: у многих сборок tun2socks UDP/IPv6 через TUN неполный — тогда AAAA/DNS v6 «висят».
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 runCatching {
@@ -662,13 +663,15 @@ class BibaVpnService : VpnService() {
             tunParcelOrphan = javaOwnedTun
 
             val proxy = proxyUrl.trim()
+            val startLatch = CountDownLatch(1)
+            val startErr = AtomicReference<String?>(null)
             tun2socksThread = Thread(
                 {
                     try {
                         val key = Key()
                         key.setDevice("fd://$fd")
                         key.setProxy(proxy)
-                        key.setMTU(1500)
+                        key.setMTU(tunMtu.toLong())
                         // П последним setter'ом: в некоторых gomobile-биндингах поля сбрасываются при других set* .
                         key.setLogLevel("info")
                         Log.i(TAG, "tun2socks Key.logLevel=${key.logLevel}")
@@ -685,13 +688,30 @@ class BibaVpnService : VpnService() {
                                 lastPhysicalNetworkForRestart = und
                             }
                         }
+                        Log.i(TAG, "tun2socks Engine.start OK")
                     } catch (e: Throwable) {
                         Log.e(TAG, "tun2socks", e)
-                        abortVpnFromWorker(e.message)
+                        startErr.set(e.message ?: e.javaClass.simpleName)
+                        mainHandler.post { abortVpnFromWorker(e.message) }
+                    } finally {
+                        startLatch.countDown()
                     }
                 },
                 "biba-tun2socks",
             ).also { it.start() }
+
+            val ok = startLatch.await(25, TimeUnit.SECONDS)
+            if (!ok) {
+                Log.e(TAG, "tun2socks: Engine.start timeout (${25}s) — останавливаем")
+                tun2socksThread?.interrupt()
+                stopTun2socksOnly()
+                return false
+            }
+            startErr.get()?.let { err ->
+                Log.e(TAG, "tun2socks failed: $err")
+                stopTun2socksOnly()
+                return false
+            }
             Log.i(TAG, "VPN up, tun2socks -> ${proxyUrlForLog(proxy)}")
             return true
         }
@@ -844,7 +864,62 @@ class BibaVpnService : VpnService() {
         o.remove("socks_auth_password")
         o.put("socks_auth_user", randomSocksCredential(16))
         o.put("socks_auth_password", randomSocksCredential(24))
+        applyLegacyPadModeForBundledNative(o)
+        capWsParallelForUdpMux(o)
         return o.toString()
+    }
+
+    /**
+     * UDP mux поднимает отдельный полный TLS+WSS поверх уже существующих параллельных mux-сессий ([ws_parallel] до 4).
+     * Суммарно получается много одновременных TLS к одному хосту; часть сетей/CDN закрывает лишние с `unexpected-eof`,
+     * после чего не работает DNS (UDP) и «интернета нет» при живом TCP.
+     */
+    private fun capWsParallelForUdpMux(o: JSONObject) {
+        if (!o.optBoolean("use_tcp_mux", true)) return
+        val cur = o.optInt("ws_parallel", 1).coerceIn(1, 4)
+        if (cur > 1) {
+            o.put("ws_parallel", 1)
+            Log.i(TAG, "config: ws_parallel=1 for this session (was $cur) — extra WSS + UDP mux TLS were failing")
+        }
+    }
+
+    /**
+     * В jniLibs может лежать lib без поддержки [pad_mode] `adaptive` (ошибка parse: use random or http-buckets).
+     * В Rust top-level `pad_mode` перекрывает значение из invite.
+     *
+     * Раньше подставляли `random`, из‑за чего UDP mux (DNS) мог отваливаться, если сервер ожидал не random‑паддинг.
+     * Для `adaptive` используем `http-buckets` — тот же wire‑формат, другой закон распределения паддинга, обычно ближе к серверу.
+     */
+    private fun applyLegacyPadModeForBundledNative(o: JSONObject) {
+        val current = o.optString("pad_mode", "").trim()
+        if (current.equals("adaptive", ignoreCase = true)) {
+            o.put("pad_mode", "http-buckets")
+            return
+        }
+        if (current.isNotEmpty()) return
+
+        val invite = o.optString("from_invite", "").trim()
+        val pass = o.optString("invite_passphrase", "")
+        if (invite.isBlank() || pass.isBlank()) return
+
+        val invPad =
+            runCatching {
+                val raw = BibaNative.nativeDecodeInvite(invite, pass)
+                val j = JSONObject(raw)
+                if (!j.optBoolean("ok")) return@runCatching null
+                j.optString("pad_mode", "").trim()
+            }.getOrNull()
+                ?: return
+
+        val legacy =
+            when {
+                invPad.isEmpty() || invPad.equals("adaptive", ignoreCase = true) -> "http-buckets"
+                invPad.equals("random", ignoreCase = true) -> "random"
+                invPad.equals("http-buckets", ignoreCase = true) ||
+                    invPad.equals("buckets", ignoreCase = true) -> "http-buckets"
+                else -> null
+            }
+        if (legacy != null) o.put("pad_mode", legacy)
     }
 
     private fun tun2socksProxyFromSessionJson(sessionJson: String): String {

@@ -78,6 +78,22 @@
     <string name="section_transport">Transport</string>
     <string name="section_transport_sub">Obfuscation and WebSocket</string>
     <string name="hint_tls_profile">ClientHello profile (default, chrome70, firefox65, …); can override for invite keys</string>
+    <string name="hint_fingerprint">Like --fingerprint (chrome-132, …); overrides tls_profile when set</string>
+    <string name="hint_tls_stack">rustls (default in APK) or boring — only if client built with BoringSSL</string>
+    <string name="hint_proto">Wire protocol version (currently 3)</string>
+    <string name="hint_proto_domain">v3 KDF label; empty = use SNI</string>
+    <string name="hint_ws_jitter_min">WS binary send delay min ms (stealth presets may fill)</string>
+    <string name="hint_ws_jitter_max">WS binary send delay max ms</string>
+    <string name="hint_ws_parallel">Parallel outer WSS sessions 1–4 (--ws-parallel)</string>
+    <string name="hint_idle_decoy_secs">Mux idle threshold for background decoy; 0 = off</string>
+    <string name="hint_stealth_profile">default | balanced | aggressive</string>
+    <string name="hint_decoy_mode">simple | browser</string>
+    <string name="hint_desync_mode">off | split2 | … (partly advisory)</string>
+    <string name="hint_tcp_fooling">tcp_fooling CLI mode</string>
+    <string name="hint_tls_fragment">TLS record fragmentation (experimental)</string>
+    <string name="hint_reality_target">REALITY front SNI (e.g. vk.com)</string>
+    <string name="hint_reality_public_key">REALITY X25519 server pubkey, standard base64, 32 bytes</string>
+    <string name="hint_reality_short_id">REALITY short_id, 16 hex (optional)</string>
     <string name="hint_ws_path">WebSocket path on server (empty = /ws from key)</string>
     <string name="toggle_tcp_mux_title">TCP multiplex (WSS)</string>
     <string name="toggle_tcp_mux_sub">Turn off for --no-mux-like mode</string>

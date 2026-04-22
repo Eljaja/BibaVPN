@@ -531,10 +531,16 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     } else {
         j.tls_fragment
     };
-    let ws_parallel = if let Some(ref inv) = invite_pair {
-        inv.ws_parallel
-    } else {
-        j.ws_parallel.unwrap_or(1).max(1)
+    // JSON (Android `nativeStart`, CLI `--config`) must override invite: invite often embeds ws_parallel>1,
+    // but the outer JSON may cap it for UDP mux / connection limits.
+    let ws_parallel = match j.ws_parallel {
+        Some(jp) => jp.max(1).min(4),
+        None => invite_pair
+            .as_ref()
+            .map(|i| i.ws_parallel)
+            .unwrap_or(1)
+            .max(1)
+            .min(4),
     };
 
     let socks_auth: Option<(String, String)> = {

@@ -78,6 +78,22 @@
     <string name="section_transport">Транспорт</string>
     <string name="section_transport_sub">Обфускация и WebSocket</string>
     <string name="hint_tls_profile">Профиль ClientHello (default, chrome70, firefox65, …); для ключа можно переопределить</string>
+    <string name="hint_fingerprint">Как --fingerprint (chrome-132 и т.д.); приоритет над tls_profile</string>
+    <string name="hint_tls_stack">rustls (по умолчанию в APK) или boring — только если сборка с BoringSSL</string>
+    <string name="hint_proto">Версия wire (сейчас 3)</string>
+    <string name="hint_proto_domain">Метка KDF v3; пусто = SNI</string>
+    <string name="hint_ws_jitter_min">Задержка WS binary, мин. мс (с пресетами stealth)</string>
+    <string name="hint_ws_jitter_max">Задержка WS binary, макс. мс</string>
+    <string name="hint_ws_parallel">Параллельных WSS 1–4 (--ws-parallel)</string>
+    <string name="hint_idle_decoy_secs">Порог тишины mux для фонового decoy, 0 = выкл.</string>
+    <string name="hint_stealth_profile">default | balanced | aggressive</string>
+    <string name="hint_decoy_mode">simple | browser</string>
+    <string name="hint_desync_mode">off | split2 | … (частично advisory)</string>
+    <string name="hint_tcp_fooling">Режим tcp_fooling из CLI</string>
+    <string name="hint_tls_fragment">Фрагментация TLS записей (экспериментально)</string>
+    <string name="hint_reality_target">REALITY: фронт SNI (напр. vk.com)</string>
+    <string name="hint_reality_public_key">REALITY: публичный ключ X25519, base64 32 байта</string>
+    <string name="hint_reality_short_id">REALITY: short_id, 16 hex (опционально)</string>
     <string name="hint_ws_path">Путь WebSocket на сервере (пусто = /ws после ключа)</string>
     <string name="toggle_tcp_mux_title">TCP multiplex (WSS)</string>
     <string name="toggle_tcp_mux_sub">Выключите для режима как --no-mux</string>

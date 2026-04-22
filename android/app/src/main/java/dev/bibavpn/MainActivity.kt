@@ -281,6 +281,54 @@ private fun BibaRootScreen(
     var pinCertPem by remember {
         mutableStateOf(last?.optString("pin_cert_pem") ?: "")
     }
+    var proto by remember {
+        mutableStateOf(
+            if (last?.has("proto") == true && last!!.isNull("proto").not()) {
+                last!!.getInt("proto").toString()
+            } else {
+                "3"
+            },
+        )
+    }
+    var protoDomain by remember { mutableStateOf(last?.optString("proto_domain") ?: "") }
+    var wsJitterMin by remember {
+        mutableStateOf(
+            if (last?.has("ws_jitter_min_ms") == true) last!!.getInt("ws_jitter_min_ms").toString() else "0",
+        )
+    }
+    var wsJitterMax by remember {
+        mutableStateOf(
+            if (last?.has("ws_jitter_max_ms") == true) last!!.getInt("ws_jitter_max_ms").toString() else "0",
+        )
+    }
+    var stealthProfile by remember { mutableStateOf(last?.optString("stealth_profile") ?: "") }
+    var decoyMode by remember { mutableStateOf(last?.optString("decoy_mode") ?: "") }
+    var desyncMode by remember { mutableStateOf(last?.optString("desync_mode") ?: "") }
+    var tcpFooling by remember { mutableStateOf(last?.optString("tcp_fooling") ?: "") }
+    var tlsFragment by remember { mutableStateOf(last?.optBoolean("tls_fragment") ?: false) }
+    var wsParallel by remember {
+        mutableStateOf(
+            if (last?.has("ws_parallel") == true) last!!.getInt("ws_parallel").coerceIn(1, 4).toString() else "1",
+        )
+    }
+    var idleDecoySecs by remember {
+        mutableStateOf(
+            if (last?.has("idle_decoy_secs") == true && last!!.isNull("idle_decoy_secs").not()) {
+                last!!.getLong("idle_decoy_secs").toString()
+            } else {
+                "0"
+            },
+        )
+    }
+    var tlsStack by remember { mutableStateOf(last?.optString("tls_stack")?.ifBlank { null } ?: "rustls") }
+    var fingerprint by remember { mutableStateOf(last?.optString("fingerprint") ?: "") }
+    var realityTarget by remember { mutableStateOf(last?.optString("reality_target") ?: "") }
+    var realityPublicKey by remember { mutableStateOf(last?.optString("reality_public_key") ?: "") }
+    var realityShortId by remember { mutableStateOf(last?.optString("reality_short_id") ?: "") }
+    var wsHost by remember { mutableStateOf(last?.optString("ws_host") ?: "") }
+    var wsOrigin by remember { mutableStateOf(last?.optString("ws_origin") ?: "") }
+    var wsUserAgent by remember { mutableStateOf(last?.optString("ws_user_agent") ?: "") }
+    var wsAcceptLanguage by remember { mutableStateOf(last?.optString("ws_accept_language") ?: "") }
     var screenOffBatterySaver by remember {
         mutableStateOf(BibaVpnService.isScreenOffBatterySaverEnabled(context))
     }
@@ -334,10 +382,16 @@ private fun BibaRootScreen(
             tlsProfile = j.optString("tls_profile", "default")
             wsPath = j.optString("ws_path", "")
             padMode = j.optString("pad_mode", "")
+            junkFrames = j.optInt("junk_frames", 0).toString()
+            earlyWs = j.optInt("early_ws_frames", 0).toString()
             wsPingJitter =
                 if (j.has("ws_ping_jitter_percent")) j.getInt("ws_ping_jitter_percent").toString() else "0"
             wsBinaryJitter =
                 if (j.has("ws_binary_send_jitter_ms")) j.getInt("ws_binary_send_jitter_ms").toString() else "0"
+            wsJitterMin =
+                if (j.has("ws_jitter_min_ms")) j.getInt("ws_jitter_min_ms").toString() else "0"
+            wsJitterMax =
+                if (j.has("ws_jitter_max_ms")) j.getInt("ws_jitter_max_ms").toString() else "0"
             udpMaxPad =
                 if (j.has("udp_max_pad") && !j.isNull("udp_max_pad")) j.getInt("udp_max_pad").toString() else ""
             udpMaxWsBin =
@@ -354,7 +408,46 @@ private fun BibaRootScreen(
                 } else {
                     "0"
                 }
-            useTcpMux = true
+            useTcpMux = j.optBoolean("use_tcp_mux", true)
+            decoyGets = j.optBoolean("decoy_gets", false)
+            decoyGetsInterval = j.optLong("decoy_gets_interval_secs", 30).toString()
+            decoyGetsPaths = j.optString("decoy_gets_paths", "")
+            proto =
+                if (j.has("proto") && !j.isNull("proto")) j.getInt("proto").toString() else "3"
+            protoDomain = j.optString("proto_domain", "")
+            stealthProfile = j.optString("stealth_profile", "")
+            decoyMode = j.optString("decoy_mode", "")
+            desyncMode = j.optString("desync_mode", "")
+            tcpFooling = j.optString("tcp_fooling", "")
+            tlsFragment = j.optBoolean("tls_fragment", false)
+            wsParallel =
+                if (j.has("ws_parallel")) j.getInt("ws_parallel").coerceIn(1, 4).toString() else "1"
+            idleDecoySecs =
+                if (j.has("idle_decoy_secs") && !j.isNull("idle_decoy_secs")) {
+                    j.getLong("idle_decoy_secs").toString()
+                } else {
+                    "0"
+                }
+            tlsStack = j.optString("tls_stack", "rustls").ifBlank { "rustls" }
+            fingerprint = j.optString("fingerprint", "")
+            realityTarget = j.optString("reality_target", "")
+            realityPublicKey = j.optString("reality_public_key", "")
+            realityShortId = j.optString("reality_short_id", "")
+            wsHost = j.optString("ws_host", "")
+            wsOrigin = j.optString("ws_origin", "")
+            wsUserAgent = j.optString("ws_user_agent", "")
+            wsAcceptLanguage = j.optString("ws_accept_language", "")
+            if (j.has("ws_headers") && !j.isNull("ws_headers")) {
+                val arr = j.getJSONArray("ws_headers")
+                wsHeaders = (0 until arr.length()).joinToString("\n") { idx -> arr.getString(idx) }
+            }
+            if (j.has("pin_cert_pem") && !j.isNull("pin_cert_pem")) {
+                pinCertPem = j.optString("pin_cert_pem", "")
+            }
+            if (j.has("socks_bind") && !j.isNull("socks_bind")) {
+                val sb = j.optString("socks_bind", "")
+                if (sb.isNotBlank()) socksBind = sb
+            }
             Toast.makeText(context, context.getString(R.string.toast_invite_fields_updated), Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(
@@ -387,6 +480,8 @@ private fun BibaRootScreen(
         padMode = padMode,
         wsPingJitter = wsPingJitter.toIntOrNull() ?: 0,
         wsBinaryJitter = wsBinaryJitter.toIntOrNull() ?: 0,
+        wsJitterMin = wsJitterMin.toIntOrNull() ?: 0,
+        wsJitterMax = wsJitterMax.toIntOrNull() ?: 0,
         udpMaxPad = udpMaxPad.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
         udpMaxWsBinary = udpMaxWsBin.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
         udpMuxTimeout = udpMuxTimeout.trim().takeIf { it.isNotEmpty() }?.toLongOrNull(),
@@ -395,6 +490,24 @@ private fun BibaRootScreen(
         decoyGetsInterval = decoyGetsInterval.toLongOrNull() ?: 30L,
         decoyGetsPaths = decoyGetsPaths,
         pinCertPem = pinCertPem,
+        proto = proto.toIntOrNull() ?: 3,
+        protoDomain = protoDomain.trim(),
+        stealthProfile = stealthProfile.trim(),
+        decoyMode = decoyMode.trim(),
+        desyncMode = desyncMode.trim(),
+        tcpFooling = tcpFooling.trim(),
+        tlsFragment = tlsFragment,
+        wsParallel = wsParallel.toIntOrNull()?.coerceIn(1, 4) ?: 1,
+        idleDecoySecs = idleDecoySecs.toLongOrNull() ?: 0L,
+        tlsStack = tlsStack.trim().ifBlank { "rustls" },
+        fingerprint = fingerprint.trim(),
+        realityTarget = realityTarget.trim(),
+        realityPublicKey = realityPublicKey.trim(),
+        realityShortId = realityShortId.trim(),
+        wsHost = wsHost.trim(),
+        wsOrigin = wsOrigin.trim(),
+        wsUserAgent = wsUserAgent.trim(),
+        wsAcceptLanguage = wsAcceptLanguage.trim(),
     )
 
     /** Актуальный сохранённый конфиг (не застывший snapshot из remember). */
@@ -447,6 +560,8 @@ private fun BibaRootScreen(
             padMode = padMode,
             wsPingJitter = wsPingJitter.toIntOrNull() ?: 0,
             wsBinaryJitter = wsBinaryJitter.toIntOrNull() ?: 0,
+            wsJitterMin = wsJitterMin.toIntOrNull() ?: 0,
+            wsJitterMax = wsJitterMax.toIntOrNull() ?: 0,
             udpMaxPad = udpMaxPad.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
             udpMaxWsBinary = udpMaxWsBin.trim().takeIf { it.isNotEmpty() }?.toIntOrNull(),
             udpMuxTimeout = udpMuxTimeout.trim().takeIf { it.isNotEmpty() }?.toLongOrNull(),
@@ -455,6 +570,24 @@ private fun BibaRootScreen(
             decoyGetsInterval = decoyGetsInterval.toLongOrNull() ?: 30L,
             decoyGetsPaths = decoyGetsPaths,
             pinCertPem = pinCertPem,
+            proto = proto.toIntOrNull() ?: 3,
+            protoDomain = protoDomain.trim(),
+            stealthProfile = stealthProfile.trim(),
+            decoyMode = decoyMode.trim(),
+            desyncMode = desyncMode.trim(),
+            tcpFooling = tcpFooling.trim(),
+            tlsFragment = tlsFragment,
+            wsParallel = wsParallel.toIntOrNull()?.coerceIn(1, 4) ?: 1,
+            idleDecoySecs = idleDecoySecs.toLongOrNull() ?: 0L,
+            tlsStack = tlsStack.trim().ifBlank { "rustls" },
+            fingerprint = fingerprint.trim(),
+            realityTarget = realityTarget.trim(),
+            realityPublicKey = realityPublicKey.trim(),
+            realityShortId = realityShortId.trim(),
+            wsHost = wsHost.trim(),
+            wsOrigin = wsOrigin.trim(),
+            wsUserAgent = wsUserAgent.trim(),
+            wsAcceptLanguage = wsAcceptLanguage.trim(),
         )
     }
 
@@ -534,6 +667,46 @@ private fun BibaRootScreen(
                 onDecoyGetsPathsChange = { decoyGetsPaths = it },
                 pinCertPem = pinCertPem,
                 onPinCertPemChange = { pinCertPem = it },
+                proto = proto,
+                onProtoChange = { proto = it },
+                protoDomain = protoDomain,
+                onProtoDomainChange = { protoDomain = it },
+                wsJitterMin = wsJitterMin,
+                onWsJitterMinChange = { wsJitterMin = it },
+                wsJitterMax = wsJitterMax,
+                onWsJitterMaxChange = { wsJitterMax = it },
+                stealthProfile = stealthProfile,
+                onStealthProfileChange = { stealthProfile = it },
+                decoyMode = decoyMode,
+                onDecoyModeChange = { decoyMode = it },
+                desyncMode = desyncMode,
+                onDesyncModeChange = { desyncMode = it },
+                tcpFooling = tcpFooling,
+                onTcpFoolingChange = { tcpFooling = it },
+                tlsFragment = tlsFragment,
+                onTlsFragmentChange = { tlsFragment = it },
+                wsParallel = wsParallel,
+                onWsParallelChange = { wsParallel = it },
+                idleDecoySecs = idleDecoySecs,
+                onIdleDecoySecsChange = { idleDecoySecs = it },
+                tlsStack = tlsStack,
+                onTlsStackChange = { tlsStack = it },
+                fingerprint = fingerprint,
+                onFingerprintChange = { fingerprint = it },
+                realityTarget = realityTarget,
+                onRealityTargetChange = { realityTarget = it },
+                realityPublicKey = realityPublicKey,
+                onRealityPublicKeyChange = { realityPublicKey = it },
+                realityShortId = realityShortId,
+                onRealityShortIdChange = { realityShortId = it },
+                wsHost = wsHost,
+                onWsHostChange = { wsHost = it },
+                wsOrigin = wsOrigin,
+                onWsOriginChange = { wsOrigin = it },
+                wsUserAgent = wsUserAgent,
+                onWsUserAgentChange = { wsUserAgent = it },
+                wsAcceptLanguage = wsAcceptLanguage,
+                onWsAcceptLanguageChange = { wsAcceptLanguage = it },
                 screenOffBatterySaver = screenOffBatterySaver,
                 onScreenOffBatterySaverChange = { v ->
                     screenOffBatterySaver = v
@@ -869,6 +1042,46 @@ private fun SettingsScreen(
     onDecoyGetsPathsChange: (String) -> Unit,
     pinCertPem: String,
     onPinCertPemChange: (String) -> Unit,
+    proto: String,
+    onProtoChange: (String) -> Unit,
+    protoDomain: String,
+    onProtoDomainChange: (String) -> Unit,
+    wsJitterMin: String,
+    onWsJitterMinChange: (String) -> Unit,
+    wsJitterMax: String,
+    onWsJitterMaxChange: (String) -> Unit,
+    stealthProfile: String,
+    onStealthProfileChange: (String) -> Unit,
+    decoyMode: String,
+    onDecoyModeChange: (String) -> Unit,
+    desyncMode: String,
+    onDesyncModeChange: (String) -> Unit,
+    tcpFooling: String,
+    onTcpFoolingChange: (String) -> Unit,
+    tlsFragment: Boolean,
+    onTlsFragmentChange: (Boolean) -> Unit,
+    wsParallel: String,
+    onWsParallelChange: (String) -> Unit,
+    idleDecoySecs: String,
+    onIdleDecoySecsChange: (String) -> Unit,
+    tlsStack: String,
+    onTlsStackChange: (String) -> Unit,
+    fingerprint: String,
+    onFingerprintChange: (String) -> Unit,
+    realityTarget: String,
+    onRealityTargetChange: (String) -> Unit,
+    realityPublicKey: String,
+    onRealityPublicKeyChange: (String) -> Unit,
+    realityShortId: String,
+    onRealityShortIdChange: (String) -> Unit,
+    wsHost: String,
+    onWsHostChange: (String) -> Unit,
+    wsOrigin: String,
+    onWsOriginChange: (String) -> Unit,
+    wsUserAgent: String,
+    onWsUserAgentChange: (String) -> Unit,
+    wsAcceptLanguage: String,
+    onWsAcceptLanguageChange: (String) -> Unit,
     screenOffBatterySaver: Boolean,
     onScreenOffBatterySaverChange: (Boolean) -> Unit,
     onBack: () -> Unit,
@@ -1113,6 +1326,41 @@ private fun SettingsScreen(
                 hint = stringResource(R.string.hint_tls_profile),
             )
             SettingsTextField(
+                label = "fingerprint",
+                value = fingerprint,
+                onChange = onFingerprintChange,
+                placeholder = "chrome-132",
+                hint = stringResource(R.string.hint_fingerprint),
+            )
+            SettingsTextField(
+                label = "tls_stack",
+                value = tlsStack,
+                onChange = onTlsStackChange,
+                placeholder = "rustls",
+                hint = stringResource(R.string.hint_tls_stack),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "proto",
+                    value = proto,
+                    onChange = onProtoChange,
+                    hint = stringResource(R.string.hint_proto),
+                    modifier = Modifier.weight(1f),
+                )
+                Column(modifier = Modifier.weight(2f)) {
+                    SettingsTextField(
+                        label = "proto_domain",
+                        value = protoDomain,
+                        onChange = onProtoDomainChange,
+                        placeholder = "",
+                        hint = stringResource(R.string.hint_proto_domain),
+                    )
+                }
+            }
+            SettingsTextField(
                 label = "ws_path",
                 value = wsPath,
                 onChange = onWsPathChange,
@@ -1218,6 +1466,144 @@ private fun SettingsScreen(
                     modifier = Modifier.weight(1f),
                 )
             }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "ws_jitter_min_ms",
+                    value = wsJitterMin,
+                    onChange = onWsJitterMinChange,
+                    hint = stringResource(R.string.hint_ws_jitter_min),
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "ws_jitter_max_ms",
+                    value = wsJitterMax,
+                    onChange = onWsJitterMaxChange,
+                    hint = stringResource(R.string.hint_ws_jitter_max),
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "ws_parallel",
+                    value = wsParallel,
+                    onChange = onWsParallelChange,
+                    hint = stringResource(R.string.hint_ws_parallel),
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "idle_decoy_secs",
+                    value = idleDecoySecs,
+                    onChange = onIdleDecoySecsChange,
+                    hint = stringResource(R.string.hint_idle_decoy_secs),
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            SettingsTextField(
+                label = "stealth_profile",
+                value = stealthProfile,
+                onChange = onStealthProfileChange,
+                placeholder = "default | balanced | aggressive",
+                hint = stringResource(R.string.hint_stealth_profile),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SettingsMiniField(
+                    label = "decoy_mode",
+                    value = decoyMode,
+                    onChange = onDecoyModeChange,
+                    hint = stringResource(R.string.hint_decoy_mode),
+                    modifier = Modifier.weight(1f),
+                )
+                SettingsMiniField(
+                    label = "desync_mode",
+                    value = desyncMode,
+                    onChange = onDesyncModeChange,
+                    hint = stringResource(R.string.hint_desync_mode),
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            SettingsTextField(
+                label = "tcp_fooling",
+                value = tcpFooling,
+                onChange = onTcpFoolingChange,
+                placeholder = "",
+                hint = stringResource(R.string.hint_tcp_fooling),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("tls_fragment", color = Color.White, fontSize = 14.sp)
+                    Text(stringResource(R.string.hint_tls_fragment), color = TextMuted, fontSize = 12.sp)
+                }
+                Switch(
+                    checked = tlsFragment,
+                    onCheckedChange = onTlsFragmentChange,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Mint,
+                        checkedTrackColor = Mint.copy(alpha = 0.4f),
+                        uncheckedThumbColor = TextMuted,
+                        uncheckedTrackColor = TextMuted.copy(alpha = 0.3f),
+                    ),
+                )
+            }
+            SettingsTextField(
+                label = "reality_target",
+                value = realityTarget,
+                onChange = onRealityTargetChange,
+                placeholder = "",
+                hint = stringResource(R.string.hint_reality_target),
+            )
+            SettingsTextField(
+                label = "reality_public_key",
+                value = realityPublicKey,
+                onChange = onRealityPublicKeyChange,
+                singleLine = false,
+                maxLines = 3,
+                placeholder = "base64, 32 bytes",
+                hint = stringResource(R.string.hint_reality_public_key),
+            )
+            SettingsTextField(
+                label = "reality_short_id",
+                value = realityShortId,
+                onChange = onRealityShortIdChange,
+                placeholder = "16 hex",
+                hint = stringResource(R.string.hint_reality_short_id),
+            )
+            SettingsTextField(
+                label = "ws_host",
+                value = wsHost,
+                onChange = onWsHostChange,
+                placeholder = "",
+            )
+            SettingsTextField(
+                label = "ws_origin",
+                value = wsOrigin,
+                onChange = onWsOriginChange,
+                placeholder = "",
+            )
+            SettingsTextField(
+                label = "ws_user_agent",
+                value = wsUserAgent,
+                onChange = onWsUserAgentChange,
+                placeholder = "",
+            )
+            SettingsTextField(
+                label = "ws_accept_language",
+                value = wsAcceptLanguage,
+                onChange = onWsAcceptLanguageChange,
+                placeholder = "",
+            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -1815,6 +2201,8 @@ private fun buildJson(
     padMode: String,
     wsPingJitter: Int,
     wsBinaryJitter: Int,
+    wsJitterMin: Int,
+    wsJitterMax: Int,
     udpMaxPad: Int?,
     udpMaxWsBinary: Int?,
     udpMuxTimeout: Long?,
@@ -1823,6 +2211,24 @@ private fun buildJson(
     decoyGetsInterval: Long,
     decoyGetsPaths: String,
     pinCertPem: String,
+    proto: Int,
+    protoDomain: String,
+    stealthProfile: String,
+    decoyMode: String,
+    desyncMode: String,
+    tcpFooling: String,
+    tlsFragment: Boolean,
+    wsParallel: Int,
+    idleDecoySecs: Long,
+    tlsStack: String,
+    fingerprint: String,
+    realityTarget: String,
+    realityPublicKey: String,
+    realityShortId: String,
+    wsHost: String,
+    wsOrigin: String,
+    wsUserAgent: String,
+    wsAcceptLanguage: String,
 ): JSONObject {
     val o = JSONObject()
     val useInvite = fromInvite.isNotBlank() && invitePassphrase.isNotBlank()
@@ -1854,6 +2260,10 @@ private fun buildJson(
     if (jPing > 0) o.put("ws_ping_jitter_percent", jPing)
     val jBin = wsBinaryJitter.coerceIn(0, 255)
     if (jBin > 0) o.put("ws_binary_send_jitter_ms", jBin)
+    val jMin = wsJitterMin.coerceIn(0, 255)
+    val jMax = wsJitterMax.coerceIn(0, 255)
+    if (jMin > 0) o.put("ws_jitter_min_ms", jMin)
+    if (jMax > 0) o.put("ws_jitter_max_ms", jMax)
     udpMaxPad?.let { o.put("udp_max_pad", it.coerceIn(0, 255)) }
     udpMaxWsBinary?.let { if (it > 0) o.put("udp_max_ws_binary", it) }
     udpMuxTimeout?.let { if (it >= 0) o.put("udp_mux_reply_timeout_secs", it) }
@@ -1869,6 +2279,39 @@ private fun buildJson(
     }
     val pin = pinCertPem.trim()
     if (pin.isNotEmpty()) o.put("pin_cert_pem", pin)
+
+    val p = proto.coerceIn(1, 255)
+    if (p != 3) o.put("proto", p)
+    val pd = protoDomain.trim()
+    if (pd.isNotEmpty()) o.put("proto_domain", pd)
+    val sp = stealthProfile.trim()
+    if (sp.isNotEmpty()) o.put("stealth_profile", sp)
+    val dm = decoyMode.trim()
+    if (dm.isNotEmpty()) o.put("decoy_mode", dm)
+    val dsm = desyncMode.trim()
+    if (dsm.isNotEmpty()) o.put("desync_mode", dsm)
+    val tf = tcpFooling.trim()
+    if (tf.isNotEmpty()) o.put("tcp_fooling", tf)
+    if (tlsFragment) o.put("tls_fragment", true)
+    // Всегда передаём в Rust: при invite иначе парсер брал бы только ws_parallel из ключа, игнорируя форму.
+    o.put("ws_parallel", wsParallel.coerceIn(1, 4))
+    if (idleDecoySecs > 0) o.put("idle_decoy_secs", idleDecoySecs)
+    val tst = tlsStack.trim().lowercase()
+    if (tst.isNotEmpty() && tst != "rustls") o.put("tls_stack", tst)
+    val fp = fingerprint.trim()
+    if (fp.isNotEmpty()) o.put("fingerprint", fp)
+    val rt = realityTarget.trim()
+    val rpk = realityPublicKey.trim()
+    val rsid = realityShortId.trim()
+    if (rt.isNotEmpty() && rpk.isNotEmpty()) {
+        o.put("reality_target", rt)
+        o.put("reality_public_key", rpk)
+        if (rsid.isNotEmpty()) o.put("reality_short_id", rsid)
+    }
+    if (wsHost.isNotEmpty()) o.put("ws_host", wsHost)
+    if (wsOrigin.isNotEmpty()) o.put("ws_origin", wsOrigin)
+    if (wsUserAgent.isNotEmpty()) o.put("ws_user_agent", wsUserAgent)
+    if (wsAcceptLanguage.isNotEmpty()) o.put("ws_accept_language", wsAcceptLanguage)
     return o
 }
 
