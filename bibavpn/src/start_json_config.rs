@@ -101,7 +101,7 @@ struct StartJson {
     /// Request TLS record / frame fragmentation (not fully implemented for rustls).
     #[serde(default)]
     tls_fragment: bool,
-    /// Parallel WSS sessions (advisory; only `1` is supported in this build).
+    /// Parallel WSS for TCP mux (1–4 when set; matches `bibavpn-client --ws-parallel`).
     #[serde(default)]
     ws_parallel: Option<u8>,
     #[serde(default)]
@@ -198,14 +198,16 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         _ => anyhow::bail!("invite: set both from_invite and invite_passphrase, or neither"),
     };
 
-    let stealth_for_merge: Option<StealthProfile> = (|| {
+    let stealth_for_merge: Option<StealthProfile> = (|| -> anyhow::Result<Option<StealthProfile>> {
         if let Some(s) = j
             .stealth_profile
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return StealthProfile::from_str(s);
+            return Ok(Some(
+                StealthProfile::from_str(s).context("stealth_profile")?,
+            ));
         }
         if let Some(ref inv) = invite_pair {
             if let Some(s) = inv
@@ -214,7 +216,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                return StealthProfile::from_str(s);
+                return Ok(Some(
+                    StealthProfile::from_str(s).context("invite stealth_profile")?,
+                ));
             }
         }
         Ok(None)

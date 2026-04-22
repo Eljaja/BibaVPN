@@ -55,8 +55,10 @@ many full v3 sessions (each with `MUX_OPEN`) and **round-robins** new streams
 across them (`TcpMuxSessionPool::pick`). After v3 HELLO/ACK and sealed **AUTH**,
 the client sends `MUX_OPEN`; per-target opens use mux records (stream id, flags,
 payload) inside padded frames, with window-based flow control. Use `--no-mux` for
-legacy **one WSS per SOCKS CONNECT** (`OPEN` + binary loop). REALITY mode does
-not use multi-WSS in this build.
+legacy **one WSS per SOCKS CONNECT** (`OPEN` + binary loop). **REALITY** mode uses
+the same **`--ws-parallel` 1..=4** pattern: each outer link runs TLS + WSS +
+REALITY (X25519) handshake, then `MUX_OPEN`; the pool **round-robins** new streams
+(`connect_reality_tcp_mux_handle` in `local_client.rs`).
 
 **UDP** (e.g. DNS via SOCKS5 UDP) uses a **separate** shared WSS:
 `UDP_MUX_OPEN` (`protocol.rs`), then v3 **`0x05` UDP_REQ** / **`0x06` UDP_REP**
@@ -132,7 +134,7 @@ dedicated WSS.
 | `bibavpn/src/camouflage.rs`                         | Shared HTML / 404 bodies for rejects and static fallbacks                                                              |
 | `bibavpn/src/ws_auth.rs`                            | Server waits for `AUTH` frame (timeout, skip noise)                                                                    |
 | `bibavpn/src/tcp_mux.rs`                            | Mux wire format, client handle, server bridge, optional idle dummy, multi-WSS pool + RR                                  |
-| `bibavpn/src/tcp_mux_roadmap.rs`                    | Long-form design notes for the TCP-mux evolution (no runtime code)                                                     |
+| `bibavpn/src/tcp_mux_roadmap.rs`                    | **Historical** one-WSS mux sketch; **current** implementation is `tcp_mux.rs` (doc-only module)                        |
 | `bibavpn/src/client_tls_stream.rs`, `tls_boring.rs` | `TlsStack` paths: `rustls` (default) vs `boring` (`--features boring-tls`); REALITY + Boring generic handshake         |
 | `bibavpn/src/tls_util.rs`                           | Cipher/ALPN hints, `TlsStack`, record-fragment helper (rustls; Boring logs if set)                                     |
 | `bibavpn/src/client_policy.rs`                      | TLS client label resolution: `fingerprint` → `tls_profile` → invite → `stealth` → default **Chrome 132+**              |
@@ -202,8 +204,7 @@ Compatible with the same PSK/decoy settings when both ends match.
   set `dummy_interval_secs`
 - Client `--decoy-gets`, `--decoy-gets-interval-secs`,
   `--decoy-gets-paths` — not part of invite JSON (client-only)
-- `--ws-parallel` **1..=4** — parallel outer WSS sessions + mux RR (`2..=4` only
-  for plain/mux, not REALITY in this build)
+- `--ws-parallel` **1..=4** — parallel outer WSS sessions + mux RR (v3 and **REALITY**)
 - `--ws-jitter-min-ms` / `--ws-jitter-max-ms` (or legacy `--ws-binary-send-jitter-ms`)
 - `--idle-decoy-secs` — background HTTPS when mux idle (merged with preset;
   balanced/aggressive default **10 s** unless overridden)
@@ -276,6 +277,7 @@ BibaVPN:
 | `scripts/docker-smoke.sh`          | `docker compose up`, `curl` via SOCKS and HTTP proxy, `down`                                            |
 | `scripts/udp-socks-smoke.sh`       | TCP via SOCKS + UDP DNS over SOCKS                                                                      |
 | `scripts/wsl-test.sh`              | Local smoke (plain / PSK) on WSL                                                                        |
+| `scripts/wsl-secure-boring-test.sh` | WSL: `cargo test -p bibavpn --features boring-tls`, release build, then **rustls+pin** and **Boring+insecure** v3 smokes (openssl temp cert; strong token/PSK) |
 | `scripts/wsl-proto-v3-smoke.sh`    | WSL: local SOCKS + `curl` smoke (release binaries + `openssl`, `python3`, `fuser`; script name is legacy) |
 | `scripts/wsl-local-bench.sh`       | 64 MiB HTTP direct vs SOCKS+WSS throughput (run in WSL from repo root)                                  |
 | `scripts/wsl-udp-socks-bench.sh`   | SOCKS UDP throughput bench on WSL                                                                       |
@@ -311,6 +313,11 @@ The server keeps a **pending map** (by destination `SocketAddr`) to correlate
 - `scripts/wsl-proto-v3-smoke.sh` is a quick local handshake + SOCKS check on
   release binaries — run it after changes to `crypto_layer.rs`, `protocol.rs`,
   or invite / CLI defaults.
+- `scripts/wsl-secure-boring-test.sh` runs **unit tests with `boring-tls`**, then
+  two integration smokes: **rustls** + `--pin-cert` (pinned self-signed PEM),
+  and **BoringSSL** + `--insecure` (self-signed; `boring`+`pin` is still
+  rejected in `local_client`). Requires **WSL**, **OpenSSL**, **curl**; run from
+  repo root: `bash scripts/wsl-secure-boring-test.sh`.
 - `scripts/wsl-local-bench.sh` is a quick sanity check for throughput after
   changes to `frame.rs`, `tcp_mux.rs`, or `ws_bridge.rs`.
 - **Example baseline (WSL, 2026-04-20, 64 MiB,** `scripts/bench-wsl-2026-04-20.txt`**):**
@@ -342,8 +349,8 @@ This table tracks **BibaV4** goals against what the **current tree** (Biba v3
 | Area | In code today (1.2.x) | Still target / gaps (see PROTOCOL) |
 | --- | --- | --- |
 | **TLS / fingerprint** | `TlsClientProfile` labels; `--fingerprint` + `client_policy` merge; **Boring** behind `--features boring-tls` + `--tls-stack boring`; `rustls` default | Full GREASE / extension-order parity; **`--pin-cert` with Boring**; HTTP/2 transport |
-| **Record fragmentation** | `--tls-fragment` on **rustls**; Boring: debug-only note (no `set_max_send_fragment` in current `boring` API) | Full CH + app-data split on both stacks if required |
-| **RTT** | Server delayed ACK, `--rtt-mask-jitter-ms`, `--ack-profile` defaults; **2–4 WSS** + `TcpMuxSessionPool` RR (not REALITY) | Broader “cross-layer” story + CI zapret/pcap (see spec) |
+| **Record fragmentation** | Client `--tls-fragment` — **Boring** path (`boring-tls`); on **rustls** the client logs that record splitting is not implemented (`desync::note_tls_fragment_requested`) | Full CH + app-data split on both stacks if required |
+| **RTT** | Server delayed ACK, `--rtt-mask-jitter-ms`, `--ack-profile` defaults; **1–4 WSS** + `TcpMuxSessionPool` RR (including REALITY) | Broader “cross-layer” story + CI zapret/pcap (see spec) |
 | **Padding** | `PadMode::Adaptive` + `stealth` / presets | BibaV4 may redefine burst heuristics / budgets on a future wire |
 | **Jitter** | Min/max MS on WS sends; preset merge | Spec band (e.g. 5–25 ms) as product default |
 | **Decoys** | Parallel `--decoy-gets`; **idle** decoys after `--idle-decoy-secs` (`activity` + `decoy_traffic`); `stealth_v12` decoy fields | Full `--decoy-mode browser` catalog (UA/Referer parity) per spec |

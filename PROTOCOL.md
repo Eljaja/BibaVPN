@@ -255,7 +255,9 @@ Top to bottom: **from the app to bytes inside one tunnel frame**. The hop from t
 
 **Default TCP (multiplexed):** **one to four** **TLS + WSS** sessions per client
 process (round-robin assignment of new streams when `--ws-parallel` is 2–4); many
-SOCKS connections become **mux streams** on those sockets.
+SOCKS connections become **mux streams** on those sockets. The same **1..=4** count
+applies in **REALITY** mode: each session runs REALITY (X25519) then the mux phase
+(plaintext `MUX_OPEN` on the REALITY path — see `local_client` / `reality` modules).
 
 ```mermaid
 flowchart TB
@@ -360,7 +362,7 @@ These options shape TLS/WebSocket timing and framing; they apply on top of the v
   defaults when explicit CLI values are unset (see `stealth_v12`)
 - `--fingerprint` / TLS profile — resolved with `tls_profile` and invite in a
   fixed order (`client_policy`); final default client label is **Chrome 132+**
-- `--ws-parallel` **1..=4** — parallel outer WSS + mux stream round-robin (REALITY: single WSS in this build)
+- `--ws-parallel` **1..=4** — parallel outer WSS + mux stream round-robin (including **REALITY**: one REALITY+`MUX_OPEN` stack per outer session)
 - `--dummy-interval-secs` — idle empty padded frames (`0` = off)
 - `--decoy-gets`, `--decoy-gets-interval-secs`, `--decoy-gets-paths` — client-only decoy HTTPS fetches
 - `--idle-decoy-secs` — when the mux is idle longer than this threshold, run short
@@ -398,8 +400,8 @@ exhaustive changelog):
   for byte-level `SslConnector` control; **`rustls` remains the default** and does
   not provide full JA3 parity by itself. **`--pin-cert` + Boring** is rejected
   until implemented.
-- **P0 RTT:** **delayed ACK** and **RTT mask jitter** on the server; **2–4 WSS** +
-  **round-robin** in `tcp_mux` (not used for REALITY in this build).
+- **P0 RTT:** **delayed ACK** and **RTT mask jitter** on the server; **1–4 WSS** +
+  **round-robin** in `tcp_mux` (v3 and REALITY both use the same pool pattern).
 - **P0 padding / jitter:** `PadMode::Adaptive`; WebSocket **min/max ms** jitter;
   **stealth presets** (`stealth_v12`) align defaults.
 - **P0 decoys:** **idle** decoys after a configurable **idle** threshold

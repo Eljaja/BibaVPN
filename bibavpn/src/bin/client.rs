@@ -209,7 +209,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     tls_fragment: bool,
 
-    /// Target parallel WSS sessions (this build: only 1; higher values are rejected on connect).
+    /// Parallel outer WSS sessions for TCP mux (1–4; round-robin). Works with REALITY as well.
     #[arg(long, default_value_t = 1)]
     ws_parallel: u8,
 
@@ -327,14 +327,16 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    let stealth_for_merge: Option<StealthProfile> = (|| {
+    let stealth_for_merge: Option<StealthProfile> = (|| -> anyhow::Result<Option<StealthProfile>> {
         let a = args
             .stealth_profile
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if let Some(s) = a {
-            return StealthProfile::from_str(s);
+            return Ok(Some(
+                StealthProfile::from_str(s).context("--stealth-profile")?,
+            ));
         }
         if let Some(ref inv) = inv_opt {
             if let Some(s) = inv
@@ -343,7 +345,9 @@ async fn main() -> anyhow::Result<()> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                return StealthProfile::from_str(s);
+                return Ok(Some(
+                    StealthProfile::from_str(s).context("invite stealth_profile")?,
+                ));
             }
         }
         Ok(None)

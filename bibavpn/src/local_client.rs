@@ -592,9 +592,6 @@ async fn connect_tcp_mux_handle(
 ) -> anyhow::Result<()> {
     // Check if REALITY mode is enabled
     if cfg.reality_target.is_some() {
-        if cfg.ws_parallel > 1 {
-            anyhow::bail!("--ws-parallel > 1 is not supported with REALITY in this build");
-        }
         return connect_reality_tcp_mux_handle(cfg, tcp_mux_slot).await;
     }
 
@@ -680,7 +677,7 @@ async fn connect_tcp_mux_handle(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tcp mux: connect failed")))
 }
 
-/// REALITY mode: connect to server and perform REALITY handshake
+/// REALITY mode: one or more parallel WSS sessions (same as non-REALITY multi-WSS), each with REALITY handshake + MUX_OPEN.
 async fn connect_reality_tcp_mux_handle(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
@@ -689,80 +686,11 @@ async fn connect_reality_tcp_mux_handle(
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::client_async;
 
+    let n = cfg.ws_parallel.max(1).min(4) as usize;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         let res: anyhow::Result<()> = async {
             let _target = cfg.reality_target.as_ref().expect("reality target");
-            let domain = ServerName::try_from(cfg.sni.clone())?;
-            let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
-            let tcp = crate::outbound_protect::tcp_connect_host_protected(
-                &cfg.server_host,
-                cfg.server_port,
-            )
-            .await
-            .context("connect server")?;
-            let _ = tcp.set_nodelay(true);
-            let tls = connector.connect(domain, tcp).await.context("tls")?;
-
-            let path = cfg.ws_path.clone();
-            let ws_host = cfg.ws_host.as_deref();
-            let ws_origin = cfg.ws_origin.as_deref();
-            let ws_ua = cfg.ws_user_agent.as_deref();
-            let ws_al = cfg.ws_accept_language.as_deref();
-            let extra = cfg.ws_extra_headers.as_ref().clone();
-            let req = build_websocket_request(WsHandshakeParams {
-                host_for_tcp: &cfg.server_host,
-                port: cfg.server_port,
-                path: &path,
-                sni: &cfg.sni,
-                host_header: ws_host,
-                origin: ws_origin,
-                user_agent: ws_ua,
-                accept_language: ws_al,
-                extra_headers: &extra,
-                tls_profile: cfg.tls_profile,
-            });
-
-            let mut ws = client_async(req, tls)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))
-                .context("websocket")?
-                .0;
-
-            info!(
-                target: "bibavpn_client",
-                server = %cfg.server_host,
-                port = cfg.server_port,
-                "REALITY: WSS up, key exchange"
-            );
-
-            let (_session_key, short_id) = reality_client_handshake(&mut ws, cfg).await?;
-
-            info!(
-                "REALITY: handshake complete, short_id={:02x?}",
-                &short_id[..4]
-            );
-
-            let open = encode_v3_mux_open();
-            ws.send(Message::Binary(Bytes::from(open)))
-                .await
-                .context("send MUX_OPEN v3 (REALITY)")?;
-
-            let mcfg = MuxClientConfig {
-                max_pad: cfg.max_pad,
-                decoy_max: cfg.decoy_max,
-                max_ws_binary: cfg.max_ws_binary,
-                ws_ping_secs: cfg.ws_ping_secs,
-                ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
-                ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
-                ws_jitter_min_ms: cfg.ws_jitter_min_ms,
-                ws_jitter_max_ms: cfg.ws_jitter_max_ms,
-                transport_v2: false,
-                pad_mode: cfg.pad_mode,
-                dummy_interval_secs: cfg.dummy_interval_secs,
-                activity: cfg.activity.clone(),
-            };
-
             *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::new_empty());
             let pool_sessions = {
                 let g = tcp_mux_slot.lock().await;
@@ -771,14 +699,90 @@ async fn connect_reality_tcp_mux_handle(
                     .sessions
                     .clone()
             };
-            let (sid, h) = tcp_mux::spawn_tcp_mux_client(ws, None, mcfg, tcp_mux_slot.clone());
-            info!(
-                target: "bibavpn_client",
-                session_id = sid,
-                server = %cfg.server_host,
-                "REALITY tunnel ready"
-            );
-            pool_sessions.lock().await.push((sid, h));
+
+            for _ in 0..n {
+                let domain = ServerName::try_from(cfg.sni.clone())?;
+                let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
+                let tcp = crate::outbound_protect::tcp_connect_host_protected(
+                    &cfg.server_host,
+                    cfg.server_port,
+                )
+                .await
+                .context("connect server")?;
+                let _ = tcp.set_nodelay(true);
+                let tls = connector.connect(domain, tcp).await.context("tls")?;
+
+                let path = cfg.ws_path.clone();
+                let ws_host = cfg.ws_host.as_deref();
+                let ws_origin = cfg.ws_origin.as_deref();
+                let ws_ua = cfg.ws_user_agent.as_deref();
+                let ws_al = cfg.ws_accept_language.as_deref();
+                let extra = cfg.ws_extra_headers.as_ref().clone();
+                let req = build_websocket_request(WsHandshakeParams {
+                    host_for_tcp: &cfg.server_host,
+                    port: cfg.server_port,
+                    path: &path,
+                    sni: &cfg.sni,
+                    host_header: ws_host,
+                    origin: ws_origin,
+                    user_agent: ws_ua,
+                    accept_language: ws_al,
+                    extra_headers: &extra,
+                    tls_profile: cfg.tls_profile,
+                });
+
+                let mut ws = client_async(req, tls)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .context("websocket")?
+                    .0;
+
+                info!(
+                    target: "bibavpn_client",
+                    server = %cfg.server_host,
+                    port = cfg.server_port,
+                    parallel = n,
+                    "REALITY: WSS up, key exchange"
+                );
+
+                let (_session_key, short_id) = reality_client_handshake(&mut ws, cfg).await?;
+
+                info!(
+                    "REALITY: handshake complete, short_id={:02x?}",
+                    &short_id[..4]
+                );
+
+                let open = encode_v3_mux_open();
+                ws.send(Message::Binary(Bytes::from(open)))
+                    .await
+                    .context("send MUX_OPEN v3 (REALITY)")?;
+
+                let mcfg = MuxClientConfig {
+                    max_pad: cfg.max_pad,
+                    decoy_max: cfg.decoy_max,
+                    max_ws_binary: cfg.max_ws_binary,
+                    ws_ping_secs: cfg.ws_ping_secs,
+                    ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
+                    ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
+                    ws_jitter_min_ms: cfg.ws_jitter_min_ms,
+                    ws_jitter_max_ms: cfg.ws_jitter_max_ms,
+                    transport_v2: false,
+                    pad_mode: cfg.pad_mode,
+                    dummy_interval_secs: cfg.dummy_interval_secs,
+                    activity: cfg.activity.clone(),
+                };
+
+                let (sid, h) =
+                    tcp_mux::spawn_tcp_mux_client(ws, None, mcfg, tcp_mux_slot.clone());
+                pool_sessions.lock().await.push((sid, h));
+                info!(
+                    target: "bibavpn_client",
+                    session_id = sid,
+                    server = %cfg.server_host,
+                    parallel = n,
+                    "REALITY tunnel ready"
+                );
+            }
             Ok(())
         }
         .await;
