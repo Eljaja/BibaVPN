@@ -51,7 +51,9 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    let proto_domain = std::env::var("INVITE_PROTO_DOMAIN").ok();
+    let proto_domain = std::env::var("INVITE_PROTO_DOMAIN")
+        .ok()
+        .or_else(|| Some("default".to_string()).filter(|_| proto >= 3));
 
     let invite = InviteV1 {
         v: 1,

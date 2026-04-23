@@ -680,12 +680,15 @@ impl TcpMuxSessionPool {
         }
     }
 
-    pub async fn pick(&self) -> TcpMuxClientHandle {
+    /// `None` if every outer WSS session has been torn down but the slot was not yet cleared.
+    pub async fn pick(&self) -> Option<TcpMuxClientHandle> {
         let g = self.sessions.lock().await;
         let n = g.len();
-        assert!(n > 0, "empty tcp mux session pool");
+        if n == 0 {
+            return None;
+        }
         let i = self.next.fetch_add(1, Ordering::Relaxed) % n;
-        g[i].1.clone()
+        Some(g[i].1.clone())
     }
 }
 

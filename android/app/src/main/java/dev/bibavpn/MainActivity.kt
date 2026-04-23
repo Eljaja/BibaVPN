@@ -2242,7 +2242,9 @@ private fun buildJson(
         o.put("token", token)
         if (tlsProfile.isNotBlank()) o.put("tls_profile", tlsProfile.trim())
     }
-    if (sni.isNotBlank()) o.put("sni", sni)
+    // In invite mode, keep the transport identity from the invite unless the app grows
+    // an explicit override UX. Mixing invite + stale form values breaks v3 ACK MAC.
+    if (!useInvite && sni.isNotBlank()) o.put("sni", sni)
     o.put("socks_bind", socksBind.trim().ifBlank { BibaVpnService.SOCKS_LOCAL })
     o.put("insecure", insecure)
     o.put("max_pad", maxPad)
@@ -2283,7 +2285,7 @@ private fun buildJson(
     val p = proto.coerceIn(1, 255)
     if (p != 3) o.put("proto", p)
     val pd = protoDomain.trim()
-    if (pd.isNotEmpty()) o.put("proto_domain", pd)
+    if (!useInvite && pd.isNotEmpty()) o.put("proto_domain", pd)
     val sp = stealthProfile.trim()
     if (sp.isNotEmpty()) o.put("stealth_profile", sp)
     val dm = decoyMode.trim()

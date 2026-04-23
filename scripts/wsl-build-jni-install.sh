@@ -40,9 +40,15 @@ to_win_path() {
     echo ""
   fi
 }
-WIN_REPO="$(to_win_path "$REPO_ROOT")"
+if command -v wslpath >/dev/null 2>&1; then
+  WIN_REPO="$(wslpath -w "$REPO_ROOT")"
+else
+  WIN_REPO="$(to_win_path "$REPO_ROOT")"
+fi
 if [[ -n "$WIN_REPO" ]]; then
-  cmd.exe /c "cd /d \"${WIN_REPO}\\android\" && gradlew.bat installDebug"
+  WIN_ANDROID="${WIN_REPO}\\android"
+  # Одна пара кавычек для cmd — иначе «syntax incorrect»
+  cmd.exe /c "cd /d \"$WIN_ANDROID\" && gradlew.bat installDebug"
 else
   cd "$REPO_ROOT/android"
   ./gradlew installDebug

@@ -1,6 +1,6 @@
 //! Shared SOCKS5 / HTTP CONNECT front-end for desktop binary and Android JNI.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
@@ -47,6 +47,19 @@ use bytes::Bytes;
 /// SOCKS UDP: limit concurrent in-flight mux requests per datagram worker pool.
 const SOCKS_UDP_WORKERS: usize = 256;
 
+fn tcp_mux_connect_serial() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+async fn tcp_mux_slot_has_sessions(slot: &TcpMuxSlot) -> bool {
+    let g = slot.lock().await;
+    match g.as_ref() {
+        Some(pool) => !pool.sessions.lock().await.is_empty(),
+        None => false,
+    }
+}
+
 /// After the shared mux WSS dies, reopen quickly without the full outbound backoff ladder.
 const TCP_MUX_SLOT_RETRIES: u32 = 8;
 const OPEN_STATUS_WAIT: Duration = Duration::from_millis(350);
@@ -71,17 +84,21 @@ async fn tcp_mux_open_stream_with_retry(
     tcp_mux_slot: TcpMuxSlot,
 ) -> anyhow::Result<()> {
     for attempt in 0..TCP_MUX_SLOT_RETRIES {
+        if tcp_mux_slot.lock().await.is_none() {
+            connect_tcp_mux_handle(&cfg, &tcp_mux_slot).await?;
+        }
         let h = {
-            let mut slot = tcp_mux_slot.lock().await;
-            if slot.is_none() {
+            let slot = tcp_mux_slot.lock().await;
+            let Some(pool) = slot.as_ref() else {
                 drop(slot);
-                connect_tcp_mux_handle(&cfg, &tcp_mux_slot).await?;
-                slot = tcp_mux_slot.lock().await;
-            }
-            slot.as_ref()
-                .expect("mux set")
-                .pick()
-                .await
+                continue;
+            };
+            pool.pick().await
+        };
+        let Some(h) = h else {
+            *tcp_mux_slot.lock().await = None;
+            sleep_mux_slot_retry(attempt).await;
+            continue;
         };
         match h
             .open_stream(local, host.clone(), port, tcp_uplink_prefix.clone())
@@ -103,7 +120,7 @@ async fn tcp_mux_open_stream_with_retry(
             }
         }
     }
-    unreachable!()
+    Err(anyhow::anyhow!("tcp mux: open stream retries exhausted"))
 }
 
 /// User-facing options (CLI, JSON over JNI, etc.).
@@ -595,6 +612,11 @@ async fn connect_tcp_mux_handle(
         return connect_reality_tcp_mux_handle(cfg, tcp_mux_slot).await;
     }
 
+    let _connect_serial = tcp_mux_connect_serial().lock().await;
+    if tcp_mux_slot_has_sessions(tcp_mux_slot).await {
+        return Ok(());
+    }
+
     let n = cfg.ws_parallel.max(1).min(4) as usize;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
@@ -685,6 +707,11 @@ async fn connect_reality_tcp_mux_handle(
     use rustls::pki_types::ServerName;
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::client_async;
+
+    let _connect_serial = tcp_mux_connect_serial().lock().await;
+    if tcp_mux_slot_has_sessions(tcp_mux_slot).await {
+        return Ok(());
+    }
 
     let n = cfg.ws_parallel.max(1).min(4) as usize;
     let mut last_err: Option<anyhow::Error> = None;

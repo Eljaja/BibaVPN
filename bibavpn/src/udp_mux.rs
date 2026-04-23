@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::crypto_layer::{self, SessionCrypto};
 use crate::frame::{AdaptivePadState, PadMode};
@@ -195,6 +195,11 @@ fn effective_udp_proto_domain(cfg: &UdpMuxConfig) -> String {
     }
 }
 
+fn short_hash8(s: &str) -> String {
+    let hex = blake3::hash(s.as_bytes()).to_hex().to_string();
+    hex[..8].to_string()
+}
+
 async fn connect_udp_mux_ws(
     cfg: &UdpMuxConfig,
 ) -> anyhow::Result<(
@@ -243,6 +248,14 @@ async fn connect_udp_mux_ws(
 
     let secret = cfg.psk.as_ref().expect("psk checked");
     let dom = effective_udp_proto_domain(cfg);
+    info!(
+        target: "bibavpn_client",
+        sni = %cfg.sni,
+        proto_domain = %cfg.proto_domain,
+        effective_proto_domain = %dom,
+        psk_hash8 = %short_hash8(secret),
+        "udp mux using transport identity"
+    );
     let (c_rand, hello) = crypto_layer::build_hello_v3();
     ws.send(Message::Binary(Bytes::from(hello)))
         .await

@@ -269,8 +269,7 @@ async fn main() -> anyhow::Result<()> {
             }
             _ => (None, None, None),
         };
-        let proto_domain = (args.proto_domain.trim() != "default" && !args.proto_domain.is_empty())
-            .then_some(args.proto_domain.clone());
+        let proto_domain = (!args.proto_domain.trim().is_empty()).then_some(args.proto_domain.clone());
         let invite = InviteV1 {
             v: 1,
             server: public.clone(),

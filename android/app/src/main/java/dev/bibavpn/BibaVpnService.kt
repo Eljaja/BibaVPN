@@ -864,6 +864,7 @@ class BibaVpnService : VpnService() {
         o.remove("socks_auth_password")
         o.put("socks_auth_user", randomSocksCredential(16))
         o.put("socks_auth_password", randomSocksCredential(24))
+        applyInviteProtoDomainFallback(o)
         applyLegacyPadModeForBundledNative(o)
         capWsParallelForUdpMux(o)
         return o.toString()
@@ -880,6 +881,39 @@ class BibaVpnService : VpnService() {
         if (cur > 1) {
             o.put("ws_parallel", 1)
             Log.i(TAG, "config: ws_parallel=1 for this session (was $cur) — extra WSS + UDP mux TLS were failing")
+        }
+    }
+
+    /**
+     * Old invites may omit `proto_domain`, while the server's v3 default is actually `default`.
+     * That makes the client fall back to SNI/IP and fail ACK MAC on UDP mux.
+     */
+    private fun applyInviteProtoDomainFallback(o: JSONObject) {
+        if (o.optString("proto_domain", "").trim().isNotEmpty()) return
+        val invite = o.optString("from_invite", "").trim()
+        val pass = o.optString("invite_passphrase", "")
+        if (invite.isBlank() || pass.isBlank()) return
+
+        val decoded =
+            runCatching {
+                val raw = BibaNative.nativeDecodeInvite(invite, pass)
+                JSONObject(raw)
+            }.getOrNull()
+                ?: return
+        if (!decoded.optBoolean("ok")) return
+
+        val invProtoDomain = decoded.optString("proto_domain", "").trim()
+        if (invProtoDomain.isNotEmpty()) {
+            o.put("proto_domain", invProtoDomain)
+            Log.i(TAG, "config: proto_domain taken from invite: $invProtoDomain")
+            return
+        }
+
+        val proto = o.optInt("proto", decoded.optInt("proto", 3))
+        val psk = o.optString("psk", decoded.optString("psk", "")).trim()
+        if (proto >= 3 && psk.isNotEmpty()) {
+            o.put("proto_domain", "default")
+            Log.w(TAG, "config: invite missing proto_domain; falling back to server default 'default'")
         }
     }
 

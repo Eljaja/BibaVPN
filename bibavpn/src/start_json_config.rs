@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use serde::Deserialize;
+use tracing::info;
 
 use crate::local_client::{
     normalize_ws_path, parse_host_port, parse_ws_header, LocalClientOptions,
@@ -148,6 +149,25 @@ fn default_decoy_interval() -> u64 {
     30
 }
 
+/// Пустая/пробельная строка в JSON не должна перекрывать invite (`Some("")` раньше ломало `proto_domain` / `sni` → ACK mac mismatch на втором WSS).
+fn json_or_invite_str(json_field: Option<String>, invite_field: Option<String>) -> Option<String> {
+    if let Some(s) = json_field {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    invite_field.and_then(|s| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    })
+}
+
+fn short_hash8(s: &str) -> String {
+    let hex = blake3::hash(s.as_bytes()).to_hex().to_string();
+    hex[..8].to_string()
+}
+
 /// Разбор JSON так же, как в Android `BibaNative.nativeStart`.
 pub fn local_client_options_from_json_str(s: &str) -> anyhow::Result<LocalClientOptions> {
     let j: StartJson = serde_json::from_str(s)?;
@@ -247,7 +267,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         insecure_tls,
     ) = if let Some(ref inv) = invite_pair {
         let (h, p) = parse_host_port(inv.server.trim()).context("invite server")?;
-        let sni = j.sni.clone().unwrap_or_else(|| inv.sni.clone());
+        let sni = json_or_invite_str(j.sni.clone(), Some(inv.sni.clone()))
+            .unwrap_or_else(|| inv.sni.clone());
         (
             h,
             p,
@@ -272,7 +293,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             anyhow::bail!("server is required when not using invite");
         }
         let (h, p) = parse_host_port(j.server.trim()).context("server")?;
-        let sni = j.sni.clone().unwrap_or_else(|| h.clone());
+        let sni = json_or_invite_str(j.sni.clone(), None).unwrap_or_else(|| h.clone());
         (
             h,
             p,
@@ -410,11 +431,11 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     let proto = j
         .proto
         .unwrap_or_else(|| invite_pair.as_ref().map(|i| i.proto).unwrap_or(3));
-    let proto_domain = j
-        .proto_domain
-        .clone()
-        .or_else(|| invite_pair.as_ref().and_then(|i| i.proto_domain.clone()))
-        .unwrap_or_default();
+    let proto_domain = json_or_invite_str(
+        j.proto_domain.clone(),
+        invite_pair.as_ref().and_then(|i| i.proto_domain.clone()),
+    )
+    .unwrap_or_default();
 
     let invite_tls: Option<TlsClientProfile> = match invite_pair.as_ref() {
         Some(inv) => tls_profile_from_invite(inv).context("invite tls")?,
@@ -623,31 +644,47 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         })
         .unwrap_or(j.socks_bind);
 
-    let http_proxy_bind = j
-        .http_proxy
-        .clone()
-        .or_else(|| invite_pair.as_ref().and_then(|i| i.http_proxy.clone()));
-    let ws_host = j
-        .ws_host
-        .clone()
-        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_host.clone()));
-    let ws_origin = j
-        .ws_origin
-        .clone()
-        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_origin.clone()));
-    let ws_user_agent = j
-        .ws_user_agent
-        .clone()
-        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_user_agent.clone()));
-    let ws_accept_language = j
-        .ws_accept_language
-        .clone()
-        .or_else(|| invite_pair.as_ref().and_then(|i| i.ws_accept_language.clone()));
+    let http_proxy_bind = json_or_invite_str(
+        j.http_proxy.clone(),
+        invite_pair.as_ref().and_then(|i| i.http_proxy.clone()),
+    );
+    let ws_host = json_or_invite_str(
+        j.ws_host.clone(),
+        invite_pair.as_ref().and_then(|i| i.ws_host.clone()),
+    );
+    let ws_origin = json_or_invite_str(
+        j.ws_origin.clone(),
+        invite_pair.as_ref().and_then(|i| i.ws_origin.clone()),
+    );
+    let ws_user_agent = json_or_invite_str(
+        j.ws_user_agent.clone(),
+        invite_pair.as_ref().and_then(|i| i.ws_user_agent.clone()),
+    );
+    let ws_accept_language = json_or_invite_str(
+        j.ws_accept_language.clone(),
+        invite_pair.as_ref().and_then(|i| i.ws_accept_language.clone()),
+    );
     let idle_merged = j
         .idle_decoy_secs
         .or(invite_pair.as_ref().and_then(|i| i.idle_decoy_secs));
     let idle_decoy_secs =
         crate::stealth_v12::merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
+
+    let effective_proto_domain = if proto_domain.trim().is_empty() {
+        sni.clone()
+    } else {
+        proto_domain.trim().to_string()
+    };
+    info!(
+        target: "bibavpn_client",
+        invite = invite_pair.is_some(),
+        final_sni = %sni,
+        proto_domain = %proto_domain,
+        effective_proto_domain = %effective_proto_domain,
+        psk_present = psk.is_some(),
+        psk_hash8 = psk.as_deref().map(short_hash8).unwrap_or_else(|| "-".to_string()),
+        "start_json resolved transport identity"
+    );
 
     Ok(LocalClientOptions {
         server_host,
