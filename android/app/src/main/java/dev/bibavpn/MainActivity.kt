@@ -9,13 +9,13 @@ import android.net.VpnService
 import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,12 +25,15 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -56,19 +59,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -81,19 +83,19 @@ import kotlinx.coroutines.isActive
 import org.json.JSONArray
 import org.json.JSONObject
 
-private val BgRoot = Color(0xFF070B14)
-private val BgScreen = Color(0xFF0B0F1A)
-private val CardBg = Color(0xFF121826)
-private val LabelSky = Color(0xFF60A5FA)
-private val TextMuted = Color(0xFF94A3B8)
-private val TextSlate200 = Color(0xFFE2E8F0)
-private val Mint = Color(0xFF00FFA3)
-private val MintSoft = Color(0xFF34D399)
-private val BorderSubtle = Color.White.copy(alpha = 0.08f)
-private val MainButtonBrush = Brush.verticalGradient(
-    listOf(Color(0xFF1A2950), Color(0xFF14203C)),
-)
-private val MainButtonBorder = Color(0x3360A5FA)
+/** Терминальная тёмная тема (как в макетах): ч/б, моноширинный шрифт. */
+private val BgRoot = Color(0xFF000000)
+private val BgScreen = Color(0xFF000000)
+private val CardBg = Color(0xFF000000)
+private val LabelSky = Color(0xFF888888)
+private val TextMuted = Color(0xFF888888)
+private val TextSlate200 = Color(0xFFFFFFFF)
+private val Mint = Color(0xFFFFFFFF)
+private val MintSoft = Color(0xFFAAAAAA)
+private val TermOrange = Color(0xFFFFA500)
+private val BorderSubtle = Color(0xFF444444)
+
+private val Mono = FontFamily.Monospace
 
 class MainActivity : AppCompatActivity() {
 
@@ -175,8 +177,11 @@ private fun BibaRootScreen(
     onRequestVpnConnect: (String) -> Unit,
 ) {
     val context = LocalContext.current
-    var showSettings by remember { mutableStateOf(false) }
+    /** 0 connection, 1 profiles, 2 config, 3 logs */
+    var mainTab by remember { mutableStateOf(0) }
     var tunnelUp by remember { mutableStateOf(BibaVpnService.isTunnelActive) }
+    var tunnelStartElapsed by remember { mutableStateOf<Long?>(null) }
+    var uptimeTick by remember { mutableStateOf(0) }
 
     val last = remember {
         BibaVpnService.getLastConfigJson(context)?.let { runCatching { JSONObject(it) }.getOrNull() }
@@ -301,6 +306,23 @@ private fun BibaRootScreen(
             delay(400)
             val t = BibaVpnService.isTunnelActive
             if (t != tunnelUp) tunnelUp = t
+        }
+    }
+
+    LaunchedEffect(tunnelUp) {
+        if (tunnelUp) {
+            if (tunnelStartElapsed == null) {
+                tunnelStartElapsed = SystemClock.elapsedRealtime()
+            }
+        } else {
+            tunnelStartElapsed = null
+        }
+    }
+
+    LaunchedEffect(tunnelUp) {
+        while (tunnelUp) {
+            delay(1000)
+            uptimeTick++
         }
     }
 
@@ -458,313 +480,817 @@ private fun BibaRootScreen(
         )
     }
 
-    Box(
+    Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.radialGradient(
-                    colors = listOf(Color(0xFF16203B), BgRoot, BgRoot),
-                    center = Offset(0.5f, 0f),
-                    radius = 1200f,
-                ),
-            ),
+            .background(BgRoot),
     ) {
-        if (showSettings) {
-            SettingsScreen(
-                bibaInvite = bibaInvite,
-                onBibaInviteChange = { bibaInvite = it },
-                invitePassphrase = invitePassphrase,
-                onInvitePassphraseChange = { invitePassphrase = it },
-                onApplyInvite = { applyInviteToForm() },
-                tlsProfile = tlsProfile,
-                onTlsProfileChange = { tlsProfile = it },
-                server = server,
-                onServerChange = { server = it },
-                token = token,
-                onTokenChange = { token = it },
-                tokenVisible = tokenVisible,
-                onTokenVisibleChange = { tokenVisible = it },
-                sni = sni,
-                onSniChange = { sni = it },
-                psk = psk,
-                onPskChange = { psk = it },
-                pskVisible = pskVisible,
-                onPskVisibleChange = { pskVisible = it },
-                insecure = insecure,
-                onInsecureChange = { insecure = it },
-                socksBind = socksBind,
-                onSocksBindChange = { socksBind = it },
-                maxPad = maxPad,
-                onMaxPadChange = { maxPad = it },
-                decoyMax = decoyMax,
-                onDecoyMaxChange = { decoyMax = it },
-                junkFrames = junkFrames,
-                onJunkFramesChange = { junkFrames = it },
-                earlyWs = earlyWs,
-                onEarlyWsChange = { earlyWs = it },
-                maxWsBin = maxWsBin,
-                onMaxWsBinChange = { maxWsBin = it },
-                wsPing = wsPing,
-                onWsPingChange = { wsPing = it },
-                wsHeaders = wsHeaders,
-                onWsHeadersChange = { wsHeaders = it },
-                wsPath = wsPath,
-                onWsPathChange = { wsPath = it },
-                useTcpMux = useTcpMux,
-                onUseTcpMuxChange = { useTcpMux = it },
-                padMode = padMode,
-                onPadModeChange = { padMode = it },
-                wsPingJitter = wsPingJitter,
-                onWsPingJitterChange = { wsPingJitter = it },
-                wsBinaryJitter = wsBinaryJitter,
-                onWsBinaryJitterChange = { wsBinaryJitter = it },
-                udpMaxPad = udpMaxPad,
-                onUdpMaxPadChange = { udpMaxPad = it },
-                udpMaxWsBin = udpMaxWsBin,
-                onUdpMaxWsBinChange = { udpMaxWsBin = it },
-                udpMuxTimeout = udpMuxTimeout,
-                onUdpMuxTimeoutChange = { udpMuxTimeout = it },
-                dummyInterval = dummyInterval,
-                onDummyIntervalChange = { dummyInterval = it },
-                decoyGets = decoyGets,
-                onDecoyGetsChange = { decoyGets = it },
-                decoyGetsInterval = decoyGetsInterval,
-                onDecoyGetsIntervalChange = { decoyGetsInterval = it },
-                decoyGetsPaths = decoyGetsPaths,
-                onDecoyGetsPathsChange = { decoyGetsPaths = it },
-                pinCertPem = pinCertPem,
-                onPinCertPemChange = { pinCertPem = it },
-                screenOffBatterySaver = screenOffBatterySaver,
-                onScreenOffBatterySaverChange = { v ->
-                    screenOffBatterySaver = v
-                    BibaVpnService.setScreenOffBatterySaver(context, v)
-                    if (!v && BibaVpnService.isTunnelActive) {
-                        BibaVpnService.requestSyncWakeLock(context)
-                    }
-                },
-                onBack = { showSettings = false },
-            )
-        } else {
-            HomeScreen(
-                tunnelUp = tunnelUp,
-                server = server.trim(),
-                sni = sni.trim(),
-                bibaInvite = bibaInvite.trim(),
-                configLooksReady = canConnectWithSavedFallback(),
-                onOpenSettings = { showSettings = true },
-                onConnectToggle = {
-                    if (tunnelUp) {
-                        BibaVpnService.stop(context)
-                    } else if (!canConnectWithSavedFallback()) {
-                        Toast.makeText(
-                            context,
-                            context.getString(R.string.toast_connect_need_config),
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    } else {
-                        val json = buildConnectJsonForVpn()
-                        BibaVpnService.saveConfig(context, json.toString())
-                        onRequestVpnConnect(json.toString())
-                    }
-                },
-                onServerCardTap = { showSettings = true },
-            )
+        Box(Modifier.weight(1f)) {
+            when (mainTab) {
+                0 -> {
+                    ConnectionTab(
+                        tunnelUp = tunnelUp,
+                        tunnelStartElapsed = tunnelStartElapsed,
+                        uptimeTick = uptimeTick,
+                        server = server.trim(),
+                        sni = sni.trim(),
+                        bibaInvite = bibaInvite.trim(),
+                        configLooksReady = canConnectWithSavedFallback(),
+                        tlsProfile = tlsProfile,
+                        decoyMax = decoyMax,
+                        maxPad = maxPad,
+                        padMode = padMode,
+                        pinCertPem = pinCertPem,
+                        insecure = insecure,
+                        onConnectToggle = {
+                            if (tunnelUp) {
+                                BibaVpnService.stop(context)
+                            } else if (!canConnectWithSavedFallback()) {
+                                Toast.makeText(
+                                    context,
+                                    context.getString(R.string.toast_connect_need_config),
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            } else {
+                                val json = buildConnectJsonForVpn()
+                                BibaVpnService.saveConfig(context, json.toString())
+                                onRequestVpnConnect(json.toString())
+                            }
+                        },
+                        onGoToConfig = { mainTab = 2 },
+                    )
+                }
+                1 -> ProfilesTab(
+                    tunnelUp = tunnelUp,
+                    server = server.trim(),
+                    sni = sni.trim(),
+                    bibaInvite = bibaInvite.trim(),
+                    insecure = insecure,
+                    onImport = { mainTab = 2 },
+                )
+                2 -> SettingsScreen(
+                    bibaInvite = bibaInvite,
+                    onBibaInviteChange = { bibaInvite = it },
+                    invitePassphrase = invitePassphrase,
+                    onInvitePassphraseChange = { invitePassphrase = it },
+                    onApplyInvite = { applyInviteToForm() },
+                    tlsProfile = tlsProfile,
+                    onTlsProfileChange = { tlsProfile = it },
+                    server = server,
+                    onServerChange = { server = it },
+                    token = token,
+                    onTokenChange = { token = it },
+                    tokenVisible = tokenVisible,
+                    onTokenVisibleChange = { tokenVisible = it },
+                    sni = sni,
+                    onSniChange = { sni = it },
+                    psk = psk,
+                    onPskChange = { psk = it },
+                    pskVisible = pskVisible,
+                    onPskVisibleChange = { pskVisible = it },
+                    insecure = insecure,
+                    onInsecureChange = { insecure = it },
+                    socksBind = socksBind,
+                    onSocksBindChange = { socksBind = it },
+                    maxPad = maxPad,
+                    onMaxPadChange = { maxPad = it },
+                    decoyMax = decoyMax,
+                    onDecoyMaxChange = { decoyMax = it },
+                    junkFrames = junkFrames,
+                    onJunkFramesChange = { junkFrames = it },
+                    earlyWs = earlyWs,
+                    onEarlyWsChange = { earlyWs = it },
+                    maxWsBin = maxWsBin,
+                    onMaxWsBinChange = { maxWsBin = it },
+                    wsPing = wsPing,
+                    onWsPingChange = { wsPing = it },
+                    wsHeaders = wsHeaders,
+                    onWsHeadersChange = { wsHeaders = it },
+                    wsPath = wsPath,
+                    onWsPathChange = { wsPath = it },
+                    useTcpMux = useTcpMux,
+                    onUseTcpMuxChange = { useTcpMux = it },
+                    padMode = padMode,
+                    onPadModeChange = { padMode = it },
+                    wsPingJitter = wsPingJitter,
+                    onWsPingJitterChange = { wsPingJitter = it },
+                    wsBinaryJitter = wsBinaryJitter,
+                    onWsBinaryJitterChange = { wsBinaryJitter = it },
+                    udpMaxPad = udpMaxPad,
+                    onUdpMaxPadChange = { udpMaxPad = it },
+                    udpMaxWsBin = udpMaxWsBin,
+                    onUdpMaxWsBinChange = { udpMaxWsBin = it },
+                    udpMuxTimeout = udpMuxTimeout,
+                    onUdpMuxTimeoutChange = { udpMuxTimeout = it },
+                    dummyInterval = dummyInterval,
+                    onDummyIntervalChange = { dummyInterval = it },
+                    decoyGets = decoyGets,
+                    onDecoyGetsChange = { decoyGets = it },
+                    decoyGetsInterval = decoyGetsInterval,
+                    onDecoyGetsIntervalChange = { decoyGetsInterval = it },
+                    decoyGetsPaths = decoyGetsPaths,
+                    onDecoyGetsPathsChange = { decoyGetsPaths = it },
+                    pinCertPem = pinCertPem,
+                    onPinCertPemChange = { pinCertPem = it },
+                    screenOffBatterySaver = screenOffBatterySaver,
+                    onScreenOffBatterySaverChange = { v ->
+                        screenOffBatterySaver = v
+                        BibaVpnService.setScreenOffBatterySaver(context, v)
+                        if (!v && BibaVpnService.isTunnelActive) {
+                            BibaVpnService.requestSyncWakeLock(context)
+                        }
+                    },
+                    onBack = null,
+                )
+                else -> LogsTab()
+            }
         }
+        TerminalBottomNav(
+            selectedIndex = mainTab,
+            onSelect = { mainTab = it },
+        )
+    }
+}
+
+private fun formatTunnelUptime(
+    start: Long?,
+    @Suppress("UNUSED_PARAMETER") tick: Int,
+): String {
+    if (start == null) return "—"
+    val elapsed = (SystemClock.elapsedRealtime() - start) / 1000L
+    val h = elapsed / 3600L
+    val m = (elapsed % 3600L) / 60L
+    val s = elapsed % 60L
+    return if (h > 0L) {
+        String.format("%d:%02d:%02d", h, m, s)
+    } else {
+        String.format("%02d:%02d", m, s)
     }
 }
 
 @Composable
-private fun HomeScreen(
+private fun ConnectionTab(
     tunnelUp: Boolean,
+    tunnelStartElapsed: Long?,
+    uptimeTick: Int,
     server: String,
     sni: String,
     bibaInvite: String,
-    /** Есть ли данные для подключения (включая fallback из последнего JSON) — только для подсказки/прозрачности. */
     configLooksReady: Boolean,
-    onOpenSettings: () -> Unit,
+    tlsProfile: String,
+    decoyMax: String,
+    maxPad: String,
+    padMode: String,
+    pinCertPem: String,
+    insecure: Boolean,
     onConnectToggle: () -> Unit,
-    onServerCardTap: () -> Unit,
+    onGoToConfig: () -> Unit,
+) {
+    if (!configLooksReady) {
+        WelcomeScreen(onOpenConfig = onGoToConfig)
+    } else {
+        TerminalConnectionScreen(
+            tunnelUp = tunnelUp,
+            tunnelStartElapsed = tunnelStartElapsed,
+            uptimeTick = uptimeTick,
+            server = server,
+            sni = sni,
+            bibaInvite = bibaInvite,
+            onConnectToggle = onConnectToggle,
+            tlsProfile = tlsProfile,
+            decoyMax = decoyMax,
+            maxPad = maxPad,
+            padMode = padMode,
+            pinCertPem = pinCertPem,
+            insecure = insecure,
+        )
+    }
+}
+
+@Composable
+private fun WelcomeScreen(
+    onOpenConfig: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            stringResource(R.string.ascii_logo_biba),
+            color = Color.White,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+            lineHeight = 15.sp,
+        )
+        Spacer(Modifier.height(40.dp))
+        Text(
+            stringResource(R.string.welcome_operator),
+            color = Color.White,
+            fontFamily = Mono,
+            fontSize = 16.sp,
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            stringResource(R.string.welcome_hint),
+            color = TextDim66,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+            lineHeight = 18.sp,
+        )
+        Spacer(Modifier.height(48.dp))
+        WelcomeOutlineButton(
+            label = stringResource(R.string.btn_welcome_import),
+            strong = true,
+            onClick = onOpenConfig,
+        )
+        Spacer(Modifier.height(12.dp))
+        WelcomeOutlineButton(
+            label = stringResource(R.string.btn_welcome_manual),
+            strong = false,
+            onClick = onOpenConfig,
+        )
+    }
+}
+
+private val TextDim66 = Color(0xFF666666)
+
+@Composable
+private fun WelcomeOutlineButton(
+    label: String,
+    strong: Boolean,
+    onClick: () -> Unit,
+) {
+    val border = if (strong) Color.White else Color(0xFF333333)
+    Text(
+        text = label,
+        color = if (strong) Color.White else TextDim66,
+        fontFamily = Mono,
+        fontSize = 13.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .border(1.dp, border, RoundedCornerShape(6.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 16.dp),
+        textAlign = TextAlign.Center,
+    )
+}
+
+@Composable
+private fun TerminalConnectionScreen(
+    tunnelUp: Boolean,
+    tunnelStartElapsed: Long?,
+    uptimeTick: Int,
+    server: String,
+    sni: String,
+    bibaInvite: String,
+    onConnectToggle: () -> Unit,
+    tlsProfile: String,
+    decoyMax: String,
+    maxPad: String,
+    padMode: String,
+    pinCertPem: String,
+    insecure: Boolean,
 ) {
     val bibaKeyShort = stringResource(R.string.home_biba_key_short)
-    val dash = stringResource(R.string.home_dash)
     val noServer = stringResource(R.string.home_no_server)
-    val displayHost = remember(server, sni, bibaInvite, bibaKeyShort, dash) {
+    val displayName = remember(server, sni, bibaInvite, bibaKeyShort) {
         when {
-            server.isNotBlank() && sni.isNotBlank() -> sni
+            sni.isNotBlank() -> sni
             server.isNotBlank() -> server.substringBefore(':').ifBlank { server }
             bibaInvite.isNotBlank() -> bibaKeyShort
-            else -> dash
+            else -> "—"
         }
     }
     val subtitle = remember(server, bibaInvite, noServer) {
         when {
             server.isNotBlank() -> server
             bibaInvite.isNotBlank() ->
-                bibaInvite.take(36).let { if (bibaInvite.length > 36) "$it…" else it }
+                bibaInvite.take(40).let { if (bibaInvite.length > 40) "$it…" else it }
             else -> noServer
         }
     }
+    var showTech by remember { mutableStateOf(true) }
+    val scroll = rememberScrollState()
+    val padLine =
+        remember(decoyMax, maxPad, padMode) {
+            "$decoyMax decoy · $maxPad pad · ${padMode.trim().ifBlank { "off" }}"
+        }
+    val tlsLine =
+        remember(tlsProfile) {
+            val p = tlsProfile.trim().ifBlank { "default" }
+            "$p · chacha20-poly1305"
+        }
+    val sniLine = sni.trim().ifBlank { server.substringBefore(':').ifBlank { "—" } }
+    val trustLine = when {
+        pinCertPem.isNotBlank() -> stringResource(R.string.tech_trust_pinned)
+        insecure -> "insecure"
+        else -> stringResource(R.string.tech_trust_system)
+    }
+    val metricDash = stringResource(R.string.metric_dash)
+    val rttText = metricDash
+    val downText = if (tunnelUp) metricDash else "0 B/s"
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(20.dp),
+            .statusBarsPadding()
+            .drawBehind {
+                val lineH = 3.dp.toPx()
+                var y = 0f
+                while (y < size.height) {
+                    drawLine(
+                        color = Color.White.copy(0.03f),
+                        start = androidx.compose.ui.geometry.Offset(0f, y),
+                        end = androidx.compose.ui.geometry.Offset(size.width, y),
+                        strokeWidth = 1f,
+                    )
+                    y += lineH
+                }
+            }
+            .verticalScroll(scroll)
+            .padding(horizontal = 20.dp, vertical = 8.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            RoundIconButton(onClick = onOpenSettings, symbol = "⚙")
-            Image(
-                painter = painterResource(id = R.drawable.img_biba_wordmark),
-                contentDescription = null,
-                modifier = Modifier
-                    .weight(1f)
-                    .height(36.dp)
-                    .padding(horizontal = 12.dp),
-                contentScale = ContentScale.Fit,
-            )
-            Spacer(Modifier.width(40.dp))
-        }
-
-        Spacer(Modifier.height(24.dp))
-
-        // Status card
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(26.dp))
-                .border(1.dp, BorderSubtle, RoundedCornerShape(26.dp))
-                .background(CardBg)
-                .padding(20.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusDot(active = tunnelUp)
-                Text(
-                    if (tunnelUp) {
-                        stringResource(R.string.home_connected)
-                    } else {
-                        stringResource(R.string.home_disconnected)
-                    },
-                    color = Color.White,
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            Spacer(Modifier.height(12.dp))
             Text(
-                if (tunnelUp) {
-                    stringResource(R.string.home_tunnel_active_line, displayHost)
-                } else {
-                    stringResource(R.string.home_tap_vpn)
-                },
-                color = TextSlate200.copy(alpha = 0.85f),
-                fontSize = 14.sp,
+                stringResource(R.string.wordmark),
+                color = Color.White,
+                fontFamily = Mono,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Normal,
+            )
+            Spacer(Modifier.weight(1f))
+            StatusDot(active = tunnelUp)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                stringResource(if (tunnelUp) R.string.status_tunnel_up else R.string.status_tunnel_down),
+                color = TextMuted,
+                fontFamily = Mono,
+                fontSize = 10.sp,
             )
         }
-
-        Spacer(Modifier.height(40.dp))
-
-        // Main action — всегда кликабельно: проверка данных и Toast в onConnectToggle
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .alpha(if (tunnelUp || configLooksReady) 1f else 0.55f)
-                .clip(RoundedCornerShape(28.dp))
-                .border(1.dp, MainButtonBorder, RoundedCornerShape(28.dp))
-                .background(MainButtonBrush)
-                .clickable { onConnectToggle() }
-                .padding(horizontal = 24.dp, vertical = 22.dp),
+        Spacer(Modifier.height(20.dp))
+        // Center: pill + power ring
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(100))
+                    .border(1.dp, Color.White, RoundedCornerShape(100))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        if (tunnelUp) {
-                            stringResource(R.string.home_disconnect)
-                        } else {
-                            stringResource(R.string.home_connect)
-                        },
-                        color = Color.White,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        if (tunnelUp) {
-                            stringResource(R.string.home_cta_protected)
-                        } else {
-                            stringResource(R.string.home_cta_traffic)
-                        },
-                        color = LabelSky.copy(alpha = 0.75f),
-                        fontSize = 14.sp,
-                    )
-                }
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(16.dp))
-                        .border(1.dp, Mint.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
-                        .background(Mint.copy(alpha = 0.12f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Box(
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(if (tunnelUp) Color.White else TextMuted),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    stringResource(if (tunnelUp) R.string.status_tunnel_up else R.string.status_tunnel_down),
+                    color = Color.White,
+                    fontFamily = Mono,
+                    fontSize = 10.sp,
+                )
+            }
+            Spacer(Modifier.height(24.dp))
+            PowerTunnelRing(
+                onClick = onConnectToggle,
+            ) {
+                Text(
+                    "⏻",
+                    color = Color.White,
+                    fontSize = 28.sp,
+                    fontFamily = Mono,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    stringResource(
+                        if (tunnelUp) {
+                            R.string.action_drop_tunnel
+                        } else {
+                            R.string.action_establish_tunnel
+                        },
+                    ),
+                    color = Color.White,
+                    fontFamily = Mono,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+        Spacer(Modifier.height(28.dp))
+        Text(
+            stringResource(R.string.label_endpoint),
+            color = TextMuted,
+            fontFamily = Mono,
+            fontSize = 10.sp,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            displayName,
+            color = Color.White,
+            fontFamily = Mono,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Text(
+            subtitle,
+            color = TextMuted,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+        )
+        Spacer(Modifier.height(24.dp))
+        // Metrics
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp)
+                .border(1.dp, BorderSubtle, RoundedCornerShape(0.dp)),
+        ) {
+            TerminalMetric(
+                label = stringResource(R.string.metric_rtt),
+                value = rttText,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                Modifier
+                    .width(1.dp)
+                    .fillMaxSize()
+                    .background(BorderSubtle),
+            )
+            TerminalMetric(
+                label = stringResource(R.string.metric_uptime),
+                value = formatTunnelUptime(tunnelStartElapsed, uptimeTick).takeIf { tunnelUp } ?: metricDash,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                Modifier
+                    .width(1.dp)
+                    .fillMaxSize()
+                    .background(BorderSubtle),
+            )
+            TerminalMetric(
+                label = stringResource(R.string.metric_down),
+                value = downText,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Spacer(Modifier.height(20.dp))
+        Text(
+            if (showTech) stringResource(R.string.hide_technical) else stringResource(R.string.show_technical),
+            color = TextMuted,
+            fontFamily = Mono,
+            fontSize = 10.sp,
+            modifier = Modifier
+                .clickable { showTech = !showTech }
+                .padding(vertical = 4.dp),
+        )
+        if (showTech) {
+            Spacer(Modifier.height(8.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .border(1.dp, BorderSubtle, RoundedCornerShape(8.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                TechKeyValue(
+                    k = stringResource(R.string.tech_sni),
+                    v = sniLine,
+                )
+                TechKeyValue(
+                    k = stringResource(R.string.tech_tls),
+                    v = tlsLine,
+                )
+                TechKeyValue(
+                    k = stringResource(R.string.tech_auth),
+                    v = stringResource(R.string.tech_auth_value),
+                )
+                TechKeyValue(
+                    k = stringResource(R.string.tech_trust),
+                    v = trustLine,
+                )
+                TechKeyValue(
+                    k = stringResource(R.string.tech_pad),
+                    v = padLine,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TechKeyValue(
+    k: String,
+    v: String,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            k,
+            color = TextMuted,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+        )
+        Text(
+            v,
+            color = Color.White,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(start = 8.dp),
+        )
+    }
+}
+
+@Composable
+private fun TerminalMetric(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxHeight()
+            .padding(vertical = 8.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            label,
+            color = TextMuted,
+            fontFamily = Mono,
+            fontSize = 9.sp,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            value,
+            color = Color.White,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+        )
+    }
+}
+
+@Composable
+private fun PowerTunnelRing(
+    onClick: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val glow = Brush.radialGradient(
+        listOf(
+            Color.White.copy(0.12f),
+            Color.Transparent,
+        ),
+    )
+    Box(
+        modifier = Modifier
+            .size(220.dp)
+            .drawBehind {
+                drawCircle(brush = glow, radius = size.minDimension * 0.5f, center = center)
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(200.dp)
+                .clip(CircleShape)
+                .border(1.dp, Color.White, CircleShape)
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(150.dp)
+                    .border(1.dp, Color.White.copy(0.85f), CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    content()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfilesTab(
+    tunnelUp: Boolean,
+    server: String,
+    sni: String,
+    bibaInvite: String,
+    insecure: Boolean,
+    onImport: () -> Unit,
+) {
+    val bibaKeyShort = stringResource(R.string.home_biba_key_short)
+    val noServer = stringResource(R.string.home_no_server)
+    val title = remember(server, sni, bibaInvite, bibaKeyShort, noServer) {
+        when {
+            sni.isNotBlank() -> sni
+            server.isNotBlank() -> server.substringBefore(':').ifBlank { server }
+            bibaInvite.isNotBlank() -> bibaKeyShort
+            else -> noServer
+        }
+    }
+    val sub = remember(server, bibaInvite, noServer) {
+        if (server.isNotBlank()) {
+            server
+        } else if (bibaInvite.isNotBlank()) {
+            bibaInvite.take(36).let { if (bibaInvite.length > 36) "$it…" else it }
+        } else {
+            "—"
+        }
+    }
+    val scroll = rememberScrollState()
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .verticalScroll(scroll)
+            .padding(20.dp)
+            .drawBehind {
+                val lineH = 3.dp.toPx()
+                var y = 0f
+                while (y < size.height) {
+                    drawLine(
+                        color = Color.White.copy(0.03f),
+                        start = androidx.compose.ui.geometry.Offset(0f, y),
+                        end = androidx.compose.ui.geometry.Offset(size.width, y),
+                        strokeWidth = 1f,
+                    )
+                    y += lineH
+                }
+            },
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Text(
+                stringResource(R.string.profiles_header),
+                color = Color.White,
+                fontFamily = Mono,
+                fontSize = 12.sp,
+            )
+            Spacer(Modifier.weight(1f))
+            Text(
+                stringResource(R.string.profiles_count_fmt, 1),
+                color = TextMuted,
+                fontFamily = Mono,
+                fontSize = 10.sp,
+            )
+        }
+        Spacer(Modifier.height(16.dp))
+        // один сохранённый профиль
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(4.dp))
+                .border(1.dp, if (tunnelUp) Color.White else BorderSubtle, RoundedCornerShape(4.dp))
+                .clickable { }
+                .padding(14.dp),
+        ) {
+            Text(title, color = Color.White, fontFamily = Mono, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(2.dp))
+            Text(sub, color = TextMuted, fontFamily = Mono, fontSize = 12.sp)
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (tunnelUp) {
+                    Text(
+                        stringResource(R.string.profile_badge_active),
+                        color = Color.White,
+                        fontFamily = Mono,
+                        fontSize = 9.sp,
                         modifier = Modifier
-                            .size(12.dp)
-                            .clip(CircleShape)
-                            .background(MintSoft),
+                            .border(1.dp, Color.White, RoundedCornerShape(2.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text("—", color = TextMuted, fontFamily = Mono, fontSize = 11.sp)
+                if (insecure) {
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        stringResource(R.string.profile_badge_insecure),
+                        color = TermOrange,
+                        fontFamily = Mono,
+                        fontSize = 9.sp,
+                        modifier = Modifier
+                            .border(1.dp, TermOrange, RoundedCornerShape(2.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
                     )
                 }
             }
         }
-
-        Spacer(Modifier.height(32.dp))
-
-        // Server card
-        Column(
+        Spacer(Modifier.height(20.dp))
+        Text(
+            stringResource(R.string.btn_import_biba),
+            color = Color.White,
+            fontFamily = Mono,
+            fontSize = 12.sp,
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp))
-                .border(1.dp, BorderSubtle, RoundedCornerShape(24.dp))
-                .background(CardBg)
-                .clickable { onServerCardTap() }
+                .clip(RoundedCornerShape(4.dp))
+                .border(1.dp, BorderSubtle, RoundedCornerShape(4.dp))
+                .clickable(onClick = onImport)
                 .padding(16.dp),
-        ) {
-            Text(
-                stringResource(R.string.home_server_label),
-                color = TextMuted,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 2.4.sp,
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun LogsTab() {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .padding(20.dp),
+    ) {
+        Text(
+            stringResource(R.string.logs_title),
+            color = TextMuted,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            stringResource(R.string.logs_placeholder),
+            color = TextMuted,
+            fontFamily = Mono,
+            fontSize = 12.sp,
+        )
+    }
+}
+
+@Composable
+private fun TerminalBottomNav(
+    selectedIndex: Int,
+    onSelect: (Int) -> Unit,
+) {
+    val items = listOf(
+        Triple(R.string.nav_connection, "◆", 0),
+        Triple(R.string.nav_profiles, "◎", 1),
+        Triple(R.string.nav_config, "▤", 2),
+        Triple(R.string.nav_logs, "≡", 3),
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .background(Color(0xFF000000))
+            .border(1.dp, BorderSubtle)
+            .padding(vertical = 6.dp, horizontal = 4.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        items.forEach { (nameRes, sym, idx) ->
+            val sel = selectedIndex == idx
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable { onSelect(idx) }
+                    .padding(4.dp),
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        displayHost,
-                        color = Color.White,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                Text(
+                    sym,
+                    color = if (sel) Color.White else TextMuted,
+                    fontSize = 16.sp,
+                    fontFamily = Mono,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    stringResource(nameRes),
+                    color = if (sel) Color.White else TextMuted,
+                    fontSize = 7.sp,
+                    fontFamily = Mono,
+                    maxLines = 1,
+                )
+                if (sel) {
+                    Spacer(Modifier.height(2.dp))
+                    Box(
+                        Modifier
+                            .height(1.dp)
+                            .width(24.dp)
+                            .background(Color.White),
                     )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        subtitle,
-                        color = TextMuted,
-                        fontSize = 14.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                } else {
+                    Spacer(Modifier.height(3.dp))
                 }
-                Text("›", color = TextMuted.copy(alpha = 0.55f), fontSize = 22.sp)
             }
         }
     }
@@ -871,34 +1397,45 @@ private fun SettingsScreen(
     onPinCertPemChange: (String) -> Unit,
     screenOffBatterySaver: Boolean,
     onScreenOffBatterySaverChange: (Boolean) -> Unit,
-    onBack: () -> Unit,
+    onBack: (() -> Unit)? = null,
 ) {
     var settingsTab by remember { mutableStateOf(0) }
     val scroll = rememberScrollState()
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .statusBarsPadding()
             .background(BgScreen)
             .verticalScroll(scroll)
             .padding(20.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            RoundIconButton(onClick = onBack, symbol = "‹")
+        if (onBack != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                RoundIconButton(onClick = onBack, symbol = "‹")
+                Text(
+                    stringResource(R.string.settings_title),
+                    color = TextSlate200,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = Mono,
+                    letterSpacing = 0.6.sp,
+                )
+                Spacer(Modifier.width(40.dp))
+            }
+            Spacer(Modifier.height(24.dp))
+        } else {
             Text(
-                stringResource(R.string.settings_title),
-                color = TextSlate200,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                letterSpacing = 0.6.sp,
+                stringResource(R.string.config_screen_title),
+                color = TextMuted,
+                fontFamily = Mono,
+                fontSize = 12.sp,
             )
-            Spacer(Modifier.width(40.dp))
+            Spacer(Modifier.height(12.dp))
         }
-
-        Spacer(Modifier.height(24.dp))
 
         SettingsTabsRow(
             selectedIndex = settingsTab,
