@@ -21,6 +21,8 @@ RUST_LOG=warn "$BIN/bibavpn-server" \
   --listen 127.0.0.1:18443 \
   --self-signed-san localhost \
   --token benchtest \
+  --psk benchpsk \
+  --proto-domain localhost \
   --ws-ping-secs 0 >/tmp/bibavpn-server.log 2>&1 &
 SPID=$!
 sleep 0.8
@@ -28,6 +30,8 @@ RUST_LOG=warn "$BIN/bibavpn-client" \
   --server 127.0.0.1:18443 \
   --sni localhost \
   --token benchtest \
+  --psk benchpsk \
+  --proto-domain localhost \
   --insecure \
   --socks5 127.0.0.1:11080 \
   --ws-ping-secs 0 >/tmp/bibavpn-client.log 2>&1 &

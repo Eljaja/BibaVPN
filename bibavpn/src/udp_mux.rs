@@ -15,19 +15,24 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::crypto_layer::{self, SessionCrypto};
-use crate::frame::PadMode;
+use crate::frame::{AdaptivePadState, PadMode};
 use crate::protocol::{
-    decode_udp_rep, decode_udp_req, encode_auth, encode_udp_mux_open, encode_udp_rep,
-    encode_udp_req, encode_v3_auth, encode_v3_udp_mux_open,
+    decode_udp_rep, decode_udp_req, encode_udp_rep, encode_udp_req, encode_v3_auth,
+    encode_v3_udp_mux_open,
 };
-use crate::retry::{maybe_ws_binary_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period};
+use crate::retry::{
+    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period,
+    ServerWsOutTiming, WsSendJitter,
+};
 use crate::stealth::{build_websocket_request, WsHandshakeParams};
 use crate::tls_util::TlsClientProfile;
 use crate::ws_bridge::SharedCrypto;
-use crate::{read_padded_frame, write_padded_frame_with_mode};
+use crate::{
+    read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode_state,
+};
 
 /// Max concurrent server-side UDP request tasks per mux session.
 const UDP_MUX_SERVER_MAX_INFLIGHT: usize = 512;
@@ -57,11 +62,23 @@ pub struct UdpMuxConfig {
     pub ws_ping_secs: u64,
     pub ws_ping_jitter_percent: u8,
     pub ws_binary_send_jitter_ms: u8,
+    pub ws_jitter_min_ms: u8,
+    pub ws_jitter_max_ms: u8,
     pub tls_profile: TlsClientProfile,
     pub ws_path: String,
     pub pad_mode: PadMode,
     pub proto: u8,
     pub proto_domain: String,
+}
+
+impl UdpMuxConfig {
+    fn send_jitter(&self) -> WsSendJitter {
+        WsSendJitter {
+            min_ms: self.ws_jitter_min_ms,
+            max_ms: self.ws_jitter_max_ms,
+            legacy_0_to_max: self.ws_binary_send_jitter_ms,
+        }
+    }
 }
 
 pub enum ClientUdpCmd {
@@ -129,7 +146,7 @@ async fn connect_udp_mux_ws_resilient(
     cfg: &UdpMuxConfig,
 ) -> anyhow::Result<(
     WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
-    Option<SharedCrypto>,
+    SharedCrypto,
 )> {
     let mut streak = 0u32;
     loop {
@@ -169,42 +186,6 @@ where
     Ok(())
 }
 
-async fn v2_client_preamble<S>(
-    ws: &mut WebSocketStream<S>,
-    psk: &str,
-    decoy_max: u8,
-) -> anyhow::Result<SessionCrypto>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (c_rand, hello) = crypto_layer::build_hello();
-    ws.send(Message::Binary(Bytes::from(hello)))
-        .await
-        .context("send HELLO")?;
-
-    loop {
-        let m = ws.next().await.context("eof before ACK")??;
-        match m {
-            Message::Binary(b) => {
-                let s_rand = crypto_layer::parse_ack(psk, None, b.as_ref(), &c_rand)?;
-                return Ok(SessionCrypto::new(
-                    psk,
-                    None,
-                    &c_rand,
-                    &s_rand,
-                    decoy_max,
-                ));
-            }
-            Message::Pong(_) => continue,
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong")?;
-            }
-            Message::Close(_) => anyhow::bail!("ws closed before ACK"),
-            _ => {}
-        }
-    }
-}
-
 fn effective_udp_proto_domain(cfg: &UdpMuxConfig) -> String {
     let t = cfg.proto_domain.trim();
     if t.is_empty() {
@@ -214,12 +195,22 @@ fn effective_udp_proto_domain(cfg: &UdpMuxConfig) -> String {
     }
 }
 
+fn short_hash8(s: &str) -> String {
+    let hex = blake3::hash(s.as_bytes()).to_hex().to_string();
+    hex[..8].to_string()
+}
+
 async fn connect_udp_mux_ws(
     cfg: &UdpMuxConfig,
 ) -> anyhow::Result<(
     WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
-    Option<SharedCrypto>,
+    SharedCrypto,
 )> {
+    anyhow::ensure!(cfg.proto >= 3, "only Biba protocol v3 is supported (proto 3)");
+    anyhow::ensure!(
+        cfg.psk.is_some(),
+        "Biba v3 UDP mux requires --psk (or invite psk)"
+    );
     let tcp =
         crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
             .await
@@ -255,109 +246,101 @@ async fn connect_udp_mux_ws(
         .await
         .context("junk frames")?;
 
-    let is_v3 = cfg.proto >= 3;
-    if is_v3 {
-        anyhow::ensure!(cfg.psk.is_some(), "Biba v3 UDP mux requires PSK");
-        let secret = cfg.psk.as_ref().expect("psk");
-        let dom = effective_udp_proto_domain(cfg);
-        let (c_rand, hello) = crypto_layer::build_hello_v3();
-        ws.send(Message::Binary(Bytes::from(hello)))
-            .await
-            .context("send v3 HELLO (udp mux)")?;
-        loop {
-            let m = ws.next().await.context("eof before ACK (udp mux)")??;
-            match m {
-                Message::Binary(b) => {
-                    let s_rand =
-                        crypto_layer::parse_ack(secret, Some(dom.as_str()), b.as_ref(), &c_rand)?;
-                    let crypto = Arc::new(SessionCrypto::new(
-                        secret,
-                        Some(dom.as_str()),
-                        &c_rand,
-                        &s_rand,
-                        cfg.decoy_max,
-                    ));
-                    let auth_inner =
-                        encode_v3_auth(&cfg.token).context("encode v3 AUTH (udp mux)")?;
-                    let mut wire = Vec::new();
-                    write_padded_frame_with_mode(&mut wire, &auth_inner, cfg.max_pad, cfg.pad_mode)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let blob = crypto
-                        .seal_client_to_server(&wire)
-                        .await
-                        .context("seal v3 AUTH (udp mux)")?;
-                    ws.send(Message::Binary(Bytes::from(blob)))
-                        .await
-                        .context("send v3 AUTH (udp mux)")?;
-                    let open = encode_v3_udp_mux_open();
-                    let mut w2 = Vec::new();
-                    write_padded_frame_with_mode(&mut w2, &open, cfg.max_pad, cfg.pad_mode)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let ob = crypto
-                        .seal_client_to_server(&w2)
-                        .await
-                        .context("seal UDP_MUX v3")?;
-                    if ob.len() > cfg.max_ws_binary {
-                        anyhow::bail!("sealed UDP_MUX_OPEN exceeds cap");
-                    }
-                    ws.send(Message::Binary(Bytes::from(ob)))
-                        .await
-                        .context("send UDP_MUX_OPEN v3")?;
-                    return Ok((ws, Some(crypto)));
+    let secret = cfg.psk.as_ref().expect("psk checked");
+    let dom = effective_udp_proto_domain(cfg);
+    info!(
+        target: "bibavpn_client",
+        sni = %cfg.sni,
+        proto_domain = %cfg.proto_domain,
+        effective_proto_domain = %dom,
+        psk_hash8 = %short_hash8(secret),
+        "udp mux using transport identity"
+    );
+    let (c_rand, hello) = crypto_layer::build_hello_v3();
+    ws.send(Message::Binary(Bytes::from(hello)))
+        .await
+        .context("send v3 HELLO (udp mux)")?;
+    loop {
+        let m = ws.next().await.context("eof before ACK (udp mux)")??;
+        match m {
+            Message::Binary(b) => {
+                let s_rand =
+                    crypto_layer::parse_ack(secret, dom.as_str(), b.as_ref(), &c_rand)?;
+                let crypto = Arc::new(SessionCrypto::new(
+                    secret,
+                    dom.as_str(),
+                    &c_rand,
+                    &s_rand,
+                    cfg.decoy_max,
+                ));
+                let mut udp_adaptive = AdaptivePadState::default();
+                let auth_inner = encode_v3_auth(&cfg.token).context("encode v3 AUTH (udp mux)")?;
+                let mut wire = Vec::new();
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &auth_inner,
+                    cfg.max_pad,
+                    cfg.pad_mode,
+                    Some(&mut udp_adaptive),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let blob = crypto
+                    .seal_client_to_server(&wire)
+                    .context("seal v3 AUTH (udp mux)")?;
+                ws.send(Message::Binary(Bytes::from(blob)))
+                    .await
+                    .context("send v3 AUTH (udp mux)")?;
+                let open = encode_v3_udp_mux_open();
+                let mut w2 = Vec::new();
+                write_padded_frame_with_mode_state(
+                    &mut w2,
+                    &open,
+                    cfg.max_pad,
+                    cfg.pad_mode,
+                    Some(&mut udp_adaptive),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let ob = crypto
+                    .seal_client_to_server(&w2)
+                    .context("seal UDP_MUX v3")?;
+                if ob.len() > cfg.max_ws_binary {
+                    anyhow::bail!("sealed UDP_MUX_OPEN exceeds cap");
                 }
-                Message::Pong(_) => continue,
-                Message::Ping(p) => {
-                    ws.send(Message::Pong(p)).await.context("pong")?;
-                }
-                Message::Close(_) => anyhow::bail!("ws closed before ACK (udp mux)"),
-                _ => {}
+                ws.send(Message::Binary(Bytes::from(ob)))
+                    .await
+                    .context("send UDP_MUX_OPEN v3")?;
+                return Ok((ws, crypto));
             }
+            Message::Pong(_) => continue,
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await.context("pong")?;
+            }
+            Message::Close(_) => anyhow::bail!("ws closed before ACK (udp mux)"),
+            _ => {}
         }
     }
-
-    let auth = encode_auth(&cfg.token).context("encode AUTH (udp mux)")?;
-    if auth.len() > cfg.max_ws_binary {
-        anyhow::bail!("AUTH frame larger than --max-ws-binary");
-    }
-    ws.send(Message::Binary(Bytes::from(auth)))
-        .await
-        .context("send AUTH (udp mux)")?;
-
-    let crypto: Option<SharedCrypto> = if let Some(ref secret) = cfg.psk {
-        Some(Arc::new(
-            v2_client_preamble(&mut ws, secret, cfg.decoy_max).await?,
-        ))
-    } else {
-        None
-    };
-
-    let open = encode_udp_mux_open();
-    if open.len() > cfg.max_ws_binary {
-        anyhow::bail!("UDP mux OPEN larger than --max-ws-binary");
-    }
-    ws.send(Message::Binary(Bytes::from(open)))
-        .await
-        .context("send UDP_MUX_OPEN")?;
-
-    Ok((ws, crypto))
 }
 
-async fn pack_tunnel_out(
-    crypto: &Option<SharedCrypto>,
+fn pack_tunnel_out(
+    crypto: &SharedCrypto,
     max_pad: u8,
     pad_mode: PadMode,
     max_ws_binary: usize,
     body: &[u8],
+    adaptive: &mut AdaptivePadState,
 ) -> anyhow::Result<Vec<u8>> {
     let mut wire = Vec::new();
-    write_padded_frame_with_mode(&mut wire, body, max_pad, pad_mode).context("pack frame")?;
-    let blob: Vec<u8> = match crypto {
-        Some(c) => c
-            .seal_client_to_server(&wire)
-            .await
-            .context("v2 seal c2s (udp mux)")?,
-        None => wire,
-    };
+    write_padded_frame_with_mode_state(
+        &mut wire,
+        body,
+        max_pad,
+        pad_mode,
+        Some(adaptive),
+    )
+    .context("pack frame")?;
+    let blob: Vec<u8> = crypto
+        .seal_client_to_server(&wire)
+        .context("seal c2s (udp mux)")?;
     if blob.len() > max_ws_binary {
         anyhow::bail!(
             "WS binary {} exceeds max_ws_binary {}",
@@ -368,24 +351,21 @@ async fn pack_tunnel_out(
     Ok(blob)
 }
 
-async fn unpack_tunnel_in(crypto: &Option<SharedCrypto>, b: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let raw = match crypto {
-        None => b.to_vec(),
-        Some(c) => c
-            .open_server_to_client(b)
-            .await
-            .context("v2 open s2c (udp mux)")?,
-    };
-    read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))
+fn unpack_tunnel_in(crypto: &SharedCrypto, b: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let raw = crypto
+        .open_server_to_client(b)
+        .context("open s2c (udp mux)")?;
+    read_padded_frame_into(raw).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// One WSS session. Returns `Ok(true)` if the command channel closed (shutdown). `Ok(false)` = reconnect.
 async fn run_udp_mux_one_session(
     ws: WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
-    crypto: Option<SharedCrypto>,
+    crypto: SharedCrypto,
     cfg: &UdpMuxConfig,
     cmd_rx: &mut mpsc::UnboundedReceiver<ClientUdpCmd>,
 ) -> anyhow::Result<bool> {
+    let mut udp_adaptive = AdaptivePadState::default();
     let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>> =
         HashMap::new();
     let (ws_tx, mut ws_rx) = ws.split();
@@ -441,9 +421,8 @@ async fn run_udp_mux_one_session(
                             cfg.pad_mode,
                             cfg.max_ws_binary,
                             &req,
-                        )
-                        .await
-                        {
+                            &mut udp_adaptive,
+                        ) {
                             Ok(b) => b,
                             Err(e) => {
                                 if let Some(tx) = pending.remove(&xid) {
@@ -452,7 +431,7 @@ async fn run_udp_mux_one_session(
                                 continue;
                             }
                         };
-                        maybe_ws_binary_send_jitter(cfg.ws_binary_send_jitter_ms).await;
+                        maybe_ws_send_jitter(cfg.send_jitter()).await;
                         let mut g = ws_tx.lock().await;
                         if let Err(e) = g.send(Message::Binary(Bytes::from(blob))).await {
                             if let Some(tx) = pending.remove(&xid) {
@@ -467,7 +446,7 @@ async fn run_udp_mux_one_session(
                 let Some(msg) = msg else { break };
                 match msg.context("ws read")? {
                     Message::Binary(b) => {
-                        let inner = match unpack_tunnel_in(&crypto, b.as_ref()).await {
+                        let inner = match unpack_tunnel_in(&crypto, b.as_ref()) {
                             Ok(x) => x,
                             Err(e) => {
                                 warn!("udp mux: drop bad frame: {e:#}");
@@ -515,17 +494,26 @@ pub async fn bridge_ws_udp_mux_server<S>(
     ws: WebSocketStream<S>,
     max_pad: u8,
     _decoy_max: u8,
-    crypto: Option<SharedCrypto>,
+    crypto: SharedCrypto,
     max_ws_binary: usize,
     ws_ping_secs: u64,
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
     recv_timeout: Duration,
     pad_mode: PadMode,
+    server_out_timing: ServerWsOutTiming,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let udp_adaptive = Arc::new(std::sync::Mutex::new(AdaptivePadState::default()));
+    let ws_send_j = WsSendJitter {
+        min_ms: ws_jitter_min_ms,
+        max_ms: ws_jitter_max_ms,
+        legacy_0_to_max: ws_binary_send_jitter_ms,
+    };
     let sem = Arc::new(Semaphore::new(UDP_MUX_SERVER_MAX_INFLIGHT));
     let (ws_sink, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_sink));
@@ -556,21 +544,17 @@ where
                 if b.len() > max_ws_binary.saturating_mul(4) {
                     anyhow::bail!("oversized WS binary");
                 }
-                let raw = match &crypto {
-                    Some(c) => c
-                        .open_client_to_server(b.as_ref())
-                        .await
-                        .context("v2 open c2s (udp mux)")?,
-                    None => b.to_vec(),
-                };
-                let plain = match read_padded_frame(&raw) {
+                let raw = crypto
+                    .open_client_to_server(b.as_ref())
+                    .context("open c2s (udp mux)")?;
+                let plain = match read_padded_frame_borrow(&raw) {
                     Ok(p) => p,
                     Err(e) => {
                         warn!("udp mux server: skip bad padded frame: {e}");
                         continue;
                     }
                 };
-                let (xid, host, port, payload) = match decode_udp_req(&plain) {
+                let (xid, host, port, payload) = match decode_udp_req(plain) {
                     Ok(x) => x,
                     Err(e) => {
                         warn!("udp mux server: bad UDP_REQ: {e:#}");
@@ -585,6 +569,9 @@ where
                     .map_err(|_| anyhow::anyhow!("udp mux sem closed"))?;
                 let ws_tx = ws_tx.clone();
                 let crypto = crypto.clone();
+                let udp_ad = udp_adaptive.clone();
+                let wsj = ws_send_j;
+                let server_out = server_out_timing;
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(e) = (async {
@@ -609,19 +596,27 @@ where
                         let rep_plain =
                             encode_udp_rep(xid, &src.ip().to_string(), src.port(), &rbuf[..n])?;
                         let mut wire = Vec::new();
-                        write_padded_frame_with_mode(&mut wire, &rep_plain, max_pad, pad_mode)
+                        {
+                            let mut g = udp_ad
+                                .lock()
+                                .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
+                            write_padded_frame_with_mode_state(
+                                &mut wire,
+                                &rep_plain,
+                                max_pad,
+                                pad_mode,
+                                Some(&mut *g),
+                            )
                             .context("pad rep")?;
-                        let blob: Vec<u8> = match &crypto {
-                            Some(c) => c
-                                .seal_server_to_client(&wire)
-                                .await
-                                .context("v2 seal s2c (udp mux)")?,
-                            None => wire,
-                        };
+                        }
+                        let blob: Vec<u8> = crypto
+                            .seal_server_to_client(&wire)
+                            .context("seal s2c (udp mux)")?;
                         if blob.len() > max_ws_binary {
                             anyhow::bail!("udp rep ws frame too large");
                         }
-                        maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
+                        maybe_server_ack_and_rtt_mask(server_out).await;
+                        maybe_ws_send_jitter(wsj).await;
                         let mut g = ws_tx.lock().await;
                         g.send(Message::Binary(Bytes::from(blob)))
                             .await

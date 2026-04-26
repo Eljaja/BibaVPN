@@ -17,10 +17,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::crypto_layer::SessionCrypto;
-use crate::frame::PadMode;
+use crate::frame::{AdaptivePadState, PadMode};
 use crate::protocol::{decode_open_err, is_open_ok};
-use crate::retry::{maybe_ws_binary_send_jitter, ws_ping_period_duration};
-use crate::{read_padded_frame, write_padded_frame_with_mode};
+use crate::retry::{
+    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration, ServerWsOutTiming,
+    WsSendJitter,
+};
+use crate::{
+    read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode_state,
+};
 
 pub type SharedCrypto = Arc<SessionCrypto>;
 
@@ -80,6 +85,8 @@ impl AsyncRead for BridgedTcpRead {
 /// `tcp_uplink_prefix`: data already consumed from the client socket (forward before reading more).
 ///
 /// `dummy_interval_secs`: send empty padded frames on idle (0 = off); interval jittered ±50% around this base.
+///
+/// `server_out_timing`: server-only; extra delay before each WS binary toward the client (ignored for `TunnelEnd::Client`).
 pub async fn bridge_ws_tcp_padded<S>(
     ws: WebSocketStream<S>,
     prefetched_ws_messages: Vec<Message>,
@@ -92,13 +99,21 @@ pub async fn bridge_ws_tcp_padded<S>(
     ws_ping_secs: u64,
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
     end: TunnelEnd,
     pad_mode: PadMode,
     dummy_interval_secs: u64,
+    server_out_timing: ServerWsOutTiming,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let send_jitter = WsSendJitter {
+        min_ms: ws_jitter_min_ms,
+        max_ms: ws_jitter_max_ms,
+        legacy_0_to_max: ws_binary_send_jitter_ms,
+    };
     let v2 = crypto.is_some();
     let max_chunk =
         crate::frame::max_tcp_payload_per_ws_message(v2, decoy_max, max_pad, max_ws_binary)
@@ -187,20 +202,32 @@ where
                             max_ws_binary.saturating_mul(4)
                         );
                     }
-                    let raw = match (&crypto_up, end) {
-                        (Some(c), TunnelEnd::Client) => c
-                            .open_server_to_client(b.as_ref())
-                            .await
-                            .context("v2 open s2c")?,
-                        (Some(c), TunnelEnd::Server) => c
-                            .open_client_to_server(b.as_ref())
-                            .await
-                            .context("v2 open c2s")?,
-                        (None, _) => b.to_vec(),
-                    };
-                    let payload = read_padded_frame(&raw).context("padded frame")?;
-                    if !payload.is_empty() {
-                        tcp_write.write_all(&payload).await?;
+                    match (&crypto_up, end) {
+                        (Some(c), TunnelEnd::Client) => {
+                            let raw = c
+                                .open_server_to_client(b.as_ref())
+                                .context("v2 open s2c")?;
+                            let payload = read_padded_frame_into(raw).context("padded frame")?;
+                            if !payload.is_empty() {
+                                tcp_write.write_all(&payload).await?;
+                            }
+                        }
+                        (Some(c), TunnelEnd::Server) => {
+                            let raw = c
+                                .open_client_to_server(b.as_ref())
+                                .context("v2 open c2s")?;
+                            let payload = read_padded_frame_into(raw).context("padded frame")?;
+                            if !payload.is_empty() {
+                                tcp_write.write_all(&payload).await?;
+                            }
+                        }
+                        (None, _) => {
+                            let payload =
+                                read_padded_frame_borrow(b.as_ref()).context("padded frame")?;
+                            if !payload.is_empty() {
+                                tcp_write.write_all(payload).await?;
+                            }
+                        }
                     }
                 }
                 Message::Ping(p) => {
@@ -216,10 +243,13 @@ where
 
     let crypto_dn = crypto.clone();
     let crypto_dum = crypto.clone();
+    let st_out = server_out_timing;
+    let st_dummy = server_out_timing;
     let down = async move {
         let read_cap = max_chunk.saturating_mul(8).min(512 * 1024).max(max_chunk);
         let mut buf = vec![0u8; read_cap];
         let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
+        let mut adaptive = AdaptivePadState::default();
         loop {
             let n = tcp_read.read(&mut buf).await?;
             if n == 0 {
@@ -228,17 +258,21 @@ where
             let mut off = 0usize;
             while off < n {
                 let take = (n - off).min(max_chunk);
-                write_padded_frame_with_mode(&mut wire, &buf[off..off + take], max_pad, pad_mode)
-                    .context("pack frame")?;
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &buf[off..off + take],
+                    max_pad,
+                    pad_mode,
+                    Some(&mut adaptive),
+                )
+                .context("pack frame")?;
                 let blob = match (&crypto_dn, end) {
                     (Some(c), TunnelEnd::Client) => bytes::Bytes::from(
                         c.seal_client_to_server(&wire)
-                            .await
                             .context("v2 seal c2s")?,
                     ),
                     (Some(c), TunnelEnd::Server) => bytes::Bytes::from(
                         c.seal_server_to_client(&wire)
-                            .await
                             .context("v2 seal s2c")?,
                     ),
                     (None, _) => bytes::Bytes::from(std::mem::take(&mut wire)),
@@ -250,7 +284,18 @@ where
                         max_ws_binary
                     );
                 }
-                maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
+                // Do not apply RTT / WS send jitter to every large TCP chunk, or bulk up/download stalls.
+                let bulk_chunk = take > 512;
+                let bulk_s2c = matches!(end, TunnelEnd::Server) && bulk_chunk;
+                let bulk_c2s = matches!(end, TunnelEnd::Client) && bulk_chunk;
+                if !bulk_s2c {
+                    if matches!(end, TunnelEnd::Server) {
+                        maybe_server_ack_and_rtt_mask(st_out).await;
+                    }
+                    if !bulk_c2s {
+                        maybe_ws_send_jitter(send_jitter).await;
+                    }
+                }
                 ws_out_dn
                     .send(Message::Binary(blob))
                     .await
@@ -266,6 +311,7 @@ where
             return Ok::<_, anyhow::Error>(());
         }
         let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
+        let mut adaptive_d = AdaptivePadState::default();
         loop {
             let lo = dummy_interval_secs
                 .saturating_mul(1)
@@ -278,15 +324,23 @@ where
             let secs = rand::thread_rng().gen_range(lo..=hi);
             sleep(Duration::from_secs(secs)).await;
             wire.clear();
-            if write_padded_frame_with_mode(&mut wire, &[], max_pad, pad_mode).is_err() {
+            if write_padded_frame_with_mode_state(
+                &mut wire,
+                &[],
+                max_pad,
+                pad_mode,
+                Some(&mut adaptive_d),
+            )
+            .is_err()
+            {
                 continue;
             }
             let blob = match (&crypto_dum, end) {
-                (Some(c), TunnelEnd::Client) => match c.seal_client_to_server(&wire).await {
+                (Some(c), TunnelEnd::Client) => match c.seal_client_to_server(&wire) {
                     Ok(b) => bytes::Bytes::from(b),
                     Err(_) => continue,
                 },
-                (Some(c), TunnelEnd::Server) => match c.seal_server_to_client(&wire).await {
+                (Some(c), TunnelEnd::Server) => match c.seal_server_to_client(&wire) {
                     Ok(b) => bytes::Bytes::from(b),
                     Err(_) => continue,
                 },
@@ -295,7 +349,10 @@ where
             if blob.len() > max_ws_binary {
                 continue;
             }
-            maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
+            if matches!(end, TunnelEnd::Server) {
+                maybe_server_ack_and_rtt_mask(st_dummy).await;
+            }
+            maybe_ws_send_jitter(send_jitter).await;
             let _ = ws_out_dummy.send(Message::Binary(blob)).await;
         }
     };

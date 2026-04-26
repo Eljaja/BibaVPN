@@ -162,28 +162,27 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeDecodeInvite(
     };
 
     let payload = match bibavpn::decode_invite_v1(&uri_s, &pass_s) {
-        Ok(inv) => json!({
-            "ok": true,
-            "server": inv.server,
-            "sni": inv.sni,
-            "token": inv.token,
-            "psk": inv.psk,
-            "decoy_max": inv.decoy_max,
-            "max_pad": inv.max_pad,
-            "max_ws_binary": inv.max_ws_binary,
-            "ws_ping_secs": inv.ws_ping_secs,
-            "ws_ping_jitter_percent": inv.ws_ping_jitter_percent,
-            "ws_binary_send_jitter_ms": inv.ws_binary_send_jitter_ms,
-            "udp_max_pad": inv.udp_max_pad,
-            "udp_max_ws_binary": inv.udp_max_ws_binary,
-            "udp_mux_reply_timeout_secs": inv.udp_mux_reply_timeout_secs,
-            "insecure": inv.insecure,
-            "tls_profile": inv.tls_profile,
-            "ws_path": inv.ws_path,
-            "pad_mode": inv.pad_mode,
-            "dummy_interval_secs": inv.dummy_interval_secs,
-        })
-        .to_string(),
+        Ok(inv) => {
+            let mut out = serde_json::Map::new();
+            out.insert("ok".to_string(), json!(true));
+            match serde_json::to_value(&inv) {
+                Ok(serde_json::Value::Object(m)) => {
+                    for (k, v) in m {
+                        out.insert(k, v);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return env
+                        .new_string(
+                            json!({ "ok": false, "error": format!("invite json: {e}") }).to_string(),
+                        )
+                        .expect("jstring")
+                        .into_raw();
+                }
+            }
+            serde_json::Value::Object(out).to_string()
+        }
         Err(e) => json!({
             "ok": false,
             "error": format!("{e:#}"),

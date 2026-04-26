@@ -77,6 +77,22 @@
     <string name="section_transport">Transporte</string>
     <string name="section_transport_sub">Ofuscación y WebSocket</string>
     <string name="hint_tls_profile">Perfil ClientHello (default, chrome70, firefox65, …); se puede sobrescribir con clave invite</string>
+    <string name="hint_fingerprint">Como --fingerprint; si se indica, tiene prioridad sobre tls_profile</string>
+    <string name="hint_tls_stack">rustls (por defecto en APK) o boring — solo si el cliente se compiló con BoringSSL</string>
+    <string name="hint_proto">Versión de protocolo wire (ahora 3)</string>
+    <string name="hint_proto_domain">Etiqueta KDF v3; vacío = SNI</string>
+    <string name="hint_ws_jitter_min">Retardo mín. ms de envío WS binary</string>
+    <string name="hint_ws_jitter_max">Retardo máx. ms de envío WS binary</string>
+    <string name="hint_ws_parallel">Sesiones WSS paralelas 1–4 (--ws-parallel)</string>
+    <string name="hint_idle_decoy_secs">Umbral de silencio del mux para decoy en segundo plano; 0 = off</string>
+    <string name="hint_stealth_profile">default | balanced | aggressive</string>
+    <string name="hint_decoy_mode">simple | browser</string>
+    <string name="hint_desync_mode">off | split2 | … (parcialmente orientativo)</string>
+    <string name="hint_tcp_fooling">Modo tcp_fooling del CLI</string>
+    <string name="hint_tls_fragment">Fragmentación de registros TLS (experimental)</string>
+    <string name="hint_reality_target">REALITY: SNI frontal (p. ej. vk.com)</string>
+    <string name="hint_reality_public_key">REALITY: clave pública X25519, base64 estándar, 32 bytes</string>
+    <string name="hint_reality_short_id">REALITY: short_id, 16 hex (opcional)</string>
     <string name="hint_ws_path">Ruta WebSocket en el servidor (vacío = /ws de la clave)</string>
     <string name="toggle_tcp_mux_title">Multiplex TCP (WSS)</string>
     <string name="toggle_tcp_mux_sub">Desactivar para modo tipo --no-mux</string>

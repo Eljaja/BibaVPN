@@ -32,6 +32,25 @@ pub(crate) async fn sleep_ws_ping_period(base_secs: u64, jitter_percent: u8) {
     sleep(ws_ping_period_duration(base_secs, jitter_percent)).await;
 }
 
+/// Outbound WebSocket send timing: optional **range** (min..=max) or legacy **uniform 0..=N** ms.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WsSendJitter {
+    /// When both `min_ms` and `max_ms` are non-zero and `min_ms <= max_ms`, sleep in that range.
+    pub min_ms: u8,
+    pub max_ms: u8,
+    /// If range is not used, sleep `0..=legacy_0_to_max` ms (BibaV2.1).
+    pub legacy_0_to_max: u8,
+}
+
+pub(crate) async fn maybe_ws_send_jitter(j: WsSendJitter) {
+    if j.min_ms > 0 && j.max_ms >= j.min_ms {
+        let ms = rand::thread_rng().gen_range(j.min_ms as u64..=j.max_ms as u64);
+        sleep(Duration::from_millis(ms)).await;
+        return;
+    }
+    maybe_ws_binary_send_jitter(j.legacy_0_to_max).await;
+}
+
 /// Optional delay before sending the next WS binary frame (uniform 0..=max_ms).
 pub(crate) async fn maybe_ws_binary_send_jitter(max_ms: u8) {
     if max_ms == 0 {
@@ -39,4 +58,26 @@ pub(crate) async fn maybe_ws_binary_send_jitter(max_ms: u8) {
     }
     let ms = rand::thread_rng().gen_range(0..=max_ms) as u64;
     sleep(Duration::from_millis(ms)).await;
+}
+
+/// Server → client: optional delay before each outbound binary (application-level “delayed ACK buffer” analog).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServerWsOutTiming {
+    /// Inclusive random delay in `[min_ms, max_ms]` before each binary (0,0 = off; supports 40–500+ ms).
+    pub ack_delay_min_ms: u16,
+    pub ack_delay_max_ms: u16,
+    /// Extra uniform jitter 0..=`rtt_mask_jitter_ms` (stacked after ack delay, before WS send jitter).
+    pub rtt_mask_jitter_ms: u16,
+}
+
+pub(crate) async fn maybe_server_ack_and_rtt_mask(t: ServerWsOutTiming) {
+    if t.ack_delay_min_ms > 0 && t.ack_delay_max_ms >= t.ack_delay_min_ms {
+        let ms = rand::thread_rng()
+            .gen_range(t.ack_delay_min_ms as u64..=t.ack_delay_max_ms as u64);
+        sleep(Duration::from_millis(ms)).await;
+    }
+    if t.rtt_mask_jitter_ms > 0 {
+        let ms = rand::thread_rng().gen_range(0..=t.rtt_mask_jitter_ms as u64);
+        sleep(Duration::from_millis(ms)).await;
+    }
 }

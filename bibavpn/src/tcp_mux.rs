@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::Context;
@@ -21,11 +22,14 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{error, info, warn};
 
 use crate::crypto_layer::SessionCrypto;
-use crate::frame::PadMode;
+use crate::frame::{AdaptivePadState, PadMode};
 use crate::protocol::encode_atyp_host_port;
-use crate::retry::{maybe_ws_binary_send_jitter, ws_ping_period_duration};
+use crate::retry::{
+    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration, ServerWsOutTiming,
+    WsSendJitter,
+};
 use crate::ws_bridge::TunnelEnd;
-use crate::{read_padded_frame, write_padded_frame_with_mode};
+use crate::{read_padded_frame_into, write_padded_frame_with_mode, write_padded_frame_with_mode_state};
 
 pub type SharedCrypto = Arc<SessionCrypto>;
 
@@ -110,12 +114,22 @@ pub async fn bridge_ws_tcp_mux_server<S>(
     ws_ping_secs: u64,
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
     pad_mode: PadMode,
     dummy_interval_secs: u64,
+    server_out_timing: ServerWsOutTiming,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let server_adaptive = Arc::new(StdMutex::new(AdaptivePadState::default()));
+    let s_timing = server_out_timing;
+    let ws_send_jitter = WsSendJitter {
+        min_ms: ws_jitter_min_ms,
+        max_ms: ws_jitter_max_ms,
+        legacy_0_to_max: ws_binary_send_jitter_ms,
+    };
     let v2 = crypto.is_some();
     // Inner padded payload is a mux record: 9-byte header + TCP slice (see `encode_mux_record`).
     let max_chunk =
@@ -132,14 +146,17 @@ where
     drop(ws_out_tx);
 
     if dummy_interval_secs > 0 {
+        let dj = ws_send_jitter;
+        let st = s_timing;
         tokio::spawn(mux_server_dummy_task(
             ws_dummy_srv,
             crypto_dummy_srv,
             max_pad,
             pad_mode,
             max_ws_binary,
-            ws_binary_send_jitter_ms,
+            dj,
             dummy_interval_secs,
+            st,
         ));
     }
 
@@ -185,6 +202,9 @@ where
     let streams: Arc<Mutex<HashMap<u32, ServerStreamState>>> = Arc::new(Mutex::new(HashMap::new()));
     let sem = Arc::new(Semaphore::new(MUX_SERVER_INFLIGHT));
     let crypto_in = crypto.clone();
+    let adaptive_in = server_adaptive.clone();
+    let jitter_in = ws_send_jitter;
+    let srv_t_in = s_timing;
 
     let up = async move {
         while let Some(m) = ws_rx.next().await {
@@ -197,11 +217,10 @@ where
                     let raw = match (&crypto_in, TunnelEnd::Server) {
                         (Some(c), _) => c
                             .open_client_to_server(b.as_ref())
-                            .await
                             .context("v2 open c2s mux")?,
                         (None, _) => b.to_vec(),
                     };
-                    let inner = read_padded_frame(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let inner = read_padded_frame_into(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
                     if inner.is_empty() {
                         continue;
                     }
@@ -235,7 +254,9 @@ where
                                         pad_mode,
                                         &crypto,
                                         max_ws_binary,
-                                        ws_binary_send_jitter_ms,
+                                        &adaptive_in,
+                                        jitter_in,
+                                        srv_t_in,
                                     )
                                     .await;
                                     continue;
@@ -251,6 +272,9 @@ where
                             let ws_tx = ws_out_srv.clone();
                             let streams_open = streams.clone();
                             let crypto_clone = crypto.clone();
+                            let adaptive_spawn = adaptive_in.clone();
+                            let j_spawn = jitter_in;
+                            let st_spawn = srv_t_in;
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 let remote = match tokio::time::timeout(
@@ -272,7 +296,9 @@ where
                                             pad_mode,
                                             &crypto_clone,
                                             max_ws_binary,
-                                            ws_binary_send_jitter_ms,
+                                            &adaptive_spawn,
+                                            j_spawn,
+                                            st_spawn,
                                         )
                                         .await;
                                         return;
@@ -289,7 +315,9 @@ where
                                             pad_mode,
                                             &crypto_clone,
                                             max_ws_binary,
-                                            ws_binary_send_jitter_ms,
+                                            &adaptive_spawn,
+                                            j_spawn,
+                                            st_spawn,
                                         )
                                         .await;
                                         return;
@@ -333,7 +361,9 @@ where
                                     pad_mode,
                                     crypto_clone,
                                     max_ws_binary,
-                                    ws_binary_send_jitter_ms,
+                                    adaptive_spawn,
+                                    j_spawn,
+                                    st_spawn,
                                     max_chunk,
                                 )
                                 .await
@@ -390,7 +420,9 @@ where
                                     pad_mode,
                                     &crypto,
                                     max_ws_binary,
-                                    ws_binary_send_jitter_ms,
+                                    &adaptive_in,
+                                    jitter_in,
+                                    srv_t_in,
                                 )
                                 .await;
                             };
@@ -426,16 +458,27 @@ async fn mux_server_send_record(
     pad_mode: PadMode,
     crypto: &Option<SharedCrypto>,
     max_ws_binary: usize,
-    ws_binary_send_jitter_ms: u8,
+    adaptive: &Arc<StdMutex<AdaptivePadState>>,
+    ws_send_jitter: WsSendJitter,
+    server_out: ServerWsOutTiming,
 ) -> anyhow::Result<()> {
     let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
     let mut rec_buf = Vec::with_capacity(payload.len() + 9);
     write_mux_record_to(&mut rec_buf, sid, flags, payload);
-    write_padded_frame_with_mode(&mut wire, &rec_buf, max_pad, pad_mode).context("mux pad")?;
+    {
+        let mut g = adaptive.lock().map_err(|e| anyhow::anyhow!("adaptive: {e}"))?;
+        write_padded_frame_with_mode_state(
+            &mut wire,
+            &rec_buf,
+            max_pad,
+            pad_mode,
+            Some(&mut *g),
+        )
+        .context("mux pad")?;
+    }
     let blob: Bytes = match crypto {
         Some(c) => Bytes::from(
             c.seal_server_to_client(&wire)
-                .await
                 .context("v2 seal s2c mux")?,
         ),
         None => Bytes::from(std::mem::take(&mut wire)),
@@ -443,7 +486,14 @@ async fn mux_server_send_record(
     if blob.len() > max_ws_binary {
         anyhow::bail!("mux ws binary too large");
     }
-    maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
+    // RTT mask + WS jitter are for traffic shaping on *small* / control frames.
+    // Applying them to every DATA chunk would add 40–500+ ms × thousands of frames and
+    // effectively stall bulk transfer (and benchmarks).
+    let bulk_data = flags == MUX_FLAG_DATA && !payload.is_empty();
+    if !bulk_data {
+        maybe_server_ack_and_rtt_mask(server_out).await;
+        maybe_ws_send_jitter(ws_send_jitter).await;
+    }
     ws_out
         .send(Message::Binary(blob))
         .await
@@ -460,7 +510,9 @@ async fn mux_server_stream_read_loop(
     pad_mode: PadMode,
     crypto: Option<SharedCrypto>,
     max_ws_binary: usize,
-    ws_binary_send_jitter_ms: u8,
+    adaptive: Arc<StdMutex<AdaptivePadState>>,
+    ws_send_jitter: WsSendJitter,
+    server_out: ServerWsOutTiming,
     max_chunk: usize,
 ) -> anyhow::Result<()> {
     let read_cap = max_chunk.saturating_mul(8).min(512 * 1024).max(max_chunk);
@@ -482,7 +534,9 @@ async fn mux_server_stream_read_loop(
                 pad_mode,
                 &crypto,
                 max_ws_binary,
-                ws_binary_send_jitter_ms,
+                &adaptive,
+                ws_send_jitter,
+                server_out,
             )
             .await?;
             off += take;
@@ -497,7 +551,9 @@ async fn mux_server_stream_read_loop(
         pad_mode,
         &crypto,
         max_ws_binary,
-        ws_binary_send_jitter_ms,
+        &adaptive,
+        ws_send_jitter,
+        server_out,
     )
     .await;
     streams.lock().await.remove(&sid);
@@ -514,11 +570,26 @@ pub struct MuxClientConfig {
     pub ws_ping_secs: u64,
     pub ws_ping_jitter_percent: u8,
     pub ws_binary_send_jitter_ms: u8,
+    /// Outbound delay range in ms; when both 0, only `ws_binary_send_jitter_ms` is used.
+    pub ws_jitter_min_ms: u8,
+    pub ws_jitter_max_ms: u8,
     /// BibaV2 AEAD outer framing (set from `spawn_tcp_mux_client`).
     pub transport_v2: bool,
     pub pad_mode: PadMode,
     /// Idle empty padded frames on the shared mux WSS (0 = off).
     pub dummy_interval_secs: u64,
+    /// When set, update on each mux read/write of payload (for idle decoy, etc.).
+    pub activity: Option<Arc<crate::activity::ActivityTracker>>,
+}
+
+impl MuxClientConfig {
+    fn send_jitter(&self) -> WsSendJitter {
+        WsSendJitter {
+            min_ms: self.ws_jitter_min_ms,
+            max_ms: self.ws_jitter_max_ms,
+            legacy_0_to_max: self.ws_binary_send_jitter_ms,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -595,17 +666,52 @@ impl TcpMuxClientHandle {
 
 static TCP_MUX_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 
-/// When the outer WSS reader or writer task ends, drop the app-wide mux handle so the next SOCKS session opens a new WSS.
-pub(crate) async fn clear_tcp_mux_slot_if_current(
-    slot: &Arc<tokio::sync::Mutex<Option<(u64, TcpMuxClientHandle)>>>,
-    session_id: u64,
-) {
-    let mut g = slot.lock().await;
-    if let Some((id, _)) = *g {
-        if id == session_id {
-            *g = None;
-            info!("tcp mux session {session_id} closed; slot cleared for reconnect");
+/// One or more parallel client→server WSS links, each a full `MUX_OPEN` session (round-robin `open_stream`).
+pub struct TcpMuxSessionPool {
+    pub sessions: Arc<Mutex<Vec<(u64, TcpMuxClientHandle)>>>,
+    next: AtomicUsize,
+}
+
+impl TcpMuxSessionPool {
+    pub fn new_empty() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            next: AtomicUsize::new(0),
         }
+    }
+
+    /// `None` if every outer WSS session has been torn down but the slot was not yet cleared.
+    pub async fn pick(&self) -> Option<TcpMuxClientHandle> {
+        let g = self.sessions.lock().await;
+        let n = g.len();
+        if n == 0 {
+            return None;
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        Some(g[i].1.clone())
+    }
+}
+
+pub type TcpMuxClientSlot = Arc<tokio::sync::Mutex<Option<TcpMuxSessionPool>>>;
+
+/// Remove one dead outer WSS; clear slot if that was the last session.
+pub async fn remove_mux_session(slot: &TcpMuxClientSlot, session_id: u64) {
+    let mut g = slot.lock().await;
+    let Some(pool) = g.as_mut() else {
+        return;
+    };
+    let mut v = pool.sessions.lock().await;
+    let before = v.len();
+    v.retain(|(id, _)| *id != session_id);
+    if v.is_empty() {
+        drop(v);
+        *g = None;
+        info!("tcp mux: all {before} session(s) ended; slot cleared for reconnect");
+    } else {
+        info!(
+            "tcp mux session {session_id} closed; {} session(s) remain",
+            v.len()
+        );
     }
 }
 
@@ -614,7 +720,7 @@ pub fn spawn_tcp_mux_client<S>(
     ws: WebSocketStream<S>,
     crypto: Option<SharedCrypto>,
     mut cfg: MuxClientConfig,
-    tcp_mux_slot: Arc<tokio::sync::Mutex<Option<(u64, TcpMuxClientHandle)>>>,
+    tcp_mux_slot: TcpMuxClientSlot,
 ) -> (u64, TcpMuxClientHandle)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -651,6 +757,8 @@ where
         };
         let mut wire = Vec::with_capacity(cfg_w.max_ws_binary.min(256 * 1024));
         let mut rec_buf = Vec::with_capacity(cfg_w.max_ws_binary.min(256 * 1024));
+        let mut client_adaptive = AdaptivePadState::default();
+        let send_j = cfg_w.send_jitter();
 
         loop {
             let cmd = match ping_sleep.as_mut() {
@@ -690,11 +798,12 @@ where
                     } => {
                         rec_buf.clear();
                         write_mux_record_to(&mut rec_buf, stream_id, flags, &payload);
-                        if write_padded_frame_with_mode(
+                        if write_padded_frame_with_mode_state(
                             &mut wire,
                             &rec_buf,
                             cfg_w.max_pad,
                             cfg_w.pad_mode,
+                            Some(&mut client_adaptive),
                         )
                         .is_err()
                         {
@@ -702,7 +811,7 @@ where
                             break;
                         }
                         let blob: Bytes = match &crypto_w {
-                            Some(c) => match c.seal_client_to_server(&wire).await {
+                            Some(c) => match c.seal_client_to_server(&wire) {
                                 Ok(b) => {
                                     wire.clear();
                                     Bytes::from(b)
@@ -720,6 +829,13 @@ where
                             stop = true;
                             break;
                         }
+                        if let Some(a) = &cfg_w.activity {
+                            a.touch();
+                        }
+                        let bulk_c2s = flags == MUX_FLAG_DATA && !payload.is_empty();
+                        if !bulk_c2s {
+                            maybe_ws_send_jitter(send_j).await;
+                        }
                         if ws_sink.feed(Message::Binary(blob)).await.is_err() {
                             stop = true;
                             break;
@@ -732,6 +848,7 @@ where
                         }
                     }
                     MuxWriteCmd::RawBinary(blob) => {
+                        maybe_ws_send_jitter(send_j).await;
                         if ws_sink.feed(Message::Binary(blob)).await.is_err() {
                             stop = true;
                             break;
@@ -746,7 +863,7 @@ where
                 break;
             }
         }
-        clear_tcp_mux_slot_if_current(&slot_w, session_id).await;
+        remove_mux_session(&slot_w, session_id).await;
     });
 
     tokio::spawn(mux_client_reader_loop(
@@ -769,7 +886,7 @@ async fn mux_client_reader_loop<S>(
     down: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     out_tx: mpsc::Sender<MuxWriteCmd>,
     session_id: u64,
-    tcp_mux_slot: Arc<Mutex<Option<(u64, TcpMuxClientHandle)>>>,
+    tcp_mux_slot: TcpMuxClientSlot,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -781,13 +898,13 @@ async fn mux_client_reader_loop<S>(
                     continue;
                 }
                 let raw = match &crypto {
-                    Some(c) => match c.open_server_to_client(b.as_ref()).await {
+                    Some(c) => match c.open_server_to_client(b.as_ref()) {
                         Ok(x) => x,
                         Err(_) => continue,
                     },
                     None => b.to_vec(),
                 };
-                let inner = match read_padded_frame(&raw) {
+                let inner = match read_padded_frame_into(raw) {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
@@ -797,6 +914,11 @@ async fn mux_client_reader_loop<S>(
                 let Ok((sid, flags, payload)) = decode_mux_record(&inner) else {
                     continue;
                 };
+                if flags == MUX_FLAG_DATA && !payload.is_empty() {
+                    if let Some(a) = &cfg.activity {
+                        a.touch();
+                    }
+                }
                 match flags {
                     MUX_FLAG_DATA => {
                         let tx = {
@@ -823,7 +945,7 @@ async fn mux_client_reader_loop<S>(
             _ => {}
         }
     }
-    clear_tcp_mux_slot_if_current(&tcp_mux_slot, session_id).await;
+    remove_mux_session(&tcp_mux_slot, session_id).await;
 }
 
 async fn mux_client_stream_bridge(
@@ -919,7 +1041,7 @@ async fn mux_client_dummy_task(
             continue;
         }
         let blob: Bytes = match &crypto {
-            Some(c) => match c.seal_client_to_server(&wire).await {
+            Some(c) => match c.seal_client_to_server(&wire) {
                 Ok(b) => Bytes::from(b),
                 Err(_) => continue,
             },
@@ -928,7 +1050,7 @@ async fn mux_client_dummy_task(
         if blob.len() > cfg.max_ws_binary {
             continue;
         }
-        maybe_ws_binary_send_jitter(cfg.ws_binary_send_jitter_ms).await;
+        maybe_ws_send_jitter(cfg.send_jitter()).await;
         if tx.send(MuxWriteCmd::RawBinary(blob)).await.is_err() {
             break;
         }
@@ -941,8 +1063,9 @@ async fn mux_server_dummy_task(
     max_pad: u8,
     pad_mode: PadMode,
     max_ws_binary: usize,
-    ws_binary_send_jitter_ms: u8,
+    ws_send_jitter: WsSendJitter,
     dummy_interval_secs: u64,
+    server_out: ServerWsOutTiming,
 ) {
     let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
     loop {
@@ -961,7 +1084,7 @@ async fn mux_server_dummy_task(
             continue;
         }
         let blob: Bytes = match &crypto {
-            Some(c) => match c.seal_server_to_client(&wire).await {
+            Some(c) => match c.seal_server_to_client(&wire) {
                 Ok(b) => Bytes::from(b),
                 Err(_) => continue,
             },
@@ -970,7 +1093,8 @@ async fn mux_server_dummy_task(
         if blob.len() > max_ws_binary {
             continue;
         }
-        maybe_ws_binary_send_jitter(ws_binary_send_jitter_ms).await;
+        maybe_server_ack_and_rtt_mask(server_out).await;
+        maybe_ws_send_jitter(ws_send_jitter).await;
         if out.send(Message::Binary(blob)).await.is_err() {
             break;
         }
@@ -1008,5 +1132,26 @@ impl AsyncRead for MuxCliTcpRead {
                 Pin::new(&mut p.inner).poll_read(cx, buf)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Mirrors `TcpMuxSessionPool::pick` index logic (round-robin over n parallel outer WSS).
+    fn rr_index(next: &AtomicUsize, n: usize) -> usize {
+        next.fetch_add(1, Ordering::Relaxed) % n
+    }
+
+    #[test]
+    fn round_robin_indices_cycle() {
+        let next = AtomicUsize::new(0);
+        let n = 3;
+        let mut out = Vec::new();
+        for _ in 0..9 {
+            out.push(rr_index(&next, n));
+        }
+        assert_eq!(out, vec![0, 1, 2, 0, 1, 2, 0, 1, 2]);
     }
 }

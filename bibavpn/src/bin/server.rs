@@ -3,25 +3,28 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
-use bibavpn::frame::{PadMode, DEFAULT_MAX_WS_BINARY};
-use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig, WsHandshakeKind};
+use bibavpn::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
+use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig};
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use bibavpn::protocol::{
-    decode_auth, decode_open_with_flags, decode_v3_auth, decode_v3_open_with_flags, encode_open_err,
-    encode_open_ok, encode_v3_open_err, encode_v3_open_ok, is_auth_frame, is_udp_mux_open,
-    is_v3_mux_open, is_v3_udp_mux_open, OPEN_FLAG_STATUS,
+    decode_v3_auth, decode_v3_open_with_flags, encode_v3_open_err, encode_v3_open_ok, is_v3_mux_open,
+    is_v3_udp_mux_open, OPEN_FLAG_STATUS,
 };
-use bibavpn::{read_padded_frame, write_padded_frame_with_mode};
+use bibavpn::ServerWsOutTiming;
+use bibavpn::{read_padded_frame_into, write_padded_frame_with_mode_state};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
+use bibavpn::reality::{bridge_reality_server, extract_sni, RealityServerConfig};
+use base64::Engine;
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
 use std::str::FromStr;
+use bibavpn::stealth_v12::StealthProfile;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
@@ -86,6 +89,29 @@ struct Args {
     #[arg(long, default_value = "0")]
     ws_binary_send_jitter_ms: u8,
 
+    /// Outbound WS send delay: random ms in `min..=max` when both set; else use `--ws-binary-send-jitter-ms`.
+    #[arg(long, default_value = "0")]
+    ws_jitter_min_ms: u8,
+
+    #[arg(long, default_value = "0")]
+    ws_jitter_max_ms: u8,
+
+    /// BibaV1.2: server→client “delayed ACK buffer”: min delay (ms) per outbound binary; use with `--server-ack-delay-max-ms` (0 = off).
+    #[arg(long, default_value_t = 0)]
+    server_ack_delay_min_ms: u16,
+
+    /// BibaV1.2: max delay (ms) for that buffer (0 = off). Typical stealth range 40–500; must be >= min when min > 0.
+    #[arg(long, default_value_t = 0)]
+    server_ack_delay_max_ms: u16,
+
+    /// BibaV1.2: extra RTT-mask jitter 0..=N ms after ack delay, before WS send jitter (0 = off).
+    #[arg(long, default_value_t = 0)]
+    rtt_mask_jitter_ms: u16,
+
+    /// BibaV1.2: when all explicit server ACK / RTT args above are 0, apply preset: `balanced` or `aggressive` (see `stealth_v12::StealthProfile::server_rtt_defaults`). `default` leaves delays off.
+    #[arg(long)]
+    ack_profile: Option<String>,
+
     /// Padding cap for UDP mux replies only (default: same as `--max-pad`).
     #[arg(long)]
     udp_max_pad: Option<u8>,
@@ -126,8 +152,8 @@ struct Args {
     #[arg(long)]
     camouflage_url: Option<String>,
 
-    /// Inner frame padding mode: `random` or `http-buckets`.
-    #[arg(long, default_value = "random")]
+    /// Inner frame padding mode: `adaptive` (default), `random`, or `http-buckets`.
+    #[arg(long, default_value = "adaptive")]
     pad_mode: String,
 
     /// Send idle padded empty frames on TCP tunnels (0 = off). Matches client `--dummy-interval-secs`.
@@ -137,6 +163,22 @@ struct Args {
     /// Biba v3 domain string for PSK key separation (must match client / invite). Default `default`.
     #[arg(long, default_value = "default")]
     proto_domain: String,
+
+    /// REALITY mode: target to steal TLS from (e.g., vk.com:443)
+    #[arg(long)]
+    reality_target: Option<String>,
+
+    /// REALITY mode: server private key (base64 encoded X25519)
+    #[arg(long)]
+    reality_private_key: Option<String>,
+
+    /// REALITY mode: allowed short IDs (hex, comma-separated). Empty = any.
+    #[arg(long)]
+    reality_short_ids: Option<String>,
+
+    /// REALITY mode: server names for SNI (comma-separated). Default: extracted from target.
+    #[arg(long)]
+    reality_server_names: Option<String>,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -197,13 +239,44 @@ async fn main() -> anyhow::Result<()> {
             .invite_passphrase
             .as_deref()
             .expect("clap requires invite_passphrase");
+        let (reality_target, reality_public_key, reality_short_id) = match (
+            args.reality_target.as_ref(),
+            args.reality_private_key.as_ref(),
+        ) {
+            (Some(t), Some(priv_b64)) => {
+                let privkey = base64::engine::general_purpose::STANDARD
+                    .decode(priv_b64)
+                    .context("invite: decode reality private key")?;
+                if privkey.len() != 32 {
+                    anyhow::bail!("invite: reality private key must be 32 bytes");
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&privkey);
+                use x25519_dalek::{PublicKey, StaticSecret};
+                let public = PublicKey::from(&StaticSecret::from(a));
+                let pk_b64 = base64::engine::general_purpose::STANDARD.encode(public.to_bytes());
+                let sid = args
+                    .reality_short_ids
+                    .as_deref()
+                    .and_then(|s| {
+                        s.split(',')
+                            .map(|h| h.trim())
+                            .find(|h| !h.is_empty())
+                    })
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| hex::encode(&public.to_bytes()[..8]));
+                (Some(t.clone()), Some(pk_b64), Some(sid))
+            }
+            _ => (None, None, None),
+        };
+        let proto_domain = (!args.proto_domain.trim().is_empty()).then_some(args.proto_domain.clone());
         let invite = InviteV1 {
             v: 1,
             server: public.clone(),
             sni,
             token: args.token.clone(),
-            proto: 2,
-            proto_domain: None,
+            proto: 3,
+            proto_domain,
             psk: args.psk.clone(),
             decoy_max: args.decoy_max,
             max_pad: args.max_pad,
@@ -211,6 +284,8 @@ async fn main() -> anyhow::Result<()> {
             ws_ping_secs: args.ws_ping_secs,
             ws_ping_jitter_percent: args.ws_ping_jitter_percent,
             ws_binary_send_jitter_ms: args.ws_binary_send_jitter_ms,
+            ws_jitter_min_ms: args.ws_jitter_min_ms,
+            ws_jitter_max_ms: args.ws_jitter_max_ms,
             udp_max_pad: args.udp_max_pad,
             udp_max_ws_binary: args.udp_max_ws_binary,
             udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
@@ -220,8 +295,41 @@ async fn main() -> anyhow::Result<()> {
             pad_mode: Some(match pad_mode {
                 PadMode::Random => "random".into(),
                 PadMode::HttpBuckets => "http-buckets".into(),
+                PadMode::Adaptive => "adaptive".into(),
             }),
             dummy_interval_secs: Some(args.dummy_interval_secs).filter(|&x| x > 0),
+            http_proxy: None,
+            socks_bind: None,
+            socks_auth_user: None,
+            socks_auth_password: None,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_headers: vec![],
+            use_tcp_mux: true,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 30,
+            decoy_gets_paths: None,
+            fingerprint: None,
+            stealth_profile: None,
+            decoy_mode: None,
+            desync_mode: None,
+            tcp_fooling: None,
+            tls_fragment: false,
+            ws_parallel: 1,
+            idle_decoy_secs: None,
+            tls_stack: "rustls".to_string(),
+            reality_target,
+            reality_public_key,
+            reality_short_id,
+            pin_cert_pem: None,
+            server_ack_delay_min_ms: Some(args.server_ack_delay_min_ms),
+            server_ack_delay_max_ms: Some(args.server_ack_delay_max_ms),
+            rtt_mask_jitter_ms: Some(args.rtt_mask_jitter_ms),
+            ack_profile: args.ack_profile.clone(),
         };
         let uri = encode_invite_v1(&invite, passphrase).context("build invite URI")?;
         println!("{}", uri);
@@ -236,6 +344,38 @@ async fn main() -> anyhow::Result<()> {
     let ws_ping_secs = args.ws_ping_secs;
     let ws_ping_jitter_percent = args.ws_ping_jitter_percent;
     let ws_binary_send_jitter_ms = args.ws_binary_send_jitter_ms;
+    let ws_jitter_min_ms = args.ws_jitter_min_ms;
+    let ws_jitter_max_ms = args.ws_jitter_max_ms;
+    let mut s_ack_lo = args.server_ack_delay_min_ms;
+    let mut s_ack_hi = args.server_ack_delay_max_ms;
+    if s_ack_lo > 0 && s_ack_hi < s_ack_lo {
+        std::mem::swap(&mut s_ack_lo, &mut s_ack_hi);
+    }
+    let mut server_ws_out = ServerWsOutTiming {
+        ack_delay_min_ms: s_ack_lo,
+        ack_delay_max_ms: s_ack_hi,
+        rtt_mask_jitter_ms: args.rtt_mask_jitter_ms,
+    };
+    if s_ack_lo == 0
+        && s_ack_hi == 0
+        && args.rtt_mask_jitter_ms == 0
+    {
+        if let Some(s) = args.ack_profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let p = StealthProfile::from_str(s).context("--ack-profile")?;
+            if let Some(d) = p.server_rtt_defaults() {
+                let mut a = d.ack_delay_min_ms;
+                let mut b = d.ack_delay_max_ms;
+                if a > 0 && b < a {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                server_ws_out = ServerWsOutTiming {
+                    ack_delay_min_ms: a,
+                    ack_delay_max_ms: b,
+                    rtt_mask_jitter_ms: d.rtt_mask_jitter_ms,
+                };
+            }
+        }
+    }
     let udp_mux_pad = args.udp_max_pad.unwrap_or(max_pad);
     let udp_mux_ws = args.udp_max_ws_binary.unwrap_or(max_ws_binary);
     let udp_mux_recv = Duration::from_secs(args.udp_mux_recv_timeout_secs.clamp(1, 600));
@@ -243,6 +383,81 @@ async fn main() -> anyhow::Result<()> {
     let dummy_interval_secs = args.dummy_interval_secs;
     let camouflage_dir = args.camouflage_dir.clone();
     let camouflage_url = args.camouflage_url.clone();
+
+    // ===== REALITY Mode Setup =====
+    let reality_config: Option<RealityServerConfig> = if let (Some(target), Some(privkey_b64)) = (
+        args.reality_target.as_ref(),
+        args.reality_private_key.as_ref(),
+    ) {
+        let privkey = base64::engine::general_purpose::STANDARD
+            .decode(privkey_b64)
+            .context("decode reality private key")?;
+
+        if privkey.len() != 32 {
+            anyhow::bail!("reality private key must be 32 bytes");
+        }
+
+        let mut privkey_arr = [0u8; 32];
+        privkey_arr.copy_from_slice(&privkey);
+
+        let server_names = args
+            .reality_server_names
+            .as_ref()
+            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_else(|| vec![extract_sni(target)]);
+
+        let short_ids: Vec<[u8; 8]> = args
+            .reality_short_ids
+            .as_ref()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|hex_str| {
+                        let hex_str = hex_str.trim();
+                        if hex_str.is_empty() {
+                            return Some([0u8; 8]); // empty = allow any
+                        }
+                        let bytes = hex::decode(hex_str).ok()?;
+                        if bytes.len() != 8 {
+                            return None;
+                        }
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&bytes);
+                        Some(arr)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        info!(
+            "REALITY mode: target={}, server_names={:?}, short_ids={} entries",
+            target,
+            server_names,
+            short_ids.len()
+        );
+
+        Some(RealityServerConfig {
+            private_key: privkey_arr,
+            target: target.clone(),
+            server_names,
+            short_ids,
+            min_client_ver: None,
+            max_client_ver: None,
+            max_time_diff: 0,
+        })
+    } else {
+        None
+    };
+
+    // Start SpiderX background crawler if REALITY is enabled
+    if let Some(ref cfg) = reality_config {
+        let target = cfg.target.clone();
+        let spiderx_interval = 30u64; // Fetch every 30 seconds
+        tokio::spawn(async move {
+            use bibavpn::reality::spawn_spiderx;
+            spawn_spiderx(target, spiderx_interval).await;
+        });
+        info!("SpiderX background crawler started for {}", cfg.target);
+    }
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -255,6 +470,8 @@ async fn main() -> anyhow::Result<()> {
         };
         let psk_conn = psk.clone();
         let proto_domain = args.proto_domain.clone();
+        let reality_cfg = reality_config.clone();
+        let server_ws_out = server_ws_out;
         tokio::spawn(async move {
             if let Err(e) = handle_one(
                 stream,
@@ -269,13 +486,17 @@ async fn main() -> anyhow::Result<()> {
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 udp_mux_pad,
                 udp_mux_ws,
                 udp_mux_recv,
                 pad_mode,
                 dummy_interval_secs,
+                server_ws_out,
                 camo,
                 proto_domain,
+                reality_cfg,
             )
             .await
             {
@@ -298,53 +519,57 @@ async fn handle_one(
     ws_ping_secs: u64,
     ws_ping_jitter_percent: u8,
     ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
     udp_mux_max_pad: u8,
     udp_mux_max_ws_binary: usize,
     udp_mux_recv_timeout: Duration,
     pad_mode: PadMode,
     dummy_interval_secs: u64,
+    server_out: ServerWsOutTiming,
     camo: CamouflageServeConfig,
     proto_domain: String,
+    reality_config: Option<RealityServerConfig>,
 ) -> anyhow::Result<()> {
     let tls = acceptor.accept(tcp).await.context("tls accept")?;
 
-    let Some((mut ws, accept_kind)) =
+    let Some((mut ws, _ws_kind)) =
         accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo).await?
     else {
         return Ok(());
     };
+
+    if let Some(ref reality_cfg) = reality_config {
+        info!("REALITY mode: forwarding to {}", reality_cfg.target);
+        return bridge_reality_server(
+            ws,
+            reality_cfg.clone(),
+            max_pad,
+            decoy_max,
+            pad_mode,
+            ws_ping_secs,
+            ws_ping_jitter_percent,
+        )
+        .await
+        .context("REALITY bridge");
+    }
 
     let domain_trim = proto_domain.trim();
     if domain_trim.is_empty() {
         anyhow::bail!("--proto-domain must not be empty");
     }
 
-    let (crypto, proto_v3) = match accept_kind {
-        WsHandshakeKind::NewPath => {
-            server_handshake_newpath(
-                &mut ws,
-                &token,
-                psk.as_deref(),
-                decoy_max,
-                domain_trim,
-            )
-            .await
-            .context("handshake")?
-        }
-        WsHandshakeKind::LegacyPath => {
-            let crypto = if let Some(ref secret) = psk {
-                info!("BibaV2 PSK mode (legacy path), decoy_max={decoy_max}");
-                Some(Arc::new(
-                    v2_server_preamble(&mut ws, secret, decoy_max).await?,
-                ))
-            } else {
-                None
-            };
-            (crypto, false)
-        }
-    };
+    let crypto = server_handshake_v3(
+        &mut ws,
+        &token,
+        psk.as_deref(),
+        decoy_max,
+        domain_trim,
+    )
+    .await
+    .context("handshake")?;
 
-    match wait_first_channel(ws, crypto.as_ref(), proto_v3).await? {
+    match wait_first_channel(ws, &crypto).await? {
         FirstChannel::Tcp {
             host,
             port,
@@ -352,38 +577,28 @@ async fn handle_one(
             supports_open_status,
         } => {
             info!("OPEN {host}:{port}");
+            let mut pad_st = AdaptivePadState::default();
             let remote = match TcpStream::connect((host.as_str(), port)).await {
                 Ok(remote) => remote,
                 Err(e) => {
                     if supports_open_status {
-                        if proto_v3 {
-                            if let Some(c) = &crypto {
-                                if let Ok(inner) = encode_v3_open_err(&format!(
-                                    "connect {host}:{port}: {e:#}"
-                                )) {
-                                    let mut wire = Vec::new();
-                                    if write_padded_frame_with_mode(
-                                        &mut wire,
-                                        &inner,
-                                        max_pad,
-                                        pad_mode,
-                                    )
-                                    .is_ok()
-                                    {
-                                        if let Ok(blob) = c.seal_server_to_client(&wire).await {
-                                            let _ = ws
-                                                .send(Message::Binary(Bytes::from(blob)))
-                                                .await;
-                                        }
-                                    }
+                        if let Ok(inner) =
+                            encode_v3_open_err(&format!("connect {host}:{port}: {e:#}"))
+                        {
+                            let mut wire = Vec::new();
+                            if write_padded_frame_with_mode_state(
+                                &mut wire,
+                                &inner,
+                                max_pad,
+                                pad_mode,
+                                Some(&mut pad_st),
+                            )
+                            .is_ok()
+                            {
+                                if let Ok(blob) = crypto.seal_server_to_client(&wire) {
+                                    let _ = ws.send(Message::Binary(Bytes::from(blob))).await;
                                 }
                             }
-                        } else {
-                            let payload = encode_open_err(&format!("connect {host}:{port}: {e:#}"))
-                                .unwrap_or_else(|_| {
-                                    encode_open_err("connect failed").expect("static open error")
-                                });
-                            let _ = ws.send(Message::Binary(Bytes::from(payload))).await;
                         }
                         return Ok(());
                     }
@@ -392,24 +607,22 @@ async fn handle_one(
             };
             let _ = remote.set_nodelay(true);
             if supports_open_status {
-                if proto_v3 {
-                    let c = crypto.as_ref().context("v3 OPEN_OK needs crypto")?;
-                    let inner = encode_v3_open_ok();
-                    let mut wire = Vec::new();
-                    write_padded_frame_with_mode(&mut wire, &inner, max_pad, pad_mode)
-                        .context("pack OPEN_OK v3")?;
-                    let blob = c
-                        .seal_server_to_client(&wire)
-                        .await
-                        .context("seal OPEN_OK v3")?;
-                    ws.send(Message::Binary(Bytes::from(blob)))
-                        .await
-                        .context("send OPEN_OK v3")?;
-                } else {
-                    ws.send(Message::Binary(Bytes::from(encode_open_ok())))
-                        .await
-                        .context("send OPEN_OK")?;
-                }
+                let inner = encode_v3_open_ok();
+                let mut wire = Vec::new();
+                write_padded_frame_with_mode_state(
+                    &mut wire,
+                    &inner,
+                    max_pad,
+                    pad_mode,
+                    Some(&mut pad_st),
+                )
+                .context("pack OPEN_OK v3")?;
+                let blob = crypto
+                    .seal_server_to_client(&wire)
+                    .context("seal OPEN_OK v3")?;
+                ws.send(Message::Binary(Bytes::from(blob)))
+                    .await
+                    .context("send OPEN_OK v3")?;
             }
             bibavpn::ws_bridge::bridge_ws_tcp_padded(
                 ws,
@@ -418,14 +631,17 @@ async fn handle_one(
                 Vec::new(),
                 max_pad,
                 decoy_max,
-                crypto,
+                Some(crypto.clone()),
                 max_ws_binary,
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 TunnelEnd::Server,
                 pad_mode,
                 dummy_interval_secs,
+                server_out,
             )
             .await?;
         }
@@ -435,13 +651,16 @@ async fn handle_one(
                 ws,
                 udp_mux_max_pad,
                 decoy_max,
-                crypto,
+                crypto.clone(),
                 udp_mux_max_ws_binary,
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 udp_mux_recv_timeout,
                 pad_mode,
+                server_out,
             )
             .await?;
         }
@@ -451,13 +670,16 @@ async fn handle_one(
                 ws,
                 max_pad,
                 decoy_max,
-                crypto,
+                Some(crypto.clone()),
                 max_ws_binary,
                 ws_ping_secs,
                 ws_ping_jitter_percent,
                 ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
                 pad_mode,
                 dummy_interval_secs,
+                server_out,
             )
             .await?;
         }
@@ -485,8 +707,7 @@ where
 
 async fn wait_first_channel<S>(
     mut ws: WebSocketStream<S>,
-    crypto: Option<&SharedCrypto>,
-    proto_v3: bool,
+    crypto: &SharedCrypto,
 ) -> anyhow::Result<FirstChannel<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -495,46 +716,23 @@ where
         let m = m.context("ws read")?;
         match m {
             Message::Binary(b) => {
-                let inner: Vec<u8> = if proto_v3 {
-                    let c = crypto.context("v3 requires session crypto")?;
-                    let raw = c
-                        .open_client_to_server(b.as_ref())
-                        .await
-                        .context("decrypt v3 control")?;
-                    read_padded_frame(&raw).context("padded v3 control")?
-                } else {
-                    b.to_vec()
-                };
-                if proto_v3 {
-                    if let Ok((h, p, flags)) = decode_v3_open_with_flags(&inner) {
-                        return Ok(FirstChannel::Tcp {
-                            host: h,
-                            port: p,
-                            supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
-                            ws,
-                        });
-                    }
-                    if is_v3_udp_mux_open(&inner) {
-                        return Ok(FirstChannel::UdpMux { ws });
-                    }
-                    if is_v3_mux_open(&inner) {
-                        return Ok(FirstChannel::Mux { ws });
-                    }
-                } else {
-                    if let Ok((h, p, flags)) = decode_open_with_flags(inner.as_slice()) {
-                        return Ok(FirstChannel::Tcp {
-                            host: h,
-                            port: p,
-                            supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
-                            ws,
-                        });
-                    }
-                    if is_udp_mux_open(inner.as_slice()) {
-                        return Ok(FirstChannel::UdpMux { ws });
-                    }
-                    if bibavpn::tcp_mux::is_mux_open(inner.as_slice()) {
-                        return Ok(FirstChannel::Mux { ws });
-                    }
+                let raw = crypto
+                    .open_client_to_server(b.as_ref())
+                    .context("decrypt v3 control")?;
+                let inner = read_padded_frame_into(raw).context("padded v3 control")?;
+                if let Ok((h, p, flags)) = decode_v3_open_with_flags(&inner) {
+                    return Ok(FirstChannel::Tcp {
+                        host: h,
+                        port: p,
+                        supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
+                        ws,
+                    });
+                }
+                if is_v3_udp_mux_open(&inner) {
+                    return Ok(FirstChannel::UdpMux { ws });
+                }
+                if is_v3_mux_open(&inner) {
+                    return Ok(FirstChannel::Mux { ws });
                 }
             }
             Message::Ping(p) => {
@@ -549,13 +747,13 @@ where
     anyhow::bail!("eof before OPEN / UDP_MUX / MUX")
 }
 
-async fn server_handshake_newpath<S>(
+async fn server_handshake_v3<S>(
     ws: &mut WebSocketStream<S>,
     token: &str,
     psk: Option<&str>,
     decoy_max: u8,
     proto_domain: &str,
-) -> anyhow::Result<(Option<SharedCrypto>, bool)>
+) -> anyhow::Result<SharedCrypto>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -569,42 +767,28 @@ where
                 .context("ws error")?;
             match m {
                 Message::Binary(b) => {
-                    if is_auth_frame(b.as_ref()) {
-                        let tok = decode_auth(b.as_ref())?;
-                        if tok != token {
-                            anyhow::bail!("auth token mismatch");
-                        }
-                        let crypto = if let Some(secret) = psk {
-                            info!("BibaV2 PSK mode, decoy_max={decoy_max}");
-                            Some(Arc::new(
-                                v2_server_preamble(ws, secret, decoy_max).await?,
-                            ))
-                        } else {
-                            None
-                        };
-                        return Ok((crypto, false));
+                    if b.is_empty() || b.as_ref()[0] != crypto_layer::V3_HELLO_TAG {
+                        continue;
                     }
-                    if b.len() == crypto_layer::V3_HELLO_WIRE_LEN
-                        && b.as_ref()[0] == crypto_layer::V3_HELLO_TAG
-                    {
-                        let secret = psk.context("Biba v3 requires server --psk")?;
-                        info!("Biba v3 PSK mode, decoy_max={decoy_max}");
-                        let c = crypto_layer::parse_hello_v3(b.as_ref())?;
-                        let (ack, s_rand) =
-                            crypto_layer::build_ack(secret, Some(domain.as_str()), &c)?;
-                        ws.send(Message::Binary(Bytes::from(ack)))
-                            .await
-                            .context("send v3 ACK")?;
-                        let crypto = Arc::new(SessionCrypto::new(
-                            secret,
-                            Some(domain.as_str()),
-                            &c,
-                            &s_rand,
-                            decoy_max,
-                        ));
-                        server_wait_v3_auth(ws, &crypto, token).await?;
-                        return Ok((Some(crypto), true));
-                    }
+                    let c = match crypto_layer::parse_hello_v3(b.as_ref()) {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    let secret = psk.context("Biba v3 requires server --psk")?;
+                    info!("Biba v3 PSK mode, decoy_max={decoy_max}");
+                    let (ack, s_rand) = crypto_layer::build_ack(secret, domain.as_str(), &c)?;
+                    ws.send(Message::Binary(Bytes::from(ack)))
+                        .await
+                        .context("send v3 ACK")?;
+                    let crypto = Arc::new(SessionCrypto::new(
+                        secret,
+                        domain.as_str(),
+                        &c,
+                        &s_rand,
+                        decoy_max,
+                    ));
+                    server_wait_v3_auth(ws, &crypto, token).await?;
+                    return Ok(crypto);
                 }
                 Message::Ping(p) => {
                     ws.send(Message::Pong(p)).await.context("pong")?;
@@ -638,9 +822,8 @@ where
             Message::Binary(b) => {
                 let raw = crypto
                     .open_client_to_server(b.as_ref())
-                    .await
                     .context("v3 open auth")?;
-                let inner = read_padded_frame(&raw).context("v3 auth frame")?;
+                let inner = read_padded_frame_into(raw).context("v3 auth frame")?;
                 let tok = decode_v3_auth(&inner).context("decode v3 auth")?;
                 if tok != expected_token {
                     anyhow::bail!("v3 auth token mismatch");
@@ -657,39 +840,3 @@ where
     }
 }
 
-async fn v2_server_preamble<S>(
-    ws: &mut WebSocketStream<S>,
-    psk: &str,
-    decoy_max: u8,
-) -> anyhow::Result<SessionCrypto>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    loop {
-        let m = ws
-            .next()
-            .await
-            .context("ws closed before BibaV2 HELLO")?
-            .context("ws read")?;
-        let b = match m {
-            Message::Binary(b) => b,
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p))
-                    .await
-                    .context("pong during HELLO")?;
-                continue;
-            }
-            Message::Pong(_) => continue,
-            Message::Close(_) => anyhow::bail!("closed before HELLO"),
-            _ => continue,
-        };
-        if b.len() == crypto_layer::HELLO_LEN && b.as_ref().starts_with(crypto_layer::HELLO_MAGIC) {
-            let c = crypto_layer::parse_hello(b.as_ref())?;
-            let (ack, s_rand) = crypto_layer::build_ack(psk, None, &c)?;
-            ws.send(Message::Binary(Bytes::from(ack)))
-                .await
-                .context("send ACK")?;
-            return Ok(SessionCrypto::new(psk, None, &c, &s_rand, decoy_max));
-        }
-    }
-}

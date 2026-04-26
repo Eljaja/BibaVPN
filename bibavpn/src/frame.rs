@@ -1,17 +1,27 @@
 use std::str::FromStr;
 
+use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
 
 const FRAME_VER: u8 = 1;
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
+/// Per-connection counter for BibaV4 **adaptive** padding (first bursts, then smaller frames).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdaptivePadState {
+    /// Incremented for each **inner** padded frame sent on this WebSocket.
+    pub count: u32,
+}
+
 /// Padding strategy for inner frames (wire format unchanged).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PadMode {
-    #[default]
     Random,
     /// Pad total inner frame size toward common HTTP response lengths.
     HttpBuckets,
+    /// BibaV4: mimic HTTP/2-style bursts (first ~7 frames target ~900–1400 B total inner size, then smaller).
+    #[default]
+    Adaptive,
 }
 
 impl FromStr for PadMode {
@@ -20,9 +30,12 @@ impl FromStr for PadMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(
             match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-                "" | "random" => PadMode::Random,
+                "" | "adaptive" => PadMode::Adaptive,
+                "random" => PadMode::Random,
                 "http-buckets" | "buckets" => PadMode::HttpBuckets,
-                other => anyhow::bail!("unknown pad-mode {other:?}: use random or http-buckets"),
+                other => anyhow::bail!(
+                    "unknown pad-mode {other:?}: use adaptive, random, or http-buckets"
+                ),
             },
         )
     }
@@ -75,12 +88,24 @@ pub fn write_padded_frame(
     write_padded_frame_with_mode(buf, payload, max_pad, PadMode::Random)
 }
 
-/// Same as [`write_padded_frame`] with selectable padding distribution.
+/// Same as [`write_padded_frame`] with selectable padding distribution (no adaptive session state).
 pub fn write_padded_frame_with_mode(
     buf: &mut Vec<u8>,
     payload: &[u8],
     max_pad: u8,
     mode: PadMode,
+) -> Result<(), FrameError> {
+    write_padded_frame_with_mode_state(buf, payload, max_pad, mode, None)
+}
+
+/// Padded frame with optional [`AdaptivePadState`] for [`PadMode::Adaptive`]. Pass `None` to use
+/// burst-size targets without a monotonic frame index (suitable for one-off control frames).
+pub fn write_padded_frame_with_mode_state(
+    buf: &mut Vec<u8>,
+    payload: &[u8],
+    max_pad: u8,
+    mode: PadMode,
+    adaptive: Option<&mut AdaptivePadState>,
 ) -> Result<(), FrameError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(FrameError::TooLarge);
@@ -89,11 +114,11 @@ pub fn write_padded_frame_with_mode(
     if len > 0xFF_FFFF {
         return Err(FrameError::TooLarge);
     }
-    let mut rng = rand::thread_rng();
     let base = 5usize.saturating_add(len);
     let pad_len: u8 = if max_pad == 0 {
         0
     } else {
+        let mut rng = rand::thread_rng();
         match mode {
             PadMode::Random => rng.gen_range(0..=max_pad),
             PadMode::HttpBuckets => {
@@ -105,6 +130,22 @@ pub fn write_padded_frame_with_mode(
                 let j = rng.gen_range(95u16..=105u16);
                 target = (target.saturating_mul(j as usize) / 100).max(base);
                 let need = target.saturating_sub(base).min(usize::from(max_pad));
+                need as u8
+            }
+            PadMode::Adaptive => {
+                let target_total = if let Some(st) = adaptive {
+                    let c = st.count;
+                    st.count = st.count.saturating_add(1);
+                    if c < 7 {
+                        rng.gen_range(900usize..=1400)
+                    } else {
+                        rng.gen_range(128usize..=512)
+                    }
+                } else {
+                    // No session: still bias toward "fat" browser-like inner sizes.
+                    rng.gen_range(900usize..=1400)
+                };
+                let need = target_total.saturating_sub(base).min(usize::from(max_pad));
                 need as u8
             }
         }
@@ -121,14 +162,14 @@ pub fn write_padded_frame_with_mode(
         let pl = usize::from(pad_len);
         let start = buf.len();
         buf.resize(start + pl, 0);
-        rng.fill_bytes(&mut buf[start..]);
+        OsRng.fill_bytes(&mut buf[start..]);
     }
     buf.extend_from_slice(payload);
     Ok(())
 }
 
-/// Returns payload bytes (allocated) from full WS binary message.
-pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
+/// Byte offset where inner payload starts (after `ver|len|pad_len|pad`).
+fn padded_frame_payload_start(raw: &[u8]) -> Result<usize, FrameError> {
     if raw.len() < 4 {
         return Err(FrameError::Proto("short frame".into()));
     }
@@ -151,7 +192,26 @@ pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
             need
         )));
     }
-    Ok(raw[5 + pad_len..].to_vec())
+    Ok(5 + pad_len)
+}
+
+/// Borrow inner payload slice (no copy). Hot-path friendly after decrypt.
+pub fn read_padded_frame_borrow(raw: &[u8]) -> Result<&[u8], FrameError> {
+    let start = padded_frame_payload_start(raw)?;
+    Ok(&raw[start..])
+}
+
+/// Consume `raw` and return only payload bytes (reuse buffer; no `to_vec` of payload).
+pub fn read_padded_frame_into(mut raw: Vec<u8>) -> Result<Vec<u8>, FrameError> {
+    let start = padded_frame_payload_start(&raw)?;
+    raw.drain(..start);
+    Ok(raw)
+}
+
+/// Returns payload bytes (allocated copy). Prefer [`read_padded_frame_borrow`] or
+/// [`read_padded_frame_into`] on hot paths.
+pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
+    read_padded_frame_borrow(raw).map(|s| s.to_vec())
 }
 
 #[cfg(test)]
@@ -163,6 +223,8 @@ mod tests {
         let mut v = Vec::new();
         write_padded_frame(&mut v, b"hello", 0).unwrap();
         assert_eq!(read_padded_frame(&v).unwrap(), b"hello");
+        assert_eq!(read_padded_frame_borrow(&v).unwrap(), b"hello");
+        assert_eq!(read_padded_frame_into(v).unwrap(), b"hello");
     }
 
     #[test]
@@ -170,6 +232,27 @@ mod tests {
         let mut v = Vec::new();
         write_padded_frame(&mut v, b"x", 20).unwrap();
         assert_eq!(read_padded_frame(&v).unwrap(), b"x");
+        assert_eq!(read_padded_frame_borrow(&v).unwrap(), b"x");
+        assert_eq!(read_padded_frame_into(v).unwrap(), b"x");
+    }
+
+    #[test]
+    fn adaptive_uses_count_and_clamps_to_max_pad() {
+        let mut st = AdaptivePadState::default();
+        let mut buf = Vec::new();
+        for _ in 0..3 {
+            write_padded_frame_with_mode_state(
+                &mut buf,
+                b"",
+                255,
+                PadMode::Adaptive,
+                Some(&mut st),
+            )
+            .unwrap();
+            // burst target ~900+ B, but u8 `max_pad` caps padding to 255 B.
+            assert_eq!(buf.len(), 5 + 255);
+        }
+        assert_eq!(st.count, 3);
     }
 
     #[test]

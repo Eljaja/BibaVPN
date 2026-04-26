@@ -1,15 +1,16 @@
-//! Long-term design: multiplex many logical TCP streams over **one** long-lived WSS (and thus one TLS session).
+//! Historical design note: one outer WSS carrying many logical TCP streams.
 //!
-//! ## Motivation
+//! > **Current code:** see [`tcp_mux`](crate::tcp_mux) — `MUX_OPEN`, stream IDs, flow control, and
+//! > optional **1..=4** parallel outer WSS links (`--ws-parallel`, `TcpMuxSessionPool` round-robin).
+//! > The sections below are an **older sketch**; the wire and tasks differ from this document.
 //!
-//! Today each tunneled TCP connection uses a separate `OPEN` → `bridge_ws_tcp_padded` pair, so the
-//! client opens **N concurrent TLS+WebSocket handshakes** to the same front. DPI and traffic
-//! analytics often flag “many parallel TLS sessions to one host” as non-browser-like. A **stream
-//! mux** collapses that to a single outer connection with logical sub-streams inside the binary
-//! framing layer (after padding / optional BibaV2), similar in spirit to HTTP/2 or SSH multiplexing
-//! but over the existing Biba wire format.
+//! ## Motivation (historical)
 //!
-//! ## Sketch protocol (not implemented)
+//! A previous concern was: each tunneled TCP using a separate WSS would mean **N TLS+WebSocket
+//! handshakes** to the same front. A **stream mux** was proposed: **one** outer connection with
+//! logical sub-streams in the Biba framing, similar in spirit to HTTP/2 over one TLS socket.
+//!
+//! ## Sketch protocol (superseded on the wire by `tcp_mux` + `MUX_OPEN`)
 //!
 //! - **Outer channel**: unchanged TLS + WSS + optional `HELLO`/`ACK` PSK; first binary after
 //!   upgrade is either today’s `OPEN` (legacy) or a new `MUX_OPEN` capability advertisement.
@@ -32,5 +33,6 @@
 //!   reconnect must replay or resume streams (hard problem) — v1 mux can treat reconnect as “all
 //!   streams reset” like today’s full tunnel loss.
 //!
-//! This module is documentation-only; implementing it is a **breaking protocol change** and should
-//! ship with version negotiation and a staged rollout (legacy `OPEN` + new mux on same path).
+//! This file remains **documentation-only** for the old one-WSS design. Do not treat it as the live
+//! mux spec — use `PROTOCOL.md` and `tcp_mux.rs` / `local_client` for the implemented path
+//! (`--no-mux` legacy `OPEN` vs mux).

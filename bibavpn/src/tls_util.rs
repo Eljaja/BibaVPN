@@ -2,6 +2,27 @@ use std::io::{BufReader, Cursor};
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Which TLS engine wraps the main WSS (`rustls` default; `boring` needs `--features boring-tls`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsStack {
+    #[default]
+    Rustls,
+    /// BoringSSL + tokio-boring: enables `--tls-fragment` record splitting (client path).
+    Boring,
+}
+
+impl FromStr for TlsStack {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "" | "rustls" => TlsStack::Rustls,
+            "boring" | "boringssl" | "bssl" => TlsStack::Boring,
+            o => anyhow::bail!("unknown tls-stack {o:?}: rustls, boring"),
+        })
+    }
+}
+
 use anyhow::Context;
 use biba::ClientHelloId;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
@@ -16,11 +37,19 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, S
 /// ClientHello (no full JA3/JA4 parity); rustls does not expose byte-level CH control.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsClientProfile {
+    /// Rustls defaults only (no `biba` cipher/ALPN hints).
     #[default]
     Default,
+    /// ~Chrome M70 ClientHello spec bytes (`biba` + rustls); use `Chrome132` for the v1.2 default label.
     Chrome70,
+    /// BibaV1.2 default browser-like label (current wire spec matches `chrome_70` template; tune as uTLS data evolves).
+    Chrome132,
     Firefox65,
     Firefox63,
+    /// Alias template (see `biba` `Firefox136`).
+    Firefox136,
+    /// Safari 18 / WebKit placeholder (current: same as Chrome spec in `biba`).
+    Safari18,
     Randomized,
     RandomizedAlpn,
     RandomizedNoAlpn,
@@ -31,8 +60,11 @@ impl TlsClientProfile {
         match self {
             TlsClientProfile::Default => None,
             TlsClientProfile::Chrome70 => Some(ClientHelloId::Chrome70),
+            TlsClientProfile::Chrome132 => Some(ClientHelloId::Chrome132),
             TlsClientProfile::Firefox65 => Some(ClientHelloId::Firefox65),
             TlsClientProfile::Firefox63 => Some(ClientHelloId::Firefox63),
+            TlsClientProfile::Firefox136 => Some(ClientHelloId::Firefox136),
+            TlsClientProfile::Safari18 => Some(ClientHelloId::Safari18),
             TlsClientProfile::Randomized => Some(ClientHelloId::HelloRandomized),
             TlsClientProfile::RandomizedAlpn => Some(ClientHelloId::HelloRandomizedAlpn),
             TlsClientProfile::RandomizedNoAlpn => Some(ClientHelloId::HelloRandomizedNoAlpn),
@@ -48,17 +80,28 @@ impl FromStr for TlsClientProfile {
         if s.is_empty() || s.eq_ignore_ascii_case("default") {
             return Ok(Self::Default);
         }
-        Ok(match s.to_ascii_lowercase().replace('_', "-").as_str() {
-            "chrome70" | "chrome-70" => Self::Chrome70,
-            "firefox65" | "firefox-65" => Self::Firefox65,
-            "firefox63" | "firefox-63" => Self::Firefox63,
-            "randomized" => Self::Randomized,
-            "randomized-alpn" => Self::RandomizedAlpn,
-            "randomized-no-alpn" => Self::RandomizedNoAlpn,
+        match s.to_ascii_lowercase().replace('_', "-").as_str() {
+            "chrome70" | "chrome-70" => Ok(Self::Chrome70),
+            "chrome-132" | "chrome132" | "chromium-132" => Ok(Self::Chrome132),
+            "firefox-136" | "firefox136" => Ok(Self::Firefox136),
+            "safari-18" | "safari18" | "webkit" => Ok(Self::Safari18),
+            "firefox65" | "firefox-65" => Ok(Self::Firefox65),
+            "firefox63" | "firefox-63" => Ok(Self::Firefox63),
+            "random" | "randomized" => Ok(Self::Randomized),
+            "randomized-alpn" => Ok(Self::RandomizedAlpn),
+            "randomized-no-alpn" => Ok(Self::RandomizedNoAlpn),
             other => anyhow::bail!(
-                "unknown tls-profile {other:?}: expected default, chrome70, firefox65, firefox63, randomized, randomized-alpn, randomized-no-alpn"
+                "unknown tls-profile / fingerprint {other:?}: \
+                 use default, chrome-132, firefox-136, safari-18, random, chrome70, firefox65, firefox63, randomized-…"
             ),
-        })
+        }
+    }
+}
+
+impl TlsClientProfile {
+    /// Same names as [`FromStr`] (for `--fingerprint`).
+    pub fn from_fingerprint_str(s: &str) -> Result<Self, anyhow::Error> {
+        s.parse()
     }
 }
 

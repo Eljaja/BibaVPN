@@ -1,5 +1,5 @@
 //! Opening a logical TCP proxy channel: first WebSocket binary message after optional junk.
-//! UDP-over-WS: second channel type with `UDP_MUX_OPEN` then `UDP_REQ` / `UDP_REP` datagrams.
+//! UDP-over-WS: second channel type with v3 `UDP_MUX` opcode then `UDP_REQ` / `UDP_REP` inner frames.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -15,16 +15,19 @@ pub const OPEN_FLAG_STATUS: u8 = 0x01;
 /// Client → server: session token after WebSocket upgrade (auth outside URL path).
 pub const AUTH_MAGIC: &[u8] = b"BIBA\x01AUTH\x00";
 
-/// Opens a WebSocket session that carries UDP datagrams (same TLS+WSS envelope as TCP tun).
-pub const UDP_MUX_OPEN_MAGIC: &[u8] = b"BIBA\x01UDPM\x00";
-
-/// Client → server: one logical UDP payload toward `host:port`.
-pub const UDP_REQ_MAGIC: &[u8] = b"BIBA\x01UDPR\x00";
-
-/// Server → client: reply `payload` from `host:port` (source of the UDP packet).
-pub const UDP_REP_MAGIC: &[u8] = b"BIBA\x01UDPQ\x00";
-
 pub const MAX_UDP_PAYLOAD: usize = 60 * 1024;
+
+// Biba v3 inner control (plaintext inside padded frame, then AEAD on the wire)
+pub const V3_CTRL_AUTH: u8 = 0x01;
+pub const V3_CTRL_OPEN: u8 = 0x02;
+pub const V3_CTRL_UDP_MUX: u8 = 0x03;
+pub const V3_CTRL_MUX: u8 = 0x04;
+/// Inner plaintext: UDP request (after `UDP_MUX` channel is open).
+pub const V3_CTRL_UDP_REQ: u8 = 0x05;
+/// Inner plaintext: UDP reply from server.
+pub const V3_CTRL_UDP_REP: u8 = 0x06;
+pub const V3_CTRL_OPEN_OK: u8 = 0x10;
+pub const V3_CTRL_OPEN_ERR: u8 = 0x11;
 
 pub fn encode_auth(token: &str) -> anyhow::Result<Vec<u8>> {
     let t = token.as_bytes();
@@ -144,14 +147,6 @@ pub fn decode_open_err(data: &[u8]) -> anyhow::Result<String> {
     Ok(std::str::from_utf8(&data[i + 2..i + 2 + ml])?.to_string())
 }
 
-pub fn encode_udp_mux_open() -> Vec<u8> {
-    UDP_MUX_OPEN_MAGIC.to_vec()
-}
-
-pub fn is_udp_mux_open(data: &[u8]) -> bool {
-    data == UDP_MUX_OPEN_MAGIC
-}
-
 pub(crate) fn encode_atyp_host_port(
     host: &str,
     port: u16,
@@ -219,8 +214,8 @@ pub fn encode_udp_req(xid: u64, host: &str, port: u16, payload: &[u8]) -> anyhow
     if payload.len() > MAX_UDP_PAYLOAD {
         anyhow::bail!("UDP payload too large");
     }
-    let mut v = Vec::with_capacity(UDP_REQ_MAGIC.len() + 8 + 16 + payload.len());
-    v.extend_from_slice(UDP_REQ_MAGIC);
+    let mut v = Vec::with_capacity(1 + 8 + 16 + payload.len());
+    v.push(V3_CTRL_UDP_REQ);
     v.extend_from_slice(&xid.to_be_bytes());
     encode_atyp_host_port(host, port, &mut v)?;
     v.extend_from_slice(payload);
@@ -228,15 +223,14 @@ pub fn encode_udp_req(xid: u64, host: &str, port: u16, payload: &[u8]) -> anyhow
 }
 
 pub fn decode_udp_req(data: &[u8]) -> anyhow::Result<(u64, String, u16, Vec<u8>)> {
-    let i0 = UDP_REQ_MAGIC.len() + 8;
-    if data.len() < i0 {
+    if data.is_empty() || data[0] != V3_CTRL_UDP_REQ {
+        anyhow::bail!("bad udp req opcode");
+    }
+    if data.len() < 1 + 8 {
         anyhow::bail!("short udp req");
     }
-    if !data.starts_with(UDP_REQ_MAGIC) {
-        anyhow::bail!("bad udp req magic");
-    }
-    let xid = u64::from_be_bytes(data[UDP_REQ_MAGIC.len()..UDP_REQ_MAGIC.len() + 8].try_into()?);
-    let rest = &data[UDP_REQ_MAGIC.len() + 8..];
+    let xid = u64::from_be_bytes(data[1..9].try_into()?);
+    let rest = &data[9..];
     let (h, p, addr_len) = decode_atyp_host_port(rest)?;
     let payload = rest[addr_len..].to_vec();
     if payload.len() > MAX_UDP_PAYLOAD {
@@ -254,8 +248,8 @@ pub fn encode_udp_rep(
     if payload.len() > MAX_UDP_PAYLOAD {
         anyhow::bail!("UDP payload too large");
     }
-    let mut v = Vec::with_capacity(UDP_REP_MAGIC.len() + 8 + 16 + payload.len());
-    v.extend_from_slice(UDP_REP_MAGIC);
+    let mut v = Vec::with_capacity(1 + 8 + 16 + payload.len());
+    v.push(V3_CTRL_UDP_REP);
     v.extend_from_slice(&xid.to_be_bytes());
     encode_atyp_host_port(src_host, src_port, &mut v)?;
     v.extend_from_slice(payload);
@@ -263,15 +257,14 @@ pub fn encode_udp_rep(
 }
 
 pub fn decode_udp_rep(data: &[u8]) -> anyhow::Result<(u64, String, u16, Vec<u8>)> {
-    let i0 = UDP_REP_MAGIC.len() + 8;
-    if data.len() < i0 {
+    if data.is_empty() || data[0] != V3_CTRL_UDP_REP {
+        anyhow::bail!("bad udp rep opcode");
+    }
+    if data.len() < 1 + 8 {
         anyhow::bail!("short udp rep");
     }
-    if !data.starts_with(UDP_REP_MAGIC) {
-        anyhow::bail!("bad udp rep magic");
-    }
-    let xid = u64::from_be_bytes(data[UDP_REP_MAGIC.len()..UDP_REP_MAGIC.len() + 8].try_into()?);
-    let rest = &data[UDP_REP_MAGIC.len() + 8..];
+    let xid = u64::from_be_bytes(data[1..9].try_into()?);
+    let rest = &data[9..];
     let (h, p, addr_len) = decode_atyp_host_port(rest)?;
     let payload = rest[addr_len..].to_vec();
     Ok((xid, h, p, payload))
@@ -303,15 +296,6 @@ pub fn parse_socks5_udp_datagram(data: &[u8]) -> anyhow::Result<(String, u16, Ve
     let (h, p, n) = decode_atyp_host_port(&data[3..])?;
     Ok((h, p, data[3 + n..].to_vec()))
 }
-
-// --- Biba v3 inner control (plaintext inside padded frame, then AEAD on the wire) ---
-
-pub const V3_CTRL_AUTH: u8 = 0x01;
-pub const V3_CTRL_OPEN: u8 = 0x02;
-pub const V3_CTRL_UDP_MUX: u8 = 0x03;
-pub const V3_CTRL_MUX: u8 = 0x04;
-pub const V3_CTRL_OPEN_OK: u8 = 0x10;
-pub const V3_CTRL_OPEN_ERR: u8 = 0x11;
 
 pub fn encode_v3_auth(token: &str) -> anyhow::Result<Vec<u8>> {
     let t = token.as_bytes();

@@ -2,6 +2,7 @@
 # UDP over SOCKS5 → bibavpn UDP mux → local echo. Run from WSL, repo root.
 set -u
 cd "$(dirname "$0")/.." || exit 1
+cargo build -p bibavpn --release -q
 BIN=target/release
 EPORT=19998
 RUST_LOG=warn
@@ -32,6 +33,8 @@ EPID=$!
   --listen 127.0.0.1:18444 \
   --self-signed-san localhost \
   --token benchudp \
+  --psk benchpsk \
+  --proto-domain localhost \
   --ws-ping-secs 0 >/tmp/bibavpn-server-udp.log 2>&1 &
 SPID=$!
 sleep 0.6
@@ -39,6 +42,8 @@ sleep 0.6
   --server 127.0.0.1:18444 \
   --sni localhost \
   --token benchudp \
+  --psk benchpsk \
+  --proto-domain localhost \
   --insecure \
   --socks5 127.0.0.1:11081 \
   --ws-ping-secs 0 \

@@ -78,6 +78,22 @@
     <string name="section_transport">ترابرد</string>
     <string name="section_transport_sub">مبهم‌سازی و WebSocket</string>
     <string name="hint_tls_profile">پروفایل ClientHello (default، chrome70، firefox65، …)؛ با کلید دعوت قابل بازنویسی</string>
+    <string name="hint_fingerprint">مثل --fingerprint؛ اگر پر باشد بر tls_profile اولویت دارد</string>
+    <string name="hint_tls_stack">rustls (پیش‌فرض) یا boring — فقط اگر کلاینت با BoringSSL ساخته شده</string>
+    <string name="hint_proto">نسخهٔ wire (اکنون 3)</string>
+    <string name="hint_proto_domain">برچسب KDF v3؛ خالی = SNI</string>
+    <string name="hint_ws_jitter_min">تأخیر ارسال WS binary، حداقل میلی‌ثانیه</string>
+    <string name="hint_ws_jitter_max">تأخیر ارسال WS binary، حداکثر میلی‌ثانیه</string>
+    <string name="hint_ws_parallel">جلسات WSS موازی 1–4</string>
+    <string name="hint_idle_decoy_secs">آستانهٔ سکوت mux برای decoy پس‌زمینه؛ 0 = خاموش</string>
+    <string name="hint_stealth_profile">default | balanced | aggressive</string>
+    <string name="hint_decoy_mode">simple | browser</string>
+    <string name="hint_desync_mode">off | split2 | …</string>
+    <string name="hint_tcp_fooling">حالت tcp_fooling</string>
+    <string name="hint_tls_fragment">تجزیهٔ رکورد TLS (آزمایشی)</string>
+    <string name="hint_reality_target">REALITY: SNI جلو (مثلاً vk.com)</string>
+    <string name="hint_reality_public_key">REALITY: کلید عمومی X25519، base64، 32 بایت</string>
+    <string name="hint_reality_short_id">REALITY: short_id، 16 کاراکتر hex (اختیاری)</string>
     <string name="hint_ws_path">مسیر WebSocket روی سرور (خالی = /ws از کلید)</string>
     <string name="toggle_tcp_mux_title">چندتایی TCP (WSS)</string>
     <string name="toggle_tcp_mux_sub">خاموش برای حالت شبیه --no-mux</string>

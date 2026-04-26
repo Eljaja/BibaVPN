@@ -50,8 +50,10 @@ fn main() -> anyhow::Result<()> {
     let proto: u8 = std::env::var("INVITE_PROTO")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
-    let proto_domain = std::env::var("INVITE_PROTO_DOMAIN").ok();
+        .unwrap_or(3);
+    let proto_domain = std::env::var("INVITE_PROTO_DOMAIN")
+        .ok()
+        .or_else(|| Some("default".to_string()).filter(|_| proto >= 3));
 
     let invite = InviteV1 {
         v: 1,
@@ -67,6 +69,8 @@ fn main() -> anyhow::Result<()> {
         ws_ping_secs: env_u64("WS_PING_SECS", 25),
         ws_ping_jitter_percent: env_u8("WS_PING_JITTER_PERCENT", 0),
         ws_binary_send_jitter_ms: env_u8("WS_BINARY_SEND_JITTER_MS", 0),
+        ws_jitter_min_ms: env_u8("WS_JITTER_MIN_MS", 0),
+        ws_jitter_max_ms: env_u8("WS_JITTER_MAX_MS", 0),
         udp_max_pad: None,
         udp_max_ws_binary: None,
         udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
@@ -75,6 +79,38 @@ fn main() -> anyhow::Result<()> {
         ws_path: Some(ws_path),
         pad_mode: Some("random".into()),
         dummy_interval_secs: None,
+        http_proxy: None,
+        socks_bind: None,
+        socks_auth_user: None,
+        socks_auth_password: None,
+        junk_frames: 0,
+        early_ws_frames: 0,
+        ws_host: None,
+        ws_origin: None,
+        ws_user_agent: None,
+        ws_accept_language: None,
+        ws_headers: vec![],
+        use_tcp_mux: true,
+        decoy_gets: false,
+        decoy_gets_interval_secs: 30,
+        decoy_gets_paths: None,
+        fingerprint: None,
+        stealth_profile: None,
+        decoy_mode: None,
+        desync_mode: None,
+        tcp_fooling: None,
+        tls_fragment: false,
+        ws_parallel: 1,
+        idle_decoy_secs: None,
+        tls_stack: "rustls".to_string(),
+        reality_target: None,
+        reality_public_key: None,
+        reality_short_id: None,
+        pin_cert_pem: None,
+        server_ack_delay_min_ms: None,
+        server_ack_delay_max_ms: None,
+        rtt_mask_jitter_ms: None,
+        ack_profile: None,
     };
 
     println!("{}", encode_invite_v1(&invite, &passphrase)?);

@@ -21,6 +21,10 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
+import java.security.SecureRandom
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import androidx.core.app.NotificationCompat
 import dev.bibavpn.core.BibaNative
 import dev.bibavpn.core.VpnProtect
@@ -370,10 +374,7 @@ class BibaVpnService : VpnService() {
         reason: String,
         json: String,
     ) {
-        val socks =
-            runCatching {
-                JSONObject(json).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
-            }.getOrDefault(SOCKS_LOCAL)
+        val sessionJson = configJsonWithSessionSocksAuth(json)
         Thread(
             {
                 try {
@@ -383,7 +384,7 @@ class BibaVpnService : VpnService() {
                         allowScreenOnStackRestart = false
                         val err =
                             try {
-                                BibaNative.nativeStart(json)
+                                BibaNative.nativeStart(sessionJson)
                             } catch (e: Throwable) {
                                 Log.e(TAG, "$reason: nativeStart", e)
                                 e.message ?: e.javaClass.simpleName
@@ -402,7 +403,7 @@ class BibaVpnService : VpnService() {
                             return@Thread
                         }
                     }
-                    if (!startVpnTunnel(socks)) {
+                    if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
                         isTunnelActive = false
                         synchronized(nativeLifecycleLock) {
                             BibaNative.nativeStop()
@@ -470,13 +471,14 @@ class BibaVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        val sessionJson = configJsonWithSessionSocksAuth(json)
         val socks = runCatching {
-            JSONObject(json).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
+            JSONObject(sessionJson).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
         }.getOrDefault(SOCKS_LOCAL)
 
         Log.i(
             TAG,
-            "bootstrap ${configFingerprint(json)} socks=$socks fromIntentExtra=" +
+            "bootstrap ${configFingerprint(sessionJson)} socks=$socks fromIntentExtra=" +
                 "${fromExtra != null && intent?.action != ACTION_ENABLE} action=${intent?.action}",
         )
 
@@ -494,7 +496,7 @@ class BibaVpnService : VpnService() {
                 requestFullStackRestart("ACTION_ENABLE", json)
                 return START_STICKY
             }
-            enqueueBootstrapWorker(json, socks)
+            enqueueBootstrapWorker(sessionJson)
             return START_STICKY
         }
 
@@ -505,7 +507,7 @@ class BibaVpnService : VpnService() {
             }
         }
 
-        enqueueBootstrapWorker(json, socks)
+        enqueueBootstrapWorker(sessionJson)
         return START_STICKY
     }
 
@@ -523,19 +525,16 @@ class BibaVpnService : VpnService() {
     }
 
     /** nativeStart ждёт bind SOCKS в Rust — не блокируем main thread (ANR). */
-    private fun enqueueBootstrapWorker(
-        json: String,
-        socks: String,
-    ) {
+    private fun enqueueBootstrapWorker(sessionJson: String) {
         val worker =
             Thread(
                 {
                     val self = Thread.currentThread()
                     try {
-                        Log.i(TAG, "worker: nativeStart begin ${configFingerprint(json)}")
+                        Log.i(TAG, "worker: nativeStart begin ${configFingerprint(sessionJson)}")
                         val err = try {
                             synchronized(nativeLifecycleLock) {
-                                BibaNative.nativeStart(json)
+                                BibaNative.nativeStart(sessionJson)
                             }
                         } catch (e: Throwable) {
                             Log.e(TAG, "native start", e)
@@ -560,7 +559,7 @@ class BibaVpnService : VpnService() {
                         }
 
                         Log.i(TAG, "worker: nativeStart OK — startVpnTunnel")
-                        if (!startVpnTunnel(socks)) {
+                        if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
                             Log.e(TAG, "startVpnTunnel returned false — nativeStop + stopSelf")
                             isTunnelActive = false
                             synchronized(nativeLifecycleLock) {
@@ -609,23 +608,22 @@ class BibaVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startVpnTunnel(socksBind: String): Boolean {
+    /** @param proxyUrl полный URL для tun2socks, например `socks5://user:pass@127.0.0.1:1080`. */
+    private fun startVpnTunnel(proxyUrl: String): Boolean {
         synchronized(tunLock) {
             stopTun2socksOnly()
+            // MTU ниже 1500: запас под Encapsulation (TUN → SOCKS → WSS); иначе фрагментация/чёрные дыры на LTE.
+            val tunMtu = 1400
             val builder = Builder()
                 .setSession("BibaVPN")
-                .setMtu(1500)
+                .setMtu(tunMtu)
                 .addAddress(VPN_LOCAL_IP, 32)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("1.1.1.1")
             builder.addDisallowedApplication(packageName)
             builder.applySplitTunnelBypasses()
-            try {
-                builder.addRoute("::", 0)
-            } catch (_: Throwable) {
-                /* IPv6 маршрут необязателен */
-            }
+            // Не добавляем ::/0: у многих сборок tun2socks UDP/IPv6 через TUN неполный — тогда AAAA/DNS v6 «висят».
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 runCatching {
@@ -664,17 +662,16 @@ class BibaVpnService : VpnService() {
             runCatching { tunParcelOrphan?.close() }
             tunParcelOrphan = javaOwnedTun
 
-            val proxy =
-                socksBind.trim().let { b ->
-                    if (b.startsWith("socks5://", ignoreCase = true)) b else "socks5://$b"
-                }
+            val proxy = proxyUrl.trim()
+            val startLatch = CountDownLatch(1)
+            val startErr = AtomicReference<String?>(null)
             tun2socksThread = Thread(
                 {
                     try {
                         val key = Key()
                         key.setDevice("fd://$fd")
                         key.setProxy(proxy)
-                        key.setMTU(1500)
+                        key.setMTU(tunMtu.toLong())
                         // П последним setter'ом: в некоторых gomobile-биндингах поля сбрасываются при других set* .
                         key.setLogLevel("info")
                         Log.i(TAG, "tun2socks Key.logLevel=${key.logLevel}")
@@ -691,14 +688,31 @@ class BibaVpnService : VpnService() {
                                 lastPhysicalNetworkForRestart = und
                             }
                         }
+                        Log.i(TAG, "tun2socks Engine.start OK")
                     } catch (e: Throwable) {
                         Log.e(TAG, "tun2socks", e)
-                        abortVpnFromWorker(e.message)
+                        startErr.set(e.message ?: e.javaClass.simpleName)
+                        mainHandler.post { abortVpnFromWorker(e.message) }
+                    } finally {
+                        startLatch.countDown()
                     }
                 },
                 "biba-tun2socks",
             ).also { it.start() }
-            Log.i(TAG, "VPN up, tun2socks -> $proxy")
+
+            val ok = startLatch.await(25, TimeUnit.SECONDS)
+            if (!ok) {
+                Log.e(TAG, "tun2socks: Engine.start timeout (${25}s) — останавливаем")
+                tun2socksThread?.interrupt()
+                stopTun2socksOnly()
+                return false
+            }
+            startErr.get()?.let { err ->
+                Log.e(TAG, "tun2socks failed: $err")
+                stopTun2socksOnly()
+                return false
+            }
+            Log.i(TAG, "VPN up, tun2socks -> ${proxyUrlForLog(proxy)}")
             return true
         }
     }
@@ -830,6 +844,139 @@ class BibaVpnService : VpnService() {
 
     private fun loadSavedConfigJson(): String? =
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_LAST_JSON, null)
+
+    private val socksRandom = SecureRandom()
+
+    private fun randomSocksCredential(length: Int): String {
+        val alphabet = ('a'..'z') + ('A'..'Z') + ('0'..'9')
+        return buildString(length) {
+            repeat(length) { append(alphabet[socksRandom.nextInt(alphabet.size)]) }
+        }
+    }
+
+    /**
+     * Случайный логин/пароль для локального SOCKS5 на эту сессию (Rust listener + tun2socks).
+     * В хранилище профиля не попадает.
+     */
+    private fun configJsonWithSessionSocksAuth(baseJson: String): String {
+        val o = JSONObject(baseJson)
+        o.remove("socks_auth_user")
+        o.remove("socks_auth_password")
+        o.put("socks_auth_user", randomSocksCredential(16))
+        o.put("socks_auth_password", randomSocksCredential(24))
+        applyInviteProtoDomainFallback(o)
+        applyLegacyPadModeForBundledNative(o)
+        capWsParallelForUdpMux(o)
+        return o.toString()
+    }
+
+    /**
+     * UDP mux поднимает отдельный полный TLS+WSS поверх уже существующих параллельных mux-сессий ([ws_parallel] до 4).
+     * Суммарно получается много одновременных TLS к одному хосту; часть сетей/CDN закрывает лишние с `unexpected-eof`,
+     * после чего не работает DNS (UDP) и «интернета нет» при живом TCP.
+     */
+    private fun capWsParallelForUdpMux(o: JSONObject) {
+        if (!o.optBoolean("use_tcp_mux", true)) return
+        val cur = o.optInt("ws_parallel", 1).coerceIn(1, 4)
+        if (cur > 1) {
+            o.put("ws_parallel", 1)
+            Log.i(TAG, "config: ws_parallel=1 for this session (was $cur) — extra WSS + UDP mux TLS were failing")
+        }
+    }
+
+    /**
+     * Old invites may omit `proto_domain`, while the server's v3 default is actually `default`.
+     * That makes the client fall back to SNI/IP and fail ACK MAC on UDP mux.
+     */
+    private fun applyInviteProtoDomainFallback(o: JSONObject) {
+        if (o.optString("proto_domain", "").trim().isNotEmpty()) return
+        val invite = o.optString("from_invite", "").trim()
+        val pass = o.optString("invite_passphrase", "")
+        if (invite.isBlank() || pass.isBlank()) return
+
+        val decoded =
+            runCatching {
+                val raw = BibaNative.nativeDecodeInvite(invite, pass)
+                JSONObject(raw)
+            }.getOrNull()
+                ?: return
+        if (!decoded.optBoolean("ok")) return
+
+        val invProtoDomain = decoded.optString("proto_domain", "").trim()
+        if (invProtoDomain.isNotEmpty()) {
+            o.put("proto_domain", invProtoDomain)
+            Log.i(TAG, "config: proto_domain taken from invite: $invProtoDomain")
+            return
+        }
+
+        val proto = o.optInt("proto", decoded.optInt("proto", 3))
+        val psk = o.optString("psk", decoded.optString("psk", "")).trim()
+        if (proto >= 3 && psk.isNotEmpty()) {
+            o.put("proto_domain", "default")
+            Log.w(TAG, "config: invite missing proto_domain; falling back to server default 'default'")
+        }
+    }
+
+    /**
+     * В jniLibs может лежать lib без поддержки [pad_mode] `adaptive` (ошибка parse: use random or http-buckets).
+     * В Rust top-level `pad_mode` перекрывает значение из invite.
+     *
+     * Раньше подставляли `random`, из‑за чего UDP mux (DNS) мог отваливаться, если сервер ожидал не random‑паддинг.
+     * Для `adaptive` используем `http-buckets` — тот же wire‑формат, другой закон распределения паддинга, обычно ближе к серверу.
+     */
+    private fun applyLegacyPadModeForBundledNative(o: JSONObject) {
+        val current = o.optString("pad_mode", "").trim()
+        if (current.equals("adaptive", ignoreCase = true)) {
+            o.put("pad_mode", "http-buckets")
+            return
+        }
+        if (current.isNotEmpty()) return
+
+        val invite = o.optString("from_invite", "").trim()
+        val pass = o.optString("invite_passphrase", "")
+        if (invite.isBlank() || pass.isBlank()) return
+
+        val invPad =
+            runCatching {
+                val raw = BibaNative.nativeDecodeInvite(invite, pass)
+                val j = JSONObject(raw)
+                if (!j.optBoolean("ok")) return@runCatching null
+                j.optString("pad_mode", "").trim()
+            }.getOrNull()
+                ?: return
+
+        val legacy =
+            when {
+                invPad.isEmpty() || invPad.equals("adaptive", ignoreCase = true) -> "http-buckets"
+                invPad.equals("random", ignoreCase = true) -> "random"
+                invPad.equals("http-buckets", ignoreCase = true) ||
+                    invPad.equals("buckets", ignoreCase = true) -> "http-buckets"
+                else -> null
+            }
+        if (legacy != null) o.put("pad_mode", legacy)
+    }
+
+    private fun tun2socksProxyFromSessionJson(sessionJson: String): String {
+        val o = JSONObject(sessionJson)
+        val raw = o.optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
+        val hostPort = raw.removePrefix("socks5://").removePrefix("SOCKS5://")
+        val u = o.optString("socks_auth_user", "")
+        val p = o.optString("socks_auth_password", "")
+        check(u.isNotEmpty() && p.isNotEmpty()) { "session SOCKS auth missing after inject" }
+        return "socks5://$u:$p@$hostPort"
+    }
+
+    private fun proxyUrlForLog(proxy: String): String {
+        val s = proxy.trim()
+        val schemeEnd = s.indexOf("://")
+        if (schemeEnd < 0) return s
+        val scheme = s.substring(0, schemeEnd)
+        val rest = s.substring(schemeEnd + 3)
+        val at = rest.lastIndexOf('@')
+        if (at <= 0) return s
+        val host = rest.substring(at + 1)
+        return "$scheme://***@$host"
+    }
 
     /** См. [Companion.isScreenOffBatterySaverEnabled]. */
     private fun screenOffBatterySaverEnabled(): Boolean =
