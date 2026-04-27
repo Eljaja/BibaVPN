@@ -12,7 +12,7 @@ import { getActiveProfile, patchActiveProfile } from "../profileUtils.js";
 import { SPLIT_TUNNEL_GROUPS, allSplitPresetIds } from "../splitPresets.js";
 import { SEMANTIC } from "../theme.js";
 
-/** @param {{ cfg: import('../vpnTypes').SavedConfig, setCfg: (fn: (c: import('../vpnTypes').SavedConfig) => import('../vpnTypes').SavedConfig) => void, boringAvailable: boolean, onBack: () => void, onSave: () => Promise<void>, onApplyInvite: () => Promise<void> }} props */
+/** @param {{ cfg: import('../vpnTypes').SavedConfig, setCfg: (fn: (c: import('../vpnTypes').SavedConfig) => import('../vpnTypes').SavedConfig) => void, boringAvailable: boolean, onBack: () => void, onSave: () => Promise<void>, onApplyInvite: () => Promise<void>, lastError: string | null, onClearError: () => Promise<void> }} props */
 export function SettingsScreen({
   cfg,
   setCfg,
@@ -20,6 +20,8 @@ export function SettingsScreen({
   onBack,
   onSave,
   onApplyInvite,
+  lastError,
+  onClearError,
 }) {
   const { theme, accent } = useT();
   const p = getActiveProfile(cfg);
@@ -117,6 +119,41 @@ export function SettingsScreen({
           gap: 10,
         }}
       >
+        {lastError && (
+          <div
+            style={{
+              padding: "10px 12px",
+              borderRadius: 4,
+              border: `1px solid ${SEMANTIC.err}`,
+              background: "rgba(255,90,90,0.08)",
+              color: SEMANTIC.err,
+              fontFamily: "IBM Plex Mono",
+              fontSize: 11,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <span>{lastError}</span>
+            <button
+              type="button"
+              onClick={() => onClearError()}
+              style={{
+                alignSelf: "flex-start",
+                background: "transparent",
+                border: `1px solid ${SEMANTIC.err}`,
+                color: SEMANTIC.err,
+                fontFamily: "IBM Plex Mono",
+                fontSize: 10,
+                padding: "6px 10px",
+                cursor: "pointer",
+                textTransform: "uppercase",
+              }}
+            >
+              {t("btn_clear")}
+            </button>
+          </div>
+        )}
         <ExpandSection label={t("settings_group_profile")} summary={p.name} defaultOpen>
           <Field
             label={t("profile_rename")}

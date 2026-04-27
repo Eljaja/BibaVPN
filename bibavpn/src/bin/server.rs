@@ -235,6 +235,22 @@ async fn main() -> anyhow::Result<()> {
             (&args.cert, &args.key, &args.self_signed_san),
             (None, None, Some(_))
         );
+        // With `--cert`/`--key`, `lab_insecure` is false so clients use CA verification.
+        // Self-signed / private-CA certs are not in the system store — embed the leaf PEM for pinning.
+        let pin_cert_pem = match &args.cert {
+            Some(path) => {
+                let pem = std::fs::read_to_string(path).with_context(|| {
+                    format!("invite: read --cert for pin_cert_pem {}", path.display())
+                })?;
+                let t = pem.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            }
+            None => None,
+        };
         let passphrase = args
             .invite_passphrase
             .as_deref()
@@ -325,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
             reality_target,
             reality_public_key,
             reality_short_id,
-            pin_cert_pem: None,
+            pin_cert_pem,
             server_ack_delay_min_ms: Some(args.server_ack_delay_min_ms),
             server_ack_delay_max_ms: Some(args.server_ack_delay_max_ms),
             rtt_mask_jitter_ms: Some(args.rtt_mask_jitter_ms),

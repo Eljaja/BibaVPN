@@ -82,7 +82,16 @@ function AppInner() {
         boringAvailable={boringAvailable}
         onBack={() => setTab("connect")}
         onSave={saveDraft}
-        onApplyInvite={applyInvite}
+        lastError={snap.error}
+        onClearError={clearError}
+        onApplyInvite={async () => {
+          try {
+            await applyInvite();
+          } finally {
+            // apply_invite updates Rust cfg; stale draft would hide filled server/token/psk fields.
+            setDraft(null);
+          }
+        }}
       />
     );
   }
