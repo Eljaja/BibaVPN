@@ -1,0 +1,13 @@
+# Кэш и артефакты
+**/target
+.git
+**/.git
+
+# Фронт (cargo check не требует node; build.rs не копируем тяжёлый dist)
+**/node_modules
+bibavpn-desktop/ui/node_modules
+
+# Не входят в workspace Cargo — если лежат рядом, не тащить в контекст
+naiveproxy
+wstunnel
+third_party

@@ -1,0 +1,58 @@
+# Одноразовая среда: SDK + Rust + Node → `tauri android init --ci`.
+# Сборка образа (опционально): docker build -f docker/Dockerfile.tauri-android-init -t bibavpn:tauri-android-init docker
+# Запуск init (из хоста WSL, каталог репозитория biba-vpn):
+#   docker run --rm --network=host \
+#     -v "$(pwd)":/work -w /work \
+#     bibavpn:tauri-android-init \
+#     bash scripts/tauri-android-init-inner.sh
+
+FROM debian:bookworm-slim
+
+# Some networks stall on deb.debian.org during `apt-get update`; use ftp for main, security.debian.org for -security.
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://security.debian.org/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://ftp.debian.org/debian|g' \
+        /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    printf 'Acquire::Retries "10";\nAcquire::http::Timeout "120";\nAcquire::https::Timeout "120";\n' \
+      > /etc/apt/apt.conf.d/80retry
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    ANDROID_HOME=/opt/android-sdk \
+    ANDROID_SDK_ROOT=/opt/android-sdk
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates unzip openjdk-17-jdk \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" \
+    && cd /tmp \
+    && curl -fsSO https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+    && unzip -q commandlinetools-linux-11076708_latest.zip -d "${ANDROID_HOME}/cmdline-tools" \
+    && mv "${ANDROID_HOME}/cmdline-tools/cmdline-tools" "${ANDROID_HOME}/cmdline-tools/latest" \
+    && rm -f commandlinetools-linux-11076708_latest.zip
+
+ENV PATH="${PATH}:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools"
+
+RUN yes | sdkmanager --sdk_root="${ANDROID_HOME}" --licenses >/dev/null \
+    && sdkmanager --sdk_root="${ANDROID_HOME}" \
+        "platform-tools" \
+        "platforms;android-34" \
+        "build-tools;34.0.0" \
+        "ndk;26.1.10909125"
+
+ENV ANDROID_NDK_ROOT="${ANDROID_HOME}/ndk/26.1.10909125" \
+    NDK_HOME="${ANDROID_HOME}/ndk/26.1.10909125"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    && /root/.cargo/bin/rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work

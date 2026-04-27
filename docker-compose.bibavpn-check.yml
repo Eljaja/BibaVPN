@@ -1,0 +1,15 @@
+# Проверочная сборка bibavpn-desktop в Docker (Debian trixie + Rust).
+#
+#   docker compose -f docker-compose.bibavpn-check.yml build
+#
+# При ошибках резолва при сборке (apt/cargo): network: host для build (Linux/WSL2).
+# Либо: ./scripts/docker-build-verify.sh
+
+services:
+  bibavpn-desktop-verify:
+    image: bibavpn-desktop:linux-check
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: verify
+      network: host

@@ -4,6 +4,8 @@
 # Set DEPLOY_VPS_IP, run once on the VPS.
 set -euo pipefail
 : "${DEPLOY_VPS_IP:?set DEPLOY_VPS_IP=host (IP or name)}"
+# Public / bind port on the host (e.g. 19843 for a non-default listener).
+: "${DEPLOY_PORT:=8443}"
 DIR="/opt/bibavpn"
 # Stop a legacy container-based install if it exists; ignore errors if Docker is absent.
 if command -v docker >/dev/null 2>&1; then
@@ -44,24 +46,30 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/bibavpn
 EnvironmentFile=-/opt/bibavpn/bibavpn.env
-ExecStart=/opt/bibavpn/bibavpn-server --listen 0.0.0.0:8443 --cert /opt/bibavpn/cert.pem --key /opt/bibavpn/key.pem --token ${BIBA_VPN_TOKEN} --psk ${BIBA_VPN_PSK} --proto-domain ${BIBA_PROTO_DOMAIN} --ws-path /ws --pad-mode adaptive --ack-profile aggressive --decoy-max 32 --max-pad 64 --max-ws-binary 1400 --ws-ping-secs 25 --ws-ping-jitter-percent 8
+ExecStart=/opt/bibavpn/bibavpn-server --listen 0.0.0.0:__DEPLOY_PORT__ --cert /opt/bibavpn/cert.pem --key /opt/bibavpn/key.pem --token ${BIBA_VPN_TOKEN} --psk ${BIBA_VPN_PSK} --proto-domain ${BIBA_PROTO_DOMAIN} --ws-path /ws --pad-mode adaptive --ack-profile aggressive --decoy-max 32 --max-pad 64 --max-ws-binary 262144 --ws-ping-secs 25 --ws-ping-jitter-percent 8
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+sed "s/__DEPLOY_PORT__/${DEPLOY_PORT}/g" /etc/systemd/system/bibavpn.service > /tmp/bibavpn.service && mv /tmp/bibavpn.service /etc/systemd/system/bibavpn.service
 
 # Capture one biba:// line, then start long-lived server under systemd
 FIFO="$DIR/invite.fifo"
 rm -f "$FIFO" invite.biba err.invite.log
 mkfifo "$FIFO"
-( read -r INV <"$FIFO" && printf '%s\n' "$INV" >"$DIR/invite.biba" ) & RID=$!
+( while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      biba://*) printf '%s\n' "$line" >"$DIR/invite.biba"; break ;;
+    esac
+  done <"$FIFO" ) & RID=$!
 (
   set -a && . "$DIR/bibavpn.env" && set +a
+  export RUST_LOG=off
   # shellcheck disable=SC2086
   exec "$DIR/bibavpn-server" \
-    --listen 0.0.0.0:8443 \
+    --listen "0.0.0.0:${DEPLOY_PORT}" \
     --cert "$DIR/cert.pem" \
     --key "$DIR/key.pem" \
     --token "$BIBA_VPN_TOKEN" \
@@ -72,12 +80,12 @@ mkfifo "$FIFO"
     --ack-profile aggressive \
     --decoy-max 32 \
     --max-pad 64 \
-    --max-ws-binary 1400 \
+    --max-ws-binary 262144 \
     --ws-ping-secs 25 \
     --ws-ping-jitter-percent 8 \
     --print-invite-uri \
     --invite-passphrase "$BIBA_INVITE_PASSPHRASE" \
-    --invite-public "${DEPLOY_VPS_IP}:8443" \
+    --invite-public "${DEPLOY_VPS_IP}:${DEPLOY_PORT}" \
     --invite-sni "${DEPLOY_VPS_IP}" >"$FIFO" 2>err.invite.log
 ) & HID=$!
 wait "$RID" || true
