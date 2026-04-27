@@ -44,6 +44,14 @@ __pycache__/
 # Desktop UI build artifacts
 /bibavpn-desktop/ui/node_modules
 /bibavpn-desktop/ui/dist
+/bibavpn-desktop/node_modules
+
+# Tauri `android init` output + merged VPN glue (regenerate: `npm run android:bootstrap` in bibavpn-desktop)
+/bibavpn-desktop/src-tauri/gen/
 
 # Design mock (static HTML / JSX prototype)
 bibavpn-desktop/design-mock/
+united-design-new/
+
+# Local cross-compilation output (e.g. Windows GNU from Linux)
+dist-windows-gnu/
