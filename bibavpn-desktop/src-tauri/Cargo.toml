@@ -4,12 +4,21 @@ version.workspace = true
 edition.workspace = true
 description = "BibaVPN desktop (Tauri): local proxy, system proxy, tray"
 
+[lib]
+name = "bibavpn_desktop"
+# `staticlib` вместе с `cdylib` на некоторых toolchain (rustc 1.94 + json diagnostics) даёт ICE при линковке; для Tauri Android достаточно lib + cdylib.
+crate-type = ["lib", "cdylib"]
+path = "src/lib.rs"
+
 [features]
 # Without `tauri/custom-protocol` Tauri stays in “dev” mode and loads `devUrl` (localhost:5173).
 # Default on so `cargo build --release` serves `frontendDist` via the asset protocol.
+# `boring-tls` is off by default so Android (Tauri mobile) links without boring-sys; desktop enables it in tauri.conf.json `build.features`.
 # For Vite HMR: `cargo run --no-default-features` and `npm run dev` in `ui/`.
 default = ["embed-ui"]
 embed-ui = ["tauri/custom-protocol"]
+# Forward to bibavpn; requires cmake/nasm on some Windows hosts for boring-sys.
+boring-tls = ["bibavpn/boring-tls"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -33,3 +42,6 @@ windows = { version = "0.58", features = ["Win32_Networking_WinInet"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

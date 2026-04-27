@@ -1,7 +1,33 @@
 # 16 KB memory pages (Android 15+ / Pixel и др.): LOAD-сегменты ELF должны быть align 2**14.
 # https://developer.android.com/guide/practices/page-sizes
+#
+# `--cap-lints allow`: иначе rustc 1.94+ при `cargo`/Tauri с `--error-format=json` может ICE в early_lint_checks
+# на предупреждениях из развёрнутых макросов (mobile).
 [target.aarch64-linux-android]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "--cap-lints", "allow",
+]
+
+[target.armv7-linux-androideabi]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "--cap-lints", "allow",
+]
+
+[target.i686-linux-android]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "--cap-lints", "allow",
+]
 
 [target.x86_64-linux-android]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "--cap-lints", "allow",
+]
+
+# Кросс-компиляция WSL → Windows GNU: rustc 1.94 + `--error-format=json` может ICE на dead_code и др.
+# Линкер задайте: `export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc`
+[target.x86_64-pc-windows-gnu]
+rustflags = ["--cap-lints", "allow"]
