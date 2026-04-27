@@ -1,20 +1,23 @@
-//! Сохранённая конфигурация и JSON для `local_client` (как в Android / старый egui-клиент).
+//! Сохранённая конфигурация (multi-profile) и JSON для `local_client`.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bibavpn::local_client::DEFAULT_CLIENT_MAX_WS_BINARY;
 use serde::{Deserialize, Serialize};
 
+pub const CONFIG_VERSION: u32 = 2;
+
+/// Один профиль туннеля (как один «сервер» в Android).
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SavedConfig {
+pub struct TunnelProfile {
+    pub id: String,
+    pub name: String,
     pub server: String,
     pub token: String,
     pub psk: String,
     pub sni: String,
     pub insecure: bool,
-    pub local_http_port: u16,
-    #[serde(default)]
-    pub local_socks_port: u16,
     #[serde(default = "default_max_pad_cfg")]
     pub max_pad: u8,
     #[serde(default = "default_decoy_max_cfg")]
@@ -61,30 +64,98 @@ pub struct SavedConfig {
     pub decoy_gets_paths: String,
     #[serde(default)]
     pub pin_cert_pem: String,
-    /// `auto` | `ru` | `en` — язык UI и меню в трее (десктоп).
-    #[serde(default = "default_ui_locale")]
-    pub ui_locale: String,
-    /// Раздельный туннель (Windows/macOS): выбранные пресеты идут в обход системного HTTP-прокси.
     #[serde(default)]
     pub split_tunnel_enabled: bool,
     #[serde(default)]
     pub split_tunnel_preset_ids: Vec<String>,
+
+    // Extended protocol (v3 / stealth)
+    #[serde(default = "default_proto")]
+    pub proto: u8,
+    #[serde(default)]
+    pub proto_domain: String,
+    #[serde(default)]
+    pub stealth_profile: String,
+    #[serde(default)]
+    pub decoy_mode: String,
+    #[serde(default)]
+    pub desync_mode: String,
+    #[serde(default)]
+    pub tcp_fooling: String,
+    #[serde(default)]
+    pub tls_fragment: bool,
+    #[serde(default = "default_ws_parallel")]
+    pub ws_parallel: u8,
+    #[serde(default)]
+    pub idle_decoy_secs: u64,
+    #[serde(default = "default_tls_stack_str")]
+    pub tls_stack: String,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub reality_target: String,
+    #[serde(default)]
+    pub reality_public_key: String,
+    #[serde(default)]
+    pub reality_short_id: String,
+    #[serde(default)]
+    pub ws_host: String,
+    #[serde(default)]
+    pub ws_origin: String,
+    #[serde(default)]
+    pub ws_user_agent: String,
+    #[serde(default)]
+    pub ws_accept_language: String,
+    #[serde(default)]
+    pub ws_jitter_min_ms: u8,
+    #[serde(default)]
+    pub ws_jitter_max_ms: u8,
+
+    // Android-only (сохраняются в профиле; в tunnel JSON не попадают, кроме socks_bind)
+    /// Локальный SOCKS для `local_client` на Android. Пусто → `127.0.0.1:1080` как в `BibaVpnService::SOCKS_LOCAL`.
+    /// Не показываем в UI как «настройки прокси» — поле для миграции/внутренних сценариев.
+    #[serde(default)]
+    pub android_socks_bind: String,
+    /// Пакеты в обход VPN (`addDisallowedApplication`), по одному в элементе вектора.
+    #[serde(default)]
+    pub android_split_tunnel_packages: Vec<String>,
+    /// Режим маршрутизации (`system_vpn` — текущее поведение VpnService).
+    #[serde(default = "default_android_vpn_routing_mode")]
+    pub android_vpn_routing_mode: String,
+    /// Экономия при выключенном экране (аналог `KEY_SCREEN_OFF_BATTERY_SAVER` в Compose).
+    #[serde(default)]
+    pub android_screen_off_battery_saver: bool,
 }
 
-fn default_decoy_gets_interval_cfg() -> u64 {
-    30
+fn default_proto() -> u8 {
+    3
 }
 
-impl Default for SavedConfig {
+fn default_ws_parallel() -> u8 {
+    1
+}
+
+fn default_tls_stack_str() -> String {
+    "rustls".to_string()
+}
+
+fn default_android_vpn_routing_mode() -> String {
+    "system_vpn".to_string()
+}
+
+/// Значение по умолчанию для `socks_bind` в JSON на Android (см. `BibaVpnService.SOCKS_LOCAL`).
+pub const ANDROID_DEFAULT_SOCKS_BIND: &str = "127.0.0.1:1080";
+
+impl Default for TunnelProfile {
     fn default() -> Self {
         Self {
+            id: String::new(),
+            name: "Profile".to_string(),
             server: String::new(),
             token: String::new(),
             psk: String::new(),
             sni: String::new(),
             insecure: false,
-            local_http_port: 17_890,
-            local_socks_port: 0,
             max_pad: default_max_pad_cfg(),
             decoy_max: default_decoy_max_cfg(),
             max_ws_binary: default_max_ws_binary_cfg(),
@@ -108,9 +179,75 @@ impl Default for SavedConfig {
             decoy_gets_interval_secs: default_decoy_gets_interval_cfg(),
             decoy_gets_paths: String::new(),
             pin_cert_pem: String::new(),
-            ui_locale: default_ui_locale(),
             split_tunnel_enabled: false,
             split_tunnel_preset_ids: Vec::new(),
+            proto: default_proto(),
+            proto_domain: String::new(),
+            stealth_profile: String::new(),
+            decoy_mode: String::new(),
+            desync_mode: String::new(),
+            tcp_fooling: String::new(),
+            tls_fragment: false,
+            ws_parallel: default_ws_parallel(),
+            idle_decoy_secs: 0,
+            tls_stack: default_tls_stack_str(),
+            fingerprint: String::new(),
+            reality_target: String::new(),
+            reality_public_key: String::new(),
+            reality_short_id: String::new(),
+            ws_host: String::new(),
+            ws_origin: String::new(),
+            ws_user_agent: String::new(),
+            ws_accept_language: String::new(),
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            android_socks_bind: String::new(),
+            android_split_tunnel_packages: Vec::new(),
+            android_vpn_routing_mode: default_android_vpn_routing_mode(),
+            android_screen_off_battery_saver: false,
+        }
+    }
+}
+
+/// Корневой сохранённый конфиг (десктоп): язык, локальные порты, список профилей.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SavedConfig {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default = "default_ui_locale")]
+    pub ui_locale: String,
+    #[serde(default = "default_http_port")]
+    pub local_http_port: u16,
+    #[serde(default)]
+    pub local_socks_port: u16,
+    #[serde(default)]
+    pub active_profile_id: String,
+    #[serde(default)]
+    pub profiles: Vec<TunnelProfile>,
+}
+
+fn default_http_port() -> u16 {
+    17_890
+}
+
+fn default_decoy_gets_interval_cfg() -> u64 {
+    30
+}
+
+impl Default for SavedConfig {
+    fn default() -> Self {
+        let id = new_profile_id();
+        Self {
+            version: CONFIG_VERSION,
+            ui_locale: default_ui_locale(),
+            local_http_port: default_http_port(),
+            local_socks_port: 0,
+            active_profile_id: id.clone(),
+            profiles: vec![TunnelProfile {
+                id,
+                name: "Default".to_string(),
+                ..TunnelProfile::default()
+            }],
         }
     }
 }
@@ -123,7 +260,51 @@ fn default_use_tcp_mux_cfg() -> bool {
     true
 }
 
+fn new_profile_id() -> String {
+    let us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    format!("p-{us}")
+}
+
 impl SavedConfig {
+    pub fn active_profile(&self) -> Option<&TunnelProfile> {
+        self.profiles
+            .iter()
+            .find(|p| p.id == self.active_profile_id)
+            .or_else(|| self.profiles.first())
+    }
+
+    pub fn active_profile_mut(&mut self) -> Option<&mut TunnelProfile> {
+        let id = self.active_profile_id.clone();
+        let idx = self.profiles.iter().position(|p| p.id == id);
+        match idx {
+            Some(i) => self.profiles.get_mut(i),
+            None => self.profiles.first_mut(),
+        }
+    }
+
+    pub fn can_connect(&self) -> bool {
+        self.active_profile()
+            .map(|p| {
+                let invite_ok = !p.from_invite.trim().is_empty() && !p.invite_passphrase.is_empty();
+                let manual_ok = !p.server.trim().is_empty() && !p.token.trim().is_empty();
+                invite_ok || manual_ok
+            })
+            .unwrap_or(false)
+    }
+
+    /// JSON для `local_client_options_from_json_str_with_binds` (только активный профиль).
+    pub fn start_config_json(&self) -> Result<String, String> {
+        let p = self
+            .active_profile()
+            .ok_or_else(|| "no active profile".to_string())?;
+        p.start_config_json()
+    }
+}
+
+impl TunnelProfile {
     pub fn can_connect(&self) -> bool {
         let invite_ok = !self.from_invite.trim().is_empty() && !self.invite_passphrase.is_empty();
         let manual_ok = !self.server.trim().is_empty() && !self.token.trim().is_empty();
@@ -146,14 +327,31 @@ impl SavedConfig {
             o.insert("server".to_string(), json!(self.server.trim()));
             o.insert("token".to_string(), json!(self.token.clone()));
             let tp = self.tls_profile.trim();
-            if !tp.is_empty() {
+            if !tp.is_empty() && tp != "default" {
                 o.insert("tls_profile".to_string(), json!(tp));
             }
         }
-        if !self.sni.trim().is_empty() {
+        // Invite: не передаём пустой sni (как Android).
+        if !use_invite {
+            if !self.sni.trim().is_empty() {
+                o.insert("sni".to_string(), json!(self.sni.trim()));
+            }
+        } else if !self.sni.trim().is_empty() {
             o.insert("sni".to_string(), json!(self.sni.trim()));
         }
-        o.insert("socks_bind".to_string(), json!("127.0.0.1:0"));
+
+        #[cfg(target_os = "android")]
+        let socks_bind: String = {
+            let s = self.android_socks_bind.trim();
+            if s.is_empty() {
+                ANDROID_DEFAULT_SOCKS_BIND.to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        #[cfg(not(target_os = "android"))]
+        let socks_bind = "127.0.0.1:0".to_string();
+        o.insert("socks_bind".to_string(), json!(socks_bind));
         o.insert("insecure".to_string(), json!(self.insecure));
         o.insert("max_pad".to_string(), json!(self.max_pad));
         o.insert("decoy_max".to_string(), json!(self.decoy_max.min(255)));
@@ -177,6 +375,14 @@ impl SavedConfig {
         let j_bin = self.ws_binary_send_jitter_ms.min(255);
         if j_bin > 0 {
             o.insert("ws_binary_send_jitter_ms".to_string(), json!(j_bin));
+        }
+        let jmin = self.ws_jitter_min_ms.min(255);
+        if jmin > 0 {
+            o.insert("ws_jitter_min_ms".to_string(), json!(jmin));
+        }
+        let jmax = self.ws_jitter_max_ms.min(255);
+        if jmax > 0 {
+            o.insert("ws_jitter_max_ms".to_string(), json!(jmax));
         }
         let udp_pad = self.udp_max_pad.trim();
         if !udp_pad.is_empty() {
@@ -235,7 +441,189 @@ impl SavedConfig {
         if !lines.is_empty() {
             o.insert("ws_headers".to_string(), json!(lines));
         }
+
+        let pr = self.proto.max(1).min(255);
+        if pr != 3 {
+            o.insert("proto".to_string(), json!(pr));
+        }
+        // Как Android `buildJson`: proto_domain только в ручном режиме (не инвайт).
+        let pd = self.proto_domain.trim();
+        if !use_invite && !pd.is_empty() {
+            o.insert("proto_domain".to_string(), json!(pd));
+        }
+        let sp = self.stealth_profile.trim();
+        if !sp.is_empty() {
+            o.insert("stealth_profile".to_string(), json!(sp));
+        }
+        let dm = self.decoy_mode.trim();
+        if !dm.is_empty() {
+            o.insert("decoy_mode".to_string(), json!(dm));
+        }
+        let dsm = self.desync_mode.trim();
+        if !dsm.is_empty() {
+            o.insert("desync_mode".to_string(), json!(dsm));
+        }
+        let tf = self.tcp_fooling.trim();
+        if !tf.is_empty() {
+            o.insert("tcp_fooling".to_string(), json!(tf));
+        }
+        if self.tls_fragment {
+            o.insert("tls_fragment".to_string(), json!(true));
+        }
+        let wsp = self.ws_parallel.max(1).min(4);
+        o.insert("ws_parallel".to_string(), json!(wsp));
+        if self.idle_decoy_secs > 0 {
+            o.insert("idle_decoy_secs".to_string(), json!(self.idle_decoy_secs));
+        }
+        let tst = self.tls_stack.trim().to_lowercase();
+        if !tst.is_empty() && tst != "rustls" {
+            o.insert("tls_stack".to_string(), json!(tst));
+        }
+        let fp = self.fingerprint.trim();
+        if !fp.is_empty() {
+            o.insert("fingerprint".to_string(), json!(fp));
+        }
+        let rt = self.reality_target.trim();
+        let rpk = self.reality_public_key.trim();
+        let rsid = self.reality_short_id.trim();
+        if !rt.is_empty() && !rpk.is_empty() {
+            o.insert("reality_target".to_string(), json!(rt));
+            o.insert("reality_public_key".to_string(), json!(rpk));
+            if !rsid.is_empty() {
+                o.insert("reality_short_id".to_string(), json!(rsid));
+            }
+        }
+        let wh = self.ws_host.trim();
+        if !wh.is_empty() {
+            o.insert("ws_host".to_string(), json!(wh));
+        }
+        let wo = self.ws_origin.trim();
+        if !wo.is_empty() {
+            o.insert("ws_origin".to_string(), json!(wo));
+        }
+        let wua = self.ws_user_agent.trim();
+        if !wua.is_empty() {
+            o.insert("ws_user_agent".to_string(), json!(wua));
+        }
+        let wal = self.ws_accept_language.trim();
+        if !wal.is_empty() {
+            o.insert("ws_accept_language".to_string(), json!(wal));
+        }
+
         serde_json::to_string(&Value::Object(o)).map_err(|e| e.to_string())
+    }
+}
+
+/// Старый формат `config.json` (один плоский профиль).
+#[derive(Deserialize)]
+struct LegacyFlatConfig {
+    server: String,
+    token: String,
+    psk: String,
+    sni: String,
+    insecure: bool,
+    #[serde(default = "default_http_port")]
+    local_http_port: u16,
+    #[serde(default)]
+    local_socks_port: u16,
+    #[serde(default = "default_max_pad_cfg")]
+    max_pad: u8,
+    #[serde(default = "default_decoy_max_cfg")]
+    decoy_max: u8,
+    #[serde(default = "default_max_ws_binary_cfg")]
+    max_ws_binary: usize,
+    #[serde(default = "default_tls_profile_cfg")]
+    tls_profile: String,
+    #[serde(default)]
+    from_invite: String,
+    #[serde(default)]
+    invite_passphrase: String,
+    #[serde(default)]
+    junk_frames: u32,
+    #[serde(default)]
+    early_ws_frames: u8,
+    #[serde(default = "default_ws_ping_secs_cfg")]
+    ws_ping_secs: u64,
+    #[serde(default)]
+    ws_headers: String,
+    #[serde(default = "default_use_tcp_mux_cfg")]
+    use_tcp_mux: bool,
+    #[serde(default)]
+    ws_path: String,
+    #[serde(default)]
+    pad_mode: String,
+    #[serde(default)]
+    ws_ping_jitter_percent: u8,
+    #[serde(default)]
+    ws_binary_send_jitter_ms: u8,
+    #[serde(default)]
+    udp_max_pad: String,
+    #[serde(default)]
+    udp_max_ws_binary: String,
+    #[serde(default)]
+    udp_mux_reply_timeout_secs: String,
+    #[serde(default)]
+    dummy_interval_secs: u64,
+    #[serde(default)]
+    decoy_gets: bool,
+    #[serde(default = "default_decoy_gets_interval_cfg")]
+    decoy_gets_interval_secs: u64,
+    #[serde(default)]
+    decoy_gets_paths: String,
+    #[serde(default)]
+    pin_cert_pem: String,
+    #[serde(default = "default_ui_locale")]
+    ui_locale: String,
+    #[serde(default)]
+    split_tunnel_enabled: bool,
+    #[serde(default)]
+    split_tunnel_preset_ids: Vec<String>,
+}
+
+fn migrate_legacy(l: LegacyFlatConfig) -> SavedConfig {
+    let id = new_profile_id();
+    let profile = TunnelProfile {
+        id: id.clone(),
+        name: "Default".to_string(),
+        server: l.server,
+        token: l.token,
+        psk: l.psk,
+        sni: l.sni,
+        insecure: l.insecure,
+        max_pad: l.max_pad,
+        decoy_max: l.decoy_max,
+        max_ws_binary: l.max_ws_binary,
+        tls_profile: l.tls_profile,
+        from_invite: l.from_invite,
+        invite_passphrase: l.invite_passphrase,
+        junk_frames: l.junk_frames,
+        early_ws_frames: l.early_ws_frames,
+        ws_ping_secs: l.ws_ping_secs,
+        ws_headers: l.ws_headers,
+        use_tcp_mux: l.use_tcp_mux,
+        ws_path: l.ws_path,
+        pad_mode: l.pad_mode,
+        ws_ping_jitter_percent: l.ws_ping_jitter_percent,
+        ws_binary_send_jitter_ms: l.ws_binary_send_jitter_ms,
+        udp_max_pad: l.udp_max_pad,
+        udp_max_ws_binary: l.udp_max_ws_binary,
+        udp_mux_reply_timeout_secs: l.udp_mux_reply_timeout_secs,
+        dummy_interval_secs: l.dummy_interval_secs,
+        decoy_gets: l.decoy_gets,
+        decoy_gets_interval_secs: l.decoy_gets_interval_secs,
+        decoy_gets_paths: l.decoy_gets_paths,
+        pin_cert_pem: l.pin_cert_pem,
+        split_tunnel_enabled: l.split_tunnel_enabled,
+        split_tunnel_preset_ids: l.split_tunnel_preset_ids,
+        ..TunnelProfile::default()
+    };
+    SavedConfig {
+        version: CONFIG_VERSION,
+        ui_locale: l.ui_locale,
+        local_http_port: l.local_http_port,
+        local_socks_port: l.local_socks_port,
+        active_profile_id: id,
+        profiles: vec![profile],
     }
 }
 
@@ -249,10 +637,23 @@ pub fn config_path() -> PathBuf {
 
 pub fn load_config_disk() -> SavedConfig {
     let p = config_path();
-    std::fs::read_to_string(p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Ok(s) = std::fs::read_to_string(&p) else {
+        return SavedConfig::default();
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return SavedConfig::default();
+    };
+    if val
+        .get("profiles")
+        .and_then(|x| x.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        serde_json::from_value(val).unwrap_or_default()
+    } else {
+        serde_json::from_value::<LegacyFlatConfig>(val)
+            .map(migrate_legacy)
+            .unwrap_or_default()
+    }
 }
 
 pub fn save_config_disk(cfg: &SavedConfig) {
@@ -262,11 +663,49 @@ pub fn save_config_disk(cfg: &SavedConfig) {
 }
 
 pub fn normalize_loaded(cfg: &mut SavedConfig) {
-    if cfg.local_http_port == 0 {
-        cfg.local_http_port = 17_890;
+    if cfg.version < CONFIG_VERSION {
+        cfg.version = CONFIG_VERSION;
     }
-    if cfg.max_ws_binary < 1024 {
-        cfg.max_ws_binary = DEFAULT_CLIENT_MAX_WS_BINARY;
+    if cfg.local_http_port == 0 {
+        cfg.local_http_port = default_http_port();
+    }
+    if cfg.profiles.is_empty() {
+        let id = new_profile_id();
+        cfg.active_profile_id = id.clone();
+        cfg.profiles.push(TunnelProfile {
+            id,
+            name: "Default".to_string(),
+            ..TunnelProfile::default()
+        });
+    }
+    if !cfg
+        .profiles
+        .iter()
+        .any(|p| p.id == cfg.active_profile_id)
+    {
+        cfg.active_profile_id = cfg.profiles[0].id.clone();
+    }
+    for p in &mut cfg.profiles {
+        if p.id.trim().is_empty() {
+            p.id = new_profile_id();
+        }
+        if p.max_ws_binary < 1024 {
+            p.max_ws_binary = DEFAULT_CLIENT_MAX_WS_BINARY;
+        }
+        if p.android_vpn_routing_mode.trim().is_empty() {
+            p.android_vpn_routing_mode = default_android_vpn_routing_mode();
+        }
+        let mut seen_pkg = std::collections::HashSet::<String>::new();
+        p.android_split_tunnel_packages = std::mem::take(&mut p.android_split_tunnel_packages)
+            .into_iter()
+            .filter_map(|pkg| {
+                let k = pkg.trim().to_string();
+                if k.is_empty() {
+                    return None;
+                }
+                seen_pkg.insert(k.clone()).then_some(k)
+            })
+            .collect();
     }
     let l = cfg.ui_locale.trim().to_lowercase();
     cfg.ui_locale = match l.as_str() {
@@ -298,9 +737,12 @@ fn default_tls_profile_cfg() -> String {
 }
 
 pub fn display_host_line(cfg: &SavedConfig) -> String {
-    let server = cfg.server.trim();
-    let sni = cfg.sni.trim();
-    let invite = cfg.from_invite.trim();
+    let Some(p) = cfg.active_profile() else {
+        return "—".to_string();
+    };
+    let server = p.server.trim();
+    let sni = p.sni.trim();
+    let invite = p.from_invite.trim();
     if !server.is_empty() && !sni.is_empty() {
         sni.to_string()
     } else if !server.is_empty() {
@@ -318,8 +760,11 @@ pub fn display_host_line(cfg: &SavedConfig) -> String {
 }
 
 pub fn server_card_subtitle(cfg: &SavedConfig) -> String {
-    let server = cfg.server.trim();
-    let invite = cfg.from_invite.trim();
+    let Some(p) = cfg.active_profile() else {
+        return "Не задан сервер".to_string();
+    };
+    let server = p.server.trim();
+    let invite = p.from_invite.trim();
     if !server.is_empty() {
         server.to_string()
     } else if !invite.is_empty() {

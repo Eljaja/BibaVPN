@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="channel_name">Прокси</string>
+    <string name="notification_title">BibaVPN активен</string>
+    <string name="notification_text">VPN-туннель активен</string>
+    <string name="notification_action_disable">Отключить</string>
+    <string name="notification_action_enable">Включить</string>
+    <string name="vpn_error_tun2socks">ошибка tun2socks</string>
+    <string name="vpn_error_prefix">BibaVPN: %1$s</string>
+</resources>
