@@ -1,0 +1,19 @@
+{
+  "name": "bibavpn-desktop",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "npm run dev --prefix ./ui",
+    "build": "npm run build --prefix ./ui",
+    "tauri": "tauri",
+    "tauri:android": "tauri android",
+    "tauri:android:dev": "tauri android dev",
+    "tauri:android:build": "tauri android build",
+    "android:bootstrap": "cd .. && bash scripts/tauri-android-init-local.sh && bash scripts/integrate-bibavpn-into-tauri-android.sh",
+    "android:bootstrap:docker": "cd .. && bash scripts/tauri-android-init-docker.sh && bash scripts/integrate-bibavpn-into-tauri-android.sh"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
