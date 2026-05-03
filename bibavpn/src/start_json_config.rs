@@ -1,4 +1,4 @@
-//! Конфиг старта клиента в виде JSON — тот же формат, что у Android `nativeStart` / `bibavpn-jni`.
+//! Конфиг старта клиента в виде JSON — тот же формат, что у Android `nativeStart` / крейта `bibavpn-jni` (`apps/bibavpn-jni`).
 
 use std::str::FromStr;
 use std::sync::Arc;
