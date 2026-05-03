@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- Должен совпадать с заливкой карты в scripts/generate-icons.mjs -->
+  <color name="ic_launcher_background">#0c0f12</color>
+</resources>

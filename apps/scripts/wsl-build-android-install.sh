@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Build BibaVPN Android APK in WSL and install (adb) when device is connected.
+# Run:  wsl -e bash /mnt/c/Users/.../biba-vpn/apps/scripts/wsl-build-android-install.sh
+set -euo pipefail
+SRC="/mnt/c/Users/ilya/biba-vpn/biba-vpn"
+DST="/root/biba-vpn"
+export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
+export ANDROID_HOME="${ANDROID_HOME:-/root/Android/Sdk}"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export NDK_HOME="${NDK_HOME:-$ANDROID_HOME/ndk/26.1.10909125}"
+export PATH="$HOME/.cargo/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:/usr/local/bin:/usr/bin:$PATH"
+export CARGO_TERM_COLOR=always
+
+if [ ! -d "$SRC/apps/bibavpn-desktop" ]; then
+  echo "No apps/bibavpn-desktop at $SRC" >&2
+  exit 1
+fi
+
+mkdir -p /root
+rsync -a --delete \
+  --exclude=node_modules \
+  --exclude=target \
+  --exclude=ui/node_modules \
+  --exclude=ui/dist \
+  "$SRC/" "$DST/"
+
+cd "$DST/apps/bibavpn-desktop"
+npm install
+npm run tauri:android:build
+
+# APK path from Tauri (universal or arm64)
+APK=""
+for p in \
+  "src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk" \
+  "src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk" \
+  "src-tauri/gen/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+ do
+  if [ -f "$p" ]; then
+    APK="$p"
+    break
+  fi
+done
+if [ -z "$APK" ]; then
+  echo "APK not found, listing outputs:" >&2
+  find src-tauri/gen/android -name "*.apk" 2>/dev/null | head -20
+  exit 1
+fi
+
+echo "Built: $APK"
+
+if command -v adb >/dev/null 2>&1; then
+  adb start-server
+  if adb devices | grep -q "device$"; then
+    # aligned/universal APK: usually install with -r
+    adb install -r "$APK" && echo "Installed on device."
+  else
+    echo "No device in 'adb devices'. APK: $PWD/$APK" >&2
+  fi
+else
+  echo "adb not in PATH ($ANDROID_HOME/platform-tools). APK: $PWD/$APK" >&2
+fi
