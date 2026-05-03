@@ -13,8 +13,8 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
-      - "bibavpn-desktop/**"
-      - "!bibavpn-desktop/**/*.md"
+      - "apps/bibavpn-desktop/**"
+      - "!apps/bibavpn-desktop/**/*.md"
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - ".github/workflows/desktop-windows.yml"
@@ -23,8 +23,8 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
-      - "bibavpn-desktop/**"
-      - "!bibavpn-desktop/**/*.md"
+      - "apps/bibavpn-desktop/**"
+      - "!apps/bibavpn-desktop/**/*.md"
       - "Cargo.toml"
       - "rust-toolchain.toml"
       - ".github/workflows/desktop-windows.yml"
@@ -50,10 +50,10 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: bibavpn-desktop/ui/package-lock.json
+          cache-dependency-path: apps/bibavpn-desktop/ui/package-lock.json
 
       - name: Install UI deps & build frontend
-        working-directory: bibavpn-desktop/ui
+        working-directory: apps/bibavpn-desktop/ui
         run: npm install --no-audit --no-fund && npm run build
 
       - name: Build bibavpn-desktop (release)
