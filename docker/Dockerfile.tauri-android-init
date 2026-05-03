@@ -4,7 +4,7 @@
 #   docker run --rm --network=host \
 #     -v "$(pwd)":/work -w /work \
 #     bibavpn:tauri-android-init \
-#     bash scripts/tauri-android-init-inner.sh
+#     bash apps/scripts/tauri-android-init-inner.sh
 
 FROM debian:bookworm-slim
 
@@ -24,7 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ANDROID_SDK_ROOT=/opt/android-sdk
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates unzip openjdk-17-jdk \
+    curl ca-certificates unzip openjdk-17-jdk build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" \
