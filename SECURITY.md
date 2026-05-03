@@ -32,11 +32,11 @@ into the next release.
 
 In scope:
 
-- The Rust crates under `bibavpn/`, `biba/`, `bibavpn-jni/`,
-  `bibavpn-desktop/src-tauri/`.
+- The Rust crates under `bibavpn/`, `biba/`, `apps/bibavpn-jni/`,
+  `apps/bibavpn-desktop/src-tauri/`.
 - The deployment scripts under `scripts/` when used with the documented
   environment variables.
-- The Android app under `android/` (glue code on top of the Rust core).
+- The Android app under `apps/android/` (glue code on top of the Rust core).
 
 Out of scope:
 

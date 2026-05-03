@@ -28,13 +28,13 @@ For the Android core:
 ```bash
 ./scripts/wsl-build-all.sh          # WSL / Linux
 # or
-./scripts/build-android-jni.ps1     # Windows PowerShell
+./apps/scripts/build-android-jni.ps1 # Windows PowerShell
 ```
 
 For the Tauri desktop app:
 
 ```bash
-cd bibavpn-desktop/ui && npm install
+cd apps/bibavpn-desktop/ui && npm install
 cd .. && cargo tauri dev
 ```
 
@@ -56,7 +56,7 @@ cd .. && cargo tauri dev
 
 - Rust: follow `cargo fmt` and `cargo clippy --workspace -- -D warnings`.
   We match the existing patterns for `clap`, `tracing`, and async (Tokio).
-- Kotlin / Android: match the style already in `android/app/src/main/java`.
+- Kotlin / Android: match the style already in `apps/android/app/src/main/java`.
 - Shell scripts: `set -euo pipefail`, prefer `"${VAR:?message}"` over
   implicit empty defaults for required inputs.
 - Commit messages: conventional-style prefix is appreciated

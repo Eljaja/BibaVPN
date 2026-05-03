@@ -298,8 +298,8 @@ Workspace layout (cargo workspace):
 | --------------------------- | -------------------------------------------------------------------------- |
 | `bibavpn`                   | `lib` + binaries `bibavpn-server`, `bibavpn-client`, `bibavpn-mint-invite` |
 | `biba`                      | uTLS-like TLS fingerprint helpers                                          |
-| `bibavpn-jni`               | Android JNI glue around `bibavpn`                                          |
-| `bibavpn-desktop/src-tauri` | Tauri desktop wrapper (systray, platform proxy setup)                      |
+| `apps/bibavpn-jni`          | Android JNI glue around `bibavpn` (crate name `bibavpn-jni`)               |
+| `apps/bibavpn-desktop/src-tauri` | Tauri desktop wrapper (systray, platform proxy setup)                 |
 
 
 Common commands:
@@ -384,10 +384,10 @@ and **`bibavpn-mint-invite`** both target v3 by default.
 
 ## Android and desktop
 
-- **Android:** `android/` (Jetpack Compose + `BibaVpnService`). Build the JNI
-core with `scripts/wsl-build-all.sh`, then open the `android/` project in
+- **Android:** `apps/android/` (Jetpack Compose + `BibaVpnService`). Build the JNI
+core with `scripts/wsl-build-all.sh`, then open the `apps/android/` project in
 Android Studio.
-- **Desktop (Tauri):** `bibavpn-desktop/` (Vite UI + Tauri shell). Prebuilt
+- **Desktop (Tauri):** `apps/bibavpn-desktop/` (Vite UI + Tauri shell). Prebuilt
 binaries are emitted by the GitHub Actions workflows in `.github/workflows/`
 for Windows and macOS.
 

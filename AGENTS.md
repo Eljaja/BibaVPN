@@ -109,17 +109,21 @@ dedicated WSS.
 | ---------------------------- | ---------------------------------------------------------------------------- |
 | `bibavpn/`                   | Core crate: `lib` plus `bibavpn-server`, `bibavpn-client`, `bibavpn-mint-invite` bins |
 | `biba/`                      | Thin wrapper / helper crate used by bins and tests                           |
-| `bibavpn-jni/`               | JNI bindings for the Android app (`nativeStart` and friends)                 |
-| `bibavpn-desktop/`           | Tauri desktop wrapper (`src-tauri/` Rust + `ui/` web front-end)              |
-| `android/`                   | Jetpack Compose Android app (Gradle)                                         |
+| `apps/`                      | Client apps: desktop + Android + JNI crate + shared tooling scripts           |
+| `apps/bibavpn-jni/`          | JNI bindings for Android (`nativeStart` and friends); crate `bibavpn-jni`    |
+| `apps/bibavpn-desktop/`      | Tauri desktop wrapper (`src-tauri/` Rust + `ui/` web front-end)              |
+| `apps/android/`              | Jetpack Compose Android app (Gradle)                                         |
+| `apps/scripts/`              | Shell/PowerShell helpers for Tauri/Android bootstrap, JNI, WSL builds        |
 | `docker/`                    | `Dockerfile.server`, `Dockerfile.server.binary`, `Dockerfile.client`         |
 | `docker-compose.yml`         | Local lab: server + client on one Docker network                             |
 | `docker-compose.hub.yml`     | Pull prebuilt images from Docker Hub for a quick start                       |
-| `scripts/`                   | Smoke tests, deploy helpers, benchmarks, packet-capture labs                 |
+| `scripts/`                   | Server/client smoke tests, deploy helpers, benchmarks, packet-capture labs   |
 | `docs/`                      | Static landing pages / extra documentation                                   |
 | `branding/`                  | Logos and design assets (see also `DESIGN.md`)                               |
 | `start.sh`                   | One-shot local server launcher; mints token/PSK/invite, runs compose         |
 | `rust-toolchain.toml`        | Pinned stable Rust toolchain for reproducible builds                         |
+
+Full layout for **`apps/`** (desktop, Android, JNI crate, scripts): **[apps/AGENTS.md](apps/AGENTS.md)**.
 
 ## `bibavpn` crate modules
 
@@ -149,7 +153,7 @@ dedicated WSS.
 | `bibavpn/src/ws_bridge.rs`                          | WebSocket ↔ TCP bridge (legacy per-connection TCP); ping + dummy task; `pad_mode`                                      |
 | `bibavpn/src/http_connect.rs`                       | HTTP `CONNECT` on a separate listen port                                                                               |
 | `bibavpn/src/invite_uri.rs`                         | `InviteV1`: `proto` (default `3`), optional `proto_domain`, plus `ws_path`, `pad_mode`, `dummy_interval_secs`            |
-| `bibavpn/src/start_json_config.rs`                  | JSON start config (same shape used by Android `nativeStart` / `bibavpn-jni`)                                           |
+| `bibavpn/src/start_json_config.rs`                  | JSON start config (same shape used by Android `nativeStart` / `apps/bibavpn-jni`)                                           |
 | `bibavpn/src/retry.rs`                              | Exponential backoff between outbound TCP+TLS+WSS attempts and optional WS timing jitter                                |
 | `bibavpn/src/outbound_protect.rs`                   | Hook for marking outbound TCP sockets before `connect` (Android `VpnService.protect`)                                  |
 
@@ -268,6 +272,19 @@ Otherwise `clap` sees an extra token and the container exits with code 2.
 `docker/Dockerfile.server.binary` — see `scripts/remote-deploy.sh`.
 
 ## Scripts
+
+### Client apps (`apps/`)
+
+Desktop (Tauri), the Gradle Android project, and shell helpers for JNI / Tauri Android gen live under **`apps/`**. See **[apps/AGENTS.md](apps/AGENTS.md)** for layout and workflows.
+
+| Path | Purpose |
+| --- | --- |
+| `apps/scripts/tauri-android-init-local.sh` | Run `tauri android init --ci` locally (or via Docker wrapper in the same folder) |
+| `apps/scripts/integrate-bibavpn-into-tauri-android.sh` | Merge legacy Android sources/resources into Tauri `gen/android` |
+| `apps/scripts/wsl-build-tauri-android-jni.sh` | Build `libbibavpn_jni.so` into Tauri gen `jniLibs` (`cargo-ndk`) |
+| `apps/scripts/wsl-build-rust-apk.sh` | Alternative flow: JNI via explicit NDK clang env + Gradle debug APK for `apps/android` |
+
+### Repository-wide helpers (`scripts/`)
 
 The `scripts/` directory is a grab bag. The ones most useful when working on
 BibaVPN:
