@@ -29,9 +29,6 @@ camouflage-site/
 biba-*-capture.txt
 biba-listen*.txt
 
-# Prebuilt Android JNI libraries (build with scripts/wsl-build-all.sh or build-android-jni.ps1)
-android/app/src/main/jniLibs/**/*.so
-
 # Local brainstorm / research notes (kept out of the public tree)
 deepreseach.md
 deepresearch-dpi-biba.md
@@ -41,16 +38,20 @@ test.py
 *.pyc
 __pycache__/
 
-# Desktop UI build artifacts
-/bibavpn-desktop/ui/node_modules
-/bibavpn-desktop/ui/dist
-/bibavpn-desktop/node_modules
+# Prebuilt Android JNI libraries (build with scripts/wsl-build-all.sh or apps/scripts/build-android-jni.ps1)
+apps/android/app/src/main/jniLibs/**/*.so
 
-# Tauri `android init` output + merged VPN glue (regenerate: `npm run android:bootstrap` in bibavpn-desktop)
-/bibavpn-desktop/src-tauri/gen/
+# Desktop UI build artifacts
+/apps/bibavpn-desktop/ui/node_modules
+/apps/bibavpn-desktop/ui/dist
+/apps/bibavpn-desktop/node_modules
+apps/bibavpn-desktop/.merge-no-vite.json
+
+# Tauri `android init` output + merged VPN glue (regenerate: `npm run android:bootstrap` in apps/bibavpn-desktop)
+/apps/bibavpn-desktop/src-tauri/gen/
 
 # Design mock (static HTML / JSX prototype)
-bibavpn-desktop/design-mock/
+apps/bibavpn-desktop/design-mock/
 united-design-new/
 
 # Local cross-compilation output (e.g. Windows GNU from Linux)
