@@ -35,7 +35,7 @@
       "minSdkVersion": 29,
       "autoIncrementVersionCode": false
     },
-    "ios": {
+    "iOS": {
       "minimumSystemVersion": "15.0"
     },
     "icon": [
