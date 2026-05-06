@@ -207,7 +207,7 @@ fn inject_mobile_tunnel_session_json(base_json: &str) -> Result<String, String> 
     use rand::{rngs::OsRng, Rng};
     let alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = OsRng;
-    let rand_part = |n: usize| -> String {
+    let mut rand_part = |n: usize| -> String {
         (0..n)
             .map(|_| {
                 let idx = rng.gen_range(0..alphabet.len());

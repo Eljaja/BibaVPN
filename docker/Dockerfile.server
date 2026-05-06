@@ -5,6 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY biba ./biba
 COPY bibavpn ./bibavpn
 COPY apps/bibavpn-jni ./apps/bibavpn-jni
+COPY apps/bibavpn-ffi ./apps/bibavpn-ffi
 COPY apps/bibavpn-desktop ./apps/bibavpn-desktop
 RUN cargo build --release -p bibavpn --bin bibavpn-server
 
