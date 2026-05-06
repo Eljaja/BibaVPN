@@ -16,7 +16,8 @@ server.txt
 *.key
 docker-compose.override.yml
 .biba-start.env
-
+scripts/*.sh
+/scripts/*
 # Local deploy helpers created by one-off runs
 scripts/.deploy-run-once.sh
 scripts/.invite_local_test.uri
@@ -38,8 +39,13 @@ test.py
 *.pyc
 __pycache__/
 
-# Prebuilt Android JNI libraries (build with scripts/wsl-build-all.sh or apps/scripts/build-android-jni.ps1)
-apps/android/app/src/main/jniLibs/**/*.so
+# Prebuilt Android JNI libraries and optional local AARs.
+apps/bibavpn-desktop/src-tauri/android-bibavpn-extras/jniLibs/**/*.so
+apps/bibavpn-desktop/src-tauri/android-bibavpn-extras/libs/*.aar
+
+# Prebuilt iOS Tun2socks xcframework + Rust static libs for Packet Tunnel
+apps/bibavpn-desktop/src-tauri/ios-bibavpn-extras/Frameworks/Tun2socks.xcframework/**
+apps/bibavpn-desktop/src-tauri/ios-bibavpn-extras/BibaVpnTunnel/rust-static/**/*.a
 
 # Desktop UI build artifacts
 /apps/bibavpn-desktop/ui/node_modules
