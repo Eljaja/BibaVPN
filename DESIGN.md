@@ -1,6 +1,6 @@
 # BibaVPN — design system for cross-platform ports
 
-This document describes the visual language of the Android app (Jetpack Compose + Material 3), brand assets, and tokens needed to reproduce the same look on iOS, desktop, web, and other platforms.
+This document describes the visual language of the Tauri app (React UI across desktop and Android), brand assets, and tokens needed to reproduce the same look on other platforms.
 
 ---
 
@@ -16,15 +16,15 @@ This document describes the visual language of the Android app (Jetpack Compose 
 
 | Role                    | Description                                                                                                                                                     | File in the repo                                                                                         |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| **Horizontal wordmark** | **BIBA** lettering + **VPN** block with ghost; dark background baked into the asset. Used in the **main screen header** and as the basis for the **TV banner**. | `branding/biba-vpn-logo.png` → in Android also `apps/android/app/src/main/res/drawable/img_biba_wordmark.png` |
-| **App icon**            | Square composition: **white ghost** on a **teal-green** rounded rectangle, overall dark background. Phone launcher / Android TV.                                | `branding/biba-vpn-app-icon.png` → `apps/android/app/src/main/res/drawable/ic_launcher.png`                   |
+| **Horizontal wordmark** | **BIBA** lettering + **VPN** block with ghost; dark background baked into the asset. Used in the **main screen header** and as the basis for app/banner assets. | `branding/biba-vpn-logo.png` |
+| **App icon**            | Square composition: **white ghost** on a **teal-green** rounded rectangle, overall dark background. Phone launcher / desktop app icon.                         | `branding/biba-vpn-app-icon.png`, exported under `apps/bibavpn-desktop/src-tauri/icons/` |
 
 
 When porting, **keep the same PNGs** (or export from source with the same aspect ratio and padding).
 
 ### 1.3 Status-bar mini icon (Android only)
 
-Vector **ghost**, fill `**#00E5FF`** (cyan): `apps/android/app/src/main/res/drawable/ic_stat_vpn.xml`. On other OSes, reuse the same 24×24 silhouette and proportions.
+Vector **ghost**, fill `**#00E5FF`** (cyan): `apps/bibavpn-desktop/src-tauri/android-bibavpn-extras/res/drawable/ic_stat_vpn.xml`. On other OSes, reuse the same 24×24 silhouette and proportions.
 
 ---
 
@@ -192,4 +192,4 @@ Strokes are **1 dp**, using `borderSubtle` or the special variants in §2.4.
 5. Typography: sans family; size/weight scale from §3.
 6. Accent semantics: **mint** for success/ON, **sky** for secondary labels.
 
-For the Android source of truth, see the constants at the top of `apps/android/app/src/main/java/dev/bibavpn/MainActivity.kt` (`BgRoot`, `CardBg`, `Mint`, …) and `fieldInsetColors()` for field styling.
+For the app source of truth, see `apps/bibavpn-desktop/ui/src/theme.js` and the React screens under `apps/bibavpn-desktop/ui/src/screens/`.

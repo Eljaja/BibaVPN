@@ -36,7 +36,8 @@ In scope:
   `apps/bibavpn-desktop/src-tauri/`.
 - The deployment scripts under `scripts/` when used with the documented
   environment variables.
-- The Android app under `apps/android/` (glue code on top of the Rust core).
+- The Android app built from `apps/bibavpn-desktop/`, with VPN glue under
+  `apps/bibavpn-desktop/src-tauri/android-bibavpn-extras/`.
 
 Out of scope:
 

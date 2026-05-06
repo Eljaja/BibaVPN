@@ -109,11 +109,11 @@ dedicated WSS.
 | ---------------------------- | ---------------------------------------------------------------------------- |
 | `bibavpn/`                   | Core crate: `lib` plus `bibavpn-server`, `bibavpn-client`, `bibavpn-mint-invite` bins |
 | `biba/`                      | Thin wrapper / helper crate used by bins and tests                           |
-| `apps/`                      | Client apps: desktop + Android + JNI crate + shared tooling scripts           |
+| `apps/`                      | Tauri client apps, Android VPN glue, JNI / iOS FFI crates, scripts           |
 | `apps/bibavpn-jni/`          | JNI bindings for Android (`nativeStart` and friends); crate `bibavpn-jni`    |
-| `apps/bibavpn-desktop/`      | Tauri desktop wrapper (`src-tauri/` Rust + `ui/` web front-end)              |
-| `apps/android/`              | Jetpack Compose Android app (Gradle)                                         |
-| `apps/scripts/`              | Shell/PowerShell helpers for Tauri/Android bootstrap, JNI, WSL builds        |
+| `apps/bibavpn-ffi/`          | C ABI static library for iOS Packet Tunnel; crate `bibavpn-ffi`             |
+| `apps/bibavpn-desktop/`      | Tauri desktop/Android/iOS wrapper (`src-tauri/` Rust + `ui/` web front-end)   |
+| `apps/scripts/`              | Shell/PowerShell helpers for Tauri/Android/iOS bootstrap, JNI, WSL builds      |
 | `docker/`                    | `Dockerfile.server`, `Dockerfile.server.binary`, `Dockerfile.client`         |
 | `docker-compose.yml`         | Local lab: server + client on one Docker network                             |
 | `docker-compose.hub.yml`     | Pull prebuilt images from Docker Hub for a quick start                       |
@@ -275,14 +275,14 @@ Otherwise `clap` sees an extra token and the container exits with code 2.
 
 ### Client apps (`apps/`)
 
-Desktop (Tauri), the Gradle Android project, and shell helpers for JNI / Tauri Android gen live under **`apps/`**. See **[apps/AGENTS.md](apps/AGENTS.md)** for layout and workflows.
+Desktop/Android (Tauri) and shell helpers for JNI / Tauri Android gen live under **`apps/`**. See **[apps/AGENTS.md](apps/AGENTS.md)** for layout and workflows.
 
 | Path | Purpose |
 | --- | --- |
 | `apps/scripts/tauri-android-init-local.sh` | Run `tauri android init --ci` locally (or via Docker wrapper in the same folder) |
-| `apps/scripts/integrate-bibavpn-into-tauri-android.sh` | Merge legacy Android sources/resources into Tauri `gen/android` |
+| `apps/scripts/integrate-bibavpn-into-tauri-android.sh` | Merge Android VPN extras into Tauri `gen/android` |
 | `apps/scripts/wsl-build-tauri-android-jni.sh` | Build `libbibavpn_jni.so` into Tauri gen `jniLibs` (`cargo-ndk`) |
-| `apps/scripts/wsl-build-rust-apk.sh` | Alternative flow: JNI via explicit NDK clang env + Gradle debug APK for `apps/android` |
+| `apps/scripts/wsl-build-rust-apk.sh` | Compatibility wrapper for the Tauri Android APK build |
 
 ### Repository-wide helpers (`scripts/`)
 

@@ -384,12 +384,10 @@ and **`bibavpn-mint-invite`** both target v3 by default.
 
 ## Android and desktop
 
-- **Android:** `apps/android/` (Jetpack Compose + `BibaVpnService`). Build the JNI
-core with `scripts/wsl-build-all.sh`, then open the `apps/android/` project in
-Android Studio.
-- **Desktop (Tauri):** `apps/bibavpn-desktop/` (Vite UI + Tauri shell). Prebuilt
-binaries are emitted by the GitHub Actions workflows in `.github/workflows/`
-for Windows and macOS.
+- **Android + desktop (Tauri):** `apps/bibavpn-desktop/` (Vite UI + Tauri shell).
+  Android VPN glue lives under `src-tauri/android-bibavpn-extras/` and is merged
+  into Tauri's generated Android project by `apps/scripts/integrate-bibavpn-into-tauri-android.sh`.
+  Prebuilt binaries are emitted by the GitHub Actions workflows in `.github/workflows/`.
 
 See [DESIGN.md](DESIGN.md) for the shared visual language if you want to port
 the UI elsewhere.
