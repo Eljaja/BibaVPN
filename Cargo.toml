@@ -1,5 +1,11 @@
 [workspace]
-members = ["bibavpn", "apps/bibavpn-jni", "apps/bibavpn-desktop/src-tauri", "biba"]
+members = [
+    "bibavpn",
+    "apps/bibavpn-jni",
+    "apps/bibavpn-ffi",
+    "apps/bibavpn-desktop/src-tauri",
+    "biba",
+]
 resolver = "2"
 
 [workspace.package]
