@@ -40,12 +40,18 @@ jobs:
         with:
           node-version: "20"
 
+      # macOS system Python is PEP 668 “externally managed” — pip3 install fails.
+      # Managed interpreter from setup-python is fine for CI-only deps.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install UI deps & build frontend
         working-directory: apps/bibavpn-desktop/ui
         run: npm ci --no-audit --no-fund && npm run build
 
-      - name: pip (PyYAML for XcodeGen merge)
-        run: pip3 install pyyaml
+      - name: PyYAML (merge_bibavpn_ios_project.py)
+        run: python -m pip install pyyaml
 
       - name: Homebrew tools
         run: brew install xcodegen
