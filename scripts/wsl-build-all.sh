@@ -56,5 +56,5 @@ if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
   exit 1
 fi
 
-echo "Rust + libbibavpn_jni + Gradle (see scripts/wsl-build-rust-apk.sh, no cargo-ndk) ..."
-bash "$SCRIPT_DIR/wsl-build-rust-apk.sh"
+echo "Rust + libbibavpn_jni + Gradle (see apps/scripts/wsl-build-rust-apk.sh, no cargo-ndk) ..."
+bash "$REPO_ROOT/apps/scripts/wsl-build-rust-apk.sh"

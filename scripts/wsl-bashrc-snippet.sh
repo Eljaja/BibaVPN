@@ -2,7 +2,7 @@
 # Одноразово добавить source wsl-android-env.sh в ~/.bashrc
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ENV_SH="$ROOT/scripts/wsl-android-env.sh"
+ENV_SH="$ROOT/apps/scripts/wsl-android-env.sh"
 LINE="source \"$ENV_SH\""
 if [ -f "$HOME/.bashrc" ] && grep -qF "$ENV_SH" "$HOME/.bashrc" 2>/dev/null; then
   echo "Уже есть в ~/.bashrc"

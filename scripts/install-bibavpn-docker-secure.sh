@@ -105,6 +105,14 @@ run_long_server
 sleep 2
 docker ps --filter "name=bibavpn" --format '{{.Status}}'
 
+if ! docker port bibavpn 2>/dev/null | grep -q .; then
+  echo "ERROR: host port was not published (docker port bibavpn empty). Check docker run -p." >&2
+  docker inspect bibavpn --format '{{json .NetworkSettings.Ports}}' >&2 || true
+  exit 1
+fi
+echo "Published ports:"
+docker port bibavpn
+
 echo ""
 echo "=== biba-invite (one line) ==="
 cat "$DIR/invite.biba"

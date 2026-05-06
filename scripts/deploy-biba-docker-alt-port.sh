@@ -82,9 +82,9 @@ run "install -d -m 0755 '$REM_DIR'"
 TAR_EXCL=(
   --exclude=target
   --exclude=.git
-  --exclude=android/.gradle
-  --exclude=android/app/build
-  --exclude=android/build
+  --exclude=apps/android/.gradle
+  --exclude=apps/android/app/build
+  --exclude=apps/android/build
 )
 if [[ -n "${BIBA_SSH_PASS:-}" ]]; then
   tar cf - "${TAR_EXCL[@]}" -C "$ROOT" . \

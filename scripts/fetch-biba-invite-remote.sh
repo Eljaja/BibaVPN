@@ -14,7 +14,8 @@ set -a
 . /opt/bibavpn/bibavpn.env
 set +a
 PP=$(cat /opt/bibavpn/invite.pass)
-timeout 12 docker run --rm -e RUST_LOG=off -v /opt/bibavpn:/data:ro bibavpn-server:secure \
+# Capture full output under a single timeout so the process always ends (pipeline with grep could leave docker running and hang SSH).
+OUT=$(timeout 20 docker run --rm -e RUST_LOG=off -v /opt/bibavpn:/data:ro bibavpn-server:secure \
   --listen 127.0.0.1:54321 \
   --cert /data/cert.pem \
   --key /data/key.pem \
@@ -32,5 +33,12 @@ timeout 12 docker run --rm -e RUST_LOG=off -v /opt/bibavpn:/data:ro bibavpn-serv
   --print-invite-uri \
   --invite-passphrase "$PP" \
   --invite-public "${DEPLOY_VPS_IP}:${DEPLOY_PORT}" \
-  --invite-sni "${DEPLOY_VPS_IP}" 2>&1 | grep -m1 '^biba://'
+  --invite-sni "${DEPLOY_VPS_IP}" 2>&1) || true
+LINE=$(printf '%s\n' "$OUT" | grep -m1 '^biba://' || true)
+if [[ -z "${LINE:-}" ]]; then
+  echo "fetch-biba-invite-remote: no biba:// line in output" >&2
+  printf '%s\n' "$OUT" | head -30 >&2
+  exit 1
+fi
+printf '%s\n' "$LINE"
 REMOTE
