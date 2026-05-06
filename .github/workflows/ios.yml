@@ -1,0 +1,54 @@
+# Cross-compile bibavpn-ffi for iOS (Rust ↔ Packet Tunnel static library).
+name: iOS FFI
+
+run-name: iOS FFI · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "!bibavpn/**/*.md"
+      - "apps/bibavpn-ffi/**"
+      - "!apps/bibavpn-ffi/**/*.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "!bibavpn/**/*.md"
+      - "apps/bibavpn-ffi/**"
+      - "!apps/bibavpn-ffi/**/*.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/ios.yml"
+
+concurrency:
+  group: ios-ffi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bibavpn-ffi-ios:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (iOS target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: cargo build -p bibavpn-ffi (aarch64-apple-ios)
+        run: cargo build -p bibavpn-ffi --target aarch64-apple-ios --locked

@@ -24,16 +24,15 @@ rsync -a --delete \
   --exclude=ui/dist \
   "$SRC/" "$DST/"
 
-cd "$DST/apps/bibavpn-desktop"
-npm install
-npm run tauri:android:build
+cd "$DST"
+bash apps/scripts/build-android-apk-wsl.sh
 
 # APK path from Tauri (universal or arm64)
 APK=""
 for p in \
-  "src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk" \
-  "src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk" \
-  "src-tauri/gen/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk" \
+  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk" \
+  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/release/app-release-unsigned.apk"
  do
   if [ -f "$p" ]; then
     APK="$p"
@@ -42,7 +41,7 @@ for p in \
 done
 if [ -z "$APK" ]; then
   echo "APK not found, listing outputs:" >&2
-  find src-tauri/gen/android -name "*.apk" 2>/dev/null | head -20
+  find apps/bibavpn-desktop/src-tauri/gen/android -name "*.apk" 2>/dev/null | head -20
   exit 1
 fi
 

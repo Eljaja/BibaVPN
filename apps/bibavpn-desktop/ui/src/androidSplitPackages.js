@@ -1,4 +1,4 @@
-/** Пакеты приложений под пресеты — как в android/.../SplitTunnelCatalog.kt */
+/** Пакеты приложений под пресеты для Android split-tunnel UI. */
 
 export const ANDROID_PRESET_PACKAGES = {
   gosuslugi: ["ru.rostel"],

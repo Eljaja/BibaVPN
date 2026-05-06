@@ -1,4 +1,4 @@
-# Manual: Actions → Android → Run workflow. Also runs on push/PR when Android / JNI paths change.
+# Manual: Actions → Android → Run workflow. Also runs on push/PR when Tauri Android / JNI paths change.
 name: Android
 
 run-name: Android · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -15,8 +15,9 @@ on:
       - "!bibavpn/**/*.md"
       - "apps/bibavpn-jni/**"
       - "!apps/bibavpn-jni/**/*.md"
-      - "apps/android/**"
-      - "!apps/android/**/*.md"
+      - "apps/bibavpn-desktop/**"
+      - "!apps/bibavpn-desktop/**/*.md"
+      - "apps/scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -28,8 +29,9 @@ on:
       - "!bibavpn/**/*.md"
       - "apps/bibavpn-jni/**"
       - "!apps/bibavpn-jni/**/*.md"
-      - "apps/android/**"
-      - "!apps/android/**/*.md"
+      - "apps/bibavpn-desktop/**"
+      - "!apps/bibavpn-desktop/**/*.md"
+      - "apps/scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -68,6 +70,11 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -77,27 +84,38 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
 
-      - name: Build JNI into jniLibs
+      - name: Install app dependencies
+        working-directory: apps/bibavpn-desktop
+        run: |
+          npm ci
+          npm ci --prefix ./ui
+
+      - name: Initialize Tauri Android project
+        run: |
+          bash apps/scripts/tauri-android-init-local.sh
+          bash apps/scripts/integrate-bibavpn-into-tauri-android.sh
+
+      - name: Build JNI into Tauri jniLibs
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
-            -o apps/android/app/src/main/jniLibs \
+            -o apps/bibavpn-desktop/src-tauri/gen/android/app/src/main/jniLibs \
             build -p bibavpn-jni --release
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          build-root-directory: apps/android
+          build-root-directory: apps/bibavpn-desktop/src-tauri/gen/android
 
-      - name: Assemble debug APK
-        working-directory: apps/android
+      - name: Build Tauri Android APK
+        working-directory: apps/bibavpn-desktop
         run: |
-          chmod +x gradlew
+          npm run build --prefix ./ui
           attempt=1
           until [ "$attempt" -gt 3 ]; do
-            ./gradlew assembleDebug --no-daemon --stacktrace && exit 0
+            npx tauri android build && exit 0
             attempt=$((attempt + 1))
             sleep 30
           done
@@ -106,6 +124,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: BibaVPN-android-debug
-          path: apps/android/app/build/outputs/apk/debug/app-debug.apk
+          name: BibaVPN-tauri-android
+          path: apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error

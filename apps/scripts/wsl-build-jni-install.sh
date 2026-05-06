@@ -23,12 +23,10 @@ if ! cargo ndk --version >/dev/null 2>&1; then
   cargo install cargo-ndk --locked
 fi
 
-echo "Building bibavpn-jni (release)..."
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
-  -o apps/android/app/src/main/jniLibs \
-  build -p bibavpn-jni --release
+echo "Build Tauri Android APK..."
+bash "$REPO_ROOT/apps/scripts/build-android-apk-wsl.sh"
 
-echo "Gradle installDebug via Windows (JDK из Android Studio)..."
+echo "Install Tauri Android APK via Windows adb..."
 to_win_path() {
   local p="$1"
   if [[ "$p" =~ ^/mnt/([a-z])/(.+)$ ]]; then
@@ -46,12 +44,11 @@ else
   WIN_REPO="$(to_win_path "$REPO_ROOT")"
 fi
 if [[ -n "$WIN_REPO" ]]; then
-  WIN_ANDROID="${WIN_REPO}\\apps\\android"
-  # Одна пара кавычек для cmd — иначе «syntax incorrect»
-  cmd.exe /c "cd /d \"$WIN_ANDROID\" && gradlew.bat installDebug"
+  WIN_APK="${WIN_REPO}\\apps\\bibavpn-desktop\\src-tauri\\gen\\android\\app\\build\\outputs\\apk\\universal\\release\\app-universal-release-unsigned.apk"
+  cmd.exe /c "\"$ADB_WIN\" install -r \"$WIN_APK\""
 else
-  cd "$REPO_ROOT/apps/android"
-  ./gradlew installDebug
+  APK="$REPO_ROOT/apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+  adb install -r "$APK"
 fi
 
 if [[ -x "$ADB_WIN" ]]; then

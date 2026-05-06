@@ -6,7 +6,7 @@ export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUT_DIR="$REPO_ROOT/apps/android/app/libs"
+OUT_DIR="$REPO_ROOT/apps/bibavpn-desktop/src-tauri/android-bibavpn-extras/libs"
 TUN2SOCKS_TAG="${TUN2SOCKS_TAG:-v2.6.0}"
 NDK_VERSION="${NDK_VERSION:-26.3.11579264}"
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/android-sdk}"

@@ -24,12 +24,15 @@ rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-andro
 cd "$ROOT/apps/bibavpn-desktop"
 npm install
 npm install --prefix ./ui
-npm run build --prefix ./ui
+npm run android:bootstrap
 
 LP="$ROOT/apps/bibavpn-desktop/src-tauri/gen/android/local.properties"
+mkdir -p "$(dirname "$LP")"
 {
   echo "sdk.dir=$ANDROID_HOME"
   echo "ndk.dir=$ANDROID_NDK_HOME"
 } >"$LP"
 
-exec npx tauri android build -c .merge-no-vite.json
+bash "$ROOT/apps/scripts/wsl-build-tauri-android-jni.sh"
+npm run build --prefix ./ui
+exec npx tauri android build

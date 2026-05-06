@@ -1,0 +1,102 @@
+# Сборка установочного .ipa для iPhone (macOS runner + подпись Apple).
+# Запуск: Actions → «iOS IPA» → Run workflow.
+#
+# Подпись для успешного `tauri ios build`:
+# - IOS_CERTIFICATE (base64 .p12), IOS_CERTIFICATE_PASSWORD, IOS_MOBILE_PROVISION (base64 .mobileprovision)
+#   см. https://v2.tauri.app/distribute/sign/ios/
+# - Альтернатива: App Store Connect API key через переменные окружения из документации Tauri (настройте в шаге вручную при необходимости).
+#
+# Для VPN с Packet Tunnel нужны возможности в Apple Developer и профиль(и) для
+# dev.bibavpn.desktop и dev.bibavpn.desktop.BibaVpnTunnel (Network Extension + App Group).
+name: iOS IPA
+
+run-name: iOS IPA · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust (host + iOS device)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install UI deps & build frontend
+        working-directory: apps/bibavpn-desktop/ui
+        run: npm ci --no-audit --no-fund && npm run build
+
+      - name: pip (PyYAML for XcodeGen merge)
+        run: pip3 install pyyaml
+
+      - name: Homebrew tools
+        run: brew install xcodegen
+
+      - name: Build bibavpn-ffi (aarch64-apple-ios)
+        run: cargo build -p bibavpn-ffi --release --target aarch64-apple-ios --locked
+
+      - name: Stage libbibavpn_ffi.a for Xcode
+        run: |
+          set -euo pipefail
+          REL="apps/bibavpn-desktop/src-tauri/ios-bibavpn-extras/BibaVpnTunnel/rust-static/Release-iphoneos"
+          DBG="apps/bibavpn-desktop/src-tauri/ios-bibavpn-extras/BibaVpnTunnel/rust-static/Debug-iphoneos"
+          mkdir -p "$REL" "$DBG"
+          cp -f target/aarch64-apple-ios/release/libbibavpn_ffi.a "$REL/"
+          cp -f target/aarch64-apple-ios/release/libbibavpn_ffi.a "$DBG/"
+
+      - name: npm install (bibavpn-desktop)
+        working-directory: apps/bibavpn-desktop
+        run: npm install --no-audit --no-fund
+
+      - name: Tauri iOS init (if missing)
+        working-directory: apps/bibavpn-desktop
+        run: |
+          if [[ ! -f src-tauri/gen/apple/project.yml ]]; then
+            npm exec -- tauri ios init --ci
+          fi
+
+      - name: Integrate BibaVPN extension into gen/apple
+        run: bash apps/scripts/integrate-bibavpn-into-tauri-ios.sh
+
+      - name: tauri ios build → IPA
+        working-directory: apps/bibavpn-desktop
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+        run: npm exec -- tauri ios build
+
+      - name: Locate IPA
+        id: ipa
+        run: |
+          set -euo pipefail
+          IPA="$(find apps/bibavpn-desktop/src-tauri/gen/apple -name "*.ipa" -print -quit)"
+          if [[ -z "$IPA" ]]; then
+            echo "Не найден .ipa под gen/apple — проверьте подпись и логи предыдущего шага." >&2
+            exit 1
+          fi
+          echo "path=$IPA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BibaVPN-ios
+          path: ${{ steps.ipa.outputs.path }}

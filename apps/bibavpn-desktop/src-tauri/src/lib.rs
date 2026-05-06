@@ -1,7 +1,7 @@
-//! BibaVPN Tauri backend — desktop (Windows/macOS/Linux) and mobile (Android) library target.
+//! BibaVPN Tauri backend — desktop (Windows/macOS/Linux) and mobile (Android, iOS) library target.
 
 mod config;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod locale;
 mod logging;
 mod split_tunnel;
@@ -27,6 +27,9 @@ use proxy_win::{apply_proxy, read_backup, restore, ProxyBackup};
 #[cfg(target_os = "android")]
 mod android_vpn;
 
+#[cfg(target_os = "ios")]
+mod ios_vpn;
+
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
@@ -39,17 +42,17 @@ use config::{
     desktop_config_json_path, display_host_line, load_config_disk, normalize_loaded,
     save_config_to_path, server_card_subtitle, SavedConfig,
 };
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 use config::load_config_from_path;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use locale::{resolved_tray_lang, tray_strings};
 use serde::Serialize;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::{include_image, WindowEvent, Wry};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -141,7 +144,9 @@ fn measure_tcp_connect_rtt_ms(host: &str, port: u16) -> Option<u32> {
 fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     #[cfg(target_os = "android")]
     let connected = android_vpn::tunnel_is_active(app).unwrap_or(false);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    let connected = ios_vpn::tunnel_is_active(app).unwrap_or(false);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let connected = {
         let _ = app;
         inner.vpn.is_some()
@@ -154,7 +159,13 @@ fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     } else {
         None
     };
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    let vpn_session_uptime_secs = if connected {
+        Some(ios_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000)
+    } else {
+        None
+    };
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let vpn_session_uptime_secs = None;
     StateSnapshot {
         cfg: inner.cfg.clone(),
@@ -171,27 +182,57 @@ fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     }
 }
 
-#[cfg(target_os = "android")]
-fn android_config_json_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn mobile_config_json_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("config.json"))
 }
 
 fn persist_cfg(app: &AppHandle, cfg: &SavedConfig) -> Result<(), String> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        let p = android_config_json_path(app)?;
+        let p = mobile_config_json_path(app)?;
         save_config_to_path(cfg, &p)
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
         save_config_to_path(cfg, &desktop_config_json_path())
     }
 }
 
-#[cfg(not(target_os = "android"))]
+/// Случайные SOCKS auth для этой сессии (как `configJsonWithSessionSocksAuth` в [`BibaVpnService.kt`](../android-bibavpn-extras/java/dev/bibavpn/BibaVpnService.kt)).
+fn inject_mobile_tunnel_session_json(base_json: &str) -> Result<String, String> {
+    use rand::{rngs::OsRng, Rng};
+    let alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = OsRng;
+    let rand_part = |n: usize| -> String {
+        (0..n)
+            .map(|_| {
+                let idx = rng.gen_range(0..alphabet.len());
+                alphabet[idx] as char
+            })
+            .collect()
+    };
+    let mut v: serde_json::Value = serde_json::from_str(base_json).map_err(|e| e.to_string())?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| "конфиг должен быть JSON-объектом".to_string())?;
+    obj.remove("socks_auth_user");
+    obj.remove("socks_auth_password");
+    obj.insert(
+        "socks_auth_user".into(),
+        serde_json::Value::String(rand_part(16)),
+    );
+    obj.insert(
+        "socks_auth_password".into(),
+        serde_json::Value::String(rand_part(24)),
+    );
+    serde_json::to_string(&v).map_err(|e| e.to_string())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn sync_tray_tooltip_i18n(app: &AppHandle, connected: bool, cfg: &SavedConfig) {
     let s = tray_strings(resolved_tray_lang(cfg));
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -204,10 +245,10 @@ fn sync_tray_tooltip_i18n(app: &AppHandle, connected: bool, cfg: &SavedConfig) {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 fn sync_tray_tooltip_i18n(_app: &AppHandle, _connected: bool, _cfg: &SavedConfig) {}
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn build_tray_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let s = tray_strings(lang);
     let show = MenuItem::with_id(app, "show", s.show, true, None::<&str>)?;
@@ -230,7 +271,7 @@ fn build_tray_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     )
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn apply_tray_menu_locale(app: &AppHandle, cfg: &SavedConfig, connected: bool) -> Result<(), String> {
     let menu = build_tray_menu(app, resolved_tray_lang(cfg)).map_err(|e| e.to_string())?;
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -240,7 +281,7 @@ fn apply_tray_menu_locale(app: &AppHandle, cfg: &SavedConfig, connected: bool) -
     Ok(())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -248,7 +289,7 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(12));
@@ -336,7 +377,33 @@ fn disconnect_inner(state: &AppState, app: &AppHandle) {
         return;
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    {
+        {
+            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+            info!(target: "bibavpn_desktop", "отключение VPN (iOS)");
+            g.last_error = None;
+            g.tunnel_server = None;
+        }
+
+        let stop_res = ios_vpn::request_disconnect(app);
+
+        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(ref e) = stop_res {
+            warn!(target: "bibavpn_desktop", "ios VPN stop: {e}");
+            g.last_error = Some(e.clone());
+        }
+        sync_tray_tooltip_i18n(app, false, &g.cfg);
+        let mut snap = snapshot(app, &g);
+        if stop_res.is_ok() {
+            snap.connected = false;
+        }
+        drop(g);
+        let _ = app.emit("vpn-state", &snap);
+        return;
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
         info!(target: "bibavpn_desktop", "отключение VPN");
@@ -418,7 +485,7 @@ fn apply_invite_to_cfg(cfg: &mut SavedConfig) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     {
         let g = match state.inner.lock() {
@@ -611,6 +678,45 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "ios")]
+fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
+    if ios_vpn::tunnel_is_active(app).unwrap_or(false) {
+        disconnect_inner(state, app);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    let mut g = match state.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.last_error = None;
+
+    if !g.cfg.can_connect() {
+        warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
+        return Err(
+            "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
+                .into(),
+        );
+    }
+
+    persist_cfg(app, &g.cfg)?;
+    let json = g.cfg.start_config_json()?;
+    let json = inject_mobile_tunnel_session_json(&json)?;
+    let remote_label = display_host_line(&g.cfg);
+    drop(g);
+
+    ios_vpn::request_connect(app, &json)?;
+
+    let mut g = match state.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.tunnel_server = Some(remote_label);
+    let tray_up = ios_vpn::tunnel_is_active(app).unwrap_or(false);
+    sync_tray_tooltip_i18n(app, tray_up, &g.cfg);
+    Ok(())
+}
+
 #[tauri::command]
 #[cfg(target_os = "android")]
 fn pick_installed_package_cmd(app: AppHandle) -> Result<Option<String>, String> {
@@ -658,15 +764,15 @@ fn save_config_cmd(
     normalize_loaded(&mut g.cfg);
     let locale_changed = old_locale != g.cfg.ui_locale;
     persist_cfg(&app, &g.cfg)?;
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let cfg_for_tray = g.cfg.clone();
     let snap = snapshot(&app, &g);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let connected = snap.connected;
     drop(g);
     let _ = app.emit("vpn-state", &snap);
     if locale_changed {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Err(e) = apply_tray_menu_locale(&app, &cfg_for_tray, connected) {
             warn!(target: "bibavpn_desktop", "обновление меню трея: {e}");
         }
@@ -735,13 +841,16 @@ fn unix_ignore_shell_signals() {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn tray_icon() -> tauri::image::Image<'static> {
     include_image!("icons/32x32.png")
 }
 
-/// Desktop + mobile entry (Tauri Android uses the `cdylib` from this crate after `tauri android init`).
-#[cfg_attr(target_os = "android", tauri::mobile_entry_point)]
+/// Desktop + mobile entry (Tauri Android / iOS use the `cdylib` after `tauri android/ios init`).
+#[cfg_attr(
+    any(target_os = "android", target_os = "ios"),
+    tauri::mobile_entry_point
+)]
 pub fn run() -> anyhow::Result<()> {
     let _log_dir = logging::init();
     std::panic::set_hook(Box::new(|info| {
@@ -777,7 +886,7 @@ pub fn run() -> anyhow::Result<()> {
 
     let mut builder = tauri::Builder::default().manage(state);
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         builder = builder
             .on_window_event(|window, event| {
@@ -866,11 +975,11 @@ pub fn run() -> anyhow::Result<()> {
             });
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         builder = builder.setup(|app| {
             let handle = app.handle().clone();
-            match android_config_json_path(&handle) {
+            match mobile_config_json_path(&handle) {
                 Ok(path) => {
                     let mut cfg = load_config_from_path(&path);
                     normalize_loaded(&mut cfg);
@@ -890,7 +999,7 @@ pub fn run() -> anyhow::Result<()> {
                     let _ = handle.emit("vpn-state", &snap);
                 }
                 Err(e) => {
-                    warn!(target: "bibavpn_desktop", "android config path: {e}");
+                    warn!(target: "bibavpn_desktop", "mobile config path: {e}");
                 }
             }
             Ok(())

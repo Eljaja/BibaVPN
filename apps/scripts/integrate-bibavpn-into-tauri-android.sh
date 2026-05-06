@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# После `tauri android init`: копирует VPN-слой из apps/android в gen/android Tauri.
+# После `tauri android init`: копирует VPN-слой из Tauri extras в gen/android.
 # Запуск из корня репозитория biba-vpn:
 #   bash apps/scripts/integrate-bibavpn-into-tauri-android.sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 GEN="$ROOT/apps/bibavpn-desktop/src-tauri/gen/android"
-LEG="$ROOT/apps/android/app/src/main"
+EXTRAS="$ROOT/apps/bibavpn-desktop/src-tauri/android-bibavpn-extras"
 
 if [ ! -d "$GEN/app" ]; then
   echo "Нет $GEN — сначала tauri android init" >&2
@@ -16,16 +16,16 @@ fi
 APP_JAVA="$GEN/app/src/main/java/dev/bibavpn"
 mkdir -p "$APP_JAVA/core"
 for f in BibaVpnService.kt TauriVpnBridge.kt BibaApplication.kt AppLocale.kt PickInstalledPackageActivity.kt; do
-  cp -f "$LEG/java/dev/bibavpn/$f" "$APP_JAVA/"
+  cp -f "$EXTRAS/java/dev/bibavpn/$f" "$APP_JAVA/"
 done
-cp -f "$LEG/java/dev/bibavpn/core/BibaNative.kt" "$APP_JAVA/core/"
-cp -f "$LEG/java/dev/bibavpn/core/VpnProtect.kt" "$APP_JAVA/core/"
+cp -f "$EXTRAS/java/dev/bibavpn/core/BibaNative.kt" "$APP_JAVA/core/"
+cp -f "$EXTRAS/java/dev/bibavpn/core/VpnProtect.kt" "$APP_JAVA/core/"
 
 mkdir -p "$GEN/app/src/main/res/drawable"
-cp -f "$LEG/res/drawable/ic_stat_vpn.xml" "$GEN/app/src/main/res/drawable/"
+cp -f "$EXTRAS/res/drawable/ic_stat_vpn.xml" "$GEN/app/src/main/res/drawable/"
 
 # Строки только для VPN-уведомлений (не перетираем strings Tauri)
-EXR="$ROOT/apps/bibavpn-desktop/src-tauri/android-bibavpn-extras/res"
+EXR="$EXTRAS/res"
 mkdir -p "$GEN/app/src/main/res/values"
 cp -f "$EXR/values/bibavpn_vpn_strings.xml" "$GEN/app/src/main/res/values/"
 
@@ -42,6 +42,7 @@ dependencies {
     } else {
         implementation("com.ooimi.library:tun2socks:1.0.4")
     }
+    implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.lifecycle:lifecycle-service:2.7.0")
 
     // PickInstalledPackageActivity (split-tunnel)
@@ -84,12 +85,12 @@ PY
 fi
 
 mkdir -p "$GEN/app/libs"
-if [ -f "$ROOT/apps/android/app/libs/tun2socks.aar" ]; then
-  cp -f "$ROOT/apps/android/app/libs/tun2socks.aar" "$GEN/app/libs/"
+if [ -f "$EXTRAS/libs/tun2socks.aar" ]; then
+  cp -f "$EXTRAS/libs/tun2socks.aar" "$GEN/app/libs/"
 fi
 
 mkdir -p "$GEN/app/src/main/jniLibs"
-cp -f "$ROOT/apps/android/app/src/main/jniLibs/README.md" "$GEN/app/src/main/jniLibs/" 2>/dev/null || true
+cp -f "$EXTRAS/jniLibs/README.md" "$GEN/app/src/main/jniLibs/" 2>/dev/null || true
 
 # ProGuard: release minify (R8) must keep Tauri/Wry/WebView — без этого вылет NoClassDefFoundError после WebView.
 cp -f "$ROOT/apps/bibavpn-desktop/src-tauri/android-bibavpn-extras/proguard-bibavpn.pro" "$GEN/app/proguard-bibavpn.pro"

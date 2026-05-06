@@ -11,7 +11,9 @@
     "tauri:android:dev": "tauri android dev",
     "tauri:android:build": "tauri android build",
     "android:bootstrap": "cd ../.. && bash apps/scripts/tauri-android-init-local.sh && bash apps/scripts/integrate-bibavpn-into-tauri-android.sh",
-    "android:bootstrap:docker": "cd ../.. && bash apps/scripts/tauri-android-init-docker.sh && bash apps/scripts/integrate-bibavpn-into-tauri-android.sh"
+    "android:bootstrap:docker": "cd ../.. && bash apps/scripts/tauri-android-init-docker.sh && bash apps/scripts/integrate-bibavpn-into-tauri-android.sh",
+    "ios:bootstrap": "cd ../.. && npm run build --prefix apps/bibavpn-desktop/ui && cd apps/bibavpn-desktop && npm exec -- tauri ios init --ci && cd ../.. && bash apps/scripts/integrate-bibavpn-into-tauri-ios.sh",
+    "ios:integrate": "cd ../.. && bash apps/scripts/integrate-bibavpn-into-tauri-ios.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
