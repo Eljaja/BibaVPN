@@ -23,7 +23,7 @@ void bibavpn_ffi_stop(void);
  */
 char *bibavpn_ffi_decode_invite(const char *uri_utf8, const char *passphrase_utf8);
 
-/** Free strings returned by this library (nullable no-op). */
+/** Free strings returned by this library; safe with NULL (no-op). */
 void bibavpn_ffi_string_free(char *s);
 
 #ifdef __cplusplus

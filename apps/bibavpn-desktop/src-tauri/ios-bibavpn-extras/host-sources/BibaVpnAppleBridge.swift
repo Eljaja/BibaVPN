@@ -6,6 +6,52 @@ private let kAppGroup = "group.dev.bibavpn.desktop"
 private let kTunnelStarted = "bibavpn_tunnel_started_at"
 private let tunnelBundleId = "dev.bibavpn.desktop.BibaVpnTunnel"
 
+private enum SemWait {
+    case ok
+    case timedOut
+}
+
+private func waitSemaphore(_ sem: DispatchSemaphore, seconds: TimeInterval) -> SemWait {
+    sem.wait(timeout: .now() + seconds) == .success ? .ok : .timedOut
+}
+
+/// Serializes async NE callbacks vs main-thread timeout so late `strdup` errors are freed and never leak after `wait` returned.
+private final class ConnectOutcomeBox {
+    private let lock = NSLock()
+    private var errPtr: UnsafeMutablePointer<CChar>?
+    private var canceled = false
+
+    func finish(error ptr: UnsafeMutablePointer<CChar>?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if canceled {
+            if let p = ptr {
+                free(p)
+            }
+            return
+        }
+        errPtr = ptr
+    }
+
+    func cancelDueToTimeout() {
+        lock.lock()
+        defer { lock.unlock() }
+        canceled = true
+        if let p = errPtr {
+            free(p)
+            errPtr = nil
+        }
+    }
+
+    func takeError() -> UnsafeMutablePointer<CChar>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let p = errPtr
+        errPtr = nil
+        return p
+    }
+}
+
 /// Rust (`bibavpn-desktop` iOS) calls these `@_cdecl` symbols — link this Swift file into the **host** Tauri app target only.
 
 @_cdecl("bibavpn_ios_tunnel_connect")
@@ -16,11 +62,11 @@ public func bibavpn_ios_tunnel_connect(_ jsonUtf8: UnsafePointer<CChar>?) -> Uns
     let json = String(cString: jsonUtf8)
 
     let sem = DispatchSemaphore(value: 0)
-    var errPtr: UnsafeMutablePointer<CChar>?
+    let outcome = ConnectOutcomeBox()
 
     NETunnelProviderManager.loadAllFromPreferences { managers, error in
         if let error {
-            errPtr = strdup(error.localizedDescription)
+            outcome.finish(error: strdup(error.localizedDescription))
             sem.signal()
             return
         }
@@ -45,30 +91,35 @@ public func bibavpn_ios_tunnel_connect(_ jsonUtf8: UnsafePointer<CChar>?) -> Uns
 
         manager.saveToPreferences { saveErr in
             if let saveErr {
-                errPtr = strdup(saveErr.localizedDescription)
+                outcome.finish(error: strdup(saveErr.localizedDescription))
                 sem.signal()
                 return
             }
             manager.loadFromPreferences { loadErr in
                 if let loadErr {
-                    errPtr = strdup(loadErr.localizedDescription)
+                    outcome.finish(error: strdup(loadErr.localizedDescription))
                     sem.signal()
                     return
                 }
                 do {
                     try manager.connection.startVPNTunnel()
                     UserDefaults(suiteName: kAppGroup)?.set(CFAbsoluteTimeGetCurrent(), forKey: kTunnelStarted)
-                    errPtr = nil
+                    outcome.finish(error: nil)
                 } catch {
-                    errPtr = strdup(error.localizedDescription)
+                    outcome.finish(error: strdup(error.localizedDescription))
                 }
                 sem.signal()
             }
         }
     }
 
-    sem.wait()
-    return errPtr
+    switch waitSemaphore(sem, seconds: 120) {
+    case .timedOut:
+        outcome.cancelDueToTimeout()
+        return strdup("timeout: NETunnelProviderManager (connect)")
+    case .ok:
+        return outcome.takeError()
+    }
 }
 
 @_cdecl("bibavpn_ios_tunnel_disconnect")
@@ -84,7 +135,7 @@ public func bibavpn_ios_tunnel_disconnect() {
         UserDefaults(suiteName: kAppGroup)?.removeObject(forKey: kTunnelStarted)
         sem.signal()
     }
-    sem.wait()
+    _ = waitSemaphore(sem, seconds: 35)
 }
 
 @_cdecl("bibavpn_ios_tunnel_is_active")
@@ -106,7 +157,7 @@ public func bibavpn_ios_tunnel_is_active() -> Bool {
             break
         }
     }
-    sem.wait()
+    _ = waitSemaphore(sem, seconds: 15)
     return on
 }
 

@@ -19,8 +19,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var errOut: UnsafeMutablePointer<CChar>?
         let rc = cfgJson.withCString { bibavpn_ffi_start($0, &errOut) }
         if rc != 0 {
-            let msg = errOut.map { String(cString: $0) } ?? "bibavpn_ffi_start rc=\(rc)"
-            bibavpn_ffi_string_free(errOut)
+            let msg: String
+            if let p = errOut {
+                msg = String(cString: p)
+                bibavpn_ffi_string_free(p)
+            } else {
+                msg = "bibavpn_ffi_start rc=\(rc)"
+            }
             completionHandler(NSError(domain: "BibaVPN", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg]))
             return
         }
@@ -67,7 +72,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         var excluded: [NEIPv4Route] = []
         if let host = (root["server_host"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !host.isEmpty {
-            for ip in resolveIPv4Addresses(host: host) {
+            let ips = resolveIPv4Addresses(host: host)
+            if ips.isEmpty {
+                NSLog("[BibaVPN] warning: server_host \"\(host)\" has no IPv4 for excludedRoutes — risk of routing loop to VPN server (use IP or fix DNS)")
+            }
+            for ip in ips {
                 excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
             }
         }
