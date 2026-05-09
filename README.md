@@ -40,6 +40,7 @@ bash start.sh
 ([Releases](https://github.com/Eljaja/BibaVPN/releases) — Android & desktop. `bash start.sh` prints a labeled **Invite URI** (`biba://…`) and **Passphrase**; paste both into the app.)
 
 - **Docs**
+  - [docs/manual/](docs/manual/) — **English user manual** (how it works, download, server & client setup) for websites
   - [PROTOCOL.md](PROTOCOL.md) — wire formats, session flow, invite URI, **BibaV4 roadmap** + **v3 + implementation status**
   - [AGENTS.md](AGENTS.md) — architecture, CLI flags, deploy notes, scripts, **stealth vs BibaV4**
   - [CHANGELOG.md](CHANGELOG.md) — v1.2.0 / BibaV4 release notes

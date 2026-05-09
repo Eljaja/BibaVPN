@@ -49,7 +49,15 @@ jobs:
           merge-multiple: true
 
       - name: Normalize APK filename
-        run: mv dist/app-debug.apk dist/BibaVPN-android-debug.apk
+        run: |
+          set -euo pipefail
+          apk="$(find dist -type f -name 'app-debug.apk' | head -n1)"
+          if [ -z "${apk}" ]; then
+            echo "::error::No app-debug.apk under dist (Android artifact path may have changed). Found:" >&2
+            find dist -type f -name '*.apk' 2>/dev/null || true
+            exit 1
+          fi
+          mv "$apk" dist/BibaVPN-android-debug.apk
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

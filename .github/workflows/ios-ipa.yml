@@ -1,10 +1,16 @@
 # Сборка установочного .ipa для iPhone (macOS runner + подпись Apple).
 # Запуск: Actions → «iOS IPA» → Run workflow.
 #
-# Подпись для успешного `tauri ios build`:
-# - IOS_CERTIFICATE (base64 .p12), IOS_CERTIFICATE_PASSWORD, IOS_MOBILE_PROVISION (base64 .mobileprovision)
-#   см. https://v2.tauri.app/distribute/sign/ios/
-# - Альтернатива: App Store Connect API key через переменные окружения из документации Tauri (настройте в шаге вручную при необходимости).
+# Подпись для успешного `tauri ios build` (Settings → Secrets → Actions):
+# - IOS_CERTIFICATE — base64 всего файла .p12 (экспорт из Keychain Access: сертификат **и приватный ключ** в один .p12).
+# - IOS_CERTIFICATE_PASSWORD — пароль экспорта .p12 (не пароль Apple ID).
+# - IOS_MOBILE_PROVISION — base64 файла .mobileprovision (профиль должен покрывать app id **и** VPN extension).
+# - APPLE_DEVELOPMENT_TEAM — 10-символьный Team ID (Membership в developer.apple.com).
+# Док: https://v2.tauri.app/distribute/sign/ios/
+#
+# Ошибка `SecKeychainItemImport … not valid` / `security import` почти всегда значит:
+# неверный пароль, обрезанный base64 при вставке в секрет, или в секрет попал не .p12 (например только .cer без ключа).
+# Альтернатива manual signing: автоподпись в CI через APPLE_API_ISSUER / APPLE_API_KEY / APPLE_API_KEY_PATH (см. ту же документацию).
 #
 # Для VPN с Packet Tunnel нужны возможности в Apple Developer и профиль(и) для
 # dev.bibavpn.desktop и dev.bibavpn.desktop.BibaVpnTunnel (Network Extension + App Group).
@@ -82,12 +88,54 @@ jobs:
       - name: Integrate BibaVPN extension into gen/apple
         run: bash apps/scripts/integrate-bibavpn-into-tauri-ios.sh
 
+      # Раньше падаем с понятной ошибкой, чем security import внутри Tauri.
+      - name: Validate signing secrets (decode + openssl pkcs12)
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ -n "${IOS_CERTIFICATE:-}" ]] || fail "IOS_CERTIFICATE пустой — добавьте секрет (base64 от .p12)."
+          [[ -n "${IOS_CERTIFICATE_PASSWORD:-}" ]] || fail "IOS_CERTIFICATE_PASSWORD пустой."
+          [[ -n "${IOS_MOBILE_PROVISION:-}" ]] || fail "IOS_MOBILE_PROVISION пустой — base64 от .mobileprovision."
+          [[ -n "${APPLE_DEVELOPMENT_TEAM:-}" ]] || fail "APPLE_DEVELOPMENT_TEAM пустой — 10-символьный Team ID (иначе будет предупреждение и часто срыв подписи)."
+          python3 <<'PY'
+          import base64, os, sys
+          def bail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          def dec(name):
+              raw = "".join((os.environ.get(name) or "").split())
+              if not raw:
+                  bail(f"{name} пустой после trim")
+              try:
+                  out = base64.b64decode(raw, validate=True)
+              except Exception as e:
+                  bail(f"{name}: невалидный base64 ({e})")
+              if len(out) < 64:
+                  bail(f"{name}: после decode слишком мало байт — возможно секрет обрезан при вставке")
+              return out
+
+          open("/tmp/tauri-ci-signing.p12", "wb").write(dec("IOS_CERTIFICATE"))
+          open("/tmp/tauri-ci-signing.mobileprovision", "wb").write(dec("IOS_MOBILE_PROVISION"))
+          PY
+          export CERT_PASS="$IOS_CERTIFICATE_PASSWORD"
+          openssl pkcs12 -in /tmp/tauri-ci-signing.p12 -nodes -passin env:CERT_PASS -noout \
+            || fail "openssl не принял P12 — неверный IOS_CERTIFICATE_PASSWORD или файл не PKCS#12 с ключом (экспорт из Keychain: .p12 с приватным ключом)."
+          rm -f /tmp/tauri-ci-signing.p12 /tmp/tauri-ci-signing.mobileprovision
+          echo "Секреты декодируются, openssl принял пароль к P12."
+
       - name: tauri ios build → IPA
         working-directory: apps/bibavpn-desktop
         env:
           IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
         run: npm exec -- tauri ios build
 
       - name: Locate IPA
