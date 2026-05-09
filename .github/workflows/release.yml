@@ -48,15 +48,43 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # CI stages one arm64 debug APK as BibaVPN-android-debug.apk; fallbacks if layout changes.
       - name: Normalize APK filename
         run: |
           set -euo pipefail
-          apk="$(find dist -type f -name 'app-debug.apk' | head -n1)"
+          apk=""
+          for name in \
+            BibaVPN-android-debug.apk \
+            app-arm64-debug.apk \
+            app-arm64-v8a-debug.apk \
+            app-universal-debug.apk \
+            app-debug.apk \
+            app-universal-release-unsigned.apk \
+            app-universal-release.apk \
+            app-release-unsigned.apk \
+            app-release.apk
+          do
+            found="$(find dist -type f -name "$name" 2>/dev/null | head -n1 || true)"
+            if [ -n "$found" ]; then
+              apk="$found"
+              break
+            fi
+          done
           if [ -z "${apk}" ]; then
-            echo "::error::No app-debug.apk under dist (Android artifact path may have changed). Found:" >&2
-            find dist -type f -name '*.apk' 2>/dev/null || true
+            apk="$(find dist -type f -path '*/debug/*.apk' 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "${apk}" ]; then
+            apk="$(find dist -type f -path '*/release/*.apk' 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "${apk}" ]; then
+            apk="$(find dist -type f -name '*.apk' 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -z "${apk}" ]; then
+            echo "::error::No .apk under dist" >&2
+            find dist -type f 2>/dev/null || true
             exit 1
           fi
+          echo "Using Android APK: ${apk}"
           mv "$apk" dist/BibaVPN-android-debug.apk
 
       - name: Create GitHub Release
