@@ -85,7 +85,10 @@ jobs:
             exit 1
           fi
           echo "Using Android APK: ${apk}"
-          mv "$apk" dist/BibaVPN-android-debug.apk
+          target="dist/BibaVPN-android-debug.apk"
+          if [ "$apk" != "$target" ]; then
+            mv "$apk" "$target"
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
