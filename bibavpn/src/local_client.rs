@@ -70,7 +70,9 @@ async fn sleep_mux_slot_retry(attempt: u32) {
 }
 
 fn tcp_mux_writer_gone(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("tcp mux writer stopped")
+    e.chain()
+        .any(|c| c.downcast_ref::<crate::tcp_mux::MuxWriterStopped>().is_some())
+        || format!("{e:#}").contains("tcp mux writer stopped")
 }
 
 type TcpMuxSlot = TcpMuxClientSlot;
@@ -286,6 +288,8 @@ impl ClientCfg {
             pad_mode: self.pad_mode,
             proto: self.proto,
             proto_domain: self.proto_domain.clone(),
+            reality_public_key: self.reality_public_key,
+            reality_short_id: self.reality_short_id,
         }
     }
 }
@@ -293,7 +297,7 @@ impl ClientCfg {
 fn effective_proto_domain(cfg: &ClientCfg) -> String {
     let t = cfg.proto_domain.trim();
     if t.is_empty() {
-        cfg.sni.clone()
+        "default".to_string()
     } else {
         t.to_string()
     }
@@ -319,58 +323,17 @@ async fn reality_client_handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    use crate::reality::encode_client_hello;
-    use crate::reality::decode_server_hello;
-    use x25519_dalek::{PublicKey, EphemeralSecret};
-    use rand::rngs::OsRng;
-
-    // Get server's expected public key from config
-    let server_expected_pubkey = cfg.reality_public_key
+    let server_expected_pubkey = cfg
+        .reality_public_key
         .ok_or_else(|| anyhow::anyhow!("REALITY: no server public key configured"))?;
 
-    // Generate ephemeral keypair for this session
-    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
-    let ephemeral_public = PublicKey::from(&ephemeral_secret);
+    let short_id = cfg.reality_short_id.unwrap_or_else(|| rand::random::<[u8; 8]>());
 
-    let short_id = cfg.reality_short_id.unwrap_or_else(|| {
-        let mut id = [0u8; 8];
-        let bytes = rand::random::<[u8; 8]>();
-        id.copy_from_slice(&bytes);
-        id
-    });
+    let session_key =
+        crate::reality::reality_client_exchange_verify(ws, &server_expected_pubkey, &short_id)
+            .await?;
 
-    // Build client HELLO: [version:1][pubkey:32][short_id:8]
-    let client_hello = encode_client_hello(&short_id, ephemeral_public.as_bytes());
-
-    // Send client hello
-    ws.send(Message::Binary(bytes::Bytes::from(client_hello)))
-        .await
-        .context("send REALITY client hello")?;
-
-    // Wait for server hello
-    let msg = match ws.next().await {
-        Some(Ok(Message::Binary(b))) => b,
-        Some(Ok(_)) => anyhow::bail!("expected binary server hello"),
-        Some(Err(e)) => Err(e).context("websocket recv")?,
-        None => anyhow::bail!("server closed during REALITY handshake"),
-    };
-
-    let server_pubkey = decode_server_hello(&msg)?;
-
-    // Verify server's public key matches expected
-    if server_pubkey != server_expected_pubkey {
-        anyhow::bail!("REALITY: server public key mismatch - possible MITM attack!");
-    }
-
-    // Compute shared secret
-    let server_public = PublicKey::from(server_pubkey);
-    let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
-    let mut session_key = [0u8; 32];
-    session_key.copy_from_slice(shared_secret.as_bytes());
-
-    info!(
-        "REALITY handshake complete, session key derived, server verified"
-    );
+    info!("REALITY handshake complete, session key derived, server verified");
 
     Ok((session_key, short_id))
 }
@@ -621,14 +584,7 @@ async fn connect_tcp_mux_handle(
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         let res: anyhow::Result<()> = async {
-            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::new_empty());
-            let pool_sessions = {
-                let g = tcp_mux_slot.lock().await;
-                g.as_ref()
-                    .expect("pool just set")
-                    .sessions
-                    .clone()
-            };
+            let mut sessions = Vec::with_capacity(n);
             for _ in 0..n {
                 let (mut ws, crypto) = one_try_wss_session(cfg).await?;
                 let mo = encode_v3_mux_open();
@@ -671,7 +627,7 @@ async fn connect_tcp_mux_handle(
                     mcfg,
                     tcp_mux_slot.clone(),
                 );
-                pool_sessions.lock().await.push((sid, h));
+                sessions.push((sid, h));
                 info!(
                     target: "bibavpn_client",
                     session_id = sid,
@@ -681,6 +637,7 @@ async fn connect_tcp_mux_handle(
                     "TCP mux WSS ready"
                 );
             }
+            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::from_sessions(sessions));
             Ok(())
         }
         .await;
@@ -718,14 +675,7 @@ async fn connect_reality_tcp_mux_handle(
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         let res: anyhow::Result<()> = async {
             let _target = cfg.reality_target.as_ref().expect("reality target");
-            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::new_empty());
-            let pool_sessions = {
-                let g = tcp_mux_slot.lock().await;
-                g.as_ref()
-                    .expect("reality pool")
-                    .sessions
-                    .clone()
-            };
+            let mut sessions = Vec::with_capacity(n);
 
             for _ in 0..n {
                 let domain = ServerName::try_from(cfg.sni.clone())?;
@@ -801,7 +751,7 @@ async fn connect_reality_tcp_mux_handle(
 
                 let (sid, h) =
                     tcp_mux::spawn_tcp_mux_client(ws, None, mcfg, tcp_mux_slot.clone());
-                pool_sessions.lock().await.push((sid, h));
+                sessions.push((sid, h));
                 info!(
                     target: "bibavpn_client",
                     session_id = sid,
@@ -810,6 +760,7 @@ async fn connect_reality_tcp_mux_handle(
                     "REALITY tunnel ready"
                 );
             }
+            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::from_sessions(sessions));
             Ok(())
         }
         .await;
@@ -848,6 +799,11 @@ pub async fn run_local_client(
     }
     if opts.socks_auth.is_some() {
         info!("SOCKS5: username/password required on local listener");
+    }
+    if opts.socks_auth.is_some() && opts.http_proxy_bind.is_some() {
+        tracing::warn!(
+            "HTTP local proxy has no auth handshake; SOCKS username/password applies only to the SOCKS port"
+        );
     }
 
     let ws_parallel = opts.ws_parallel.max(1).min(4);
@@ -1183,11 +1139,12 @@ async fn run_socks_udp_assoc(
     let workers = Arc::new(Semaphore::new(SOCKS_UDP_WORKERS));
     let udp = Arc::new(udp);
     let mut mbuf = vec![0u8; 65535];
-    let reply_timeout = if cfg.udp_mux_reply_timeout_secs > 0 {
-        Some(Duration::from_secs(cfg.udp_mux_reply_timeout_secs))
+    let reply_timeout_secs = if cfg.udp_mux_reply_timeout_secs == 0 {
+        DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS
     } else {
-        None
+        cfg.udp_mux_reply_timeout_secs
     };
+    let reply_timeout = Duration::from_secs(reply_timeout_secs);
 
     loop {
         tokio::select! {
@@ -1212,15 +1169,12 @@ async fn run_socks_udp_assoc(
                         let xid: u64 = rand::random();
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         handle.forward(xid, dst_host, dst_port, payload, tx)?;
-                        let reply = match reply_timeout {
-                            Some(d) => match timeout(d, rx).await {
-                                Ok(inner) => inner,
-                                Err(_) => {
-                                    error!("udp mux: reply timeout for xid {xid}");
-                                    return Ok(());
-                                }
-                            },
-                            None => rx.await,
+                        let reply = match timeout(reply_timeout, rx).await {
+                            Ok(inner) => inner,
+                            Err(_) => {
+                                error!("udp mux: reply timeout for xid {xid}");
+                                return Ok(());
+                            }
                         };
                         match reply {
                             Ok(Ok(socks_body)) => {

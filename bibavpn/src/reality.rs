@@ -23,7 +23,6 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::frame::PadMode;
 
 /// REALITY protocol magic bytes
 pub const REALITY_MAGIC: &[u8] = b"REAL1";
@@ -329,14 +328,8 @@ impl RealitySession {
         session_key.copy_from_slice(shared_secret.as_bytes());
         self.session_key = Some(session_key);
 
-        // Send SERVER HELLO: [version:1][server_pubkey:32][...TLS cert from target...]
-        let (server_priv, server_pub) = RealityServerConfig::generate_keys();
-        self.private_key = server_priv; // Update for next session
-
-        let mut response = Vec::with_capacity(1 + 32);
-        response.push(REALITY_VERSION);
-        response.extend_from_slice(&server_pub);
-
+        // Send SERVER HELLO: public key of configured long-term secret (must match invite pin).
+        let response = server_hello_from_private(&self.private_key);
         ws.send(Message::Binary(Bytes::from(response)))
             .await
             .context("send REALITY SERVER_HELLO")?;
@@ -345,71 +338,66 @@ impl RealitySession {
     }
 }
 
-/// Bridge WebSocket to REALITY TLS target (server side)
-pub async fn bridge_reality_server<S>(
-    ws: WebSocketStream<S>,
-    config: RealityServerConfig,
-    _max_pad: u8,
-    _decoy_max: u8,
-    _pad_mode: PadMode,
-    _ws_ping_secs: u64,
-    _ws_ping_jitter_percent: u8,
+/// Wire bytes for REALITY SERVER_HELLO: `[version][server_x25519_pubkey:32]`.
+pub fn server_hello_from_private(private_key: &[u8; 32]) -> Vec<u8> {
+    let server_secret = StaticSecret::from(*private_key);
+    let server_pub = PublicKey::from(&server_secret);
+    let mut response = Vec::with_capacity(1 + 32);
+    response.push(REALITY_VERSION);
+    response.extend_from_slice(server_pub.as_bytes());
+    response
+}
+
+/// Server-side REALITY X25519 exchange: validate client HELLO, reply with pinned pubkey from `cfg.private_key`.
+pub async fn server_handshake_reality<S>(
+    ws: &mut WebSocketStream<S>,
+    cfg: &RealityServerConfig,
 ) -> anyhow::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let (target_host, target_port) = parse_target(&config.target)?;
-    let target_addr = format!("{}:{}", target_host, target_port);
-
-    // Connect to target and do TLS handshake
-    let target_tcp = TcpStream::connect(&target_addr)
-        .await
-        .context("connect to REALITY target")?;
-
-    let connector = create_tls_connector(&target_host)?;
-    let sn = ServerName::try_from(target_host.clone())?;
-    let target_tls = connector
-        .connect(sn, target_tcp)
-        .await
-        .context("TLS handshake with target")?;
-
-    let (mut target_read, mut target_write) = tokio::io::split(target_tls);
-    let (mut ws_sink, mut ws_stream) = ws.split();
-
-    let mut buf = [0u8; 65536];
     loop {
-        tokio::select! {
-            msg = ws_stream.next() => {
-                match msg {
-                    Some(Ok(Message::Binary(b))) => {
-                        if target_write.write_all(&b).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws_sink.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
+        let msg = match ws.next().await {
+            Some(Ok(Message::Binary(b))) => b,
+            Some(Ok(Message::Ping(p))) => {
+                ws.send(Message::Pong(p)).await.context("REALITY pong")?;
+                continue;
             }
-            n = target_read.read(&mut buf) => {
-                match n {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = Bytes::copy_from_slice(&buf[..n]);
-                        if ws_sink.send(Message::Binary(data)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    }
+            Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(_)) => bail!("expected binary REALITY HELLO"),
+            Some(Err(e)) => Err(e).context("websocket recv")?,
+            None => bail!("ws closed before REALITY HELLO"),
+        };
 
-    Ok(())
+        if msg.len() < 1 + 32 + 8 {
+            bail!("short REALITY HELLO");
+        }
+        if msg[0] != REALITY_VERSION {
+            bail!("unsupported REALITY version: {}", msg[0]);
+        }
+
+        let client_pubkey: [u8; 32] = msg[1..33].try_into().unwrap();
+        let mut short_id = [0u8; 8];
+        short_id.copy_from_slice(&msg[33..41]);
+
+        if !cfg.short_ids.is_empty()
+            && !cfg.short_ids.iter().any(|s| s == &short_id)
+            && !cfg.short_ids.iter().any(|s| s.iter().all(|&b| b == 0))
+        {
+            bail!("invalid short ID");
+        }
+
+        let server_secret = StaticSecret::from(cfg.private_key);
+        let client_public = PublicKey::try_from(client_pubkey)
+            .map_err(|_| anyhow::anyhow!("invalid REALITY client public key"))?;
+        let _shared = server_secret.diffie_hellman(&client_public);
+
+        let response = server_hello_from_private(&cfg.private_key);
+        ws.send(Message::Binary(Bytes::from(response)))
+            .await
+            .context("send REALITY SERVER_HELLO")?;
+        return Ok(());
+    }
 }
 
 /// REALITY client connection
@@ -470,6 +458,42 @@ pub fn encode_client_hello(short_id: &[u8; 8], client_pubkey: &[u8; 32]) -> Vec<
     msg.extend_from_slice(client_pubkey);
     msg.extend_from_slice(short_id);
     msg
+}
+
+/// Client REALITY HELLO + verify server pubkey (X25519 ephemeral, same flow as `local_client::reality_client_handshake`).
+pub async fn reality_client_exchange_verify<S>(
+    ws: &mut WebSocketStream<S>,
+    expected_server_pubkey: &[u8; 32],
+    short_id: &[u8; 8],
+) -> anyhow::Result<[u8; 32]>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use rand::rngs::OsRng;
+    use x25519_dalek::{EphemeralSecret, PublicKey};
+
+    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+    let ephemeral_public = PublicKey::from(&ephemeral_secret);
+    let client_hello = encode_client_hello(short_id, ephemeral_public.as_bytes());
+    ws.send(Message::Binary(Bytes::from(client_hello)))
+        .await
+        .context("send REALITY client hello")?;
+
+    let msg = match ws.next().await {
+        Some(Ok(Message::Binary(b))) => b,
+        Some(Ok(_)) => bail!("expected binary server hello"),
+        Some(Err(e)) => Err(e).context("websocket recv")?,
+        None => bail!("server closed during REALITY handshake"),
+    };
+    let server_pubkey = decode_server_hello(&msg)?;
+    if server_pubkey != *expected_server_pubkey {
+        bail!("REALITY: server public key mismatch (possible MITM)");
+    }
+    let server_public = PublicKey::from(server_pubkey);
+    let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+    let mut session_key = [0u8; 32];
+    session_key.copy_from_slice(shared_secret.as_bytes());
+    Ok(session_key)
 }
 
 /// Decode REALITY SERVER HELLO

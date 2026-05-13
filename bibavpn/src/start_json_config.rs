@@ -20,8 +20,9 @@ use crate::{decode_invite_v1, InviteV1, PadMode};
 struct StartJson {
     #[serde(default)]
     server: String,
-    #[serde(default = "default_token")]
-    token: String,
+    /// Omitted or null: use invite token, or `"change-me"` when no invite.
+    #[serde(default)]
+    token: Option<String>,
     sni: Option<String>,
     #[serde(default = "default_socks")]
     socks_bind: String,
@@ -115,10 +116,6 @@ struct StartJson {
     /// Same as client `--fingerprint` (e.g. `chrome-132`); takes precedence over `tls_profile` and invite.
     #[serde(default)]
     fingerprint: Option<String>,
-}
-
-fn default_token() -> String {
-    "change-me".to_string()
 }
 
 fn default_socks() -> String {
@@ -251,11 +248,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         server_host,
         server_port,
         sni,
-        token,
         max_pad,
         junk_frames,
         early_ws_frames,
-        psk,
         decoy_max,
         max_ws_binary,
         ws_ping_secs,
@@ -273,11 +268,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             h,
             p,
             sni,
-            inv.token.clone(),
             inv.max_pad,
             inv.junk_frames,
             inv.early_ws_frames,
-            inv.psk.clone(),
             inv.decoy_max,
             inv.max_ws_binary,
             inv.ws_ping_secs,
@@ -298,11 +291,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             h,
             p,
             sni,
-            j.token,
             j.max_pad,
             j.junk_frames,
             j.early_ws_frames,
-            j.psk.clone(),
             j.decoy_max,
             j.max_ws_binary,
             j.ws_ping_secs,
@@ -313,6 +304,46 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             j.udp_mux_reply_timeout_secs,
             j.insecure,
         )
+    };
+
+    let token = if let Some(ref inv) = invite_pair {
+        let inv_t = inv.token.trim();
+        match j.token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => inv.token.clone(),
+            Some(t) if t == inv_t => inv.token.clone(),
+            Some(_) => {
+                anyhow::bail!(
+                    "JSON `token` disagrees with invite token; remove `token` from JSON or match the invite"
+                );
+            }
+        }
+    } else {
+        j.token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "change-me".to_string())
+    };
+
+    let psk = if let Some(ref inv) = invite_pair {
+        let from_j = j
+            .psk
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match (&from_j, &inv.psk) {
+            (Some(a), Some(b)) if a != b => {
+                anyhow::bail!(
+                    "JSON `psk` disagrees with invite `psk`; remove one field or align values"
+                );
+            }
+            (Some(a), _) => Some(a.clone()),
+            (None, _) => inv.psk.clone(),
+        }
+    } else {
+        j.psk.clone()
     };
 
     let mut extra = Vec::new();
@@ -435,7 +466,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         j.proto_domain.clone(),
         invite_pair.as_ref().and_then(|i| i.proto_domain.clone()),
     )
-    .unwrap_or_default();
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| "default".to_string());
 
     let invite_tls: Option<TlsClientProfile> = match invite_pair.as_ref() {
         Some(inv) => tls_profile_from_invite(inv).context("invite tls")?,
@@ -546,6 +579,10 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         }
         Ok(TlsStack::Rustls)
     })()?;
+
+    if matches!(tls_stack, TlsStack::Boring) && pinned_certs_pem.is_some() {
+        anyhow::bail!("tls_stack=boring is incompatible with pin_cert_pem (certificate pinning)");
+    }
 
     let tls_fragment = if let Some(ref inv) = invite_pair {
         inv.tls_fragment
@@ -670,11 +707,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     let idle_decoy_secs =
         crate::stealth_v12::merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
 
-    let effective_proto_domain = if proto_domain.trim().is_empty() {
-        sni.clone()
-    } else {
-        proto_domain.trim().to_string()
-    };
+    let effective_proto_domain = proto_domain.trim().to_string();
     info!(
         target: "bibavpn_client",
         invite = invite_pair.is_some(),
@@ -737,4 +770,16 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         stealth_profile: stealth_for_merge,
         tls_stack,
     })
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::local_client_options_from_json_str;
+
+    #[test]
+    fn proto_domain_defaults_to_default_label() {
+        let j = r#"{"server":"127.0.0.1:1","token":"t","psk":"0123456789abcdef0123456789abcdef"}"#;
+        let o = local_client_options_from_json_str(j).unwrap();
+        assert_eq!(o.proto_domain, "default");
+    }
 }

@@ -6,6 +6,7 @@ use rand::Rng;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -130,6 +131,11 @@ where
     let ws_out_dummy = ws_out_tx.clone();
     drop(ws_out_tx);
 
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_up = shutdown.clone();
+    let shutdown_dn = shutdown.clone();
+    let shutdown_dummy = shutdown.clone();
+
     let writer = async move {
         let mut ping_sleep: Option<Pin<Box<tokio::time::Sleep>>> = if ws_ping_secs > 0 {
             Some(Box::pin(sleep(ws_ping_period_duration(
@@ -185,8 +191,17 @@ where
             let m = if let Some(m) = prefetched_ws_messages.pop_front() {
                 m
             } else {
-                let Some(m) = ws_rx.next().await else { break };
-                m.context("websocket read")?
+                let Some(m) = ws_rx.next().await else {
+                    shutdown_up.store(true, Ordering::SeqCst);
+                    break;
+                };
+                match m {
+                    Ok(m) => m,
+                    Err(e) => {
+                        shutdown_up.store(true, Ordering::SeqCst);
+                        return Err(anyhow::Error::from(e).context("websocket read"));
+                    }
+                }
             };
             match m {
                 Message::Binary(b) => {
@@ -234,10 +249,14 @@ where
                     ws_out_up.send(Message::Pong(p)).await.context("ws pong")?;
                 }
                 Message::Pong(_) => {}
-                Message::Close(_) => break,
+                Message::Close(_) => {
+                    shutdown_up.store(true, Ordering::SeqCst);
+                    break;
+                }
                 _ => {}
             }
         }
+        shutdown_up.store(true, Ordering::SeqCst);
         Ok::<_, anyhow::Error>(())
     };
 
@@ -251,6 +270,9 @@ where
         let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
         let mut adaptive = AdaptivePadState::default();
         loop {
+            if shutdown_dn.load(Ordering::Relaxed) {
+                break;
+            }
             let n = tcp_read.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -313,6 +335,9 @@ where
         let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
         let mut adaptive_d = AdaptivePadState::default();
         loop {
+            if shutdown_dummy.load(Ordering::Relaxed) {
+                return Ok::<_, anyhow::Error>(());
+            }
             let lo = dummy_interval_secs
                 .saturating_mul(1)
                 .saturating_div(2)

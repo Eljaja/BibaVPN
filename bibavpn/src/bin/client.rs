@@ -169,8 +169,8 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     proto: u8,
 
-    /// Domain label for v3 PSK KDF (must match server `--proto-domain`). Empty = use SNI.
-    #[arg(long, default_value = "")]
+    /// Domain label for v3 PSK KDF (must match server `--proto-domain`). Default matches server `default`.
+    #[arg(long, default_value = "default")]
     proto_domain: String,
 
     /// REALITY mode: server's public key (base64, 32-byte X25519).

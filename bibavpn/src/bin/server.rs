@@ -17,7 +17,7 @@ use bibavpn::ServerWsOutTiming;
 use bibavpn::{read_padded_frame_into, write_padded_frame_with_mode_state};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
-use bibavpn::reality::{bridge_reality_server, extract_sni, RealityServerConfig};
+use bibavpn::reality::{extract_sni, server_handshake_reality, RealityServerConfig};
 use base64::Engine;
 use bytes::Bytes;
 use clap::Parser;
@@ -522,14 +522,62 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn handle_one(
-    tcp: TcpStream,
-    acceptor: TlsAcceptor,
-    token: String,
-    ws_path: String,
-    legacy_path_auth: bool,
+async fn read_next_binary_after_reality<S>(ws: &mut WebSocketStream<S>) -> anyhow::Result<Bytes>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    loop {
+        let m = ws
+            .next()
+            .await
+            .context("eof after REALITY")?
+            .context("ws error after REALITY")?;
+        match m {
+            Message::Binary(b) => return Ok(b),
+            Message::Ping(p) => {
+                ws.send(Message::Pong(p)).await.context("pong after REALITY")?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => anyhow::bail!("closed after REALITY"),
+            _ => {}
+        }
+    }
+}
+
+async fn server_handshake_v3_after_first_hello<S>(
+    ws: &mut WebSocketStream<S>,
+    first_hello: &[u8],
+    token: &str,
+    psk: &str,
+    decoy_max: u8,
+    proto_domain: &str,
+) -> anyhow::Result<SharedCrypto>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let c = crypto_layer::parse_hello_v3(first_hello).context("parse v3 HELLO")?;
+    let (ack, s_rand) = crypto_layer::build_ack(psk, proto_domain, &c)?;
+    ws.send(Message::Binary(Bytes::from(ack)))
+        .await
+        .context("send v3 ACK (REALITY follow-up)")?;
+    let crypto = Arc::new(SessionCrypto::new(
+        psk,
+        proto_domain,
+        &c,
+        &s_rand,
+        decoy_max,
+    ));
+    server_wait_v3_auth(ws, &crypto, token).await?;
+    Ok(crypto)
+}
+
+async fn run_session_after_v3_handshake<S>(
+    mut ws: WebSocketStream<S>,
+    crypto: SharedCrypto,
+    udp_mux_max_pad: u8,
+    udp_mux_max_ws_binary: usize,
+    udp_mux_recv_timeout: Duration,
     max_pad: u8,
-    psk: Option<String>,
     decoy_max: u8,
     max_ws_binary: usize,
     ws_ping_secs: u64,
@@ -537,54 +585,13 @@ async fn handle_one(
     ws_binary_send_jitter_ms: u8,
     ws_jitter_min_ms: u8,
     ws_jitter_max_ms: u8,
-    udp_mux_max_pad: u8,
-    udp_mux_max_ws_binary: usize,
-    udp_mux_recv_timeout: Duration,
     pad_mode: PadMode,
     dummy_interval_secs: u64,
     server_out: ServerWsOutTiming,
-    camo: CamouflageServeConfig,
-    proto_domain: String,
-    reality_config: Option<RealityServerConfig>,
-) -> anyhow::Result<()> {
-    let tls = acceptor.accept(tcp).await.context("tls accept")?;
-
-    let Some((mut ws, _ws_kind)) =
-        accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo).await?
-    else {
-        return Ok(());
-    };
-
-    if let Some(ref reality_cfg) = reality_config {
-        info!("REALITY mode: forwarding to {}", reality_cfg.target);
-        return bridge_reality_server(
-            ws,
-            reality_cfg.clone(),
-            max_pad,
-            decoy_max,
-            pad_mode,
-            ws_ping_secs,
-            ws_ping_jitter_percent,
-        )
-        .await
-        .context("REALITY bridge");
-    }
-
-    let domain_trim = proto_domain.trim();
-    if domain_trim.is_empty() {
-        anyhow::bail!("--proto-domain must not be empty");
-    }
-
-    let crypto = server_handshake_v3(
-        &mut ws,
-        &token,
-        psk.as_deref(),
-        decoy_max,
-        domain_trim,
-    )
-    .await
-    .context("handshake")?;
-
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     match wait_first_channel(ws, &crypto).await? {
         FirstChannel::Tcp {
             host,
@@ -703,6 +710,153 @@ async fn handle_one(
     Ok(())
 }
 
+async fn handle_one(
+    tcp: TcpStream,
+    acceptor: TlsAcceptor,
+    token: String,
+    ws_path: String,
+    legacy_path_auth: bool,
+    max_pad: u8,
+    psk: Option<String>,
+    decoy_max: u8,
+    max_ws_binary: usize,
+    ws_ping_secs: u64,
+    ws_ping_jitter_percent: u8,
+    ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
+    udp_mux_max_pad: u8,
+    udp_mux_max_ws_binary: usize,
+    udp_mux_recv_timeout: Duration,
+    pad_mode: PadMode,
+    dummy_interval_secs: u64,
+    server_out: ServerWsOutTiming,
+    camo: CamouflageServeConfig,
+    proto_domain: String,
+    reality_config: Option<RealityServerConfig>,
+) -> anyhow::Result<()> {
+    let tls = acceptor.accept(tcp).await.context("tls accept")?;
+
+    let Some((mut ws, _ws_kind)) =
+        accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo).await?
+    else {
+        return Ok(());
+    };
+
+    if let Some(ref reality_cfg) = reality_config {
+        info!("REALITY mode: app tunnel after X25519");
+        server_handshake_reality(&mut ws, reality_cfg)
+            .await
+            .context("REALITY handshake")?;
+
+        let domain_trim = proto_domain.trim();
+        if domain_trim.is_empty() {
+            anyhow::bail!("--proto-domain must not be empty");
+        }
+
+        let next = read_next_binary_after_reality(&mut ws)
+            .await
+            .context("after REALITY: first application frame")?;
+
+        if is_v3_mux_open(next.as_ref()) {
+            info!("REALITY: TCP mux (plaintext mux records)");
+            return bibavpn::tcp_mux::bridge_ws_tcp_mux_server(
+                ws,
+                max_pad,
+                decoy_max,
+                None,
+                max_ws_binary,
+                ws_ping_secs,
+                ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
+                pad_mode,
+                dummy_interval_secs,
+                server_out,
+            )
+            .await
+            .context("REALITY TCP mux");
+        }
+
+        if !next.is_empty() && next[0] == crypto_layer::V3_HELLO_TAG {
+            let secret =
+                psk.as_deref()
+                    .context("REALITY + v3 requires server --psk (UDP mux path)")?;
+            let crypto = server_handshake_v3_after_first_hello(
+                &mut ws,
+                next.as_ref(),
+                &token,
+                secret,
+                decoy_max,
+                domain_trim,
+            )
+            .await
+            .context("REALITY + v3 PSK")?;
+            return run_session_after_v3_handshake(
+                ws,
+                crypto,
+                udp_mux_max_pad,
+                udp_mux_max_ws_binary,
+                udp_mux_recv_timeout,
+                max_pad,
+                decoy_max,
+                max_ws_binary,
+                ws_ping_secs,
+                ws_ping_jitter_percent,
+                ws_binary_send_jitter_ms,
+                ws_jitter_min_ms,
+                ws_jitter_max_ms,
+                pad_mode,
+                dummy_interval_secs,
+                server_out,
+            )
+            .await;
+        }
+
+        anyhow::bail!(
+            "after REALITY: expected mux open or v3 HELLO, got len {} first=0x{:02x}",
+            next.len(),
+            next.first().copied().unwrap_or(0)
+        );
+    }
+
+    let domain_trim = proto_domain.trim();
+    if domain_trim.is_empty() {
+        anyhow::bail!("--proto-domain must not be empty");
+    }
+
+    let crypto = server_handshake_v3(
+        &mut ws,
+        &token,
+        psk.as_deref(),
+        decoy_max,
+        domain_trim,
+    )
+    .await
+    .context("handshake")?;
+
+    run_session_after_v3_handshake(
+        ws,
+        crypto,
+        udp_mux_max_pad,
+        udp_mux_max_ws_binary,
+        udp_mux_recv_timeout,
+        max_pad,
+        decoy_max,
+        max_ws_binary,
+        ws_ping_secs,
+        ws_ping_jitter_percent,
+        ws_binary_send_jitter_ms,
+        ws_jitter_min_ms,
+        ws_jitter_max_ms,
+        pad_mode,
+        dummy_interval_secs,
+        server_out,
+    )
+    .await
+}
+
 enum FirstChannel<S>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -775,6 +929,10 @@ where
 {
     let domain = proto_domain.to_string();
     let fut = async {
+        let mut junk_frames = 0u32;
+        let mut junk_bytes = 0usize;
+        const MAX_PRE_HELLO_FRAMES: u32 = 256;
+        const MAX_PRE_HELLO_BYTES: usize = 256 * 1024;
         loop {
             let m = ws
                 .next()
@@ -784,6 +942,11 @@ where
             match m {
                 Message::Binary(b) => {
                     if b.is_empty() || b.as_ref()[0] != crypto_layer::V3_HELLO_TAG {
+                        junk_frames = junk_frames.saturating_add(1);
+                        junk_bytes = junk_bytes.saturating_add(b.len());
+                        if junk_frames > MAX_PRE_HELLO_FRAMES || junk_bytes > MAX_PRE_HELLO_BYTES {
+                            anyhow::bail!("too much pre-handshake data before v3 HELLO");
+                        }
                         continue;
                     }
                     let c = match crypto_layer::parse_hello_v3(b.as_ref()) {

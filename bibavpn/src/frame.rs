@@ -256,6 +256,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_trailing_garbage() {
+        let mut v = Vec::new();
+        write_padded_frame(&mut v, b"hi", 0).unwrap();
+        v.push(0xfe);
+        assert!(read_padded_frame(&v).is_err());
+    }
+
+    #[test]
     fn mtu_cap_plaintext_budget() {
         let small = 1400usize;
         let n = max_tcp_payload_per_ws_message(false, 0, 64, small);

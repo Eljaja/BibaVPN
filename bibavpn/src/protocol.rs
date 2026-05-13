@@ -53,6 +53,9 @@ pub fn decode_auth(data: &[u8]) -> anyhow::Result<String> {
     if data.len() < i + 2 + tl {
         anyhow::bail!("truncated auth token");
     }
+    if data.len() != i + 2 + tl {
+        anyhow::bail!("trailing bytes in auth frame");
+    }
     let s = std::str::from_utf8(&data[i + 2..i + 2 + tl])?.to_string();
     Ok(s)
 }
@@ -98,17 +101,23 @@ fn decode_open_inner(data: &[u8]) -> anyhow::Result<(String, u16, &[u8])> {
 }
 
 pub fn decode_open(data: &[u8]) -> anyhow::Result<(String, u16)> {
-    let (host, port, _) = decode_open_inner(data)?;
+    let (host, port, _) = decode_open_with_flags(data)?;
     Ok((host, port))
 }
 
 pub fn decode_open_with_flags(data: &[u8]) -> anyhow::Result<(String, u16, u8)> {
     let (host, port, rest) = decode_open_inner(data)?;
+    let mut i = 0usize;
     let flags = if rest.len() >= 2 && rest[0] == OPEN_EXT_V1 {
-        rest[1]
+        let f = rest[1];
+        i = 2;
+        f
     } else {
         0
     };
+    if i != rest.len() {
+        anyhow::bail!("trailing bytes in legacy open");
+    }
     Ok((host, port, flags))
 }
 
@@ -143,6 +152,9 @@ pub fn decode_open_err(data: &[u8]) -> anyhow::Result<String> {
     let ml = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
     if data.len() < i + 2 + ml {
         anyhow::bail!("truncated open error");
+    }
+    if data.len() != i + 2 + ml {
+        anyhow::bail!("trailing bytes in open error");
     }
     Ok(std::str::from_utf8(&data[i + 2..i + 2 + ml])?.to_string())
 }
@@ -320,6 +332,9 @@ pub fn decode_v3_auth(data: &[u8]) -> anyhow::Result<String> {
     if data.len() < 3 + tl {
         anyhow::bail!("truncated v3 auth");
     }
+    if data.len() != 3 + tl {
+        anyhow::bail!("trailing bytes in v3 auth");
+    }
     Ok(std::str::from_utf8(&data[3..3 + tl])?.to_string())
 }
 
@@ -342,7 +357,7 @@ pub fn encode_v3_open_with_flags(host: &str, port: u16, flags: u8) -> anyhow::Re
     Ok(v)
 }
 
-fn decode_v3_open_inner(data: &[u8]) -> anyhow::Result<(String, u16, u8, &[u8])> {
+fn decode_v3_open_inner(data: &[u8]) -> anyhow::Result<(String, u16, u8)> {
     if data.is_empty() || data[0] != V3_CTRL_OPEN {
         anyhow::bail!("not v3 open");
     }
@@ -360,21 +375,25 @@ fn decode_v3_open_inner(data: &[u8]) -> anyhow::Result<(String, u16, u8, &[u8])>
     let port = u16::from_be_bytes([data[i], data[i + 1]]);
     i += 2;
     let flags = if data.len() >= i + 2 && data[i] == OPEN_EXT_V1 {
-        data[i + 1]
+        let f = data[i + 1];
+        i += 2;
+        f
     } else {
         0
     };
-    Ok((host, port, flags, &data[i..]))
+    if i != data.len() {
+        anyhow::bail!("trailing bytes in v3 open");
+    }
+    Ok((host, port, flags))
 }
 
 pub fn decode_v3_open(data: &[u8]) -> anyhow::Result<(String, u16)> {
-    let (h, p, _, _) = decode_v3_open_inner(data)?;
+    let (h, p, _) = decode_v3_open_inner(data)?;
     Ok((h, p))
 }
 
 pub fn decode_v3_open_with_flags(data: &[u8]) -> anyhow::Result<(String, u16, u8)> {
-    let (h, p, f, _) = decode_v3_open_inner(data)?;
-    Ok((h, p, f))
+    decode_v3_open_inner(data)
 }
 
 pub fn encode_v3_udp_mux_open() -> Vec<u8> {
@@ -421,6 +440,9 @@ pub fn decode_v3_open_err(data: &[u8]) -> anyhow::Result<String> {
     if data.len() < 3 + ml {
         anyhow::bail!("truncated v3 open err");
     }
+    if data.len() != 3 + ml {
+        anyhow::bail!("trailing bytes in v3 open err");
+    }
     Ok(std::str::from_utf8(&data[3..3 + ml])?.to_string())
 }
 
@@ -433,6 +455,32 @@ mod auth_tests {
         let t = "secret-token-xyz";
         let b = encode_auth(t).unwrap();
         assert_eq!(decode_auth(&b).unwrap(), t);
+    }
+}
+
+#[cfg(test)]
+mod strict_parse_tests {
+    use super::*;
+
+    #[test]
+    fn reject_trailing_v3_auth() {
+        let mut b = encode_v3_auth("x").unwrap();
+        b.push(1);
+        assert!(decode_v3_auth(&b).is_err());
+    }
+
+    #[test]
+    fn reject_trailing_v3_open() {
+        let mut v = encode_v3_open_with_flags("h", 1, 0).unwrap();
+        v.push(0xaa);
+        assert!(decode_v3_open_with_flags(&v).is_err());
+    }
+
+    #[test]
+    fn reject_trailing_legacy_auth() {
+        let mut b = encode_auth("t").unwrap();
+        b.push(9);
+        assert!(decode_auth(&b).is_err());
     }
 }
 

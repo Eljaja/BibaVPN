@@ -43,6 +43,20 @@ pub const MUX_FLAG_WIN: u8 = 0x10;
 
 pub const MUX_INITIAL_WINDOW: u32 = 1024 * 1024;
 
+/// Returned when the mux WebSocket writer task stopped (e.g. reconnect).
+#[derive(Debug)]
+pub struct MuxWriterStopped;
+
+impl std::fmt::Display for MuxWriterStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tcp mux writer stopped")
+    }
+}
+
+impl std::error::Error for MuxWriterStopped {}
+
+static UNKNOWN_MUX_DATA_LOG: AtomicU64 = AtomicU64::new(0);
+
 pub fn is_mux_open(data: &[u8]) -> bool {
     data == MUX_OPEN_MAGIC
 }
@@ -72,10 +86,14 @@ pub fn decode_mux_record(data: &[u8]) -> anyhow::Result<(u32, u8, Vec<u8>)> {
     let stream_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
     let flags = data[4];
     let plen = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
-    if data.len() < 9 + plen {
+    let total = 9usize.saturating_add(plen);
+    if data.len() < total {
         anyhow::bail!("truncated mux payload");
     }
-    Ok((stream_id, flags, data[9..9 + plen].to_vec()))
+    if data.len() != total {
+        anyhow::bail!("mux record length mismatch (trailing bytes)");
+    }
+    Ok((stream_id, flags, data[9..total].to_vec()))
 }
 
 pub fn decode_mux_open_target(payload: &[u8]) -> anyhow::Result<(String, u16)> {
@@ -376,6 +394,7 @@ where
                             let mut maybe_tx = None;
                             let mut payload_opt = Some(payload);
                             let mut rst = false;
+                            let mut unknown_stream_data = false;
                             {
                                 let mut g = streams.lock().await;
                                 match g.get_mut(&sid) {
@@ -399,7 +418,12 @@ where
                                                 .push(payload_opt.take().expect("payload present"));
                                         }
                                     }
-                                    None => {}
+                                    None => {
+                                        unknown_stream_data = payload_opt
+                                            .as_ref()
+                                            .map(|p| !p.is_empty())
+                                            .unwrap_or(false);
+                                    }
                                 }
                             }
                             if let Some(tx) = maybe_tx {
@@ -425,7 +449,27 @@ where
                                     srv_t_in,
                                 )
                                 .await;
-                            };
+                            } else if unknown_stream_data {
+                                let n =
+                                    UNKNOWN_MUX_DATA_LOG.fetch_add(1, Ordering::Relaxed);
+                                if n < 8 || n % 64 == 0 {
+                                    warn!("mux: DATA for unknown stream {sid} (sending RST)");
+                                }
+                                let _ = mux_server_send_record(
+                                    &ws_out_srv,
+                                    sid,
+                                    MUX_FLAG_RST,
+                                    &[],
+                                    max_pad,
+                                    pad_mode,
+                                    &crypto,
+                                    max_ws_binary,
+                                    &adaptive_in,
+                                    jitter_in,
+                                    srv_t_in,
+                                )
+                                .await;
+                            }
                         }
                         MUX_FLAG_CLOSE | MUX_FLAG_RST => {
                             streams.lock().await.remove(&sid);
@@ -628,7 +672,7 @@ impl TcpMuxClientHandle {
                 payload,
             })
             .await
-            .map_err(|_| anyhow::anyhow!("tcp mux writer stopped"))
+            .map_err(|_| anyhow::Error::new(MuxWriterStopped))
     }
 
     pub async fn open_stream(
@@ -676,6 +720,13 @@ impl TcpMuxSessionPool {
     pub fn new_empty() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(Vec::new())),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn from_sessions(sessions: Vec<(u64, TcpMuxClientHandle)>) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(sessions)),
             next: AtomicUsize::new(0),
         }
     }
@@ -926,7 +977,7 @@ async fn mux_client_reader_loop<S>(
                             g.get(&sid).cloned()
                         };
                         if let Some(tx) = tx {
-                            if tx.try_send(payload).is_err() {
+                            if tx.send(payload).await.is_err() {
                                 down.lock().await.remove(&sid);
                             }
                         }
@@ -995,7 +1046,7 @@ async fn mux_client_stream_bridge(
                             payload: pl,
                         })
                         .await
-                        .map_err(|_| anyhow::anyhow!("mux writer stopped"))?;
+                        .map_err(|_| anyhow::Error::new(MuxWriterStopped))?;
                     off += take;
                 }
             }
@@ -1132,6 +1183,27 @@ impl AsyncRead for MuxCliTcpRead {
                 Pin::new(&mut p.inner).poll_read(cx, buf)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    #[test]
+    fn mux_record_rejects_trailing() {
+        let mut v = encode_mux_record(3, MUX_FLAG_DATA, b"abc");
+        v.push(9);
+        assert!(decode_mux_record(&v).is_err());
+    }
+
+    #[test]
+    fn mux_record_roundtrip() {
+        let v = encode_mux_record(9, MUX_FLAG_OPEN, b"");
+        let (sid, f, pl) = decode_mux_record(&v).unwrap();
+        assert_eq!(sid, 9);
+        assert_eq!(f, MUX_FLAG_OPEN);
+        assert!(pl.is_empty());
     }
 }
 

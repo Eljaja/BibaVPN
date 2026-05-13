@@ -39,10 +39,11 @@ pub use frame::{
 };
 pub use invite_uri::{decode_invite_v1, encode_invite_v1, InviteV1};
 pub use reality::{
-    RealityClientConfig, RealityServerConfig, TlsFingerprint, RealitySession,
-    bridge_reality_server, encode_client_hello, decode_server_hello,
-    extract_sni, is_short_id_allowed, REALITY_MAGIC, REALITY_VERSION,
-    spiderx_fetch, spawn_spiderx, parse_target, create_tls_connector,
+    decode_server_hello, encode_client_hello, extract_sni, is_short_id_allowed, parse_target,
+    create_tls_connector,
+    reality_client_exchange_verify, server_handshake_reality, server_hello_from_private,
+    RealityClientConfig, RealityServerConfig, RealitySession, REALITY_MAGIC, REALITY_VERSION,
+    spiderx_fetch, spawn_spiderx, TlsFingerprint,
 };
 pub use start_json_config::{
     local_client_options_from_json_str, local_client_options_from_json_str_with_binds,
@@ -52,4 +53,5 @@ pub use stealth_v12::{
     apply_preset_ws_jitter, merge_idle_decoy_secs, DecoyMode, DesyncMode, ServerRttDefaults,
     StealthProfile, StealthPreset, TcpFooling, preset,
 };
+pub use tcp_mux::MuxWriterStopped;
 pub use tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile, TlsStack};

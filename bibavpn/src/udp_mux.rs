@@ -40,6 +40,9 @@ const UDP_MUX_SERVER_MAX_INFLIGHT: usize = 512;
 /// Max outstanding client replies per mux session (bounded map growth).
 const UDP_MUX_CLIENT_PENDING_CAP: usize = 2048;
 
+/// Max queued UDP forwarding commands per client driver (backpressure).
+const UDP_MUX_CMD_QUEUE_CAP: usize = 16384;
+
 /// Config snapshot for opening a UDP-mux WebSocket (mirrors `local_client::ClientCfg` mux fields).
 #[derive(Clone)]
 pub struct UdpMuxConfig {
@@ -69,6 +72,9 @@ pub struct UdpMuxConfig {
     pub pad_mode: PadMode,
     pub proto: u8,
     pub proto_domain: String,
+    /// When set, run REALITY X25519 exchange after WSS upgrade (before v3 PSK).
+    pub reality_public_key: Option<[u8; 32]>,
+    pub reality_short_id: Option<[u8; 8]>,
 }
 
 impl UdpMuxConfig {
@@ -93,7 +99,7 @@ pub enum ClientUdpCmd {
 
 #[derive(Clone)]
 pub struct UdpMuxHandle {
-    tx: mpsc::UnboundedSender<ClientUdpCmd>,
+    tx: mpsc::Sender<ClientUdpCmd>,
 }
 
 impl UdpMuxHandle {
@@ -106,21 +112,28 @@ impl UdpMuxHandle {
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     ) -> anyhow::Result<()> {
         self.tx
-            .send(ClientUdpCmd::Forward {
+            .try_send(ClientUdpCmd::Forward {
                 xid,
                 dst_host,
                 dst_port,
                 payload,
                 reply,
             })
-            .map_err(|_| anyhow::anyhow!("udp mux driver stopped"))?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("udp mux command queue full (backpressure)")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("udp mux driver stopped")
+                }
+            })?;
         Ok(())
     }
 }
 
 /// Start background driver; returns handle for submitting UDP requests.
 pub fn spawn_udp_mux_driver(cfg: UdpMuxConfig) -> UdpMuxHandle {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(UDP_MUX_CMD_QUEUE_CAP);
     tokio::spawn(async move {
         if let Err(e) = run_udp_mux_driver_forever(cfg, rx).await {
             error!("udp mux client: {e:#}");
@@ -131,7 +144,7 @@ pub fn spawn_udp_mux_driver(cfg: UdpMuxConfig) -> UdpMuxHandle {
 
 async fn run_udp_mux_driver_forever(
     cfg: UdpMuxConfig,
-    mut cmd_rx: mpsc::UnboundedReceiver<ClientUdpCmd>,
+    mut cmd_rx: mpsc::Receiver<ClientUdpCmd>,
 ) -> anyhow::Result<()> {
     loop {
         let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg).await?;
@@ -189,7 +202,7 @@ where
 fn effective_udp_proto_domain(cfg: &UdpMuxConfig) -> String {
     let t = cfg.proto_domain.trim();
     if t.is_empty() {
-        cfg.sni.clone()
+        "default".to_string()
     } else {
         t.to_string()
     }
@@ -240,6 +253,15 @@ async fn connect_udp_mux_ws(
     let (mut ws, _) = tokio_tungstenite::client_async(req, tls)
         .await
         .context("websocket")?;
+
+    if let Some(pk) = cfg.reality_public_key {
+        let short_id = cfg
+            .reality_short_id
+            .unwrap_or_else(|| rand::random::<[u8; 8]>());
+        crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id)
+            .await
+            .context("REALITY handshake (udp mux)")?;
+    }
 
     send_noise_binaries(&mut ws, u32::from(cfg.early_ws_frames), cfg.max_ws_binary).await?;
     send_noise_binaries(&mut ws, cfg.junk_frames, cfg.max_ws_binary)
@@ -363,13 +385,14 @@ async fn run_udp_mux_one_session(
     ws: WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     crypto: SharedCrypto,
     cfg: &UdpMuxConfig,
-    cmd_rx: &mut mpsc::UnboundedReceiver<ClientUdpCmd>,
+    cmd_rx: &mut mpsc::Receiver<ClientUdpCmd>,
 ) -> anyhow::Result<bool> {
     let mut udp_adaptive = AdaptivePadState::default();
     let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>> =
         HashMap::new();
     let (ws_tx, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_tx));
+    let mut bad_frames: u32 = 0;
 
     let _ping = if cfg.ws_ping_secs > 0 {
         let w = ws_tx.clone();
@@ -450,13 +473,22 @@ async fn run_udp_mux_one_session(
                             Ok(x) => x,
                             Err(e) => {
                                 warn!("udp mux: drop bad frame: {e:#}");
+                                bad_frames = bad_frames.saturating_add(1);
+                                if bad_frames >= 24 {
+                                    anyhow::bail!("udp mux: too many bad frames; reconnecting");
+                                }
                                 continue;
                             }
                         };
+                        bad_frames = 0;
                         let rep = match decode_udp_rep(&inner) {
                             Ok(x) => x,
                             Err(e) => {
                                 warn!("udp mux: bad UDP_REP: {e:#}");
+                                bad_frames = bad_frames.saturating_add(1);
+                                if bad_frames >= 24 {
+                                    anyhow::bail!("udp mux: too many bad frames; reconnecting");
+                                }
                                 continue;
                             }
                         };
@@ -517,6 +549,7 @@ where
     let sem = Arc::new(Semaphore::new(UDP_MUX_SERVER_MAX_INFLIGHT));
     let (ws_sink, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_sink));
+    let mut bad_frames: u32 = 0;
 
     let _ping = if ws_ping_secs > 0 {
         let w = ws_tx.clone();
@@ -551,13 +584,22 @@ where
                     Ok(p) => p,
                     Err(e) => {
                         warn!("udp mux server: skip bad padded frame: {e}");
+                        bad_frames = bad_frames.saturating_add(1);
+                        if bad_frames >= 64 {
+                            anyhow::bail!("udp mux server: too many bad client frames");
+                        }
                         continue;
                     }
                 };
+                bad_frames = 0;
                 let (xid, host, port, payload) = match decode_udp_req(plain) {
                     Ok(x) => x,
                     Err(e) => {
                         warn!("udp mux server: bad UDP_REQ: {e:#}");
+                        bad_frames = bad_frames.saturating_add(1);
+                        if bad_frames >= 64 {
+                            anyhow::bail!("udp mux server: too many bad client frames");
+                        }
                         continue;
                     }
                 };
@@ -575,23 +617,58 @@ where
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(e) = (async {
-                        let sock = UdpSocket::bind("0.0.0.0:0")
-                            .await
-                            .context("udp mux bind ephemeral")?;
-                        sock.set_broadcast(true).ok();
-                        let mut dest_iter = tokio::net::lookup_host((host.as_str(), port))
+                        let dest_iter = tokio::net::lookup_host((host.as_str(), port))
                             .await
                             .with_context(|| format!("lookup {host}:{port}"))?;
                         let dest = dest_iter
+                            .into_iter()
                             .next()
                             .with_context(|| format!("no addr for {host}:{port}"))?;
+                        let sock = if dest.is_ipv6() {
+                            UdpSocket::bind("[::]:0")
+                                .await
+                                .context("udp mux bind v6")?
+                        } else {
+                            UdpSocket::bind("0.0.0.0:0")
+                                .await
+                                .context("udp mux bind v4")?
+                        };
+                        sock.set_broadcast(true).ok();
                         sock.send_to(&payload, dest).await.context("udp send")?;
                         let mut rbuf = vec![0u8; 65535];
-                        let (n, src) = match timeout(recv_timeout, sock.recv_from(&mut rbuf)).await
-                        {
+                        let (n, src) = match timeout(recv_timeout, sock.recv_from(&mut rbuf)).await {
                             Ok(Ok(v)) => v,
                             Ok(Err(e)) => return Err(e.into()),
-                            Err(_) => return Ok(()),
+                            Err(_) => {
+                                let rep_plain = encode_udp_rep(xid, "0.0.0.0", 0, &[])?;
+                                let mut wire = Vec::new();
+                                {
+                                    let mut g = udp_ad
+                                        .lock()
+                                        .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
+                                    write_padded_frame_with_mode_state(
+                                        &mut wire,
+                                        &rep_plain,
+                                        max_pad,
+                                        pad_mode,
+                                        Some(&mut *g),
+                                    )
+                                    .context("pad rep")?;
+                                }
+                                let blob: Vec<u8> = crypto
+                                    .seal_server_to_client(&wire)
+                                    .context("seal s2c (udp mux)")?;
+                                if blob.len() > max_ws_binary {
+                                    anyhow::bail!("udp rep ws frame too large");
+                                }
+                                maybe_server_ack_and_rtt_mask(server_out).await;
+                                maybe_ws_send_jitter(wsj).await;
+                                let mut g = ws_tx.lock().await;
+                                g.send(Message::Binary(Bytes::from(blob)))
+                                    .await
+                                    .context("ws send udp rep (timeout)")?;
+                                return Ok::<_, anyhow::Error>(());
+                            }
                         };
                         let rep_plain =
                             encode_udp_rep(xid, &src.ip().to_string(), src.port(), &rbuf[..n])?;
