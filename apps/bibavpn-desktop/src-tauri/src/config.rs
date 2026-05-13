@@ -329,7 +329,8 @@ impl TunnelProfile {
                 json!(self.invite_passphrase.clone()),
             );
             o.insert("server".to_string(), json!(""));
-            o.insert("token".to_string(), json!("change-me"));
+            // Do not set `token`: it must come from the decoded invite. A placeholder like
+            // "change-me" breaks `start_json_config` validation (JSON token must match invite).
         } else {
             o.insert("server".to_string(), json!(self.server.trim()));
             o.insert("token".to_string(), json!(self.token.clone()));
