@@ -1,4 +1,4 @@
-# Manual: Actions → Desktop macOS → Run workflow. Also runs on push/PR when desktop paths change.
+# Manual: Actions → Desktop macOS → Run workflow. Also runs on push/PR when core VPN library or desktop app paths change.
 name: Desktop macOS
 
 run-name: Desktop macOS · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -13,9 +13,12 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
       - "apps/bibavpn-desktop/**"
       - "!apps/bibavpn-desktop/**/*.md"
       - "Cargo.toml"
+      - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/desktop-macos.yml"
   pull_request:
@@ -23,9 +26,12 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
       - "apps/bibavpn-desktop/**"
       - "!apps/bibavpn-desktop/**/*.md"
       - "Cargo.toml"
+      - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/desktop-macos.yml"
 

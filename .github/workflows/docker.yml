@@ -20,15 +20,54 @@
 # repository (i.e. where the secrets exist). PRs from forks build only.
 name: Docker images
 
+# Run only when server/client binaries or image definitions could change — not on docs-only or unrelated app commits.
 on:
   push:
     branches:
       - main
     tags:
       - "v*"
+    paths:
+      - "bibavpn/**"
+      - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
+      - "docker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "apps/bibavpn-jni/**"
+      - "!apps/bibavpn-jni/**/*.md"
+      - "apps/bibavpn-ffi/**"
+      - "!apps/bibavpn-ffi/**/*.md"
+      - "apps/bibavpn-desktop/src-tauri/**"
+      - "!apps/bibavpn-desktop/src-tauri/**/*.md"
+      - "docker-compose.yml"
+      - "docker-compose.hub.yml"
+      - "docker-compose.bibavpn-check.yml"
+      - ".github/workflows/docker.yml"
   pull_request:
     branches:
       - main
+    paths:
+      - "bibavpn/**"
+      - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
+      - "docker/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "apps/bibavpn-jni/**"
+      - "!apps/bibavpn-jni/**/*.md"
+      - "apps/bibavpn-ffi/**"
+      - "!apps/bibavpn-ffi/**/*.md"
+      - "apps/bibavpn-desktop/src-tauri/**"
+      - "!apps/bibavpn-desktop/src-tauri/**/*.md"
+      - "docker-compose.yml"
+      - "docker-compose.hub.yml"
+      - "docker-compose.bibavpn-check.yml"
+      - ".github/workflows/docker.yml"
   workflow_dispatch:
 
 permissions:

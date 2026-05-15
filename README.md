@@ -15,18 +15,8 @@ and HTTP camouflage on the same TLS port.
 Pure Rust server and client; Android app (Jetpack Compose) and a Tauri desktop
 wrapper live in the same workspace.
 
-> **Status:** experimental. Protocol is not frozen — treat any deployment as a
+> **Status:** experimental. Protocol is not frozen — treat any deployment as a  
 > personal lab, not a production service. See [Security](#security).
-
-> **v1.2.x (stealth on v3) —** current releases still speak the **Biba v3** PSK
-> wire, with optional **BibaV1.2** layers (Boring or rustls outer TLS, adaptive
-> padding, WS jitter, multi-WSS + RR, decoys, server ACK/RTT masks). A future
-> **BibaV4** inner protocol may break compatibility — that target spec is
-> [PROTOCOL.md — BibaV4](PROTOCOL.md#bibav4-v120-target-specification) and
-> [AGENTS — status vs BibaV4](AGENTS.md#bibav12-stealth-status-vs-bibav4). Until
-> then, **upgrade client and server together** for any given checkout or release
-> build; do not mix binaries from different eras without checking
-> [CHANGELOG.md](CHANGELOG.md).
 
 **Quick start**
 
@@ -97,21 +87,21 @@ For the full wire format, frame layout and session setup see
 - **TLS + WebSocket** transport; the server serves plain HTTP on the same port
 as camouflage (`--camouflage-dir` for a static site, `--camouflage-url` for a
 reverse origin).
-- **Biba v3** shared-PSK wire: variable-length opaque HELLO/ACK (no fixed
+- **Biba** shared-PSK wire: variable-length opaque HELLO/ACK (no fixed
 33/48-byte signatures), **domain-separated** key derivation (`--proto-domain`),
 and **sealed** control frames (AUTH, OPEN, MUX / UDP_MUX, OPEN_OK / OPEN_ERR).
 UDP datagrams use **v3 single-byte opcodes** (`0x05` / `0x06` for REQ/REP) inside
 the AEAD plaintext, not legacy ASCII magics.
-- **BibaV2.1** shaping knobs: **adaptive** / random / HTTP-bucket padding, WS
+- **Biba** shaping knobs: **adaptive** / random / HTTP-bucket padding, WS
 Ping with jitter, binary size cap, **per-frame WS jitter (min–max ms)**,
 configurable upgrade headers per **TLS client profile** (default **Chrome
 132+** when nothing else is selected), early-session noise, **TLS** via **rustls**
 (default) or **BoringSSL** (`--features boring-tls`, client `--tls-stack boring`
-— **`--pin-cert` + Boring** is not supported yet), TLS leaf pinning on **rustls**
+— `**--pin-cert` + Boring** is not supported yet), TLS leaf pinning on **rustls**
 (`--pin-cert`).
 - **TCP mux** over **1–4** outer WSS sessions (round-robin when `--ws-parallel` is
 2–4) + a separate **single** WSS for UDP mux.
-- **BibaV1.2 extras:** optional `--stealth-profile`, `fingerprint` / `tls_profile`
+- **Biba extras:** optional `--stealth-profile`, `fingerprint` / `tls_profile`
 merge rules (`client_policy`), parallel decoys plus **idle** decoys, server
 **delayed ACK** + **ACK profile** and RTT mask — see [AGENTS.md](AGENTS.md).
 - **Encrypted invite URIs** (`biba://…`) so you can ship one line of config
@@ -295,12 +285,12 @@ SOCKS5 host `127.0.0.1`, port `1080`, "Proxy DNS when using SOCKS v5" **on**.
 Workspace layout (cargo workspace):
 
 
-| Crate                       | Role                                                                       |
-| --------------------------- | -------------------------------------------------------------------------- |
-| `bibavpn`                   | `lib` + binaries `bibavpn-server`, `bibavpn-client`, `bibavpn-mint-invite` |
-| `biba`                      | uTLS-like TLS fingerprint helpers                                          |
-| `apps/bibavpn-jni`          | Android JNI glue around `bibavpn` (crate name `bibavpn-jni`)               |
-| `apps/bibavpn-desktop/src-tauri` | Tauri desktop wrapper (systray, platform proxy setup)                 |
+| Crate                            | Role                                                                       |
+| -------------------------------- | -------------------------------------------------------------------------- |
+| `bibavpn`                        | `lib` + binaries `bibavpn-server`, `bibavpn-client`, `bibavpn-mint-invite` |
+| `biba`                           | uTLS-like TLS fingerprint helpers                                          |
+| `apps/bibavpn-jni`               | Android JNI glue around `bibavpn` (crate name `bibavpn-jni`)               |
+| `apps/bibavpn-desktop/src-tauri` | Tauri desktop wrapper (systray, platform proxy setup)                      |
 
 
 Common commands:
@@ -337,12 +327,14 @@ Rough positioning only; details depend on version and network path. Stealth
 features land incrementally on top of v3; check the crate version and
 [CHANGELOG.md](CHANGELOG.md).
 
-| | **BibaVPN (1.2.x, v3 wire)** | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (e.g. Xray) |
-| --- | --- | --- | --- | --- |
-| **Primary transport** | TLS + WSS, PSK inner | TLS + WSS, generic | QUIC | TLS fronting / proxy protocol |
-| **DPI focus** | Explicit (fingerprints, timing, padding, decoys) | General tunneling | Brutal throughput / quic | Site mimicry |
-| **Typical role** | Single small VPS, SOCKS/CONNECT | Port forwarding / WSS | High perf | Domain fronting style |
-| **Ecosystem** | Rust + mobile/desktop in-repo | many | Go server | V2Ray / Xray family |
+
+|                       | **BibaVPN (1.2.x, v3 wire)**                     | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (e.g. Xray)       |
+| --------------------- | ------------------------------------------------ | --------------------------------------------- | ----------------------------------------- | ----------------------------- |
+| **Primary transport** | TLS + WSS, PSK inner                             | TLS + WSS, generic                            | QUIC                                      | TLS fronting / proxy protocol |
+| **DPI focus**         | Explicit (fingerprints, timing, padding, decoys) | General tunneling                             | Brutal throughput / quic                  | Site mimicry                  |
+| **Typical role**      | Single small VPS, SOCKS/CONNECT                  | Port forwarding / WSS                         | High perf                                 | Domain fronting style         |
+| **Ecosystem**         | Rust + mobile/desktop in-repo                    | many                                          | Go server                                 | V2Ray / Xray family           |
+
 
 BibaVPN does not claim a security or anonymity property beyond “harder to
 classify on the wire” — see [Security](#security).
@@ -354,7 +346,7 @@ classify on the wire” — see [Security](#security).
 Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. The short story:
 
 - **Required for an encrypted tunnel:** `--server`, `--sni`, `--token`, `--psk`.
-The client wire is **Biba v3 only** (`--proto` defaults to **`3`**). Server
+The client wire is **Biba v3 only** (`--proto` defaults to `**3`**). Server
 `--proto-domain` (default `default`) must match the client’s `--proto-domain`, or
 the **SNI** when the client leaves `--proto-domain` empty.
 - **Shape / anti-DPI:** `--decoy-max`, `--max-pad`, `--pad-mode`,
@@ -373,9 +365,9 @@ Never put secrets in the URL: the token is carried in the **v3 sealed AUTH**
 opcode after HELLO/ACK, and the WebSocket path (`--ws-path`, default `/ws`) does
 not contain credentials.
 
-**Invites:** JSON includes **`proto`** (default **`3`**) and optional
-**`proto_domain`** (see **[PROTOCOL.md](PROTOCOL.md)**). **`--print-invite-uri`**
-and **`bibavpn-mint-invite`** both target v3 by default.
+**Invites:** JSON includes `**proto`** (default `**3**`) and optional
+`**proto_domain**` (see **[PROTOCOL.md](PROTOCOL.md)**). `**--print-invite-uri`**
+and `**bibavpn-mint-invite**` both target v3 by default.
 
 **WSL smoke:** after `cargo build --release -p bibavpn`, you can run
 `scripts/wsl-proto-v3-smoke.sh` for a quick local SOCKS + `curl` check (see
@@ -386,9 +378,9 @@ and **`bibavpn-mint-invite`** both target v3 by default.
 ## Android and desktop
 
 - **Android + desktop (Tauri):** `apps/bibavpn-desktop/` (Vite UI + Tauri shell).
-  Android VPN glue lives under `src-tauri/android-bibavpn-extras/` and is merged
-  into Tauri's generated Android project by `apps/scripts/integrate-bibavpn-into-tauri-android.sh`.
-  Prebuilt binaries are emitted by the GitHub Actions workflows in `.github/workflows/`.
+Android VPN glue lives under `src-tauri/android-bibavpn-extras/` and is merged
+into Tauri's generated Android project by `apps/scripts/integrate-bibavpn-into-tauri-android.sh`.
+Prebuilt binaries are emitted by the GitHub Actions workflows in `.github/workflows/`.
 
 See [DESIGN.md](DESIGN.md) for the shared visual language if you want to port
 the UI elsewhere.

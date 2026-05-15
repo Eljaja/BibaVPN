@@ -11,6 +11,8 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
       - "apps/bibavpn-ffi/**"
       - "!apps/bibavpn-ffi/**/*.md"
       - "Cargo.toml"
@@ -22,6 +24,8 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
       - "apps/bibavpn-ffi/**"
       - "!apps/bibavpn-ffi/**/*.md"
       - "Cargo.toml"

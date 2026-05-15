@@ -1,4 +1,4 @@
-# Manual: Actions → Android → Run workflow. Also runs on push/PR when Tauri Android / JNI paths change.
+# Manual: Actions → Android → Run workflow. Also runs on push/PR when core VPN (protocol/server/client lib), JNI, or Tauri Android paths change.
 name: Android
 
 run-name: Android · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -13,6 +13,8 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
       - "apps/bibavpn-jni/**"
       - "!apps/bibavpn-jni/**/*.md"
       - "apps/bibavpn-desktop/**"
@@ -27,6 +29,8 @@ on:
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
       - "apps/bibavpn-jni/**"
       - "!apps/bibavpn-jni/**/*.md"
       - "apps/bibavpn-desktop/**"
