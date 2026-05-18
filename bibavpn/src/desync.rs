@@ -1,4 +1,7 @@
 //! Client-side TCP desync / TCP options “fooling” hooks. Real low-TTL fake ClientHello and IP fragmentation need raw sockets or OS helpers — not shipped in the default build.
+
+pub use crate::transport_capabilities::{effective_desync_mode, DesyncApplied};
+
 use std::io;
 use std::time::Duration;
 
@@ -57,4 +60,28 @@ pub fn decoy_high_rtt_delay_ms() -> u64 {
 /// Sleep before a “noisy” decoy request.
 pub async fn sleep_decoy_rtt_variance() {
     tokio::time::sleep(Duration::from_millis(decoy_high_rtt_delay_ms())).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoy_high_rtt_delay_in_range() {
+        for _ in 0..64 {
+            let ms = decoy_high_rtt_delay_ms();
+            assert!((120..=480).contains(&ms));
+        }
+    }
+
+    #[tokio::test]
+    async fn after_tcp_connect_is_noop_ok() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = listener.accept().await;
+        after_tcp_connect(&client, DesyncMode::Split2, TcpFooling::Off)
+            .await
+            .unwrap();
+    }
 }

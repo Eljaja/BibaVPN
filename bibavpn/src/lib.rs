@@ -31,6 +31,7 @@ pub mod reality;
 pub mod log_ratelimit;
 pub mod logging;
 pub mod server_limits;
+pub mod transport_capabilities;
 pub mod udp_mux;
 pub mod ws_auth;
 pub mod ws_bridge;
