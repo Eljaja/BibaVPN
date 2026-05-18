@@ -11,6 +11,7 @@ use crate::local_client::{
     normalize_ws_path, parse_host_port, parse_ws_header, LocalClientOptions,
     DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
+use crate::logging::{self, LogConfig, LogFormat};
 use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
 use crate::client_policy::tls_profile_from_invite;
 use crate::tls_util::{TlsClientProfile, TlsStack};
@@ -116,6 +117,12 @@ struct StartJson {
     /// Same as client `--fingerprint` (e.g. `chrome-132`); takes precedence over `tls_profile` and invite.
     #[serde(default)]
     fingerprint: Option<String>,
+    /// When `RUST_LOG` is unset, default filter level (Android / desktop JSON start).
+    #[serde(default)]
+    log_level: Option<String>,
+    /// `plain` or `json`.
+    #[serde(default)]
+    log_format: Option<String>,
 }
 
 fn default_socks() -> String {
@@ -168,6 +175,16 @@ fn short_hash8(s: &str) -> String {
 /// Разбор JSON так же, как в Android `BibaNative.nativeStart`.
 pub fn local_client_options_from_json_str(s: &str) -> anyhow::Result<LocalClientOptions> {
     let j: StartJson = serde_json::from_str(s)?;
+    logging::init(LogConfig {
+        level: logging::level_directive(j.log_level.as_deref().unwrap_or("info"))?,
+        format: j
+            .log_format
+            .as_deref()
+            .unwrap_or("plain")
+            .parse::<LogFormat>()
+            .context("log_format")?,
+        filter: None,
+    })?;
     start_json_into_options(j)
 }
 
@@ -775,11 +792,111 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
 #[cfg(test)]
 mod merge_tests {
     use super::local_client_options_from_json_str;
+    use crate::stealth_v12::StealthProfile;
+    use crate::tls_util::TlsClientProfile;
+
+    const BASE: &str =
+        r#"{"server":"127.0.0.1:8443","token":"t","psk":"0123456789abcdef0123456789abcdef"}"#;
 
     #[test]
     fn proto_domain_defaults_to_default_label() {
-        let j = r#"{"server":"127.0.0.1:1","token":"t","psk":"0123456789abcdef0123456789abcdef"}"#;
-        let o = local_client_options_from_json_str(j).unwrap();
+        let o = local_client_options_from_json_str(BASE).unwrap();
         assert_eq!(o.proto_domain, "default");
+    }
+
+    #[test]
+    fn stealth_profile_and_ws_parallel_from_json() {
+        let j = format!(
+            r#"{{"server":"127.0.0.1:8443","token":"t","psk":"0123456789abcdef0123456789abcdef","stealth_profile":"balanced","ws_parallel":3,"proto_domain":"lab"}}"#
+        );
+        let o = local_client_options_from_json_str(&j).unwrap();
+        assert_eq!(o.stealth_profile, Some(StealthProfile::Balanced));
+        assert_eq!(o.ws_parallel, 3);
+        assert_eq!(o.proto_domain, "lab");
+        assert_eq!(o.tls_profile, TlsClientProfile::Chrome132);
+    }
+
+    #[test]
+    fn fingerprint_overrides_tls_profile_in_json() {
+        let j = r#"{"server":"127.0.0.1:8443","token":"t","psk":"0123456789abcdef0123456789abcdef","tls_profile":"firefox-136","fingerprint":"chrome-132"}"#;
+        let o = local_client_options_from_json_str(j).unwrap();
+        assert_eq!(o.tls_profile, TlsClientProfile::Chrome132);
+    }
+
+    #[test]
+    fn invite_requires_passphrase_pair() {
+        let j = r#"{"server":"127.0.0.1:1","token":"t","from_invite":"biba://x","psk":"0123456789abcdef0123456789abcdef"}"#;
+        assert!(local_client_options_from_json_str(j).is_err());
+    }
+
+    #[test]
+    fn empty_json_sni_does_not_block_invite_fields() {
+        use crate::invite_uri::{encode_invite_v1, InviteV1};
+
+        let inv = InviteV1 {
+            v: 1,
+            server: "10.0.0.2:443".into(),
+            sni: "vpn.example.com".into(),
+            token: "tok".into(),
+            proto: 3,
+            proto_domain: None,
+            psk: Some("0123456789abcdef0123456789abcdef".into()),
+            decoy_max: 8,
+            max_pad: 64,
+            max_ws_binary: 1400,
+            ws_ping_secs: 25,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            udp_max_pad: None,
+            udp_max_ws_binary: None,
+            udp_mux_reply_timeout_secs: 130,
+            insecure: true,
+            tls_profile: "default".into(),
+            ws_path: None,
+            pad_mode: None,
+            dummy_interval_secs: None,
+            http_proxy: None,
+            socks_bind: None,
+            socks_auth_user: None,
+            socks_auth_password: None,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_headers: vec![],
+            use_tcp_mux: true,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 30,
+            decoy_gets_paths: None,
+            fingerprint: None,
+            stealth_profile: None,
+            decoy_mode: None,
+            desync_mode: None,
+            tcp_fooling: None,
+            tls_fragment: false,
+            ws_parallel: 1,
+            idle_decoy_secs: None,
+            tls_stack: "rustls".into(),
+            reality_target: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            pin_cert_pem: None,
+            server_ack_delay_min_ms: None,
+            server_ack_delay_max_ms: None,
+            rtt_mask_jitter_ms: None,
+            ack_profile: None,
+        };
+        let uri = encode_invite_v1(&inv, "passphrase-test").unwrap();
+        let j = format!(
+            r#"{{"from_invite":"{uri}","invite_passphrase":"passphrase-test","sni":"","psk":"0123456789abcdef0123456789abcdef"}}"#
+        );
+        let o = local_client_options_from_json_str(&j).unwrap();
+        assert_eq!(o.sni, "vpn.example.com");
+        assert_eq!(o.server_host, "10.0.0.2");
+        assert_eq!(o.server_port, 443);
     }
 }

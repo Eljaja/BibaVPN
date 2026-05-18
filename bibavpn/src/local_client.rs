@@ -28,7 +28,10 @@ use crate::protocol::{
 };
 use crate::retry::{sleep_outbound_backoff, OUTBOUND_CONNECT_ATTEMPTS};
 use crate::ServerWsOutTiming;
-use crate::stealth::{build_websocket_request, default_user_agent_for_profile, WsHandshakeParams};
+use crate::stealth::{
+    build_websocket_request, default_user_agent_for_profile, WsHandshakeParams,
+    DEFAULT_ACCEPT_LANGUAGE,
+};
 use crate::activity::ActivityTracker;
 use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
 use crate::tcp_mux::{
@@ -907,7 +910,14 @@ pub async fn run_local_client(
     });
 
     if cfg.decoy_gets {
-        let ua = default_user_agent_for_profile(cfg.tls_profile).to_string();
+        let ua = cfg
+            .ws_user_agent
+            .clone()
+            .unwrap_or_else(|| default_user_agent_for_profile(cfg.tls_profile).to_string());
+        let al = cfg
+            .ws_accept_language
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ACCEPT_LANGUAGE.to_string());
         spawn_decoy_gets(
             DecoyConfig {
                 server_host: cfg.server_host.clone(),
@@ -919,6 +929,7 @@ pub async fn run_local_client(
                 interval_secs: cfg.decoy_gets_interval_secs.max(5),
                 paths: cfg.decoy_gets_paths.clone(),
                 user_agent: ua,
+                accept_language: al,
                 mode: cfg.decoy_mode,
             },
             shutdown.clone(),
@@ -928,6 +939,14 @@ pub async fn run_local_client(
     if let Some(ref act) = cfg.activity {
         if cfg.idle_decoy_secs > 0 {
             let idle_s = cfg.idle_decoy_secs;
+            let ua = cfg
+                .ws_user_agent
+                .clone()
+                .unwrap_or_else(|| default_user_agent_for_profile(cfg.tls_profile).to_string());
+            let al = cfg
+                .ws_accept_language
+                .clone()
+                .unwrap_or_else(|| DEFAULT_ACCEPT_LANGUAGE.to_string());
             let decoy = DecoyConfig {
                 server_host: cfg.server_host.clone(),
                 server_port: cfg.server_port,
@@ -937,7 +956,8 @@ pub async fn run_local_client(
                 pinned_certs_pem: opts.pinned_certs_pem.clone(),
                 interval_secs: idle_s.max(5),
                 paths: cfg.decoy_gets_paths.clone(),
-                user_agent: default_user_agent_for_profile(cfg.tls_profile).to_string(),
+                user_agent: ua,
+                accept_language: al,
                 mode: cfg.decoy_mode,
             };
             let act = act.clone();
@@ -1166,24 +1186,39 @@ async fn run_socks_udp_assoc(
                     let res: anyhow::Result<()> = async {
                         let (dst_host, dst_port, payload) =
                             crate::protocol::parse_socks5_udp_datagram(&data).context("socks udp parse")?;
-                        let xid: u64 = rand::random();
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        handle.forward(xid, dst_host, dst_port, payload, tx)?;
-                        let reply = match timeout(reply_timeout, rx).await {
-                            Ok(inner) => inner,
-                            Err(_) => {
-                                error!("udp mux: reply timeout for xid {xid}");
-                                return Ok(());
+                        let mut collision_retries = 0u8;
+                        loop {
+                            let xid: u64 = rand::random();
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            handle.forward(xid, dst_host.clone(), dst_port, payload.clone(), tx)?;
+                            let reply = match timeout(reply_timeout, rx).await {
+                                Ok(inner) => inner,
+                                Err(_) => {
+                                    error!("udp mux: reply timeout for xid {xid}");
+                                    return Ok(());
+                                }
+                            };
+                            match reply {
+                                Ok(Ok(socks_body)) => {
+                                    udp.send_to(&socks_body, peer).await?;
+                                    return Ok(());
+                                }
+                                Ok(Err(e)) => {
+                                    if e.to_string().contains("udp_mux_xid_collision")
+                                        && collision_retries < 8
+                                    {
+                                        collision_retries = collision_retries.saturating_add(1);
+                                        continue;
+                                    }
+                                    error!("udp mux: {e:#}");
+                                    return Ok(());
+                                }
+                                Err(_) => {
+                                    error!("udp mux driver dropped channel");
+                                    return Ok(());
+                                }
                             }
-                        };
-                        match reply {
-                            Ok(Ok(socks_body)) => {
-                                udp.send_to(&socks_body, peer).await?;
-                            }
-                            Ok(Err(e)) => error!("udp mux: {e:#}"),
-                            Err(_) => error!("udp mux driver dropped channel"),
                         }
-                        Ok(())
                     }
                     .await;
                     if let Err(e) = res {
@@ -1337,3 +1372,44 @@ pub const DEFAULT_CLIENT_MAX_WS_BINARY: usize = DEFAULT_MAX_WS_BINARY;
 
 /// Default SOCKS UDP-mux reply wait (seconds). Server embeds this in `biba://` invites for clients.
 pub const DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS: u64 = 130;
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_ws_path_defaults_and_prefix() {
+        assert_eq!(normalize_ws_path(""), "/ws");
+        assert_eq!(normalize_ws_path("  "), "/ws");
+        assert_eq!(normalize_ws_path("/custom"), "/custom");
+        assert_eq!(normalize_ws_path("no-slash"), "/no-slash");
+    }
+
+    #[test]
+    fn parse_host_port_ipv4_and_bracket_ipv6() {
+        let (h, p) = parse_host_port("203.0.113.7:8443").unwrap();
+        assert_eq!(h, "203.0.113.7");
+        assert_eq!(p, 8443);
+        let (h6, p6) = parse_host_port("[2001:db8::1]:443").unwrap();
+        assert_eq!(h6, "[2001:db8::1]");
+        assert_eq!(p6, 443);
+    }
+
+    #[test]
+    fn parse_host_port_rejects_missing_port() {
+        assert!(parse_host_port("example.com").is_err());
+        assert!(parse_host_port("").is_err());
+    }
+
+    #[test]
+    fn parse_ws_header_splits_name_value() {
+        let (k, v) = parse_ws_header("X-Custom: hello world").unwrap();
+        assert_eq!(k, "X-Custom");
+        assert_eq!(v, "hello world");
+    }
+
+    #[test]
+    fn parse_ws_header_requires_colon() {
+        assert!(parse_ws_header("BadHeader").is_err());
+    }
+}

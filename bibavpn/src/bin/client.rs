@@ -197,7 +197,7 @@ struct Args {
     #[arg(long)]
     decoy_mode: Option<String>,
 
-    /// `off`, `split2`, `fakedsplit`, `disorder` (advisory on most platforms).
+    /// TCP desync preset (`split2`, …). **Advisory** in this binary: not applied in-process; pair with an external tool (e.g. zapret) if you need real split/disorder.
     #[arg(long)]
     desync_mode: Option<String>,
 
@@ -220,19 +220,29 @@ struct Args {
     /// Outer WSS transport: `rustls` (default) or `boring` (BoringSSL, optional record splitting with `--tls-fragment`). Build: `--features boring-tls`.
     #[arg(long, default_value = "rustls")]
     tls_stack: String,
+
+    /// Log level when `RUST_LOG` is unset (trace, debug, info, warn, error).
+    #[arg(long, default_value = "info")]
+    log_level: String,
+
+    /// Log format: `plain` or `json`.
+    #[arg(long, default_value = "plain")]
+    log_format: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let args = Args::parse();
+    bibavpn::logging::init(bibavpn::logging::LogConfig {
+        level: bibavpn::logging::level_directive(&args.log_level)?,
+        format: args
+            .log_format
+            .parse::<bibavpn::logging::LogFormat>()
+            .context("--log-format")?,
+        filter: None,
+    })?;
 
     install_ring_crypto();
-    let args = Args::parse();
     if args.from_invite.is_some() != args.invite_passphrase.is_some() {
         anyhow::bail!("use --from-invite and --invite-passphrase together");
     }
@@ -722,6 +732,13 @@ async fn main() -> anyhow::Result<()> {
         stealth_profile: stealth_for_merge,
         tls_stack,
     };
+
+    if matches!(opts.tls_stack, TlsStack::Boring) && opts.pinned_certs_pem.is_some() {
+        anyhow::bail!(
+            "--tls-stack boring does not support --pin-cert yet; use the default rustls stack for pinning"
+        );
+    }
+    bibavpn::transport_capabilities::log_client_transport_caps(&opts);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(async move {

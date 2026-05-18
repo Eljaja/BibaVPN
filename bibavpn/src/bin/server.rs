@@ -1,10 +1,18 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
 use bibavpn::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
-use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig};
+use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig, WsHandshakeKind};
+use bibavpn::logging::{self, LogConfig, LogFormat};
+use bibavpn::server_limits::{
+    AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget, ServerStats,
+};
+use bibavpn::transport_capabilities::log_server_listen_caps;
+use bibavpn::udp_mux::UdpSocketPool;
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
@@ -27,11 +35,23 @@ use std::str::FromStr;
 use bibavpn::stealth_v12::StealthProfile;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
+
+#[derive(Clone)]
+struct ServerConnParams {
+    peer: SocketAddr,
+    session_id: u64,
+    auth: Arc<AuthRateLimiter>,
+    pre_auth: PreAuthBudget,
+    handshake_timeout: Duration,
+    mux_connect_timeout: Duration,
+    udp_pool: Option<Arc<UdpSocketPool>>,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -164,6 +184,53 @@ struct Args {
     #[arg(long, default_value = "default")]
     proto_domain: String,
 
+    /// Per-IP v3 AUTH failures in `--auth-failure-window-secs` before `--auth-ban-secs` temporary ban.
+    #[arg(long, default_value_t = 10)]
+    auth_max_failures: u32,
+
+    #[arg(long, default_value_t = 60)]
+    auth_failure_window_secs: u64,
+
+    #[arg(long, default_value_t = 300)]
+    auth_ban_secs: u64,
+
+    /// Disable per-IP auth failure rate limiting.
+    #[arg(long = "no-auth-rate-limit", default_value_t = false)]
+    no_auth_rate_limit: bool,
+
+    /// Cap concurrent TLS handshakes+sessions (0 = unlimited).
+    #[arg(long, default_value_t = 512)]
+    max_concurrent_sessions: usize,
+
+    /// Max junk bytes (failed decrypt noise) before v3 AUTH completes.
+    #[arg(long, default_value_t = 262144)]
+    handshake_max_junk_bytes: usize,
+
+    /// Overall v3 handshake wait (HELLO..AUTH) timeout in seconds.
+    #[arg(long, default_value_t = 15)]
+    handshake_timeout_secs: u64,
+
+    /// TCP connect timeout for each mux stream on the server (seconds).
+    #[arg(long, default_value_t = 10)]
+    mux_connect_timeout_secs: u64,
+
+    /// Reuse up to N UDP sockets on the UDP mux server (0 = bind per datagram).
+    #[arg(long, default_value_t = 64)]
+    udp_socket_pool_size: usize,
+
+    #[arg(long, default_value = "info")]
+    log_level: String,
+
+    #[arg(long, default_value = "plain")]
+    log_format: String,
+
+    #[arg(long)]
+    log_filter: Option<String>,
+
+    /// Emit periodic stats every N seconds (0 = off).
+    #[arg(long, default_value_t = 0)]
+    stats_interval_secs: u64,
+
     /// REALITY mode: target to steal TLS from (e.g., vk.com:443)
     #[arg(long)]
     reality_target: Option<String>,
@@ -185,15 +252,15 @@ type SharedCrypto = Arc<SessionCrypto>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let args = Args::parse();
+
+    logging::init(LogConfig {
+        level: logging::level_directive(&args.log_level)?,
+        format: args.log_format.parse::<LogFormat>()?,
+        filter: args.log_filter.clone(),
+    })?;
 
     install_ring_crypto();
-    let args = Args::parse();
     let ws_path = normalize_ws_path(&args.ws_path);
     let pad_mode = PadMode::from_str(args.pad_mode.trim()).context("pad-mode")?;
 
@@ -464,6 +531,63 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    if args.legacy_path_auth {
+        warn!(
+            target: "bibavpn_security",
+            "--legacy-path-auth is deprecated; use standard ws path + AUTH frame only; not recommended for production"
+        );
+    }
+
+    let auth_cfg = AuthRateLimiterConfig {
+        enabled: !args.no_auth_rate_limit,
+        max_failures: args.auth_max_failures.max(1),
+        window: Duration::from_secs(args.auth_failure_window_secs.max(1)),
+        ban: Duration::from_secs(args.auth_ban_secs.max(1)),
+    };
+    let auth = AuthRateLimiter::new(auth_cfg);
+    let stats = ServerStats::new();
+    let conn_sem = if args.max_concurrent_sessions > 0 {
+        Some(Arc::new(Semaphore::new(args.max_concurrent_sessions)))
+    } else {
+        None
+    };
+    let udp_pool = if args.udp_socket_pool_size > 0 {
+        Some(UdpSocketPool::new(args.udp_socket_pool_size))
+    } else {
+        None
+    };
+    let pre_auth = PreAuthBudget {
+        max_junk_frames: 256,
+        max_junk_bytes: args.handshake_max_junk_bytes.max(1024),
+        max_decrypt_failures: 64,
+    };
+    let handshake_timeout = Duration::from_secs(args.handshake_timeout_secs.max(1));
+    let mux_connect_timeout = Duration::from_secs(args.mux_connect_timeout_secs.max(1));
+
+    log_server_listen_caps(
+        args.legacy_path_auth,
+        !args.no_auth_rate_limit,
+        args.max_concurrent_sessions,
+        args.udp_socket_pool_size,
+    );
+
+    if args.stats_interval_secs > 0 {
+        let stats_c = Arc::clone(&stats);
+        let auth_c = Arc::clone(&auth);
+        let iv = Duration::from_secs(args.stats_interval_secs);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(iv).await;
+                info!(
+                    target: "bibavpn_server",
+                    active_sessions = stats_c.active_sessions(),
+                    auth_bans_active = auth_c.bans_active.load(Ordering::Relaxed),
+                    "periodic server stats"
+                );
+            }
+        });
+    }
+
     // Start SpiderX background crawler if REALITY is enabled
     if let Some(ref cfg) = reality_config {
         let target = cfg.target.clone();
@@ -488,7 +612,57 @@ async fn main() -> anyhow::Result<()> {
         let proto_domain = args.proto_domain.clone();
         let reality_cfg = reality_config.clone();
         let server_ws_out = server_ws_out;
+        let auth = Arc::clone(&auth);
+        let stats = Arc::clone(&stats);
+        let conn_sem = conn_sem.clone();
+        let pre_auth = pre_auth.clone();
+        let udp_pool = udp_pool.clone();
+        let handshake_timeout = handshake_timeout;
+        let mux_connect_timeout = mux_connect_timeout;
+        let session_id = rand::random::<u64>();
+
         tokio::spawn(async move {
+            let permit = match &conn_sem {
+                Some(sem) => {
+                    match timeout(Duration::from_secs(5), sem.clone().acquire_owned()).await {
+                        Ok(Ok(p)) => Some(p),
+                        Ok(Err(_)) => return,
+                        Err(_) => {
+                            debug!(
+                                target: "bibavpn_server",
+                                %peer,
+                                "dropped: concurrent session semaphore acquire timeout (server busy)"
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            if let Err(e) = auth.check_allowed(peer.ip()).await {
+                debug!(
+                    target: "bibavpn_security",
+                    %peer,
+                    session_id,
+                    "rejected: {e:#}"
+                );
+                drop(permit);
+                return;
+            }
+
+            let _sess = stats.session_guard();
+
+            let params = ServerConnParams {
+                peer,
+                session_id,
+                auth,
+                pre_auth,
+                handshake_timeout,
+                mux_connect_timeout,
+                udp_pool,
+            };
+
             if let Err(e) = handle_one(
                 stream,
                 acceptor,
@@ -513,11 +687,18 @@ async fn main() -> anyhow::Result<()> {
                 camo,
                 proto_domain,
                 reality_cfg,
+                params,
             )
             .await
             {
-                error!("from {peer}: {e:#}");
+                error!(
+                    target: "bibavpn_server",
+                    %peer,
+                    session_id,
+                    "session error: {e:#}"
+                );
             }
+            drop(permit);
         });
     }
 }
@@ -551,6 +732,10 @@ async fn server_handshake_v3_after_first_hello<S>(
     psk: &str,
     decoy_max: u8,
     proto_domain: &str,
+    auth: &Arc<AuthRateLimiter>,
+    peer_ip: std::net::IpAddr,
+    pre_auth: &PreAuthBudget,
+    handshake_timeout: Duration,
 ) -> anyhow::Result<SharedCrypto>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -567,7 +752,18 @@ where
         &s_rand,
         decoy_max,
     ));
-    server_wait_v3_auth(ws, &crypto, token).await?;
+    let auth_c = Arc::clone(auth);
+    let wait = async {
+        server_wait_v3_auth(ws, &crypto, token, &auth_c, peer_ip, pre_auth).await
+    };
+    match timeout(handshake_timeout, wait).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            auth.record_failure(peer_ip).await;
+            anyhow::bail!("handshake timeout waiting for v3 AUTH (REALITY path)");
+        }
+    }
     Ok(crypto)
 }
 
@@ -588,6 +784,8 @@ async fn run_session_after_v3_handshake<S>(
     pad_mode: PadMode,
     dummy_interval_secs: u64,
     server_out: ServerWsOutTiming,
+    mux_connect_timeout: Duration,
+    udp_socket_pool: Option<Arc<UdpSocketPool>>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -684,6 +882,7 @@ where
                 udp_mux_recv_timeout,
                 pad_mode,
                 server_out,
+                udp_socket_pool,
             )
             .await?;
         }
@@ -703,6 +902,7 @@ where
                 pad_mode,
                 dummy_interval_secs,
                 server_out,
+                mux_connect_timeout,
             )
             .await?;
         }
@@ -734,14 +934,44 @@ async fn handle_one(
     camo: CamouflageServeConfig,
     proto_domain: String,
     reality_config: Option<RealityServerConfig>,
+    params: ServerConnParams,
 ) -> anyhow::Result<()> {
+    let span = tracing::info_span!(
+        target: "bibavpn_server",
+        "session",
+        session_id = params.session_id,
+        peer_ip = %params.peer.ip()
+    );
+    let _span_enter = span.enter();
+
     let tls = acceptor.accept(tcp).await.context("tls accept")?;
 
-    let Some((mut ws, _ws_kind)) =
-        accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo).await?
+    let Some((mut ws, ws_kind)) =
+        accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo, Some(params.peer))
+            .await?
     else {
         return Ok(());
     };
+
+    static LEGACY_CONN_LOG: AtomicU64 = AtomicU64::new(0);
+    if matches!(ws_kind, WsHandshakeKind::LegacyPath) {
+        let n = LEGACY_CONN_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n % 64 == 0 {
+            warn!(
+                target: "bibavpn_security",
+                peer_ip = %params.peer.ip(),
+                session_id = params.session_id,
+                "legacy path WebSocket auth in use (deprecated)"
+            );
+        }
+    }
+
+    let peer_ip = params.peer.ip();
+    let auth = &params.auth;
+    let pre_auth = &params.pre_auth;
+    let handshake_timeout = params.handshake_timeout;
+    let mux_connect_timeout = params.mux_connect_timeout;
+    let udp_pool = params.udp_pool.clone();
 
     if let Some(ref reality_cfg) = reality_config {
         info!("REALITY mode: app tunnel after X25519");
@@ -774,6 +1004,7 @@ async fn handle_one(
                 pad_mode,
                 dummy_interval_secs,
                 server_out,
+                mux_connect_timeout,
             )
             .await
             .context("REALITY TCP mux");
@@ -790,6 +1021,10 @@ async fn handle_one(
                 secret,
                 decoy_max,
                 domain_trim,
+                auth,
+                peer_ip,
+                pre_auth,
+                handshake_timeout,
             )
             .await
             .context("REALITY + v3 PSK")?;
@@ -810,6 +1045,8 @@ async fn handle_one(
                 pad_mode,
                 dummy_interval_secs,
                 server_out,
+                mux_connect_timeout,
+                udp_pool,
             )
             .await;
         }
@@ -832,6 +1069,10 @@ async fn handle_one(
         psk.as_deref(),
         decoy_max,
         domain_trim,
+        auth,
+        peer_ip,
+        pre_auth,
+        handshake_timeout,
     )
     .await
     .context("handshake")?;
@@ -853,6 +1094,8 @@ async fn handle_one(
         pad_mode,
         dummy_interval_secs,
         server_out,
+        mux_connect_timeout,
+        udp_pool,
     )
     .await
 }
@@ -923,11 +1166,17 @@ async fn server_handshake_v3<S>(
     psk: Option<&str>,
     decoy_max: u8,
     proto_domain: &str,
+    auth: &Arc<AuthRateLimiter>,
+    peer_ip: std::net::IpAddr,
+    pre_auth: &PreAuthBudget,
+    handshake_timeout: Duration,
 ) -> anyhow::Result<SharedCrypto>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let domain = proto_domain.to_string();
+    let auth_f = Arc::clone(auth);
+    let peer = peer_ip;
     let fut = async {
         let mut junk_frames = 0u32;
         let mut junk_bytes = 0usize;
@@ -966,7 +1215,8 @@ where
                         &s_rand,
                         decoy_max,
                     ));
-                    server_wait_v3_auth(ws, &crypto, token).await?;
+                    let auth_c = Arc::clone(&auth_f);
+                    server_wait_v3_auth(ws, &crypto, token, &auth_c, peer, pre_auth).await?;
                     return Ok(crypto);
                 }
                 Message::Ping(p) => {
@@ -978,19 +1228,29 @@ where
             }
         }
     };
-    timeout(Duration::from_secs(15), fut)
-        .await
-        .map_err(|_| anyhow::anyhow!("handshake timeout"))?
+    match timeout(handshake_timeout, fut).await {
+        Ok(Ok(crypto)) => Ok(crypto),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            auth_f.record_failure(peer).await;
+            anyhow::bail!("handshake timeout");
+        }
+    }
 }
 
 async fn server_wait_v3_auth<S>(
     ws: &mut WebSocketStream<S>,
     crypto: &SharedCrypto,
     expected_token: &str,
+    auth: &Arc<AuthRateLimiter>,
+    peer_ip: std::net::IpAddr,
+    pre_auth: &PreAuthBudget,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    use bibavpn::server_limits::PreAuthBudgetTracker;
+    let mut tracker = PreAuthBudgetTracker::default();
     loop {
         let m = ws
             .next()
@@ -999,14 +1259,32 @@ where
             .context("ws read")?;
         match m {
             Message::Binary(b) => {
-                let raw = crypto
-                    .open_client_to_server(b.as_ref())
-                    .context("v3 open auth")?;
+                if let Err(e) = tracker.note_binary_frame(b.len(), pre_auth) {
+                    auth.record_failure(peer_ip).await;
+                    return Err(e);
+                }
+                let raw = match crypto.open_client_to_server(b.as_ref()) {
+                    Ok(x) => x,
+                    Err(_) => {
+                        if let Err(e) = tracker.note_decrypt_failure(pre_auth) {
+                            auth.record_failure(peer_ip).await;
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                };
                 let inner = read_padded_frame_into(raw).context("v3 auth frame")?;
                 let tok = decode_v3_auth(&inner).context("decode v3 auth")?;
                 if tok != expected_token {
+                    auth.record_failure(peer_ip).await;
+                    warn!(
+                        target: "bibavpn_security",
+                        %peer_ip,
+                        "v3 auth token mismatch"
+                    );
                     anyhow::bail!("v3 auth token mismatch");
                 }
+                auth.record_success(peer_ip).await;
                 return Ok(());
             }
             Message::Ping(p) => {
