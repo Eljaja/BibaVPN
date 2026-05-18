@@ -1,7 +1,7 @@
 //! BoringSSL client handshake for the outer WSS (`--tls-stack boring` + `boring-tls` feature).
 //!
 //! `biba` / parrot **ClientHello** templates do not apply to this stack; use for TLS record
-//! options (e.g. `SSL_set_max_send_fragment`–style) and standard Boring cipher negotiation.
+//! options (e.g. `SSL_CTX_set_max_send_fragment`) and standard Boring cipher negotiation.
 
 use tokio::net::TcpStream;
 
@@ -16,6 +16,7 @@ pub async fn upgrade_tcp_boring(
 ) -> anyhow::Result<tokio_boring::SslStream<TcpStream>> {
     use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
     use boring::x509::X509;
+    use foreign_types::ForeignTypeRef;
 
     let mut build = SslConnector::builder(SslMethod::tls()).context("boring SslConnector::builder")?;
     if insecure {
@@ -44,15 +45,31 @@ pub async fn upgrade_tcp_boring(
         }
         build.set_cert_store_builder(store);
     }
-    if tls_fragment {
-        tracing::debug!(
-            "tls-fragment: requested; Boring record cap needs SSL_CTX_set_max_send_fragment in bindings (work in progress)"
-        );
-    }
     // WebSocket over HTTPS
     build.set_alpn_protos(b"\x08http/1.1").context("boring alpn")?;
 
     let connector = build.build();
+    if tls_fragment {
+        use std::os::raw::c_int;
+
+        unsafe extern "C" {
+            fn SSL_CTX_set_max_send_fragment(ctx: *mut std::ffi::c_void, m: usize) -> c_int;
+        }
+        let ctx_ptr = connector.context().as_ptr().cast::<std::ffi::c_void>();
+        let rc = unsafe { SSL_CTX_set_max_send_fragment(ctx_ptr, 512) };
+        if rc != 1 {
+            tracing::warn!(
+                target: "bibavpn_client",
+                rc,
+                "tls-fragment: SSL_CTX_set_max_send_fragment did not return success"
+            );
+        } else {
+            tracing::info!(
+                target: "bibavpn_client",
+                "tls-fragment: BoringSSL max send fragment set to 512"
+            );
+        }
+    }
     let connect_cfg = connector.configure().context("boring configure")?;
 
     tokio_boring::connect(connect_cfg, sni, tcp)

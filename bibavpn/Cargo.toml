@@ -52,14 +52,15 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = [
     "rustls-tls-webpki-roots",
 ] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hex = "0.4"
 boring = { version = "5.1.0", optional = true }
 tokio-boring = { version = "5.0.0", optional = true }
+foreign-types = { version = "0.5", optional = true }
 
 [features]
 default = []
 # BoringSSL + tokio (optional build; `cmake` + `nasm` on Windows may be required for boring-sys).
-boring-tls = ["dep:boring", "dep:tokio-boring"]
+boring-tls = ["dep:boring", "dep:tokio-boring", "dep:foreign-types"]

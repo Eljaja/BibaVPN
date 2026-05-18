@@ -452,3 +452,39 @@ impl ServerCertVerifier for NoVerifier {
 pub fn install_ring_crypto() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_stack_from_str() {
+        assert_eq!("rustls".parse::<TlsStack>().unwrap(), TlsStack::Rustls);
+        assert_eq!("boring".parse::<TlsStack>().unwrap(), TlsStack::Boring);
+        assert_eq!("".parse::<TlsStack>().unwrap(), TlsStack::Rustls);
+        assert!("unknown-stack".parse::<TlsStack>().is_err());
+    }
+
+    #[test]
+    fn tls_profile_aliases() {
+        assert_eq!(
+            "chrome-132".parse::<TlsClientProfile>().unwrap(),
+            TlsClientProfile::Chrome132
+        );
+        assert_eq!(
+            "firefox_136".parse::<TlsClientProfile>().unwrap(),
+            TlsClientProfile::Firefox136
+        );
+        assert_eq!(
+            "randomized-alpn".parse::<TlsClientProfile>().unwrap(),
+            TlsClientProfile::RandomizedAlpn
+        );
+        assert_eq!("".parse::<TlsClientProfile>().unwrap(), TlsClientProfile::Default);
+    }
+
+    #[test]
+    fn fingerprint_str_matches_profile_parse() {
+        let p = TlsClientProfile::from_fingerprint_str("safari-18").unwrap();
+        assert_eq!(p, TlsClientProfile::Safari18);
+    }
+}
