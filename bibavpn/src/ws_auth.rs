@@ -9,6 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::protocol::{decode_auth, is_auth_frame};
+use crate::server_limits::{PreAuthBudget, PreAuthBudgetTracker};
 
 /// Read WebSocket messages until a valid AUTH frame matching `expected_token` or timeout.
 /// Ignores non-AUTH binary frames (noise). Handles Ping/Pong.
@@ -16,6 +17,7 @@ pub async fn server_wait_token_auth<S>(
     ws: &mut WebSocketStream<S>,
     expected_token: &str,
     wait: Duration,
+    mut pre_auth: Option<(&PreAuthBudget, &mut PreAuthBudgetTracker)>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -29,6 +31,9 @@ where
                 .context("ws error during auth wait")?;
             match m {
                 Message::Binary(b) => {
+                    if let Some((budget, track)) = pre_auth.as_mut() {
+                        track.note_binary_frame(b.len(), budget)?;
+                    }
                     if is_auth_frame(b.as_ref()) {
                         let tok = decode_auth(b.as_ref())?;
                         if tok == expected_token {
