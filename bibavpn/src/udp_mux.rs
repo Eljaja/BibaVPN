@@ -1,6 +1,8 @@
 //! UDP datagram relay inside the same TLS + WebSocket transport as TCP tunnels (DPI profile).
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,7 +13,7 @@ use rand::Rng;
 use rand::RngCore;
 use rustls::pki_types::ServerName;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -42,6 +44,131 @@ const UDP_MUX_CLIENT_PENDING_CAP: usize = 2048;
 
 /// Max queued UDP forwarding commands per client driver (backpressure).
 const UDP_MUX_CMD_QUEUE_CAP: usize = 16384;
+
+/// Resolve all socket addresses for a UDP destination (stable sort).
+pub async fn resolve_udp_dest(host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut v: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("lookup {host}:{port}"))?
+        .collect();
+    v.sort_by_key(|a| a.to_string());
+    Ok(v)
+}
+
+async fn bind_udp_for_family(want_v6: bool) -> anyhow::Result<UdpSocket> {
+    if want_v6 {
+        UdpSocket::bind("[::]:0")
+            .await
+            .context("udp mux bind v6")
+    } else {
+        UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("udp mux bind v4")
+    }
+}
+
+struct UdpPoolInner {
+    max_idle_per_family: usize,
+    v4_idle: Mutex<Vec<UdpSocket>>,
+    v6_idle: Mutex<Vec<UdpSocket>>,
+    sem: Arc<Semaphore>,
+}
+
+/// Reuse bound UDP sockets on the server to cut `bind(2)` churn (`--udp-socket-pool-size`).
+pub struct UdpSocketPool {
+    inner: Arc<UdpPoolInner>,
+}
+
+pub struct UdpLease {
+    inner: Arc<UdpPoolInner>,
+    sock: Option<UdpSocket>,
+    v6: bool,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl UdpSocketPool {
+    pub fn new(cap: usize) -> Arc<Self> {
+        let cap = cap.max(1);
+        Arc::new(Self {
+            inner: Arc::new(UdpPoolInner {
+                max_idle_per_family: cap,
+                v4_idle: Mutex::new(Vec::new()),
+                v6_idle: Mutex::new(Vec::new()),
+                sem: Arc::new(Semaphore::new(cap)),
+            }),
+        })
+    }
+
+    pub async fn lease(self: &Arc<Self>, v6: bool) -> anyhow::Result<UdpLease> {
+        let permit = self
+            .inner
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("udp socket pool closed"))?;
+        let sock = {
+            let idle = if v6 {
+                &self.inner.v6_idle
+            } else {
+                &self.inner.v4_idle
+            };
+            let mut g = idle.lock().await;
+            g.pop()
+        };
+        let sock = match sock {
+            Some(s) => s,
+            None => bind_udp_for_family(v6).await?,
+        };
+        Ok(UdpLease {
+            inner: Arc::clone(&self.inner),
+            sock: Some(sock),
+            v6,
+            _permit: permit,
+        })
+    }
+}
+
+impl UdpLease {
+    fn sock_mut(&mut self) -> &mut UdpSocket {
+        self.sock.as_mut().expect("udp lease socket")
+    }
+}
+
+impl Drop for UdpLease {
+    fn drop(&mut self) {
+        let Some(sock) = self.sock.take() else {
+            return;
+        };
+        let inner = self.inner.clone();
+        let v6 = self.v6;
+        tokio::spawn(async move {
+            let idle = if v6 {
+                &inner.v6_idle
+            } else {
+                &inner.v4_idle
+            };
+            let mut g = idle.lock().await;
+            if g.len() < inner.max_idle_per_family {
+                g.push(sock);
+            }
+        });
+    }
+}
+
+enum UdpSockHolder {
+    Pooled(UdpLease),
+    Ephemeral(UdpSocket),
+}
+
+impl UdpSockHolder {
+    fn sock_mut(&mut self) -> &mut UdpSocket {
+        match self {
+            UdpSockHolder::Pooled(l) => l.sock_mut(),
+            UdpSockHolder::Ephemeral(s) => s,
+        }
+    }
+}
 
 /// Config snapshot for opening a UDP-mux WebSocket (mirrors `local_client::ClientCfg` mux fields).
 #[derive(Clone)]
@@ -428,7 +555,15 @@ async fn run_udp_mux_one_session(
                             )));
                             continue;
                         }
-                        pending.insert(xid, reply);
+                        match pending.entry(xid) {
+                            Entry::Occupied(_) => {
+                                let _ = reply.send(Err(anyhow::anyhow!("udp_mux_xid_collision")));
+                                continue;
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert(reply);
+                            }
+                        }
                         let req = match encode_udp_req(xid, &dst_host, dst_port, &payload) {
                             Ok(r) => r,
                             Err(e) => {
@@ -536,10 +671,12 @@ pub async fn bridge_ws_udp_mux_server<S>(
     recv_timeout: Duration,
     pad_mode: PadMode,
     server_out_timing: ServerWsOutTiming,
+    udp_socket_pool: Option<Arc<UdpSocketPool>>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let udp_socket_pool = udp_socket_pool;
     let udp_adaptive = Arc::new(std::sync::Mutex::new(AdaptivePadState::default()));
     let ws_send_j = WsSendJitter {
         min_ms: ws_jitter_min_ms,
@@ -614,95 +751,115 @@ where
                 let udp_ad = udp_adaptive.clone();
                 let wsj = ws_send_j;
                 let server_out = server_out_timing;
+                let udp_pool = udp_socket_pool.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = (async {
-                        let dest_iter = tokio::net::lookup_host((host.as_str(), port))
-                            .await
-                            .with_context(|| format!("lookup {host}:{port}"))?;
-                        let dest = dest_iter
-                            .into_iter()
-                            .next()
-                            .with_context(|| format!("no addr for {host}:{port}"))?;
-                        let sock = if dest.is_ipv6() {
-                            UdpSocket::bind("[::]:0")
-                                .await
-                                .context("udp mux bind v6")?
-                        } else {
-                            UdpSocket::bind("0.0.0.0:0")
-                                .await
-                                .context("udp mux bind v4")?
-                        };
-                        sock.set_broadcast(true).ok();
-                        sock.send_to(&payload, dest).await.context("udp send")?;
-                        let mut rbuf = vec![0u8; 65535];
-                        let (n, src) = match timeout(recv_timeout, sock.recv_from(&mut rbuf)).await {
-                            Ok(Ok(v)) => v,
-                            Ok(Err(e)) => return Err(e.into()),
-                            Err(_) => {
-                                let rep_plain = encode_udp_rep(xid, "0.0.0.0", 0, &[])?;
-                                let mut wire = Vec::new();
-                                {
-                                    let mut g = udp_ad
-                                        .lock()
-                                        .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
-                                    write_padded_frame_with_mode_state(
-                                        &mut wire,
-                                        &rep_plain,
-                                        max_pad,
-                                        pad_mode,
-                                        Some(&mut *g),
-                                    )
-                                    .context("pad rep")?;
-                                }
-                                let blob: Vec<u8> = crypto
-                                    .seal_server_to_client(&wire)
-                                    .context("seal s2c (udp mux)")?;
-                                if blob.len() > max_ws_binary {
-                                    anyhow::bail!("udp rep ws frame too large");
-                                }
-                                maybe_server_ack_and_rtt_mask(server_out).await;
-                                maybe_ws_send_jitter(wsj).await;
-                                let mut g = ws_tx.lock().await;
-                                g.send(Message::Binary(Bytes::from(blob)))
-                                    .await
-                                    .context("ws send udp rep (timeout)")?;
-                                return Ok::<_, anyhow::Error>(());
+                    if let Err(e) = async {
+                        let addrs = resolve_udp_dest(&host, port).await?;
+                        if addrs.is_empty() {
+                            anyhow::bail!("no addr for {host}:{port}");
+                        }
+                        let mut last_err: Option<anyhow::Error> = None;
+                        for (i, dest) in addrs.iter().copied().enumerate() {
+                            if i > 0 {
+                                trace!(
+                                    target: "bibavpn_udp",
+                                    %dest,
+                                    "udp mux server: resolve fallback"
+                                );
                             }
-                        };
-                        let rep_plain =
-                            encode_udp_rep(xid, &src.ip().to_string(), src.port(), &rbuf[..n])?;
-                        let mut wire = Vec::new();
-                        {
-                            let mut g = udp_ad
-                                .lock()
-                                .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
-                            write_padded_frame_with_mode_state(
-                                &mut wire,
-                                &rep_plain,
-                                max_pad,
-                                pad_mode,
-                                Some(&mut *g),
-                            )
-                            .context("pad rep")?;
+                            let want_v6 = dest.is_ipv6();
+                            let mut holder = if let Some(ref pool) = udp_pool {
+                                UdpSockHolder::Pooled(pool.lease(want_v6).await?)
+                            } else {
+                                UdpSockHolder::Ephemeral(bind_udp_for_family(want_v6).await?)
+                            };
+                            let sock = holder.sock_mut();
+                            sock.set_broadcast(true).ok();
+                            if let Err(e) = sock.send_to(&payload, dest).await {
+                                last_err = Some(anyhow::Error::from(e).context("udp send"));
+                                continue;
+                            }
+                            let mut rbuf = vec![0u8; 65535];
+                            match timeout(recv_timeout, sock.recv_from(&mut rbuf)).await {
+                                Ok(Ok((n, src))) => {
+                                    let rep_plain = encode_udp_rep(
+                                        xid,
+                                        &src.ip().to_string(),
+                                        src.port(),
+                                        &rbuf[..n],
+                                    )?;
+                                    let mut wire = Vec::new();
+                                    {
+                                        let mut g = udp_ad
+                                            .lock()
+                                            .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
+                                        write_padded_frame_with_mode_state(
+                                            &mut wire,
+                                            &rep_plain,
+                                            max_pad,
+                                            pad_mode,
+                                            Some(&mut *g),
+                                        )
+                                        .context("pad rep")?;
+                                    }
+                                    let blob: Vec<u8> = crypto
+                                        .seal_server_to_client(&wire)
+                                        .context("seal s2c (udp mux)")?;
+                                    if blob.len() > max_ws_binary {
+                                        anyhow::bail!("udp rep ws frame too large");
+                                    }
+                                    maybe_server_ack_and_rtt_mask(server_out).await;
+                                    maybe_ws_send_jitter(wsj).await;
+                                    let mut g = ws_tx.lock().await;
+                                    g.send(Message::Binary(Bytes::from(blob)))
+                                        .await
+                                        .context("ws send udp rep")?;
+                                    return Ok::<_, anyhow::Error>(());
+                                }
+                                Ok(Err(e)) => {
+                                    last_err = Some(anyhow::Error::from(e));
+                                    continue;
+                                }
+                                Err(_) => {
+                                    let rep_plain = encode_udp_rep(xid, "0.0.0.0", 0, &[])?;
+                                    let mut wire = Vec::new();
+                                    {
+                                        let mut g = udp_ad
+                                            .lock()
+                                            .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
+                                        write_padded_frame_with_mode_state(
+                                            &mut wire,
+                                            &rep_plain,
+                                            max_pad,
+                                            pad_mode,
+                                            Some(&mut *g),
+                                        )
+                                        .context("pad rep")?;
+                                    }
+                                    let blob: Vec<u8> = crypto
+                                        .seal_server_to_client(&wire)
+                                        .context("seal s2c (udp mux)")?;
+                                    if blob.len() > max_ws_binary {
+                                        anyhow::bail!("udp rep ws frame too large");
+                                    }
+                                    maybe_server_ack_and_rtt_mask(server_out).await;
+                                    maybe_ws_send_jitter(wsj).await;
+                                    let mut g = ws_tx.lock().await;
+                                    g.send(Message::Binary(Bytes::from(blob)))
+                                        .await
+                                        .context("ws send udp rep (timeout)")?;
+                                    return Ok::<_, anyhow::Error>(());
+                                }
+                            }
                         }
-                        let blob: Vec<u8> = crypto
-                            .seal_server_to_client(&wire)
-                            .context("seal s2c (udp mux)")?;
-                        if blob.len() > max_ws_binary {
-                            anyhow::bail!("udp rep ws frame too large");
-                        }
-                        maybe_server_ack_and_rtt_mask(server_out).await;
-                        maybe_ws_send_jitter(wsj).await;
-                        let mut g = ws_tx.lock().await;
-                        g.send(Message::Binary(Bytes::from(blob)))
-                            .await
-                            .context("ws send udp rep")?;
-                        Ok::<_, anyhow::Error>(())
-                    })
+                        Err(last_err.unwrap_or_else(|| {
+                            anyhow::anyhow!("udp mux: all resolve targets failed")
+                        }))
+                    }
                     .await
                     {
-                        error!("udp mux server outbound: {e:#}");
+                        error!(target: "bibavpn_udp", "udp mux server outbound: {e:#}");
                     }
                 });
             }
@@ -717,4 +874,86 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto_layer::{build_ack, build_hello_v3, SessionCrypto};
+    use crate::protocol::{decode_udp_rep, decode_udp_req, encode_udp_rep, encode_udp_req};
+    use std::sync::Arc;
+
+    fn test_session_crypto() -> SharedCrypto {
+        let (c, _hello) = build_hello_v3();
+        let psk = "udp-mux-test-psk";
+        let dom = "lab";
+        let (_ack, s) = build_ack(psk, dom, &c).unwrap();
+        Arc::new(SessionCrypto::new(psk, dom, &c, &s, 4))
+    }
+
+    #[test]
+    fn pack_unpack_tunnel_roundtrip_udp_req() {
+        let crypto = test_session_crypto();
+        let mut adaptive = AdaptivePadState::default();
+        let inner = encode_udp_req(0xDEAD_BEEF_0000_0001, "1.1.1.1", 53, b"dns-q").unwrap();
+        let blob = pack_tunnel_out(&crypto, 16, PadMode::Random, 65_536, &inner, &mut adaptive)
+            .unwrap();
+        let raw = crypto.open_client_to_server(&blob).unwrap();
+        let plain = read_padded_frame_into(raw).unwrap();
+        assert_eq!(plain, inner);
+        let (xid, host, port, payload) = decode_udp_req(&plain).unwrap();
+        assert_eq!(xid, 0xDEAD_BEEF_0000_0001);
+        assert_eq!(host, "1.1.1.1");
+        assert_eq!(port, 53);
+        assert_eq!(payload, b"dns-q");
+    }
+
+    #[test]
+    fn pack_unpack_tunnel_roundtrip_udp_rep() {
+        let crypto = test_session_crypto();
+        let mut adaptive = AdaptivePadState::default();
+        let inner = encode_udp_rep(42, "8.8.8.8", 53, b"dns-a").unwrap();
+        let sealed = {
+            let mut wire = Vec::new();
+            write_padded_frame_with_mode_state(
+                &mut wire,
+                &inner,
+                8,
+                PadMode::Random,
+                Some(&mut adaptive),
+            )
+            .unwrap();
+            crypto.seal_server_to_client(&wire).unwrap()
+        };
+        let plain = unpack_tunnel_in(&crypto, &sealed).unwrap();
+        let (xid, host, port, payload) = decode_udp_rep(&plain).unwrap();
+        assert_eq!(xid, 42);
+        assert_eq!(host, "8.8.8.8");
+        assert_eq!(port, 53);
+        assert_eq!(payload, b"dns-a");
+    }
+
+    #[test]
+    fn pack_tunnel_rejects_ws_binary_cap() {
+        let crypto = test_session_crypto();
+        let mut adaptive = AdaptivePadState::default();
+        let inner = encode_udp_req(1, "example.com", 443, &vec![0u8; 2048]).unwrap();
+        let err = pack_tunnel_out(&crypto, 64, PadMode::Random, 256, &inner, &mut adaptive)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("max_ws_binary"));
+    }
+
+    #[test]
+    fn unpack_tunnel_rejects_garbage_ciphertext() {
+        let crypto = test_session_crypto();
+        assert!(unpack_tunnel_in(&crypto, &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn pending_xid_map_insert_collision() {
+        let mut pending: HashMap<u64, u64> = HashMap::new();
+        assert!(pending.insert(1, 10).is_none());
+        assert_eq!(pending.insert(1, 20), Some(10));
+        assert_eq!(pending.get(&1), Some(&20));
+    }
 }

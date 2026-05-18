@@ -504,4 +504,92 @@ mod udp_tests {
         assert_eq!(sp, 53);
         assert_eq!(pl2, pl);
     }
+
+    #[test]
+    fn udp_ipv6_and_socks5_framing_roundtrip() {
+        let p = encode_udp_req(7, "2001:db8::1", 5353, b"q").unwrap();
+        let (_, h, port, pl) = decode_udp_req(&p).unwrap();
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(port, 5353);
+        assert_eq!(pl, b"q");
+
+        let socks = build_socks5_udp_datagram("example.com", 53, b"dns").unwrap();
+        let (sh, sp, payload) = parse_socks5_udp_datagram(&socks).unwrap();
+        assert_eq!(sh, "example.com");
+        assert_eq!(sp, 53);
+        assert_eq!(payload, b"dns");
+    }
+
+    #[test]
+    fn udp_payload_max_enforced() {
+        let big = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        assert!(encode_udp_req(1, "1.1.1.1", 53, &big).is_err());
+        assert!(encode_udp_rep(1, "1.1.1.1", 53, &big).is_err());
+    }
+
+    #[test]
+    fn udp_rep_includes_trailing_in_payload() {
+        let mut q = encode_udp_rep(9, "10.0.0.1", 1234, b"x").unwrap();
+        q.push(b'y');
+        let (_, _, _, payload) = decode_udp_rep(&q).unwrap();
+        assert_eq!(payload, b"xy");
+    }
+
+    #[test]
+    fn socks5_udp_rejects_fragment() {
+        let mut socks = build_socks5_udp_datagram("h", 1, b"p").unwrap();
+        socks[2] = 1;
+        assert!(parse_socks5_udp_datagram(&socks).is_err());
+    }
+}
+
+#[cfg(test)]
+mod v3_ctrl_tests {
+    use super::*;
+
+    #[test]
+    fn v3_channel_open_opcodes() {
+        assert!(is_v3_mux_open(&encode_v3_mux_open()));
+        assert!(is_v3_udp_mux_open(&encode_v3_udp_mux_open()));
+        assert!(!is_v3_mux_open(&encode_v3_udp_mux_open()));
+    }
+
+    #[test]
+    fn v3_open_err_roundtrip_and_strict() {
+        let e = encode_v3_open_err("connect timeout").unwrap();
+        assert_eq!(decode_v3_open_err(&e).unwrap(), "connect timeout");
+        let mut bad = e.clone();
+        bad.push(1);
+        assert!(decode_v3_open_err(&bad).is_err());
+    }
+
+    #[test]
+    fn legacy_open_err_roundtrip() {
+        let e = encode_open_err("refused").unwrap();
+        assert_eq!(decode_open_err(&e).unwrap(), "refused");
+    }
+
+    #[test]
+    fn v3_open_ok_and_mux_opcodes_single_byte() {
+        assert!(is_v3_open_ok(&encode_v3_open_ok()));
+        assert_eq!(encode_v3_mux_open(), vec![V3_CTRL_MUX]);
+        assert_eq!(encode_v3_udp_mux_open(), vec![V3_CTRL_UDP_MUX]);
+    }
+
+    #[test]
+    fn decode_open_with_status_flags() {
+        let open = encode_open("host", 80).unwrap();
+        let (h, p, flags) = decode_open_with_flags(&open).unwrap();
+        assert_eq!(h, "host");
+        assert_eq!(p, 80);
+        assert_ne!(flags & OPEN_FLAG_STATUS, 0);
+    }
+
+    #[test]
+    fn encode_atyp_via_udp_ipv4_literal() {
+        let p = encode_udp_req(1, "192.0.2.1", 9, b"q").unwrap();
+        let (_, h, port, _) = decode_udp_req(&p).unwrap();
+        assert_eq!(h, "192.0.2.1");
+        assert_eq!(port, 9);
+    }
 }
