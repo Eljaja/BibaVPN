@@ -9,6 +9,7 @@ use tokio::time::{sleep, Duration};
 use tracing::warn;
 
 use crate::desync::sleep_decoy_rtt_variance;
+use crate::stealth::format_decoy_get_request;
 use crate::stealth_v12::DecoyMode;
 use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile};
 
@@ -22,6 +23,7 @@ pub struct DecoyConfig {
     pub interval_secs: u64,
     pub paths: Vec<String>,
     pub user_agent: String,
+    pub accept_language: String,
     pub mode: DecoyMode,
 }
 
@@ -99,24 +101,15 @@ pub async fn run_decoy_gets_loop(
             sleep_decoy_rtt_variance().await;
         }
 
-        let req = match cfg.mode {
-            DecoyMode::Simple => format!(
-                "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n\r\n",
-                path = path,
-                host_hdr = host_hdr,
-                ua = cfg.user_agent.as_str(),
-            ),
-            DecoyMode::Browser => {
-                let origin = format!("https://{}", cfg.sni);
-                format!(
-                    "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.5\r\nAccept-Encoding: gzip, deflate, br\r\nReferer: {origin}/\r\nDNT: 1\r\nConnection: close\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-User: ?1\r\nUpgrade-Insecure-Requests: 1\r\n\r\n",
-                    path = path,
-                    host_hdr = host_hdr,
-                    ua = cfg.user_agent.as_str(),
-                    origin = origin,
-                )
-            }
-        };
+        let req = format_decoy_get_request(
+            path,
+            host_hdr.as_str(),
+            &cfg.sni,
+            cfg.user_agent.as_str(),
+            cfg.accept_language.as_str(),
+            cfg.tls_profile,
+            cfg.mode,
+        );
 
         let run = async {
             let tcp = crate::outbound_protect::tcp_connect_host_protected(
@@ -193,24 +186,15 @@ pub async fn run_one_decoy_get(cfg: &DecoyConfig) {
     if cfg.mode == DecoyMode::Browser {
         sleep_decoy_rtt_variance().await;
     }
-    let req = match cfg.mode {
-        DecoyMode::Simple => format!(
-            "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-            path = path,
-            host_hdr = host_hdr,
-            ua = cfg.user_agent.as_str(),
-        ),
-        DecoyMode::Browser => {
-            let origin = format!("https://{}", cfg.sni);
-            format!(
-                "GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: {ua}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.5\r\nAccept-Encoding: gzip, deflate, br\r\nReferer: {origin}/\r\nConnection: close\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n",
-                path = path,
-                host_hdr = host_hdr,
-                ua = cfg.user_agent.as_str(),
-                origin = origin,
-            )
-        }
-    };
+    let req = format_decoy_get_request(
+        path,
+        host_hdr.as_str(),
+        &cfg.sni,
+        cfg.user_agent.as_str(),
+        cfg.accept_language.as_str(),
+        cfg.tls_profile,
+        cfg.mode,
+    );
     let run = async {
         let tcp = crate::outbound_protect::tcp_connect_host_protected(
             &cfg.server_host,

@@ -5,11 +5,15 @@
 use http::{Request, Uri};
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 
+use crate::stealth_v12::DecoyMode;
 use crate::tls_util::TlsClientProfile;
 
 const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 
 const DEFAULT_AL: &str = "en-US,en;q=0.9";
+
+/// Default `Accept-Language` for browser-like HTTP used in decoy GETs and WS when unset.
+pub const DEFAULT_ACCEPT_LANGUAGE: &str = DEFAULT_AL;
 
 const UA_CHROME132: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
 
@@ -164,6 +168,55 @@ pub fn build_websocket_request(p: WsHandshakeParams<'_>) -> Request<()> {
     req.body(()).expect("request")
 }
 
+/// Plain HTTP/1.1 GET for decoy traffic (aligns with [`build_websocket_request`] per TLS profile).
+pub fn format_decoy_get_request(
+    path: &str,
+    host_header: &str,
+    sni: &str,
+    user_agent: &str,
+    accept_language: &str,
+    tls_profile: TlsClientProfile,
+    mode: DecoyMode,
+) -> String {
+    let origin = format!("https://{}", sni);
+    match mode {
+        DecoyMode::Simple => format!(
+            "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {user_agent}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n\r\n",
+            path = path,
+            host_header = host_header,
+            user_agent = user_agent,
+        ),
+        DecoyMode::Browser => {
+            if is_firefox_profile(tls_profile) {
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: {accept_language}\r\nAccept-Encoding: {ACCEPT_ENCODING}\r\nDNT: 1\r\nConnection: close\r\nUpgrade-Insecure-Requests: 1\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: none\r\nSec-Fetch-User: ?1\r\n\r\n",
+                    path = path,
+                    host_header = host_header,
+                    user_agent = user_agent,
+                    accept_language = accept_language,
+                )
+            } else if is_safari_profile(tls_profile) {
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: {accept_language}\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n",
+                    path = path,
+                    host_header = host_header,
+                    user_agent = user_agent,
+                    accept_language = accept_language,
+                )
+            } else {
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: {user_agent}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\nAccept-Language: {accept_language}\r\nAccept-Encoding: {ACCEPT_ENCODING}\r\nReferer: {origin}/\r\nDNT: 1\r\nConnection: close\r\nSec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-User: ?1\r\nUpgrade-Insecure-Requests: 1\r\nSec-CH-UA: \"Google Chrome\";v=\"132\", \"Chromium\";v=\"132\", \"Not_A Brand\";v=\"24\"\r\nSec-CH-UA-Mobile: ?0\r\nSec-CH-UA-Platform: \"Windows\"\r\n\r\n",
+                    path = path,
+                    host_header = host_header,
+                    user_agent = user_agent,
+                    accept_language = accept_language,
+                    origin = origin,
+                )
+            }
+        }
+    }
+}
+
 /// Default browser-like handshake (backward compatible).
 pub fn browser_websocket_request(
     host_for_tcp: &str,
@@ -183,4 +236,115 @@ pub fn browser_websocket_request(
         extra_headers: &[],
         tls_profile: TlsClientProfile::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::header;
+
+    #[test]
+    fn chrome_request_has_client_hints() {
+        let req = build_websocket_request(WsHandshakeParams {
+            host_for_tcp: "1.2.3.4",
+            port: 443,
+            path: "/ws",
+            sni: "vpn.example.com",
+            host_header: None,
+            origin: None,
+            user_agent: None,
+            accept_language: None,
+            extra_headers: &[],
+            tls_profile: TlsClientProfile::Chrome132,
+        });
+        assert_eq!(req.uri().path(), "/ws");
+        assert!(req.headers().contains_key(header::SEC_WEBSOCKET_KEY));
+        assert!(req.headers().contains_key("Sec-CH-UA"));
+        assert_eq!(
+            req.headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some(default_user_agent_for_profile(TlsClientProfile::Chrome132))
+        );
+    }
+
+    #[test]
+    fn firefox_request_uses_upgrade_connection() {
+        let req = build_websocket_request(WsHandshakeParams {
+            host_for_tcp: "127.0.0.1",
+            port: 8443,
+            path: "/tunnel",
+            sni: "localhost",
+            host_header: Some("localhost:8443"),
+            origin: Some("https://localhost"),
+            user_agent: None,
+            accept_language: None,
+            extra_headers: &[],
+            tls_profile: TlsClientProfile::Firefox136,
+        });
+        let conn = req
+            .headers()
+            .get(header::CONNECTION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(conn.to_ascii_lowercase().contains("upgrade"));
+        assert!(!req.headers().contains_key("Sec-CH-UA"));
+    }
+
+    #[test]
+    fn extra_headers_are_appended() {
+        let extras = [("Cookie".to_string(), "a=b".to_string())];
+        let req = build_websocket_request(WsHandshakeParams {
+            host_for_tcp: "h",
+            port: 443,
+            path: "/ws",
+            sni: "h",
+            host_header: None,
+            origin: None,
+            user_agent: None,
+            accept_language: None,
+            extra_headers: &extras,
+            tls_profile: TlsClientProfile::Default,
+        });
+        assert_eq!(
+            req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()),
+            Some("a=b")
+        );
+    }
+
+    #[test]
+    fn browser_websocket_request_backward_compat() {
+        let req = browser_websocket_request("host", 443, "/ws", "host");
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.uri().to_string(), "wss://host:443/ws");
+    }
+
+    #[test]
+    fn decoy_browser_chrome_matches_ws_client_hints() {
+        let s = format_decoy_get_request(
+            "/",
+            "vpn.example.com",
+            "vpn.example.com",
+            default_user_agent_for_profile(TlsClientProfile::Chrome132),
+            DEFAULT_ACCEPT_LANGUAGE,
+            TlsClientProfile::Chrome132,
+            DecoyMode::Browser,
+        );
+        assert!(s.contains("Sec-CH-UA:"), "{s:?}");
+        assert!(s.contains("Sec-Fetch-Site: same-origin"), "{s:?}");
+    }
+
+    #[test]
+    fn decoy_browser_firefox_has_no_client_hints() {
+        let s = format_decoy_get_request(
+            "/",
+            "vpn.example.com",
+            "vpn.example.com",
+            default_user_agent_for_profile(TlsClientProfile::Firefox136),
+            DEFAULT_ACCEPT_LANGUAGE,
+            TlsClientProfile::Firefox136,
+            DecoyMode::Browser,
+        );
+        assert!(!s.contains("Sec-CH-UA:"), "{s:?}");
+    }
 }

@@ -223,4 +223,36 @@ mod tests {
         assert_eq!(merge_idle_decoy_secs(None, Some(&pr)), 10);
         assert_eq!(merge_idle_decoy_secs(Some(0), Some(&pr)), 0);
     }
+
+    #[test]
+    fn stealth_profile_from_str() {
+        assert_eq!(
+            "balanced".parse::<StealthProfile>().unwrap(),
+            StealthProfile::Balanced
+        );
+        assert_eq!(
+            "AGGRESSIVE".parse::<StealthProfile>().unwrap(),
+            StealthProfile::Aggressive
+        );
+        assert!("weird".parse::<StealthProfile>().is_err());
+    }
+
+    #[test]
+    fn decoy_and_desync_from_str() {
+        assert_eq!("browser".parse::<DecoyMode>().unwrap(), DecoyMode::Browser);
+        assert_eq!("split2".parse::<DesyncMode>().unwrap(), DesyncMode::Split2);
+        assert_eq!(
+            "fake-dsplit".parse::<DesyncMode>().unwrap(),
+            DesyncMode::FakeDsplit
+        );
+        assert_eq!("md5sig".parse::<TcpFooling>().unwrap(), TcpFooling::Md5Sig);
+    }
+
+    #[test]
+    fn aggressive_preset_stronger_than_default() {
+        let d = preset(StealthProfile::Default);
+        let a = preset(StealthProfile::Aggressive);
+        assert!(a.ws_jitter_max_ms >= d.ws_jitter_max_ms);
+        assert!(a.idle_decoy_secs >= d.idle_decoy_secs);
+    }
 }
