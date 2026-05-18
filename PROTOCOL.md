@@ -467,6 +467,10 @@ true JA3/JA4 parity requires byte-level control (see `tls_util.rs` comments).
   allows). **Requires elevated privileges** on most platforms; see
   [SECURITY.md](SECURITY.md).
 
+#### External desync (typical deployment)
+
+The stock **bibavpn-client** build does **not** perform raw-socket split / disorder / fake-handshake inside the process: `--desync-mode` and related knobs are **advisory** (they record intent, emit guidance, and keep room for future hooks). For paths that need real desync, operators usually run an **external** helper in front of the TCP session (for example **zapret**-style `nfqws` / `tpws`), then connect the client through that path. Code: `bibavpn::transport_capabilities::effective_desync_mode`; logs: tracing target `bibavpn_stealth`.
+
 ### P1 (v1.2.0 or v1.2.1)
 
 - WebSocket upgrade over **HTTP/2** (`--transport http2`) with **HTTP/1.1**

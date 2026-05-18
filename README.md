@@ -104,6 +104,7 @@ configurable upgrade headers per **TLS client profile** (default **Chrome
 - **Biba extras:** optional `--stealth-profile`, `fingerprint` / `tls_profile`
 merge rules (`client_policy`), parallel decoys plus **idle** decoys, server
 **delayed ACK** + **ACK profile** and RTT mask — see [AGENTS.md](AGENTS.md).
+- **Packet desync / TCP “fooling” flags** in the client are **mostly advisory** in the default build; real DPI-oriented split/disorder usually means an **external** helper (e.g. **zapret**-class tools) documented in [PROTOCOL.md](PROTOCOL.md) (external desync section).
 - **Encrypted invite URIs** (`biba://…`) so you can ship one line of config
 instead of a wall of flags.
 - **Android** app (Jetpack Compose, JNI core) and **Tauri desktop** wrapper.
