@@ -1,6 +1,6 @@
 //! PSK handshake + ChaCha20-Poly1305 outer framing (v3 domain-separated keys).
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context};
 use blake3::derive_key;
@@ -70,25 +70,25 @@ fn transport_keys(
 
 struct ChaHalf {
     cipher: ChaCha20Poly1305,
-    ctr: u64,
+    ctr: AtomicU64,
 }
 
 impl ChaHalf {
     fn new(key: &[u8; 32]) -> Self {
         Self {
             cipher: ChaCha20Poly1305::new_from_slice(key).expect("32B key"),
-            ctr: 0,
+            ctr: AtomicU64::new(0),
         }
     }
 
-    fn next_nonce(&mut self) -> [u8; 12] {
+    fn next_nonce(&self) -> [u8; 12] {
+        let c = self.ctr.fetch_add(1, Ordering::Relaxed);
         let mut n = [0u8; 12];
-        n[4..].copy_from_slice(&self.ctr.to_be_bytes());
-        self.ctr = self.ctr.wrapping_add(1);
+        n[4..].copy_from_slice(&c.to_be_bytes());
         n
     }
 
-    fn seal(&mut self, decoy_max: u8, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn seal(&self, decoy_max: u8, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
         let plain = if decoy_max == 0 {
             let mut v = Vec::with_capacity(1 + inner.len());
             v.push(0u8);
@@ -145,12 +145,10 @@ fn strip_decoy(mut pt: Vec<u8>) -> Result<Vec<u8>, anyhow::Error> {
     Ok(pt)
 }
 
-/// Bidirectional session keys. Each direction has its own `std::sync::Mutex` so seal/open stay
-/// **synchronous** (no fake `async` / tokio mutex on the hot path). Uplink and downlink use
-/// different mutexes and can run in parallel on different threads/tasks.
+/// Bidirectional session keys. Each direction uses a lock-free nonce counter; seal/open are `Sync`.
 pub struct SessionCrypto {
-    c2s: Mutex<ChaHalf>,
-    s2c: Mutex<ChaHalf>,
+    c2s: ChaHalf,
+    s2c: ChaHalf,
     pub decoy_max: u8,
 }
 
@@ -164,30 +162,26 @@ impl SessionCrypto {
     ) -> Self {
         let (k_up, k_dn) = transport_keys(psk.as_bytes(), domain, client_random, server_random);
         Self {
-            c2s: Mutex::new(ChaHalf::new(&k_up)),
-            s2c: Mutex::new(ChaHalf::new(&k_dn)),
+            c2s: ChaHalf::new(&k_up),
+            s2c: ChaHalf::new(&k_dn),
             decoy_max,
         }
     }
 
     pub fn seal_client_to_server(&self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut g = self.c2s.lock().expect("session crypto mutex poisoned");
-        g.seal(self.decoy_max, inner)
+        self.c2s.seal(self.decoy_max, inner)
     }
 
     pub fn open_client_to_server(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let g = self.c2s.lock().expect("session crypto mutex poisoned");
-        g.open(wire).context("chacha decrypt (c2s)")
+        self.c2s.open(wire).context("chacha decrypt (c2s)")
     }
 
     pub fn seal_server_to_client(&self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut g = self.s2c.lock().expect("session crypto mutex poisoned");
-        g.seal(self.decoy_max, inner)
+        self.s2c.seal(self.decoy_max, inner)
     }
 
     pub fn open_server_to_client(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let g = self.s2c.lock().expect("session crypto mutex poisoned");
-        g.open(wire).context("chacha decrypt (s2c)")
+        self.s2c.open(wire).context("chacha decrypt (s2c)")
     }
 }
 
@@ -309,5 +303,61 @@ mod tests {
         let inner = b"payload".to_vec();
         let w = a.seal_client_to_server(&inner).unwrap();
         assert!(b.open_client_to_server(&w).is_err());
+    }
+
+    #[test]
+    fn corrupt_ciphertext_fails_open() {
+        let psk = "psk";
+        let c = [1u8; 32];
+        let s = [2u8; 32];
+        let enc = SessionCrypto::new(psk, "dom", &c, &s, 0);
+        let mut wire = enc.seal_client_to_server(b"x").unwrap();
+        if let Some(b) = wire.last_mut() {
+            *b ^= 0xff;
+        }
+        assert!(enc.open_client_to_server(&wire).is_err());
+    }
+
+    #[test]
+    fn wrong_psk_fails_ack_mac() {
+        let (c, hello) = build_hello_v3();
+        let psk = "correct-psk";
+        let dom = "dom";
+        let (ack, _) = build_ack(psk, dom, &c).unwrap();
+        assert!(parse_hello_v3(&hello).is_ok());
+        assert!(parse_ack("wrong-psk", dom, &ack, &c).is_err());
+        assert!(parse_ack(psk, "other.domain", &ack, &c).is_err());
+    }
+
+    #[test]
+    fn decoy_max_zero_means_no_noise_bytes() {
+        let psk = "psk";
+        let c = [5u8; 32];
+        let s = [6u8; 32];
+        let enc = SessionCrypto::new(psk, "dom", &c, &s, 0);
+        let wire = enc.seal_client_to_server(b"plain").unwrap();
+        let plain = enc.open_client_to_server(&wire).unwrap();
+        assert_eq!(plain, b"plain");
+    }
+
+    #[test]
+    fn concurrent_c2s_seals_open_correctly() {
+        let psk = "c-test";
+        let c = [9u8; 32];
+        let s = [8u8; 32];
+        let enc = std::sync::Arc::new(SessionCrypto::new(psk, "d", &c, &s, 0));
+        std::thread::scope(|sc| {
+            for _ in 0..32 {
+                let enc = enc.clone();
+                sc.spawn(move || {
+                    for _ in 0..64 {
+                        let inner: Vec<u8> = rand::random::<[u8; 16]>().to_vec();
+                        let wire = enc.seal_client_to_server(&inner).unwrap();
+                        let out = enc.open_client_to_server(&wire).unwrap();
+                        assert_eq!(out, inner);
+                    }
+                });
+            }
+        });
     }
 }
