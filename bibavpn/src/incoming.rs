@@ -1,5 +1,6 @@
 //! First request on a TLS stream: WebSocket upgrade vs plain HTTP (camouflage).
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -31,6 +32,7 @@ pub async fn accept_websocket_or_camouflage<S>(
     legacy_path_auth: bool,
     token: &str,
     camo: CamouflageServeConfig,
+    peer: Option<SocketAddr>,
 ) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -97,7 +99,7 @@ Sec-WebSocket-Accept: {accept}\r\n\
 
     // Plain HTTP
     if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
-        serve_camouflage_http(&mut stream, method, path, &camo).await?;
+        serve_camouflage_http(&mut stream, method, path, &camo, peer).await?;
     } else {
         write_camouflage_status(&mut stream, 405, camouflage::NOT_FOUND_HTML).await?;
     }
@@ -184,10 +186,15 @@ async fn serve_camouflage_http<S: AsyncRead + AsyncWrite + Unpin>(
     method: &str,
     path: &str,
     camo: &CamouflageServeConfig,
+    peer: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
     if let Some(origin) = camo.reverse_proxy.as_deref() {
         if let Err(e) = forward_http_get(stream, method, path, origin).await {
-            tracing::warn!("camouflage reverse-proxy: {e:#}");
+            tracing::warn!(
+                target: "bibavpn_camouflage",
+                ?peer,
+                "camouflage reverse-proxy: {e:#}"
+            );
             let (st, body) = camouflage::html_ok_index();
             write_html_response(stream, method, st.as_u16(), &body).await?;
         }
@@ -382,4 +389,29 @@ Connection: close\r\n\
     }
     client_tls.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn guess_mime_common_extensions() {
+        assert!(guess_mime("html").contains("text/html"));
+        assert!(guess_mime("CSS").contains("text/css"));
+        assert_eq!(guess_mime("bin"), "application/octet-stream");
+    }
+
+    #[test]
+    fn safe_static_path_blocks_traversal() {
+        let base = std::env::temp_dir().join(format!("bibavpn_incoming_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("index.html"), b"ok").unwrap();
+        assert!(safe_static_path_under_base(&base, "/").is_some());
+        assert!(safe_static_path_under_base(&base, "/../etc/passwd").is_none());
+        assert!(safe_static_path_under_base(&base, "/subdir/../../outside").is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
 }

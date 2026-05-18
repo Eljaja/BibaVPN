@@ -137,6 +137,7 @@ pub async fn bridge_ws_tcp_mux_server<S>(
     pad_mode: PadMode,
     dummy_interval_secs: u64,
     server_out_timing: ServerWsOutTiming,
+    mux_connect_timeout: Duration,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -296,7 +297,7 @@ where
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 let remote = match tokio::time::timeout(
-                                    Duration::from_secs(10),
+                                    mux_connect_timeout,
                                     TcpStream::connect((host.as_str(), port)),
                                 )
                                 .await
@@ -322,7 +323,7 @@ where
                                         return;
                                     }
                                     Err(_) => {
-                                        error!("mux connect {host}:{port}: timeout 10s");
+                                        error!("mux connect {host}:{port}: timeout {:?}", mux_connect_timeout);
                                         streams_open.lock().await.remove(&sid);
                                         let _ = mux_server_send_record(
                                             &ws_tx,
@@ -453,7 +454,11 @@ where
                                 let n =
                                     UNKNOWN_MUX_DATA_LOG.fetch_add(1, Ordering::Relaxed);
                                 if n < 8 || n % 64 == 0 {
-                                    warn!("mux: DATA for unknown stream {sid} (sending RST)");
+                                    warn!(
+                                        target: "bibavpn_mux",
+                                        stream_id = sid,
+                                        "mux: DATA for unknown stream (sending RST)"
+                                    );
                                 }
                                 let _ = mux_server_send_record(
                                     &ws_out_srv,
@@ -475,7 +480,7 @@ where
                             streams.lock().await.remove(&sid);
                         }
                         MUX_FLAG_WIN => {}
-                        _ => warn!("mux: unknown flags {flags:#x}"),
+                        _ => warn!(target: "bibavpn_mux", "mux: unknown flags {flags:#x}"),
                     }
                 }
                 Message::Ping(p) => {
@@ -941,28 +946,89 @@ async fn mux_client_reader_loop<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    use crate::log_ratelimit::LogEvery;
+    static DECODE_WARN: LogEvery = LogEvery::new(8, 64);
+    let mut decode_failures: u32 = 0;
     while let Some(m) = ws_rx.next().await {
         let Ok(m) = m else { break };
         match m {
             Message::Binary(b) => {
                 if b.len() > cfg.max_ws_binary.saturating_mul(4) {
+                    decode_failures = decode_failures.saturating_add(1);
+                    if DECODE_WARN.should_emit() {
+                        warn!(
+                            target: "bibavpn_mux",
+                            session_id,
+                            "mux client: dropping oversized binary frame"
+                        );
+                    }
+                    if decode_failures >= 24 {
+                        warn!(
+                            target: "bibavpn_mux",
+                            session_id,
+                            "mux client: too many bad frames; closing reader"
+                        );
+                        break;
+                    }
                     continue;
                 }
                 let raw = match &crypto {
                     Some(c) => match c.open_server_to_client(b.as_ref()) {
-                        Ok(x) => x,
-                        Err(_) => continue,
+                        Ok(x) => {
+                            decode_failures = 0;
+                            x
+                        }
+                        Err(e) => {
+                            decode_failures = decode_failures.saturating_add(1);
+                            if DECODE_WARN.should_emit() {
+                                warn!(
+                                    target: "bibavpn_mux",
+                                    session_id,
+                                    "mux client: AEAD decrypt failed: {e:#}"
+                                );
+                            }
+                            if decode_failures >= 24 {
+                                warn!(
+                                    target: "bibavpn_mux",
+                                    session_id,
+                                    "mux client: too many decrypt failures; closing reader"
+                                );
+                                break;
+                            }
+                            continue;
+                        }
                     },
-                    None => b.to_vec(),
+                    None => {
+                        decode_failures = 0;
+                        b.to_vec()
+                    }
                 };
                 let inner = match read_padded_frame_into(raw) {
                     Ok(x) => x,
-                    Err(_) => continue,
+                    Err(e) => {
+                        decode_failures = decode_failures.saturating_add(1);
+                        if DECODE_WARN.should_emit() {
+                            warn!(
+                                target: "bibavpn_mux",
+                                session_id,
+                                "mux client: bad padded frame: {e}"
+                            );
+                        }
+                        if decode_failures >= 24 {
+                            break;
+                        }
+                        continue;
+                    }
                 };
+                decode_failures = 0;
                 if inner.is_empty() {
                     continue;
                 }
                 let Ok((sid, flags, payload)) = decode_mux_record(&inner) else {
+                    decode_failures = decode_failures.saturating_add(1);
+                    if decode_failures >= 24 {
+                        break;
+                    }
                     continue;
                 };
                 if flags == MUX_FLAG_DATA && !payload.is_empty() {
@@ -980,6 +1046,13 @@ async fn mux_client_reader_loop<S>(
                             if tx.send(payload).await.is_err() {
                                 down.lock().await.remove(&sid);
                             }
+                        } else if !payload.is_empty() {
+                            tracing::debug!(
+                                target: "bibavpn_mux",
+                                stream_id = sid,
+                                session_id,
+                                "mux client: DATA for unknown stream (dropping)"
+                            );
                         }
                     }
                     MUX_FLAG_CLOSE | MUX_FLAG_RST => {
@@ -1225,5 +1298,42 @@ mod pick_tests {
             out.push(rr_index(&next, n));
         }
         assert_eq!(out, vec![0, 1, 2, 0, 1, 2, 0, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod open_target_tests {
+    use super::*;
+
+    #[test]
+    fn mux_open_target_domain_ipv4_ipv6() {
+        for (host, port) in [
+            ("example.com", 443u16),
+            ("127.0.0.1", 8080),
+            ("::1", 8443),
+            ("2001:db8::53", 53),
+        ] {
+            let pl = encode_mux_open_target(host, port).unwrap();
+            let (h, p) = decode_mux_open_target(&pl).unwrap();
+            assert_eq!(h, host, "host {host}");
+            assert_eq!(p, port, "port for {host}");
+        }
+    }
+
+    #[test]
+    fn mux_open_target_rejects_trailing() {
+        let mut pl = encode_mux_open_target("h", 1).unwrap();
+        pl.push(0);
+        assert!(decode_mux_open_target(&pl).is_err());
+    }
+
+    #[test]
+    fn mux_record_large_payload_roundtrip() {
+        let payload = vec![0xABu8; 4096];
+        let wire = encode_mux_record(99, MUX_FLAG_DATA, &payload);
+        let (sid, flags, out) = decode_mux_record(&wire).unwrap();
+        assert_eq!(sid, 99);
+        assert_eq!(flags, MUX_FLAG_DATA);
+        assert_eq!(out, payload);
     }
 }

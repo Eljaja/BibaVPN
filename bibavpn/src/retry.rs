@@ -81,3 +81,35 @@ pub(crate) async fn maybe_server_ack_and_rtt_mask(t: ServerWsOutTiming) {
         sleep(Duration::from_millis(ms)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_backoff_grows_and_caps() {
+        let d0 = outbound_backoff_duration(0);
+        assert!(d0.as_millis() >= 200);
+        assert!(d0.as_millis() <= 250);
+
+        let d5 = outbound_backoff_duration(5);
+        let d10 = outbound_backoff_duration(10);
+        let d20 = outbound_backoff_duration(20);
+        assert!(d5.as_millis() <= 30_000 + 7_500);
+        assert!(d10.as_millis() <= 30_000 + 7_500);
+        assert!(d20.as_millis() <= 30_000 + 7_500);
+        assert!(d10.as_millis() >= 30_000);
+        assert!(d20.as_millis() >= 30_000);
+    }
+
+    #[test]
+    fn ws_ping_period_respects_bounds() {
+        for _ in 0..32 {
+            let d = ws_ping_period_duration(25, 20);
+            let s = d.as_secs();
+            assert!((20..=30).contains(&s));
+        }
+        let d0 = ws_ping_period_duration(0, 50);
+        assert!(d0.as_secs() >= 1);
+    }
+}

@@ -28,6 +28,8 @@ pub mod tcp_mux;
 mod tcp_mux_roadmap;
 pub mod tls_util;
 pub mod reality;
+pub mod log_ratelimit;
+pub mod logging;
 pub mod server_limits;
 pub mod udp_mux;
 pub mod ws_auth;

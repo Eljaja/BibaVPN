@@ -39,3 +39,26 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 pub fn text_plain_ok(body: &str) -> (http::StatusCode, String) {
     (http::StatusCode::OK, body.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_reject_is_404_nginx() {
+        let r = ws_reject_not_found();
+        assert_eq!(r.status(), 404);
+        assert_eq!(
+            r.headers().get("Server").and_then(|v| v.to_str().ok()),
+            Some("nginx/1.24.0")
+        );
+        assert!(r.body().as_ref().is_some_and(|b| b.contains("404 Not Found")));
+    }
+
+    #[test]
+    fn html_ok_index_looks_like_nginx() {
+        let (code, body) = html_ok_index();
+        assert_eq!(code, http::StatusCode::OK);
+        assert!(body.contains("nginx/1.24.0"));
+    }
+}

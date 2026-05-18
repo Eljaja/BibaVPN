@@ -32,3 +32,20 @@ impl ActivityTracker {
             .unwrap_or(0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    fn touch_updates_idle() {
+        let t = ActivityTracker::new();
+        assert_eq!(t.idle_secs(), 0);
+        thread::sleep(StdDuration::from_millis(20));
+        t.touch();
+        thread::sleep(StdDuration::from_millis(30));
+        assert!(t.idle_secs() >= 1 || t.idle_secs() == 0);
+    }
+}

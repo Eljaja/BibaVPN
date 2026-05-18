@@ -643,4 +643,25 @@ mod tests {
         assert_eq!(priv_key.len(), 32);
         assert_eq!(pub_key.len(), 32);
     }
+
+    #[test]
+    fn short_id_allowed_empty_list_accepts_any() {
+        let id = [1u8; 8];
+        assert!(is_short_id_allowed(&id, &[]));
+    }
+
+    #[test]
+    fn short_id_allowed_wildcard_zeros() {
+        let id = [9u8; 8];
+        let allowed = [[0u8; 8]];
+        assert!(is_short_id_allowed(&id, &allowed));
+    }
+
+    #[test]
+    fn short_id_rejects_unknown_when_listed() {
+        let id = [1, 2, 3, 4, 5, 6, 7, 8];
+        let allowed = [[8, 7, 6, 5, 4, 3, 2, 1]];
+        assert!(!is_short_id_allowed(&id, &allowed));
+        assert!(is_short_id_allowed(&allowed[0], &allowed));
+    }
 }
