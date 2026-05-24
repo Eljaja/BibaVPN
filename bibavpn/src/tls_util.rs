@@ -113,6 +113,15 @@ fn read_certs(pem: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
+/// Parse PEM `CERTIFICATE` blocks (shared by rustls pin path and Boring `--pin-cert`).
+pub fn parse_pem_certificates(pem: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let certs = read_certs(pem)?;
+    if certs.is_empty() {
+        anyhow::bail!("pin-cert: no certificates in PEM");
+    }
+    Ok(certs)
+}
+
 fn read_key(pem: &[u8]) -> anyhow::Result<PrivateKeyDer<'static>> {
     let mut reader = BufReader::new(Cursor::new(pem));
     let items = rustls_pemfile::read_all(&mut reader)
@@ -270,13 +279,7 @@ pub fn client_tls_config(params: &ClientTlsParams) -> anyhow::Result<Arc<ClientC
 
     let pins: Option<Vec<CertificateDer<'static>>> = match &params.pinned_certs_pem {
         None => None,
-        Some(pem) => {
-            let v = read_certs(pem)?;
-            if v.is_empty() {
-                anyhow::bail!("pin-cert: no certificates in PEM");
-            }
-            Some(v)
-        }
+        Some(pem) => Some(parse_pem_certificates(pem)?),
     };
 
     match (&pins, params.profile.biba_id()) {

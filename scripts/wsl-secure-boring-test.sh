@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # WSL: build bibavpn with boring-tls, run unit tests, then two integration smokes:
 #  1) rustls + --pin-cert + strong token/PSK/proto (TLS verification to pinned leaf)
-#  2) --tls-stack boring + same secrets; for self-signed cert use --insecure (boring+pin not supported yet in code)
+#  2) --tls-stack boring + --pin-cert (pinned leaf verification via BoringSSL)
+#  3) --tls-stack boring + --insecure (lab fallback)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -77,8 +78,7 @@ kill "$CL_PID" 2>/dev/null || true
 wait "$CL_PID" 2>/dev/null || true
 sleep 1
 
-echo "=== Client B: --tls-stack boring + same secrets (self-signed → --insecure; pin unsupported with boring) ==="
-echo "    (see local_client: Boring + pin-cert is rejected until implemented)"
+echo "=== Client B: --tls-stack boring + --pin-cert (production path) ==="
 "$CLIENT_BIN" \
   --server "127.0.0.1:$PORT" \
   --sni localhost \
@@ -86,7 +86,7 @@ echo "    (see local_client: Boring + pin-cert is rejected until implemented)"
   --psk "$PSK" \
   --proto 3 \
   --proto-domain "$DOMAIN" \
-  --insecure \
+  --pin-cert "$CERT" \
   --tls-stack boring \
   --socks5 "$SOCKS_B" \
   --pad-mode adaptive \
@@ -100,9 +100,31 @@ echo
 kill "$CL_PID" 2>/dev/null || true
 wait "$CL_PID" 2>/dev/null || true
 
+echo "=== Client C: --tls-stack boring + --insecure (lab only) ==="
+"$CLIENT_BIN" \
+  --server "127.0.0.1:$PORT" \
+  --sni localhost \
+  --token "$TOKEN" \
+  --psk "$PSK" \
+  --proto 3 \
+  --proto-domain "$DOMAIN" \
+  --insecure \
+  --tls-stack boring \
+  --socks5 "127.0.0.1:21082" \
+  --pad-mode adaptive \
+  --max-pad 64 \
+  --decoy-max 0 \
+  &
+CL_PID=$!
+sleep 2
+curl -fsS --connect-timeout 12 --socks5-hostname "127.0.0.1:21082" http://example.com/ | head -c 100
+echo
+kill "$CL_PID" 2>/dev/null || true
+wait "$CL_PID" 2>/dev/null || true
+
 kill "$SRV_PID" 2>/dev/null || true
 wait "$SRV_PID" 2>/dev/null || true
 SRV_PID=
 
 echo ""
-echo "OK: unit tests + rustls+pin smoke + boring-stack smoke passed."
+echo "OK: unit tests + rustls+pin + boring+pin + boring smoke passed."

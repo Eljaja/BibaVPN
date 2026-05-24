@@ -68,7 +68,7 @@ pub fn log_client_transport_caps(opts: &LocalClientOptions) {
         tcp_fooling = ?opts.tcp_fooling,
         tls_fragment_requested = opts.tls_fragment,
         pin_cert_configured = pin,
-        "transport: desync/tcp-fooling are advisory in this build; tls-fragment on rustls is not applied; pin-cert uses rustls verifier when used"
+        "transport: desync/tcp-fooling are advisory; tls-fragment applies on boring stack; pin-cert works on rustls and boring"
     );
 
     if opts.desync_mode != DesyncMode::Off {
