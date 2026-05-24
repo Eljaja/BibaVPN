@@ -87,12 +87,21 @@ parallel decoy `--decoy-gets` (+ interval and paths), decoy presets in `stealth_
 `--server-ack-delay-*-ms`, `--rtt-mask-jitter-ms`, and optional `--ack-profile balanced|aggressive` when the explicit millisecond args are all zero
 (`ServerRttDefaults` in `stealth_v12.rs`). **Outer TLS engine:** `rustls` (default,
 `biba` cipher/ALPN hints) or **BoringSSL** (`cargo build -p bibavpn --features boring-tls`,
-client `--tls-stack boring`); **certificate pinning** is not supported on the
-Boring path yet. **Raw desync** (`desync.rs` — re-exports `effective_desync_mode` /
+client `--tls-stack boring`); **`--pin-cert`** works on **both** stacks (leaf DER match on
+Boring via `tls_boring.rs`). **Raw desync** (`desync.rs` — re-exports `effective_desync_mode` /
 `DesyncApplied` from `transport_capabilities.rs`): split / disorder / fake
 handshake are **mostly advisory** until raw-socket or external helpers (e.g.
 zapret) participate; see **[PROTOCOL.md](PROTOCOL.md)** / **[README.md](README.md)**
 for the operator story.
+
+**REALITY (WSS path):** optional front-domain mode — outer **TLS SNI** follows
+`reality_target` (e.g. `vk.com`), then **WSS upgrade**, then **X25519** binary frames on the
+WebSocket (`reality.rs`), then **plaintext** `MUX_OPEN` (no v3 PSK on that TCP path). This is
+**not** Xray-style TLS ClientHello stealing; see **[PROTOCOL.md — REALITY](PROTOCOL.md#reality-wss-path)**.
+Server: `--reality-target`, `--reality-private-key`, optional `--reality-short-ids` (SpiderX
+background fetch runs when REALITY is enabled). Client / invite: `reality_target`,
+`reality_public_key`, `reality_short_id`. Outer TLS may use **rustls** or **boring** (same as
+non-REALITY). Test: `cargo test -p bibavpn --test reality_handshake`.
 
 Typical traffic path (TCP, mux):
 
@@ -146,7 +155,8 @@ Full layout for `**apps/`** (desktop, Android, JNI crate, scripts): **[apps/AGEN
 | `bibavpn/src/ws_auth.rs`                            | Server waits for sealed `AUTH` (timeout, pre-`AUTH` junk/decrypt budgets via `PreAuthBudget` in `server_limits.rs`)   |
 | `bibavpn/src/tcp_mux.rs`                            | Mux wire format, client handle, server bridge, optional idle dummy, multi-WSS pool + RR                            |
 | `bibavpn/src/tcp_mux_roadmap.rs`                    | **Historical** one-WSS mux sketch; **current** implementation is `tcp_mux.rs` (doc-only module)                    |
-| `bibavpn/src/client_tls_stream.rs`, `tls_boring.rs` | `TlsStack` paths: `rustls` (default) vs `boring` (`--features boring-tls`); REALITY + Boring; Boring **max send fragment** when `--tls-fragment` |
+| `bibavpn/src/reality.rs`                              | WSS REALITY: X25519 exchange, SpiderX, `effective_tls_sni`, invite fields                     |
+| `bibavpn/src/client_tls_stream.rs`, `tls_boring.rs` | `TlsStack` paths: `rustls` (default) vs `boring` (`--features boring-tls`); REALITY + Boring; **`--pin-cert`** on both; Boring **`--tls-fragment`** via `SSL_CTX_set_max_send_fragment` |
 | `bibavpn/src/client_policy.rs`                      | TLS client label resolution: `fingerprint` → `tls_profile` → invite → `stealth` → default **Chrome 132+**          |
 | `bibavpn/src/stealth_v12.rs`                        | `StealthProfile` / presets (pad, jitter, decoys, idle threshold, server RTT defaults)                              |
 | `bibavpn/src/activity.rs`                           | Idle detection for idle-decoy scheduling                                                                           |
@@ -201,7 +211,9 @@ the mux record header when chunking TCP).
 - `--ws-host`, `--ws-origin`, `--ws-user-agent`, `--ws-accept-language`,
 `--ws-header` (repeatable `Name: value`)
 - `--early-ws-frames`, `--junk-frames`
-- `--pin-cert` (client) — incompatible with `--insecure`
+- `--pin-cert` (client) — incompatible with `--insecure`; supported on **rustls** and **boring** (`boring-tls` build)
+- `--reality-target`, `--reality-public-key`, `--reality-short-id` (client) — WSS REALITY front mode; invite JSON mirrors these fields
+- Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any; all-zero entry = wildcard), `--reality-server-names` (optional SNI allowlist; default = host from target)
 - `--ws-path` / server `--ws-path` — WebSocket path; token via `AUTH`
 (default `/ws`)
 - Client `--proto` (only `**3`** is supported) and `--proto-domain` (KDF label;
@@ -222,8 +234,8 @@ set `dummy_interval_secs`
 - `--idle-decoy-secs` — background HTTPS when mux idle (merged with preset;
 balanced/aggressive default **10 s** unless overridden)
 - `--tls-stack rustls|boring` — build with `cargo build -p bibavpn --features boring-tls`
-for Boring; `**--pin-cert` + Boring** is rejected
-- Client `--tls-fragment` — **Boring** path may lower max TLS record size via
+  for Boring; **`--pin-cert`** works on both stacks
+- Client `--tls-fragment` — **Boring** path lowers max TLS record size via
 `SSL_CTX_set_max_send_fragment` (`tls_boring.rs`); on **rustls** the client logs
 that record splitting is not implemented (`desync::note_tls_fragment_requested`)
 - **Server:** `--ack-profile balanced|aggressive` if explicit `--server-ack-`* /
@@ -349,7 +361,7 @@ BibaVPN:
 | `scripts/docker-smoke.sh`           | `docker compose up`, `curl` via SOCKS and HTTP proxy, `down`                                                                                                   |
 | `scripts/udp-socks-smoke.sh`        | TCP via SOCKS + UDP DNS over SOCKS                                                                                                                             |
 | `scripts/wsl-test.sh`               | Local smoke (plain / PSK) on WSL                                                                                                                               |
-| `scripts/wsl-secure-boring-test.sh` | WSL: `cargo test -p bibavpn --features boring-tls`, release build, then **rustls+pin** and **Boring+insecure** handshake smokes (openssl temp cert; strong token/PSK) |
+| `scripts/wsl-secure-boring-test.sh` | WSL: `cargo test -p bibavpn --features boring-tls`, release build, then **rustls+pin**, **boring+pin**, and **boring+insecure** smokes (openssl temp cert; strong token/PSK) |
 | `scripts/wsl-proto-v3-smoke.sh`     | WSL: local SOCKS + `curl` smoke (release binaries + `openssl`, `python3`, `fuser`; script name is legacy)                                                      |
 | `scripts/wsl-local-bench.sh`        | 64 MiB HTTP direct vs SOCKS+WSS throughput (run in WSL from repo root)                                                                                         |
 | `scripts/wsl-udp-socks-bench.sh`    | SOCKS UDP throughput bench on WSL                                                                                                                              |
@@ -403,8 +415,8 @@ cargo clippy -p bibavpn -- -D warnings   # рекомендуется перед
 - при правках UDP: `bash scripts/udp-socks-smoke.sh`
 - при правках Boring: `bash scripts/wsl-secure-boring-test.sh`
 
-Интеграционные тесты лежат в `bibavpn/tests/` (`smoke.rs`, `tunnel_integration.rs`);
-юнит-тесты — рядом с кодом в `bibavpn/src/**` (`#[cfg(test)]`).
+Интеграционные тесты лежат в `bibavpn/tests/` (`smoke.rs`, `tunnel_integration.rs`,
+`reality_handshake.rs`); юнит-тесты — рядом с кодом в `bibavpn/src/**` (`#[cfg(test)]`).
 
 - Unit and integration tests live alongside the code in `bibavpn/src/…` and
   `bibavpn/tests/`. Run the whole workspace with:
@@ -417,10 +429,10 @@ regressed at the TLS+WSS layer.
 release binaries — run it after changes to `crypto_layer.rs`, `protocol.rs`,
 or invite / CLI defaults.
 - `scripts/wsl-secure-boring-test.sh` runs **unit tests with `boring-tls`**, then
-two integration smokes: **rustls** + `--pin-cert` (pinned self-signed PEM),
-and **BoringSSL** + `--insecure` (self-signed; `boring`+`pin` is still
-rejected in `local_client`). Requires **WSL**, **OpenSSL**, **curl**; run from
-repo root: `bash scripts/wsl-secure-boring-test.sh`.
+  integration smokes: **rustls** + `--pin-cert`, **Boring** + `--pin-cert`, and
+  **Boring** + `--insecure` (lab). Requires **WSL**, **OpenSSL**, **curl**; run from
+  repo root: `bash scripts/wsl-secure-boring-test.sh`.
+- After REALITY changes: `cargo test -p bibavpn --test reality_handshake`.
 - `scripts/wsl-local-bench.sh` is a quick sanity check for throughput after  
 changes to `frame.rs`, `tcp_mux.rs`, or `ws_bridge.rs`.
 
@@ -430,8 +442,7 @@ changes to `frame.rs`, `tcp_mux.rs`, or `ws_bridge.rs`.
 `.gitignore`).
 - Treat PSK, token, and invite passphrase as **secrets**.
 - `--pin-cert` narrows trust; do not combine with `--insecure` on the
-client. **BoringSSL** (`--tls-stack boring`) does not support pinning in this
-build — the client rejects `--pin-cert` with that stack.
+client. **BoringSSL** (`--tls-stack boring`) supports `--pin-cert` when built with `boring-tls`.
 - Prefer **SSH keys** for `remote-deploy.sh`.
 - Do not embed real credentials in docs or examples.
 
@@ -448,12 +459,13 @@ This table tracks **PROTOCOL.md roadmap** items against what the **current tree*
 
 | Area                     | In the tree today                                                                                                                                                    | Still target / gaps (see PROTOCOL)                                                   |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| **TLS / fingerprint**    | `TlsClientProfile` labels; `--fingerprint` + `client_policy` merge; **Boring** behind `--features boring-tls` + `--tls-stack boring`; `rustls` default                   | Full GREASE / extension-order parity; `**--pin-cert` with Boring**; HTTP/2 transport |
+| **TLS / fingerprint**    | `TlsClientProfile` labels; `--fingerprint` + `client_policy` merge; **Boring** behind `--features boring-tls` + `--tls-stack boring`; **`--pin-cert` on Boring** (leaf DER match); `rustls` default                   | Full GREASE / extension-order parity; HTTP/2 transport |
 | **Record fragmentation** | Client `--tls-fragment` — **Boring** enforces via `SSL_CTX_set_max_send_fragment` (`tls_boring.rs`); **rustls** logs “not implemented” (`desync::note_tls_fragment_requested`) | Full CH + app-data split on both stacks if required                                  |
 | **RTT**                  | Server delayed ACK, `--rtt-mask-jitter-ms`, `--ack-profile` defaults; **1–4 WSS** + `TcpMuxSessionPool` RR (including REALITY)                                           | Broader “cross-layer” story + CI zapret/pcap (see spec)                              |
 | **Padding**              | `PadMode::Adaptive` + `stealth` / presets                                                                                                                                | Future spec may redefine burst heuristics / budgets                                                                                      |
 | **Jitter**               | Min/max MS on WS sends; preset merge                                                                                                                                     | Spec band (e.g. 5–25 ms) as product default                                          |
 | **Decoys**               | Parallel `--decoy-gets` + idle decoys (`--idle-decoy-secs`): same **TLS/WS fingerprint class** as tunnel (UA / `Accept-Language` / upgrade shape); decoy fields in presets (`stealth_v12.rs`) | Full `--decoy-mode browser` catalog (Referer parity, etc.) per spec                     |
+| **REALITY (WSS)**        | X25519 after WSS upgrade; pinned server pubkey in invite; auto **SNI** from `reality_target`; plaintext mux; SpiderX; **rustls** or **boring** outer TLS; test `reality_handshake.rs` | Xray TLS ClientHello relay / uTLS parity on REALITY path |
 | **Desync**               | `DesyncConfig` on wire + `desync` module (`effective_desync_mode` / `DesyncApplied`; operator notes in PROTOCOL/README) | Raw-socket / OS hook paths; privilege guards                                         |
 | **UI / JNI**             | `start_json_config` fields for new options where wired                                                                                                                   | Expose all toggles in Tauri + Android as they stabilize                              |
 

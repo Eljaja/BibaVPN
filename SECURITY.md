@@ -55,8 +55,8 @@ Out of scope:
   the first time you stand up a server. The examples in this repo are
   placeholders.
 - Use a real TLS certificate (Let's Encrypt behind a reverse proxy or
-  directly) or pin the leaf with `--pin-cert`. Do **not** ship `--insecure`
-  to end users.
+  directly) or pin the leaf with `--pin-cert` on **rustls or boring** (`--features boring-tls`).
+  Do **not** ship `--insecure` to end users.
 - Keep the Docker image up to date (`docker compose build --pull`).
 - Do not commit `server.txt`, `.env*`, `*.pem`, `*.key` — the repo's
   `.gitignore` already covers these.

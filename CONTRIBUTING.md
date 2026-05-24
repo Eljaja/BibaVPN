@@ -47,6 +47,9 @@ cd .. && cargo tauri dev
    - `scripts/docker-smoke.sh` — compose build + SOCKS / HTTP CONNECT curl
    - `scripts/udp-socks-smoke.sh` — TCP via SOCKS + UDP DNS over SOCKS
    - `scripts/wsl-local-bench.sh` — 64 MiB throughput sanity (WSL)
+   - `cargo test -p bibavpn --features boring-tls` — Boring + pin unit tests (after TLS changes)
+   - `cargo test -p bibavpn --test reality_handshake` — REALITY WSS handshake (after `reality.rs` changes)
+   - `bash scripts/wsl-secure-boring-test.sh` — Boring integration smokes (WSL)
 4. Update **[PROTOCOL.md](PROTOCOL.md)** if you change anything on the wire.
    Wire-format changes must land **client and server in the same PR**.
 5. Update **[AGENTS.md](AGENTS.md)** if you add / rename a CLI flag, script

@@ -305,7 +305,7 @@ padded frames.
 
 The server can print a **single-line encrypted config** after it binds: JSON (`InviteV1`) sealed with **ChaCha20-Poly1305** and a key derived from a **passphrase** (BLAKE3 KDF). Clients and Android JNI can consume the same blob instead of spelling out `--server`, `--token`, and matching tunnel options by hand.
 
-Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`proto_domain`** (omit to let the client default the KDF label to **SNI** — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, and other tunnel fields. **`--print-invite-uri`** on the server embeds the same defaults as hand-written JSON. **`bibavpn-mint-invite`** uses environment variables (`INVITE_PROTO`, `INVITE_PROTO_DOMAIN`, …) with the same v3-first defaults. **Do not** paste real invites or passphrases into tickets or public logs.
+Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`proto_domain`** (omit to let the client default the KDF label to **SNI** — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, optional **`tls_stack`** (`rustls` | `boring`), optional **`pin_cert_pem`**, optional REALITY fields (`reality_target`, `reality_public_key`, `reality_short_id`), and other tunnel fields. **`--print-invite-uri`** on the server embeds the same defaults as hand-written JSON. **`bibavpn-mint-invite`** uses environment variables (`INVITE_PROTO`, `INVITE_PROTO_DOMAIN`, …) with the same v3-first defaults. **Do not** paste real invites or passphrases into tickets or public logs.
 
 **Server** (stdout = only the URI; passphrase must stay secret — share out-of-band):
 
@@ -339,6 +339,48 @@ Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`pro
 - **Control:** single-byte opcodes `0x01`…`0x04`, `0x10`/`0x11` **inside AEAD** after the handshake.
 - **UDP datagrams:** inner **`0x05` / `0x06`** records with SOCKS-like addressing.
 
+## REALITY (WSS path)
+
+BibaVPN implements a **REALITY-style front** on the **WebSocket transport**, not inside the TLS
+ClientHello the way [Xray REALITY](https://github.com/XTLS/REALITY) does. Use this when you want
+the **outer TLS SNI** and HTTP `Host` to match an allowlisted front domain while TCP still lands
+on your VPS.
+
+**Session order (TCP mux + REALITY):**
+
+1. Client → VPS: **TLS** (SNI = front domain from `reality_target`) + **WSS** upgrade on `--ws-path`.
+2. **REALITY binary exchange** on the WebSocket (before v3 PSK on this path):
+   - Client → server: `[version:1][client_ephemeral_x25519:32][short_id:8]`
+   - Server → client: `[version:1][server_long_term_x25519:32]` (must match invite `reality_public_key`)
+3. Client sends plaintext **`MUX_OPEN`**; mux streams carry target TCP (no v3 HELLO/AUTH on this path).
+
+**Server CLI**
+
+```bash
+bibavpn-server \
+  --reality-target 'vk.com:443' \
+  --reality-private-key "$REALITY_PRIV_B64" \
+  --reality-short-ids '0123456789abcdef'   # optional; omit = any; 000…000 = wildcard
+```
+
+Generate keys in Rust (`RealityServerConfig::generate_keys()`), or from any X25519 tool; publish
+the **public** key and a **short ID** in the client invite. **SpiderX** (background GETs to the
+target) starts automatically when REALITY is enabled — warms camouflage against the front host.
+
+**Client / invite fields**
+
+| Field | Meaning |
+| ----- | ------- |
+| `reality_target` | Front reference, e.g. `vk.com:443` — sets outer **SNI** unless `--sni` overrides |
+| `reality_public_key` | Base64, 32-byte X25519 public key (pin against MITM) |
+| `reality_short_id` | 16 hex digits (8 bytes); must match server allowlist when configured |
+
+**Build note:** outer TLS may use **`--tls-stack rustls`** (default) or **`boring`** (build with
+`--features boring-tls`). **`--pin-cert`** works on both. REALITY does **not** replace VPS IP
+allowlists — it aligns **SNI / handshake behaviour**, not routing to the front site's IP.
+
+**Tests:** `cargo test -p bibavpn --test reality_handshake` (WSS + X25519 roundtrip).
+
 ## BibaV2.1 transport knobs
 
 These options shape TLS/WebSocket timing and framing; they apply on top of the v3 tunnel.
@@ -351,8 +393,8 @@ These options shape TLS/WebSocket timing and framing; they apply on top of the v
 - `--udp-max-pad`, `--udp-max-ws-binary`, `--udp-mux-reply-timeout-secs`
 - `--ws-host`, `--ws-origin`, `--ws-user-agent`, `--ws-accept-language`, `--ws-header`
 - `--early-ws-frames`, `--junk-frames`
-- `--pin-cert` (client) — incompatible with `--insecure`; **not** supported on the
-  **BoringSSL** path (client rejects the combination)
+- `--pin-cert` (client) — incompatible with `--insecure`; leaf PEM pinning on **rustls** and
+  **boring** (`boring-tls` build)
 - `--tls-stack rustls|boring` (client) — build with `cargo build -p bibavpn --features boring-tls` for Boring
 - `--tls-fragment` — record-size hint where the TLS stack supports it (see `tls_util`)
 - `--ws-path` — WebSocket path; token via sealed **AUTH** (default `/ws`)
@@ -397,9 +439,10 @@ Rough mapping from the P0 / P1 bullets below to the **current tree** (not an
 exhaustive changelog):
 
 - **P0 TLS:** optional **BoringSSL** build (`boring-tls` + `--tls-stack boring`)
-  for byte-level `SslConnector` control; **`rustls` remains the default** and does
-  not provide full JA3 parity by itself. **`--pin-cert` + Boring** is rejected
-  until implemented.
+  for record-size control and production **`--pin-cert`** on the Boring path;
+  **`rustls` remains the default** and does not provide full JA3 parity by itself.
+- **P0 REALITY (WSS):** X25519 exchange after WSS; pinned pubkey in invite; auto SNI from
+  `reality_target`; integration test `reality_handshake.rs`. **Not** Xray TLS-hook REALITY.
 - **P0 RTT:** **delayed ACK** and **RTT mask jitter** on the server; **1–4 WSS** +
   **round-robin** in `tcp_mux` (v3 and REALITY both use the same pool pattern).
 - **P0 padding / jitter:** `PadMode::Adaptive`; WebSocket **min/max ms** jitter;

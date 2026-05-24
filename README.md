@@ -96,9 +96,11 @@ the AEAD plaintext, not legacy ASCII magics.
 Ping with jitter, binary size cap, **per-frame WS jitter (min–max ms)**,
 configurable upgrade headers per **TLS client profile** (default **Chrome
 132+** when nothing else is selected), early-session noise, **TLS** via **rustls**
-(default) or **BoringSSL** (`--features boring-tls`, client `--tls-stack boring`
-— `**--pin-cert` + Boring** is not supported yet), TLS leaf pinning on **rustls**
-(`--pin-cert`).
+(default) or **BoringSSL** (`--features boring-tls`, client `--tls-stack boring`;
+**`--pin-cert`** on both stacks), TLS leaf pinning (`--pin-cert`).
+- **REALITY (WSS):** optional front-domain mode — TLS **SNI** from `reality_target`,
+  X25519 proof-of-server after WebSocket upgrade, then plaintext TCP mux (see
+  [PROTOCOL.md — REALITY](PROTOCOL.md#reality-wss-path)).
 - **TCP mux** over **1–4** outer WSS sessions (round-robin when `--ws-parallel` is
 2–4) + a separate **single** WSS for UDP mux.
 - **Biba extras:** optional `--stealth-profile`, `fingerprint` / `tls_profile`
@@ -302,6 +304,16 @@ cargo build --release -p bibavpn --bin bibavpn-client
 cargo test --workspace
 ```
 
+**BoringSSL client path** (optional; needs `cmake` / `nasm` on some platforms):
+
+```bash
+cargo build --release -p bibavpn --features boring-tls --bin bibavpn-client
+cargo test -p bibavpn --features boring-tls
+bash scripts/wsl-secure-boring-test.sh   # WSL: pin + boring integration smokes
+```
+
+Use `--tls-stack boring` on the client. **`--pin-cert`** is supported on both rustls and boring.
+
 A `rust-toolchain.toml` pins the compiler version so CI and local builds stay
 reproducible. Docker images use the same or a newer toolchain.
 
@@ -332,8 +344,8 @@ features land incrementally on top of v3; check the crate version and
 |                       | **BibaVPN (1.2.x, v3 wire)**                     | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (e.g. Xray)       |
 | --------------------- | ------------------------------------------------ | --------------------------------------------- | ----------------------------------------- | ----------------------------- |
 | **Primary transport** | TLS + WSS, PSK inner                             | TLS + WSS, generic                            | QUIC                                      | TLS fronting / proxy protocol |
-| **DPI focus**         | Explicit (fingerprints, timing, padding, decoys) | General tunneling                             | Brutal throughput / quic                  | Site mimicry                  |
-| **Typical role**      | Single small VPS, SOCKS/CONNECT                  | Port forwarding / WSS                         | High perf                                 | Domain fronting style         |
+| **DPI focus**         | Explicit (fingerprints, timing, padding, decoys, WSS REALITY) | General tunneling                             | Brutal throughput / quic                  | Site mimicry (TLS hook)       |
+| **Typical role**      | Single small VPS, SOCKS/CONNECT                  | Port forwarding / WSS                         | High perf                                 | Domain / cert fronting style  |
 | **Ecosystem**         | Rust + mobile/desktop in-repo                    | many                                          | Go server                                 | V2Ray / Xray family           |
 
 
@@ -360,7 +372,11 @@ the **SNI** when the client leaves `--proto-domain` empty.
 - **Camouflage on the TLS port (server):** `--camouflage-dir <path>` or
 `--camouflage-url http://…`.
 - **TLS trust (client):** real CA by default, `--pin-cert <pem>` to pin the
-leaf, `--insecure` **lab only**.
+leaf on **rustls or boring**, `--insecure` **lab only**.
+- **REALITY (optional):** server `--reality-target`, `--reality-private-key`;
+  client / invite `reality_target`, `reality_public_key`, `reality_short_id`.
+  When REALITY is on, outer **SNI** defaults to the front host from `reality_target`
+  (e.g. `vk.com:443` → SNI `vk.com`); TCP still connects to your VPS `--server` address.
 
 Never put secrets in the URL: the token is carried in the **v3 sealed AUTH**
 opcode after HELLO/ACK, and the WebSocket path (`--ws-path`, default `/ws`) does

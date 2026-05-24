@@ -80,6 +80,15 @@ bash apps/scripts/build-ios-ipa.sh
 
 Включите App Group `group.dev.bibavpn.desktop` и **Personal VPN** для основного target; bundle id extension: `dev.bibavpn.desktop.BibaVpnTunnel`.
 
+## JNI / JSON config
+
+Mobile apps call `local_client_options_from_json_str` in `bibavpn` (`start_json_config.rs`).
+Supported JSON fields mirror CLI flags where wired — including `tls_stack` (`rustls` | `boring`),
+`pin_cert_pem`, and REALITY invite fields when present in the decrypted invite. **Boring** requires
+the native library to be built with `--features boring-tls` (`boring_tls_available` in Tauri).
+
+See root **[AGENTS.md](../AGENTS.md)** for REALITY and Boring operator notes.
+
 ## Environment (WSL / Linux)
 
 - `apps/scripts/wsl-android-env.sh` — NDK linkers on `PATH`; source from `~/.bashrc`
