@@ -215,7 +215,7 @@ fn cache_is_fresh(state: &CacheState) -> bool {
 /// Load presets from memory, disk, or network (in that order when stale).
 pub fn ensure_loaded(force_refresh: bool) -> Result<Vec<BypassPresetInfo>, String> {
     let url = bypass_domains_url().ok_or_else(|| {
-        "BIBA_BYPASS_DOMAINS_URL не задан (CI secret или local .env)".into()
+        "BIBA_BYPASS_DOMAINS_URL не задан (CI secret или local .env)".to_string()
     })?;
 
     {
