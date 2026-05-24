@@ -1,10 +1,14 @@
-//! REALITY protocol implementation for BibaVPN
-//! Based on: https://github.com/XTLS/REALITY
+//! REALITY-style front authentication for BibaVPN (WSS path).
 //!
-//! REALITY is a protocol that "steals" TLS from a target website.
-//! The server relays TLS handshake to a target (e.g., vk.com:443)
-//! and the client receives the REAL certificate from that target.
-//! To DPI, the traffic looks like normal HTTPS to the target website.
+//! BibaVPN runs REALITY **after** the outer TLS + WebSocket upgrade (unlike Xray, which hooks
+//! TLS ClientHello). Flow:
+//!
+//! 1. Client opens TLS to the VPS with **SNI = front domain** (`reality_target`, e.g. `vk.com`).
+//! 2. Standard WSS upgrade on `--ws-path`.
+//! 3. Binary REALITY frames: X25519 ephemeral + short ID → server long-term pubkey (pinned in invite).
+//! 4. Plaintext mux (`MUX_OPEN`) or v3 PSK tunnel follows.
+//!
+//! SpiderX background fetches keep server-side camouflage warm against the REALITY target.
 
 use std::sync::Arc;
 
@@ -21,53 +25,52 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{info, warn};
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-
-/// REALITY protocol magic bytes
+/// REALITY protocol magic bytes (reserved for future wire extensions).
 pub const REALITY_MAGIC: &[u8] = b"REAL1";
 pub const REALITY_VERSION: u8 = 1;
 
 /// REALITY server configuration
 #[derive(Debug, Clone)]
 pub struct RealityServerConfig {
-    /// Target website to steal TLS from (e.g., "vk.com:443")
+    /// Target website for SpiderX / operator reference (e.g., "vk.com:443")
     pub target: String,
-    /// Accepted server names (SNI) - must include target's SNI
+    /// Accepted TLS SNI / Host values for REALITY clients
     pub server_names: Vec<String>,
     /// Server's private key (X25519)
     pub private_key: [u8; 32],
-    /// Short IDs for client identification (8 bytes each)
+    /// Short IDs for client identification (8 bytes each); empty = any; all-zero entry = wildcard
     pub short_ids: Vec<[u8; 8]>,
-    /// Minimum client version (e.g., "1.0.0")
     pub min_client_ver: Option<String>,
-    /// Maximum client version
     pub max_client_ver: Option<String>,
-    /// Maximum time difference in milliseconds
     pub max_time_diff: u64,
 }
 
 impl RealityServerConfig {
-    /// Generate new X25519 keypair
+    /// Generate new X25519 keypair `(private, public)`.
     pub fn generate_keys() -> ([u8; 32], [u8; 32]) {
         let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public = PublicKey::from(&secret);
         (secret.to_bytes(), public.to_bytes())
     }
 
-    /// Get public key as hex string (for client config)
-    pub fn public_key_hex(&self) -> String {
-        let secret = StaticSecret::from(self.private_key);
-        let public = PublicKey::from(&secret);
-        hex::encode(public.to_bytes())
+    /// Long-term public key bytes for client invite pinning.
+    pub fn public_key_from_private(private_key: &[u8; 32]) -> [u8; 32] {
+        let secret = StaticSecret::from(*private_key);
+        PublicKey::from(&secret).to_bytes()
     }
 
-    /// Generate short ID from public key (first 8 bytes)
+    /// Get public key as hex string (for client config)
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(Self::public_key_from_private(&self.private_key))
+    }
+
+    /// Default short ID: first 8 bytes of public key (Xray-style convenience).
     pub fn generate_short_id(&self) -> [u8; 8] {
-        let secret = StaticSecret::from(self.private_key);
-        let public = PublicKey::from(&secret);
+        let pub_key = Self::public_key_from_private(&self.private_key);
         let mut sid = [0u8; 8];
-        sid.copy_from_slice(&public.to_bytes()[..8]);
+        sid.copy_from_slice(&pub_key[..8]);
         sid
     }
 }
@@ -75,19 +78,14 @@ impl RealityServerConfig {
 /// REALITY client configuration
 #[derive(Debug, Clone)]
 pub struct RealityClientConfig {
-    /// Server's public key (from server's private key)
     pub server_public_key: [u8; 32],
-    /// One of server's allowed server names
     pub server_name: String,
-    /// One of server's short IDs
     pub short_id: [u8; 8],
-    /// Target website (for SpiderX crawler)
     pub spider_path: String,
-    /// Client TLS fingerprint
     pub fingerprint: TlsFingerprint,
 }
 
-/// TLS fingerprint to use
+/// TLS fingerprint to use (outer WSS path; Boring/rustls profile elsewhere).
 #[derive(Debug, Clone, Copy, Default)]
 pub enum TlsFingerprint {
     #[default]
@@ -108,67 +106,12 @@ impl TlsFingerprint {
     }
 }
 
-/// Certificate verification result
-#[derive(Debug)]
-pub enum CertVerifyResult {
-    /// Temporary trusted certificate (REALITY working)
-    TemporaryTrusted,
-    /// Real certificate from target (need SpiderX crawl)
-    RealCertificate,
-    /// Invalid certificate
-    Invalid,
-}
-
-/// REALITY TLS server that forwards to target
-#[allow(dead_code)]
-pub struct RealityTlsServer {
-    target: String,
-    server_names: Vec<String>,
-    private_key: [u8; 32],
-    short_ids: Vec<[u8; 8]>,
-}
-
-impl RealityTlsServer {
-    pub fn new(config: RealityServerConfig) -> Self {
-        Self {
-            target: config.target,
-            server_names: config.server_names,
-            private_key: config.private_key,
-            short_ids: config.short_ids,
-        }
-    }
-
-    /// Handle incoming TLS connection and forward to target
-    pub async fn handle_connection<S>(&self, _stream: S) -> anyhow::Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        // Parse target address
-        let (target_host, target_port) = parse_target(&self.target)?;
-        
-        // Connect to target
-        let target_addr = format!("{}:{}", target_host, target_port);
-        let target_stream = TcpStream::connect(&target_addr)
-            .await
-            .context("connect to target")?;
-
-        // Create TLS connector to target
-        let connector = create_tls_connector(&target_host)?;
-        
-        // Do TLS handshake with target
-        let sn = ServerName::try_from(target_host.clone())?;
-        let _target_tls = connector
-            .connect(sn, target_stream)
-            .await
-            .context("TLS handshake with target")?;
-
-        // Now we have a stream that looks like REAL TLS to target
-        // The client will receive the REAL certificate from target
-        
-        // For now, just forward data
-        // In full implementation, we'd bridge this to the client WebSocket
-        Ok(())
-    }
+/// SNI for the outer TLS layer when REALITY is enabled: front domain from `target`.
+pub fn effective_tls_sni(configured_sni: &str, reality_target: Option<&str>) -> String {
+    reality_target
+        .map(extract_sni)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| configured_sni.to_string())
 }
 
 /// Parse target string like "vk.com:443" into host and port
@@ -182,21 +125,20 @@ pub fn parse_target(target: &str) -> anyhow::Result<(String, u16)> {
     Ok((host, port))
 }
 
-/// Create TLS connector for target
+/// Create TLS connector for outbound SpiderX fetches (verification disabled; lab fetch only).
 pub fn create_tls_connector(_server_name: &str) -> anyhow::Result<TlsConnector> {
     let config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
+        .with_custom_certificate_verifier(Arc::new(SpiderxInsecureVerifier))
         .with_no_client_auth();
 
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-/// Insecure verifier - we verify based on REALITY logic, not standard TLS
 #[derive(Debug)]
-struct InsecureVerifier;
+struct SpiderxInsecureVerifier;
 
-impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
+impl rustls::client::danger::ServerCertVerifier for SpiderxInsecureVerifier {
     fn verify_server_cert(
         &self,
         _end_entity: &CertificateDer,
@@ -205,8 +147,6 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // In REALITY, we accept any certificate
-        // The real verification happens at a different layer
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -231,121 +171,29 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         vec![
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
             rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
             rustls::SignatureScheme::ED25519,
         ]
     }
 }
 
-/// REALITY Session - holds state for one client connection
-#[allow(dead_code)]
-pub struct RealitySession {
-    /// Server private key
-    private_key: [u8; 32],
-    /// Target to forward to (e.g., "vk.com:443")
-    target: String,
-    /// Allowed server names
-    server_names: Vec<String>,
-    /// Short IDs for clients
-    short_ids: Vec<[u8; 8]>,
-    /// Session key derived from key exchange
-    session_key: Option<[u8; 32]>,
-    /// Client's short ID
-    client_short_id: Option<[u8; 8]>,
-    /// Max padding
-    max_pad: u8,
-    /// Decoy max
-    decoy_max: u8,
-}
-
-impl RealitySession {
-    pub fn new(config: &RealityServerConfig, max_pad: u8, decoy_max: u8) -> Self {
-        Self {
-            private_key: config.private_key,
-            target: config.target.clone(),
-            server_names: config.server_names.clone(),
-            short_ids: config.short_ids.clone(),
-            session_key: None,
-            client_short_id: None,
-            max_pad,
-            decoy_max,
-        }
-    }
-
-    /// Perform REALITY key exchange with client
-    pub async fn handshake<S>(
-        &mut self,
-        ws: &mut WebSocketStream<S>,
-    ) -> anyhow::Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
-    {
-        // Wait for client HELLO with short ID and public key
-        let msg = match ws.next().await {
-            Some(Ok(Message::Binary(b))) => b,
-            Some(Ok(_)) => bail!("expected binary REALITY HELLO"),
-            Some(Err(e)) => Err(e).context("websocket recv")?,
-            None => bail!("ws closed before REALITY HELLO"),
-        };
-
-        if msg.len() < 1 + 32 + 8 {
-            bail!("short REALITY HELLO");
-        }
-
-        // Parse: [version:1][client_pubkey:32][short_id:8][...padding]
-        let version = msg[0];
-        if version != REALITY_VERSION {
-            bail!("unsupported REALITY version: {}", version);
-        }
-
-        let client_pubkey: [u8; 32] = msg[1..33].try_into().unwrap();
-        let mut short_id = [0u8; 8];
-        short_id.copy_from_slice(&msg[33..41]);
-
-        // Verify short_id is in allowed list
-        if !self.short_ids.is_empty() 
-            && !self.short_ids.iter().any(|s| s == &short_id)
-            && !self.short_ids.iter().any(|s| s.iter().all(|&b| b == 0)) {
-            bail!("invalid short ID");
-        }
-
-        self.client_short_id = Some(short_id);
-
-        // Perform X25519 key exchange
-        let server_secret = StaticSecret::from(self.private_key);
-        let client_public = PublicKey::try_from(client_pubkey)
-            .map_err(|_| anyhow::anyhow!("invalid REALITY client public key"))?;
-        let shared_secret = server_secret.diffie_hellman(&client_public);
-        
-        let mut session_key = [0u8; 32];
-        session_key.copy_from_slice(shared_secret.as_bytes());
-        self.session_key = Some(session_key);
-
-        // Send SERVER HELLO: public key of configured long-term secret (must match invite pin).
-        let response = server_hello_from_private(&self.private_key);
-        ws.send(Message::Binary(Bytes::from(response)))
-            .await
-            .context("send REALITY SERVER_HELLO")?;
-
-        Ok(())
-    }
-}
-
 /// Wire bytes for REALITY SERVER_HELLO: `[version][server_x25519_pubkey:32]`.
 pub fn server_hello_from_private(private_key: &[u8; 32]) -> Vec<u8> {
-    let server_secret = StaticSecret::from(*private_key);
-    let server_pub = PublicKey::from(&server_secret);
+    let server_pub = RealityServerConfig::public_key_from_private(private_key);
     let mut response = Vec::with_capacity(1 + 32);
     response.push(REALITY_VERSION);
-    response.extend_from_slice(server_pub.as_bytes());
+    response.extend_from_slice(&server_pub);
     response
+}
+
+fn validate_short_id(short_id: &[u8; 8], cfg: &RealityServerConfig) -> anyhow::Result<()> {
+    if is_short_id_allowed(short_id, &cfg.short_ids) {
+        return Ok(());
+    }
+    bail!(
+        "REALITY: short ID {:02x?} not in server allowlist (configure --reality-short-id / invite reality_short_id)",
+        &short_id[..4]
+    );
 }
 
 /// Server-side REALITY X25519 exchange: validate client HELLO, reply with pinned pubkey from `cfg.private_key`.
@@ -380,12 +228,7 @@ where
         let mut short_id = [0u8; 8];
         short_id.copy_from_slice(&msg[33..41]);
 
-        if !cfg.short_ids.is_empty()
-            && !cfg.short_ids.iter().any(|s| s == &short_id)
-            && !cfg.short_ids.iter().any(|s| s.iter().all(|&b| b == 0))
-        {
-            bail!("invalid short ID");
-        }
+        validate_short_id(&short_id, cfg)?;
 
         let server_secret = StaticSecret::from(cfg.private_key);
         let client_public = PublicKey::try_from(client_pubkey)
@@ -400,7 +243,7 @@ where
     }
 }
 
-/// REALITY client connection
+/// REALITY client connection (standalone helper; main client uses `reality_client_exchange_verify`).
 pub async fn connect_reality_client(
     server_addr: &str,
     config: &RealityClientConfig,
@@ -451,7 +294,7 @@ pub async fn connect_reality_client(
     Ok(ws)
 }
 
-/// Encode REALITY client HELLO
+/// Encode REALITY client HELLO: `[version][ephemeral_pubkey:32][short_id:8]`.
 pub fn encode_client_hello(short_id: &[u8; 8], client_pubkey: &[u8; 32]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(1 + 32 + 8);
     msg.push(REALITY_VERSION);
@@ -460,7 +303,7 @@ pub fn encode_client_hello(short_id: &[u8; 8], client_pubkey: &[u8; 32]) -> Vec<
     msg
 }
 
-/// Client REALITY HELLO + verify server pubkey (X25519 ephemeral, same flow as `local_client::reality_client_handshake`).
+/// Client REALITY HELLO + verify server pubkey (X25519 ephemeral).
 pub async fn reality_client_exchange_verify<S>(
     ws: &mut WebSocketStream<S>,
     expected_server_pubkey: &[u8; 32],
@@ -469,34 +312,40 @@ pub async fn reality_client_exchange_verify<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    use rand::rngs::OsRng;
-    use x25519_dalek::{EphemeralSecret, PublicKey};
-
-    let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+    let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
     let client_hello = encode_client_hello(short_id, ephemeral_public.as_bytes());
     ws.send(Message::Binary(Bytes::from(client_hello)))
         .await
         .context("send REALITY client hello")?;
 
-    let msg = match ws.next().await {
-        Some(Ok(Message::Binary(b))) => b,
-        Some(Ok(_)) => bail!("expected binary server hello"),
-        Some(Err(e)) => Err(e).context("websocket recv")?,
-        None => bail!("server closed during REALITY handshake"),
-    };
-    let server_pubkey = decode_server_hello(&msg)?;
-    if server_pubkey != *expected_server_pubkey {
-        bail!("REALITY: server public key mismatch (possible MITM)");
+    loop {
+        let msg = match ws.next().await {
+            Some(Ok(Message::Binary(b))) => b,
+            Some(Ok(Message::Ping(p))) => {
+                ws.send(Message::Pong(p))
+                    .await
+                    .context("REALITY client pong")?;
+                continue;
+            }
+            Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(_)) => bail!("expected binary server hello"),
+            Some(Err(e)) => Err(e).context("websocket recv")?,
+            None => bail!("server closed during REALITY handshake"),
+        };
+        let server_pubkey = decode_server_hello(&msg)?;
+        if server_pubkey != *expected_server_pubkey {
+            bail!("REALITY: server public key mismatch (possible MITM)");
+        }
+        let server_public = PublicKey::from(server_pubkey);
+        let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+        let mut session_key = [0u8; 32];
+        session_key.copy_from_slice(shared_secret.as_bytes());
+        return Ok(session_key);
     }
-    let server_public = PublicKey::from(server_pubkey);
-    let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
-    let mut session_key = [0u8; 32];
-    session_key.copy_from_slice(shared_secret.as_bytes());
-    Ok(session_key)
 }
 
-/// Decode REALITY SERVER HELLO
+/// Decode REALITY SERVER_HELLO
 pub fn decode_server_hello(data: &[u8]) -> anyhow::Result<[u8; 32]> {
     if data.len() < 1 + 32 {
         bail!("short SERVER_HELLO");
@@ -509,15 +358,11 @@ pub fn decode_server_hello(data: &[u8]) -> anyhow::Result<[u8; 32]> {
     Ok(pubkey)
 }
 
-/// SpiderX: Fetch content from target to simulate real browser behavior
-/// This makes traffic look more like normal HTTPS browsing
+/// SpiderX: fetch a page from the REALITY target (server-side cache warm-up).
 pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u8>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let (host, port) = parse_target(target)?;
     let addr = format!("{}:{}", host, port);
 
-    // Create simple TLS connector
     let connector = create_tls_connector(&host)?;
     let tcp = TcpStream::connect(&addr).await.context("connect to target")?;
     let sn = ServerName::try_from(host.clone())?;
@@ -525,7 +370,6 @@ pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u
 
     let (mut read, mut write) = tokio::io::split(tls);
 
-    // Build HTTP request for a common path
     let path = paths.first().unwrap_or(&"/");
     let accept_language = if is_vk_host(&host) {
         "ru-RU,ru;q=0.9,en-US;q=0.5,en;q=0.4"
@@ -546,11 +390,10 @@ pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u
     write.write_all(request.as_bytes()).await.context("send request")?;
     drop(write);
 
-    // Read response (limited)
     let mut response = Vec::new();
     let mut buf = [0u8; 4096];
     let mut collected = 0;
-    let max_collect = 32 * 1024; // 32KB max
+    let max_collect = 32 * 1024;
 
     while collected < max_collect {
         let n = read.read(&mut buf).await?;
@@ -573,10 +416,8 @@ fn is_vk_host(host: &str) -> bool {
 }
 
 /// SpiderX background task: periodically fetch content from target
-/// This simulates browser behavior and makes traffic pattern less suspicious
 pub async fn spawn_spiderx(target: String, interval_secs: u64) {
     let sni = extract_sni(&target);
-    // Wikipedia-specific paths break on other fronts; VK uses these entry points.
     let paths: &[&str] = if is_vk_host(&sni) {
         &["/", "/video", "/audio", "/clips"]
     } else {
@@ -586,7 +427,6 @@ pub async fn spawn_spiderx(target: String, interval_secs: u64) {
     info!("SpiderX: starting background crawler for {}", target);
 
     loop {
-        // Random path selection
         let path = paths[rand::thread_rng().gen_range(0..paths.len())];
 
         match spiderx_fetch(&target, &[path]).await {
@@ -603,25 +443,21 @@ pub async fn spawn_spiderx(target: String, interval_secs: u64) {
             }
         }
 
-        // Wait for next interval with some jitter
         let jitter = rand::thread_rng().gen_range(0..30);
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs + jitter)).await;
     }
 }
 
-/// Install ring crypto provider (delegates to shared rustls setup).
 pub fn install_ring_crypto() {
     crate::tls_util::install_ring_crypto();
 }
 
-/// Helper: parse server name from target (e.g., "vk.com:443" -> "vk.com")
 pub fn extract_sni(target: &str) -> String {
     target.split(':').next().unwrap_or(target).to_string()
 }
 
-/// Helper: is this short ID allowed?
 pub fn is_short_id_allowed(id: &[u8; 8], allowed: &[[u8; 8]]) -> bool {
-    allowed.is_empty() 
+    allowed.is_empty()
         || allowed.iter().any(|a| a == id)
         || allowed.iter().any(|a| a.iter().all(|&b| b == 0))
 }
@@ -642,6 +478,19 @@ mod tests {
         let (priv_key, pub_key) = RealityServerConfig::generate_keys();
         assert_eq!(priv_key.len(), 32);
         assert_eq!(pub_key.len(), 32);
+        assert_eq!(
+            RealityServerConfig::public_key_from_private(&priv_key),
+            pub_key
+        );
+    }
+
+    #[test]
+    fn effective_tls_sni_uses_front_domain() {
+        assert_eq!(
+            effective_tls_sni("vps.example.com", Some("vk.com:443")),
+            "vk.com"
+        );
+        assert_eq!(effective_tls_sni("vps.example.com", None), "vps.example.com");
     }
 
     #[test]
@@ -663,5 +512,33 @@ mod tests {
         let allowed = [[8, 7, 6, 5, 4, 3, 2, 1]];
         assert!(!is_short_id_allowed(&id, &allowed));
         assert!(is_short_id_allowed(&allowed[0], &allowed));
+    }
+
+    #[test]
+    fn reality_x25519_shared_secret_roundtrip() {
+        let (priv_key, expected_pub) = RealityServerConfig::generate_keys();
+        let server_hello = server_hello_from_private(&priv_key);
+        let decoded_pub = decode_server_hello(&server_hello).unwrap();
+        assert_eq!(decoded_pub, expected_pub);
+
+        let client_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let client_public = PublicKey::from(&client_secret);
+        let server_secret = StaticSecret::from(priv_key);
+        let server_public = PublicKey::from(expected_pub);
+
+        let c_shared = client_secret.diffie_hellman(&server_public);
+        let s_shared = server_secret.diffie_hellman(&client_public);
+        assert_eq!(c_shared.as_bytes(), s_shared.as_bytes());
+    }
+
+    #[test]
+    fn client_hello_wire_layout() {
+        let sid = [7u8; 8];
+        let pk = [3u8; 32];
+        let wire = encode_client_hello(&sid, &pk);
+        assert_eq!(wire.len(), 41);
+        assert_eq!(wire[0], REALITY_VERSION);
+        assert_eq!(&wire[1..33], &pk);
+        assert_eq!(&wire[33..41], &sid);
     }
 }

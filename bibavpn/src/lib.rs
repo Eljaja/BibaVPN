@@ -43,11 +43,10 @@ pub use frame::{
 };
 pub use invite_uri::{decode_invite_v1, encode_invite_v1, InviteV1};
 pub use reality::{
-    decode_server_hello, encode_client_hello, extract_sni, is_short_id_allowed, parse_target,
-    create_tls_connector,
-    reality_client_exchange_verify, server_handshake_reality, server_hello_from_private,
-    RealityClientConfig, RealityServerConfig, RealitySession, REALITY_MAGIC, REALITY_VERSION,
-    spiderx_fetch, spawn_spiderx, TlsFingerprint,
+    decode_server_hello, effective_tls_sni, encode_client_hello, extract_sni,
+    is_short_id_allowed, parse_target, create_tls_connector, reality_client_exchange_verify,
+    server_handshake_reality, server_hello_from_private, RealityClientConfig, RealityServerConfig,
+    REALITY_MAGIC, REALITY_VERSION, spiderx_fetch, spawn_spiderx, TlsFingerprint,
 };
 pub use start_json_config::{
     local_client_options_from_json_str, local_client_options_from_json_str_with_binds,

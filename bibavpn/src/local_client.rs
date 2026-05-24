@@ -345,25 +345,11 @@ type SharedCrypto = Arc<SessionCrypto>;
 
 type ClientWs = WebSocketStream<ClientTlsStream>;
 
-/// One attempt: TCP + TLS + WS + noise + v3 hello + sealed AUTH.
-async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, SharedCrypto)> {
-    anyhow::ensure!(cfg.proto >= 3, "only Biba protocol v3 is supported (use --proto 3)");
-    anyhow::ensure!(cfg.psk.is_some(), "Biba v3 requires --psk (or invite psk)");
-    if matches!(cfg.tls_stack, TlsStack::Boring) && cfg.pinned_certs_pem.is_some() {
-        anyhow::bail!("--tls-stack boring does not support --pin-cert yet; use the default rustls stack for pinning");
-    }
-
-    let path = cfg.ws_path.clone();
-
-    let tcp =
-        crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
-            .await
-            .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
+async fn upgrade_client_tls(cfg: &ClientCfg, tcp: TcpStream) -> anyhow::Result<ClientTlsStream> {
     desync::after_tcp_connect(&tcp, cfg.desync_mode, cfg.tcp_fooling).await?;
     desync::note_tls_fragment_requested(cfg.tls_fragment);
-    let _ = tcp.set_nodelay(true);
 
-    let tls: ClientTlsStream = match cfg.tls_stack {
+    match cfg.tls_stack {
         TlsStack::Rustls => {
             let domain = ServerName::try_from(cfg.sni.clone())?;
             let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
@@ -371,31 +357,49 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
                 .connect(domain, tcp)
                 .await
                 .context("tls (rustls)")?;
-            ClientTlsStream::Rustls(t)
+            Ok(ClientTlsStream::Rustls(t))
         }
         TlsStack::Boring => {
             #[cfg(feature = "boring-tls")]
             {
-                let t = crate::tls_boring::upgrade_tcp_boring(
-                    tcp,
-                    &cfg.sni,
-                    cfg.insecure_tls,
-                    cfg.tls_fragment,
-                )
-                .await
-                .context("tls (boring)")?;
-                ClientTlsStream::Boring(t)
+                let params = crate::tls_boring::BoringTlsParams {
+                    insecure: cfg.insecure_tls,
+                    pinned_certs_pem: cfg.pinned_certs_pem.clone(),
+                    tls_fragment: cfg.tls_fragment,
+                };
+                let t = crate::tls_boring::upgrade_tcp_boring(tcp, &cfg.sni, &params)
+                    .await
+                    .context("tls (boring)")?;
+                Ok(ClientTlsStream::Boring(t))
             }
             #[cfg(not(feature = "boring-tls"))]
             {
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "Boring stack not compiled: build with `cargo build -p bibavpn --features boring-tls`"
-                ));
+                ))
             }
         }
-    };
+    }
+}
 
-    let ws_host = cfg.ws_host.as_deref();
+/// TCP + TLS + WebSocket upgrade (no v3 / REALITY application frames).
+async fn dial_outer_wss(cfg: &ClientCfg, log_context: &str) -> anyhow::Result<ClientWs> {
+    let path = cfg.ws_path.clone();
+    let tcp =
+        crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
+            .await
+            .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
+    let _ = tcp.set_nodelay(true);
+    let tls = upgrade_client_tls(cfg, tcp).await?;
+
+    let ws_host = cfg
+        .ws_host
+        .as_deref()
+        .or(if cfg.reality_target.is_some() {
+            Some(cfg.sni.as_str())
+        } else {
+            None
+        });
     let ws_origin = cfg.ws_origin.as_deref();
     let ws_ua = cfg.ws_user_agent.as_deref();
     let ws_al = cfg.ws_accept_language.as_deref();
@@ -413,11 +417,10 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
         tls_profile: cfg.tls_profile,
     });
 
-    let mut ws = tokio_tungstenite::client_async(req, tls)
+    let (ws, _) = tokio_tungstenite::client_async(req, tls)
         .await
         .map_err(|e| anyhow::anyhow!(e))
-        .context("websocket")?
-        .0;
+        .context("websocket")?;
 
     info!(
         target: "bibavpn_client",
@@ -425,6 +428,21 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
         port = cfg.server_port,
         sni = %cfg.sni,
         path = %path,
+        context = log_context,
+        "outer WSS up"
+    );
+    Ok(ws)
+}
+
+/// One attempt: TCP + TLS + WS + noise + v3 hello + sealed AUTH.
+async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, SharedCrypto)> {
+    anyhow::ensure!(cfg.proto >= 3, "only Biba protocol v3 is supported (use --proto 3)");
+    anyhow::ensure!(cfg.psk.is_some(), "Biba v3 requires --psk (or invite psk)");
+
+    let mut ws = dial_outer_wss(cfg, "v3 tunnel").await?;
+
+    info!(
+        target: "bibavpn_client",
         proto = cfg.proto,
         "WSS handshake OK, sending noise + auth / v3 hello"
     );
@@ -664,9 +682,7 @@ async fn connect_reality_tcp_mux_handle(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
 ) -> anyhow::Result<()> {
-    use rustls::pki_types::ServerName;
     use tokio_tungstenite::tungstenite::Message;
-    use tokio_tungstenite::client_async;
 
     let _connect_serial = tcp_mux_connect_serial().lock().await;
     if tcp_mux_slot_has_sessions(tcp_mux_slot).await {
@@ -681,41 +697,7 @@ async fn connect_reality_tcp_mux_handle(
             let mut sessions = Vec::with_capacity(n);
 
             for _ in 0..n {
-                let domain = ServerName::try_from(cfg.sni.clone())?;
-                let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
-                let tcp = crate::outbound_protect::tcp_connect_host_protected(
-                    &cfg.server_host,
-                    cfg.server_port,
-                )
-                .await
-                .context("connect server")?;
-                let _ = tcp.set_nodelay(true);
-                let tls = connector.connect(domain, tcp).await.context("tls")?;
-
-                let path = cfg.ws_path.clone();
-                let ws_host = cfg.ws_host.as_deref();
-                let ws_origin = cfg.ws_origin.as_deref();
-                let ws_ua = cfg.ws_user_agent.as_deref();
-                let ws_al = cfg.ws_accept_language.as_deref();
-                let extra = cfg.ws_extra_headers.as_ref().clone();
-                let req = build_websocket_request(WsHandshakeParams {
-                    host_for_tcp: &cfg.server_host,
-                    port: cfg.server_port,
-                    path: &path,
-                    sni: &cfg.sni,
-                    host_header: ws_host,
-                    origin: ws_origin,
-                    user_agent: ws_ua,
-                    accept_language: ws_al,
-                    extra_headers: &extra,
-                    tls_profile: cfg.tls_profile,
-                });
-
-                let mut ws = client_async(req, tls)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))
-                    .context("websocket")?
-                    .0;
+                let mut ws = dial_outer_wss(cfg, "REALITY mux").await?;
 
                 info!(
                     target: "bibavpn_client",
@@ -861,7 +843,7 @@ pub async fn run_local_client(
     let cfg = Arc::new(ClientCfg {
         server_host: opts.server_host.clone(),
         server_port: opts.server_port,
-        sni: opts.sni,
+        sni: crate::reality::effective_tls_sni(&opts.sni, opts.reality_target.as_deref()),
         token: opts.token,
         insecure_tls: opts.insecure_tls,
         tls,

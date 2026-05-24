@@ -597,10 +597,6 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         Ok(TlsStack::Rustls)
     })()?;
 
-    if matches!(tls_stack, TlsStack::Boring) && pinned_certs_pem.is_some() {
-        anyhow::bail!("tls_stack=boring is incompatible with pin_cert_pem (certificate pinning)");
-    }
-
     let tls_fragment = if let Some(ref inv) = invite_pair {
         inv.tls_fragment
     } else {
@@ -686,6 +682,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             );
         }
     }
+
+    let sni = crate::reality::effective_tls_sni(&sni, reality_target.as_deref());
 
     let socks_bind = invite_pair
         .as_ref()

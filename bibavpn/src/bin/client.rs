@@ -681,6 +681,9 @@ async fn main() -> anyhow::Result<()> {
         .or(inv_opt.as_ref().and_then(|i| i.idle_decoy_secs));
     let idle_decoy_secs = merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
 
+    let sni_owned =
+        bibavpn::reality::effective_tls_sni(&sni_owned, reality_target.as_deref());
+
     let opts = LocalClientOptions {
         server_host,
         server_port,
@@ -733,11 +736,6 @@ async fn main() -> anyhow::Result<()> {
         tls_stack,
     };
 
-    if matches!(opts.tls_stack, TlsStack::Boring) && opts.pinned_certs_pem.is_some() {
-        anyhow::bail!(
-            "--tls-stack boring does not support --pin-cert yet; use the default rustls stack for pinning"
-        );
-    }
     bibavpn::transport_capabilities::log_client_transport_caps(&opts);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
