@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
 
   workflow_call:
+    secrets:
+      BIBA_BYPASS_DOMAINS_URL:
+        required: false
 
   push:
     branches: [main, master]
@@ -49,6 +52,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      BIBA_BYPASS_DOMAINS_URL: ${{ secrets.BIBA_BYPASS_DOMAINS_URL }}
     steps:
       - uses: actions/checkout@v4
 

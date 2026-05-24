@@ -132,6 +132,7 @@ jobs:
       - name: tauri ios build → IPA
         working-directory: apps/bibavpn-desktop
         env:
+          BIBA_BYPASS_DOMAINS_URL: ${{ secrets.BIBA_BYPASS_DOMAINS_URL }}
           IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
           IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
