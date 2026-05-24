@@ -9,7 +9,8 @@ import {
   mergedAndroidSplitPackages,
   migrateAndroidSplitFields,
 } from "../androidSplitPackages.js";
-import { SPLIT_TUNNEL_GROUPS, allSplitPresetIds } from "../splitPresets.js";
+import { groupBypassPresets, allSplitPresetIds } from "../splitPresets.js";
+import { useBypassPresets, presetLabel } from "../useBypassPresets.js";
 import { SEMANTIC } from "../theme.js";
 
 /** @param {{ theme: object, title: React.ReactNode, children: React.ReactNode }} p */
@@ -54,6 +55,9 @@ export function SettingsScreen({
   onClearError,
 }) {
   const { theme } = useT();
+  const { presets: bypassPresets, loading: bypassLoading, error: bypassError, configured: bypassConfigured } =
+    useBypassPresets();
+  const splitGroups = useMemo(() => groupBypassPresets(bypassPresets), [bypassPresets]);
   const p = getActiveProfile(cfg);
   const isAndroid = useMemo(
     () => /Android/i.test(typeof navigator !== "undefined" ? navigator.userAgent : ""),
@@ -64,9 +68,9 @@ export function SettingsScreen({
     if (!isAndroid || !cfg) return;
     const prof = getActiveProfile(cfg);
     if (!prof) return;
-    const delta = migrateAndroidSplitFields(prof);
+    const delta = migrateAndroidSplitFields(prof, bypassPresets);
     if (delta) setCfg((c) => patchActiveProfile(c, delta));
-  }, [cfg, isAndroid, setCfg]);
+  }, [cfg, isAndroid, setCfg, bypassPresets]);
 
   if (!p) return null;
 
@@ -80,7 +84,7 @@ export function SettingsScreen({
       if (!cur) return c;
       if (!isAndroid) {
         let ids = [...cur.split_tunnel_preset_ids];
-        if (on && ids.length === 0) ids = allSplitPresetIds();
+        if (on && ids.length === 0) ids = allSplitPresetIds(bypassPresets);
         return patchActiveProfile(c, {
           split_tunnel_enabled: on,
           split_tunnel_preset_ids: ids,
@@ -95,13 +99,13 @@ export function SettingsScreen({
         });
       }
       let ids = [...cur.split_tunnel_preset_ids];
-      if (ids.length === 0) ids = allSplitPresetIds();
+      if (ids.length === 0) ids = allSplitPresetIds(bypassPresets);
       const manual = [...(cur.android_manual_split_packages || [])];
       return patchActiveProfile(c, {
         split_tunnel_enabled: true,
         split_tunnel_preset_ids: ids,
         android_manual_split_packages: manual,
-        android_split_tunnel_packages: mergedAndroidSplitPackages(ids, manual),
+        android_split_tunnel_packages: mergedAndroidSplitPackages(bypassPresets, ids, manual),
       });
     });
   }
@@ -122,7 +126,7 @@ export function SettingsScreen({
       const manual = [...(cur.android_manual_split_packages || [])];
       return patchActiveProfile(c, {
         split_tunnel_preset_ids: newIds,
-        android_split_tunnel_packages: mergedAndroidSplitPackages(newIds, manual),
+        android_split_tunnel_packages: mergedAndroidSplitPackages(bypassPresets, newIds, manual),
       });
     });
   }
@@ -141,7 +145,7 @@ export function SettingsScreen({
         const arr = [...manual].sort();
         return patchActiveProfile(c, {
           android_manual_split_packages: arr,
-          android_split_tunnel_packages: mergedAndroidSplitPackages(cur.split_tunnel_preset_ids, arr),
+          android_split_tunnel_packages: mergedAndroidSplitPackages(bypassPresets, cur.split_tunnel_preset_ids, arr),
         });
       });
       await onPersist();
@@ -157,7 +161,7 @@ export function SettingsScreen({
       const manual = (cur.android_manual_split_packages || []).filter((x) => x !== pkg);
       return patchActiveProfile(c, {
         android_manual_split_packages: manual,
-        android_split_tunnel_packages: mergedAndroidSplitPackages(cur.split_tunnel_preset_ids, manual),
+        android_split_tunnel_packages: mergedAndroidSplitPackages(bypassPresets, cur.split_tunnel_preset_ids, manual),
       });
     });
   }
@@ -599,6 +603,15 @@ export function SettingsScreen({
             onChange={setSplitEnabled}
           />
           <p style={{ color: theme.textDim, fontSize: 11, margin: 0 }}>{t("split_tunnel_reconnect")}</p>
+          {bypassLoading && (
+            <p style={{ color: theme.textDim, fontSize: 11, margin: 0 }}>{t("split_tunnel_presets_loading")}</p>
+          )}
+          {!bypassConfigured && !bypassLoading && (
+            <p style={{ color: SEMANTIC.warn, fontSize: 11, margin: 0 }}>{t("split_tunnel_api_not_configured")}</p>
+          )}
+          {bypassError && (
+            <p style={{ color: SEMANTIC.warn, fontSize: 11, margin: 0 }}>{bypassError}</p>
+          )}
           {isAndroid && (
             <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 10 }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -624,10 +637,10 @@ export function SettingsScreen({
                 checked={Boolean(p.android_screen_off_battery_saver)}
                 onChange={(v) => patchP({ android_screen_off_battery_saver: v })}
               />
-              {p.split_tunnel_enabled && (
+              {p.split_tunnel_enabled && splitGroups.length > 0 && (
                 <>
                   <div style={{ display: "flex", flexDirection: "column", gap: 14, marginTop: 10 }}>
-                    {SPLIT_TUNNEL_GROUPS.map((g) => (
+                    {splitGroups.map((g) => (
                       <div key={g.groupKey}>
                         <div
                           style={{
@@ -641,12 +654,12 @@ export function SettingsScreen({
                           {t(g.groupKey)}
                         </div>
                         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                          {g.ids.map((id) => (
+                          {g.presets.map((preset) => (
                             <CheckRow
-                              key={id}
-                              label={t(`split_preset_${id}`)}
-                              checked={p.split_tunnel_preset_ids.includes(id)}
-                              onChange={(on) => togglePreset(id, on)}
+                              key={preset.id}
+                              label={presetLabel(bypassPresets, preset.id)}
+                              checked={p.split_tunnel_preset_ids.includes(preset.id)}
+                              onChange={(on) => togglePreset(preset.id, on)}
                             />
                           ))}
                         </div>
@@ -695,6 +708,7 @@ export function SettingsScreen({
                       patchP({
                         android_manual_split_packages: manual,
                         android_split_tunnel_packages: mergedAndroidSplitPackages(
+                          bypassPresets,
                           p.split_tunnel_preset_ids,
                           manual,
                         ),
@@ -707,9 +721,9 @@ export function SettingsScreen({
               )}
             </div>
           )}
-          {p.split_tunnel_enabled && !isAndroid && (
+          {p.split_tunnel_enabled && !isAndroid && splitGroups.length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 14, marginTop: 8 }}>
-              {SPLIT_TUNNEL_GROUPS.map((g) => (
+              {splitGroups.map((g) => (
                 <div key={g.groupKey}>
                   <div
                     style={{
@@ -723,12 +737,12 @@ export function SettingsScreen({
                     {t(g.groupKey)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                    {g.ids.map((id) => (
+                    {g.presets.map((preset) => (
                       <CheckRow
-                        key={id}
-                        label={t(`split_preset_${id}`)}
-                        checked={p.split_tunnel_preset_ids.includes(id)}
-                        onChange={(on) => togglePreset(id, on)}
+                        key={preset.id}
+                        label={presetLabel(bypassPresets, preset.id)}
+                        checked={p.split_tunnel_preset_ids.includes(preset.id)}
+                        onChange={(on) => togglePreset(preset.id, on)}
                       />
                     ))}
                   </div>

@@ -58,11 +58,15 @@ const MESSAGES = {
     split_tunnel_enable: "Включить обход для отмеченных ниже",
     split_tunnel_reconnect:
       "Если VPN уже включён — отключите и снова подключитесь, чтобы применить список.",
+    split_tunnel_presets_loading: "Загрузка списков обхода…",
+    split_tunnel_api_not_configured:
+      "URL API не задан (BIBA_BYPASS_DOMAINS_URL). См. local.env.example.",
     split_group_government: "Госуслуги",
     split_group_social: "Мессенджеры и соцсети",
     split_group_banks: "Банки",
     split_group_shops: "Магазины и сервисы",
     split_group_delivery: "Доставка и такси",
+    split_group_other: "Прочее",
     split_preset_gosuslugi: "Госуслуги",
     split_preset_max: "MAX",
     split_preset_vk: "ВКонтакте",
@@ -197,11 +201,15 @@ const MESSAGES = {
     split_tunnel_enable: "Enable bypass for the selections below",
     split_tunnel_reconnect:
       "If VPN is already on — disconnect and connect again to apply the list.",
+    split_tunnel_presets_loading: "Loading bypass lists…",
+    split_tunnel_api_not_configured:
+      "API URL is not set (BIBA_BYPASS_DOMAINS_URL). See local.env.example.",
     split_group_government: "Government",
     split_group_social: "Messengers & social",
     split_group_banks: "Banks",
     split_group_shops: "Shops & services",
     split_group_delivery: "Delivery & taxi",
+    split_group_other: "Other",
     split_preset_gosuslugi: "Gosuslugi",
     split_preset_max: "MAX",
     split_preset_vk: "VK",

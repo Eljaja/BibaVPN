@@ -1,5 +1,6 @@
 //! BibaVPN Tauri backend — desktop (Windows/macOS/Linux) and mobile (Android, iOS) library target.
 
+mod bypass_domains;
 mod config;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod locale;
@@ -586,6 +587,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     let http_hp = format!("127.0.0.1:{http_port}");
     let socks_hp = format!("127.0.0.1:{socks_port}");
+    let _ = bypass_domains::ensure_loaded(false);
     let split_hosts = g
         .cfg
         .active_profile()
@@ -649,10 +651,11 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     persist_cfg(app, &g.cfg)?;
     let json = g.cfg.start_config_json()?;
+    let _ = bypass_domains::ensure_loaded(false);
     let (split_tunnel_enabled, packages, battery) = match g.cfg.active_profile() {
         Some(p) => (
             p.split_tunnel_enabled,
-            p.android_split_tunnel_packages.clone(),
+            split_tunnel::android_split_packages_for_profile(p),
             p.android_screen_off_battery_saver,
         ),
         None => (false, Vec::new(), false),
@@ -833,6 +836,41 @@ fn clear_error_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSn
     Ok(snap)
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BypassPresetsResponse {
+    presets: Vec<bypass_domains::BypassPresetInfo>,
+    configured: bool,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
+    let configured = bypass_domains::bypass_domains_url().is_some();
+    match bypass_domains::ensure_loaded(refresh) {
+        Ok(presets) => BypassPresetsResponse {
+            presets,
+            configured,
+            error: None,
+        },
+        Err(e) => BypassPresetsResponse {
+            presets: bypass_domains::cached_presets_or_empty(),
+            configured,
+            error: Some(e),
+        },
+    }
+}
+
+fn prefetch_bypass_domains() {
+    std::thread::spawn(|| {
+        if bypass_domains::bypass_domains_url().is_some() {
+            if let Err(e) = bypass_domains::ensure_loaded(false) {
+                warn!(target: "bibavpn_desktop", "prefetch bypass-domains: {e}");
+            }
+        }
+    });
+}
+
 #[cfg(unix)]
 fn unix_ignore_shell_signals() {
     unsafe {
@@ -971,6 +1009,7 @@ pub fn run() -> anyhow::Result<()> {
                     app.handle().clone(),
                     Clone::clone(&*app.state::<AppState>()),
                 );
+                prefetch_bypass_domains();
                 Ok(())
             });
     }
@@ -1002,6 +1041,7 @@ pub fn run() -> anyhow::Result<()> {
                     warn!(target: "bibavpn_desktop", "mobile config path: {e}");
                 }
             }
+            prefetch_bypass_domains();
             Ok(())
         });
     }
@@ -1016,6 +1056,7 @@ pub fn run() -> anyhow::Result<()> {
             disconnect_cmd,
             apply_invite_cmd,
             clear_error_cmd,
+            get_bypass_presets_cmd,
         ])
         .build(tauri::generate_context!())?;
 
