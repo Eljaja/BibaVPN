@@ -31,6 +31,9 @@ camouflage-site/
 biba-*-capture.txt
 biba-listen*.txt
 
+# Local experiments and prototypes (not part of the product tree)
+experiments/
+
 # Local brainstorm / research notes (kept out of the public tree)
 deepreseach.md
 deepresearch-dpi-biba.md
