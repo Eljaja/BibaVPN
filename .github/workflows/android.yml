@@ -125,7 +125,7 @@ jobs:
           npm run build --prefix ./ui
           attempt=1
           until [ "$attempt" -gt 3 ]; do
-            npx tauri android build --debug --ci && exit 0
+            npx tauri android build --debug --ci -t aarch64 && exit 0
             attempt=$((attempt + 1))
             sleep 30
           done
@@ -136,11 +136,8 @@ jobs:
           set -euo pipefail
           ROOT="apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk"
           apk="$(find "$ROOT" \( -path '*/arm64/debug/*.apk' -o -path '*/arm64-v8a/debug/*.apk' \) -type f 2>/dev/null | head -n1 || true)"
-          if [ -z "${apk}" ]; then
-            apk="$(find "$ROOT" -path '*/debug/*.apk' -type f 2>/dev/null | head -n1 || true)"
-          fi
           if [ -z "${apk}" ] || [ ! -f "${apk}" ]; then
-            echo "::error::No debug APK under ${ROOT}" >&2
+            echo "::error::No arm64 debug APK under ${ROOT} (refusing universal/multi-ABI fallback)" >&2
             find "$ROOT" -type f -name '*.apk' 2>/dev/null || true
             exit 1
           fi
