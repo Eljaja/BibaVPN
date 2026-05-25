@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android TV launcher banner (320x180 dp). Background: DESIGN.md tvBannerBg (#0B0F1A). -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#0B0F1A" />
+        </shape>
+    </item>
+    <item
+        android:width="96dp"
+        android:height="96dp"
+        android:gravity="center">
+        <bitmap android:src="@mipmap/ic_launcher" />
+    </item>
+</layer-list>
