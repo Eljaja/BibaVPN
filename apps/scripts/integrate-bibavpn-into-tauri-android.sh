@@ -23,6 +23,7 @@ cp -f "$EXTRAS/java/dev/bibavpn/core/VpnProtect.kt" "$APP_JAVA/core/"
 
 mkdir -p "$GEN/app/src/main/res/drawable"
 cp -f "$EXTRAS/res/drawable/ic_stat_vpn.xml" "$GEN/app/src/main/res/drawable/"
+cp -f "$EXTRAS/res/drawable/tv_banner.xml" "$GEN/app/src/main/res/drawable/"
 
 # Строки только для VPN-уведомлений (не перетираем strings Tauri)
 EXR="$EXTRAS/res"

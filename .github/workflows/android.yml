@@ -125,7 +125,7 @@ jobs:
           npm run build --prefix ./ui
           attempt=1
           until [ "$attempt" -gt 3 ]; do
-            npx tauri android build --debug --ci -t aarch64 && exit 0
+            npx tauri android build --debug --ci && exit 0
             attempt=$((attempt + 1))
             sleep 30
           done
