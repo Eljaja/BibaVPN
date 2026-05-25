@@ -18,9 +18,11 @@
 #
 # Forks: this workflow only pushes when the event runs on the original
 # repository (i.e. where the secrets exist). PRs from forks build only.
+#
+# Path gating: workflow skips docs-only / desktop-only / app-only commits.
+# Per-image matrix: server and client images build independently when only one side changed.
 name: Docker images
 
-# Run only when server/client binaries or image definitions could change — not on docs-only or unrelated app commits.
 on:
   push:
     branches:
@@ -32,16 +34,11 @@ on:
       - "!bibavpn/**/*.md"
       - "biba/**"
       - "!biba/**/*.md"
-      - "docker/**"
+      - "docker/Dockerfile.server"
+      - "docker/Dockerfile.client"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
-      - "apps/bibavpn-jni/**"
-      - "!apps/bibavpn-jni/**/*.md"
-      - "apps/bibavpn-ffi/**"
-      - "!apps/bibavpn-ffi/**/*.md"
-      - "apps/bibavpn-desktop/src-tauri/**"
-      - "!apps/bibavpn-desktop/src-tauri/**/*.md"
       - "docker-compose.yml"
       - "docker-compose.hub.yml"
       - "docker-compose.bibavpn-check.yml"
@@ -54,16 +51,11 @@ on:
       - "!bibavpn/**/*.md"
       - "biba/**"
       - "!biba/**/*.md"
-      - "docker/**"
+      - "docker/Dockerfile.server"
+      - "docker/Dockerfile.client"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
-      - "apps/bibavpn-jni/**"
-      - "!apps/bibavpn-jni/**/*.md"
-      - "apps/bibavpn-ffi/**"
-      - "!apps/bibavpn-ffi/**/*.md"
-      - "apps/bibavpn-desktop/src-tauri/**"
-      - "!apps/bibavpn-desktop/src-tauri/**/*.md"
       - "docker-compose.yml"
       - "docker-compose.hub.yml"
       - "docker-compose.bibavpn-check.yml"
@@ -78,18 +70,87 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect changed paths
+        id: filter
+        if: github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            server:
+              - 'bibavpn/**'
+              - '!bibavpn/**/*.md'
+              - 'biba/**'
+              - '!biba/**/*.md'
+              - 'docker/Dockerfile.server'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'docker-compose.yml'
+              - 'docker-compose.hub.yml'
+              - 'docker-compose.bibavpn-check.yml'
+              - '.github/workflows/docker.yml'
+            client:
+              - 'bibavpn/**'
+              - '!bibavpn/**/*.md'
+              - 'biba/**'
+              - '!biba/**/*.md'
+              - 'docker/Dockerfile.client'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'docker-compose.yml'
+              - 'docker-compose.hub.yml'
+              - 'docker-compose.bibavpn-check.yml'
+              - '.github/workflows/docker.yml'
+
+      - name: Plan matrix (which images to build)
+        id: plan
+        env:
+          FILTER_SERVER: ${{ steps.filter.outputs.server }}
+          FILTER_CLIENT: ${{ steps.filter.outputs.client }}
+        run: |
+          set -euo pipefail
+          build_server=false
+          build_client=false
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            build_server=true
+            build_client=true
+          elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            build_server=true
+            build_client=true
+          else
+            if [ "${FILTER_SERVER:-}" = "true" ]; then build_server=true; fi
+            if [ "${FILTER_CLIENT:-}" = "true" ]; then build_client=true; fi
+          fi
+
+          matrix='[]'
+          if [ "$build_server" = true ]; then
+            matrix=$(echo "$matrix" | jq -c '. + [{"name":"server","image":"eljaja/bibavpn-server","dockerfile":"docker/Dockerfile.server"}]')
+          fi
+          if [ "$build_client" = true ]; then
+            matrix=$(echo "$matrix" | jq -c '. + [{"name":"client","image":"eljaja/bibavpn-client","dockerfile":"docker/Dockerfile.client"}]')
+          fi
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Planned Docker matrix: $matrix"
+
   build-push:
+    needs: changes
+    if: needs.changes.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: server
-            image: eljaja/bibavpn-server
-            dockerfile: docker/Dockerfile.server
-          - name: client
-            image: eljaja/bibavpn-client
-            dockerfile: docker/Dockerfile.client
+        include: ${{ fromJson(needs.changes.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
