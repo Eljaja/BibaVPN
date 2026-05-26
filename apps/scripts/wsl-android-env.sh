@@ -8,8 +8,6 @@ export PATH="$NDK_LLVM_BIN:$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID
 # Иначе rustc на финальном линке вызывает хостовый `cc` и падает.
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_LLVM_BIN/aarch64-linux-android29-clang"
 export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$NDK_LLVM_BIN/armv7a-linux-androideabi29-clang"
-export CARGO_TARGET_I686_LINUX_ANDROID_LINKER="$NDK_LLVM_BIN/i686-linux-android29-clang"
-export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_LLVM_BIN/x86_64-linux-android29-clang"
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 # Артефакты на ext4 (не на DrvFS). Не делайте `rm -rf` этого каталога без нужды — следующая
 # сборка заново компилирует все зависимости и выглядит как «зависание» (десятки минут).

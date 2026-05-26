@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Собрать libbibavpn_jni.so для всех ABI в Tauri gen/android (после android:bootstrap).
+# Собрать libbibavpn_jni.so для ARM ABI в Tauri gen/android (после android:bootstrap).
 # Запуск из корня репозитория biba-vpn:
 #   bash apps/scripts/wsl-build-tauri-android-jni.sh
 set -euo pipefail
@@ -29,14 +29,14 @@ if [ -z "${ANDROID_NDK_HOME:-}" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
 fi
 
 cd "$ROOT"
-rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android 2>/dev/null || true
+rustup target add aarch64-linux-android armv7-linux-androideabi 2>/dev/null || true
 if ! cargo ndk --version >/dev/null 2>&1; then
   echo "Установка cargo-ndk..."
   cargo install cargo-ndk --locked
 fi
 
 echo "Сборка bibavpn-jni → $OUT"
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
+cargo ndk -t arm64-v8a -t armeabi-v7a \
   -o "$OUT" \
   build -p bibavpn-jni --release
 echo "Готово."

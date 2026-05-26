@@ -27,12 +27,14 @@ rsync -a --delete \
 cd "$DST"
 bash apps/scripts/build-android-apk-wsl.sh
 
-# APK path from Tauri (universal or arm64)
+# APK path from Tauri. Prefer signed debug APKs for sideload/ADB; unsigned release
+# artifacts are not installable on Android TV.
 APK=""
 for p in \
-  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk" \
-  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk" \
-  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk" \
+  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk" \
+  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/arm64-v8a/debug/app-arm64-v8a-debug.apk" \
+  "apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/debug/app-debug.apk"
  do
   if [ -f "$p" ]; then
     APK="$p"
