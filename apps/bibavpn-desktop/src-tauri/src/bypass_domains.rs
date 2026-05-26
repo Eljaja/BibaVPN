@@ -16,10 +16,36 @@ const USER_AGENT: &str = "bibavpn-desktop/1.0";
 const DEFAULT_TTL_SEC: u64 = 86_400;
 /// When the bulk JSON stalls (~17 KiB on the origin), fetch each preset via `?preset=`.
 const FALLBACK_PRESET_IDS: &[&str] = &[
-    "gosuslugi", "gov", "max", "vk", "media", "entertainment", "banks", "tinkoff", "sber",
-    "yandex_bank", "banki", "bog", "vtb", "alfa", "ecommerce", "retail", "ozon",
-    "yandex_market", "steam", "games", "yandex_taxi", "yandex_vezet", "deliveryclub",
-    "yandex_eda", "yandex_lavka", "samokat", "travel", "yandex", "medicine", "ru_all",
+    "gosuslugi",
+    "gov",
+    "max",
+    "vk",
+    "media",
+    "entertainment",
+    "banks",
+    "tinkoff",
+    "sber",
+    "yandex_bank",
+    "banki",
+    "bog",
+    "vtb",
+    "alfa",
+    "ecommerce",
+    "retail",
+    "ozon",
+    "yandex_market",
+    "steam",
+    "games",
+    "yandex_taxi",
+    "yandex_vezet",
+    "deliveryclub",
+    "yandex_eda",
+    "yandex_lavka",
+    "samokat",
+    "travel",
+    "yandex",
+    "medicine",
+    "ru_all",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,9 +366,8 @@ fn cache_is_fresh(state: &CacheState) -> bool {
 
 /// Load presets from memory, disk, or network (in that order when stale).
 pub fn ensure_loaded(force_refresh: bool) -> Result<Vec<BypassPresetInfo>, String> {
-    let url = bypass_domains_url().ok_or_else(|| {
-        "BIBA_BYPASS_DOMAINS_URL не задан (CI secret или local .env)".to_string()
-    })?;
+    let url = bypass_domains_url()
+        .ok_or_else(|| "BIBA_BYPASS_DOMAINS_URL не задан (CI secret или local .env)".to_string())?;
 
     {
         let state = cache_lock().lock().map_err(|e| e.to_string())?;
@@ -403,8 +428,7 @@ pub fn cached_presets_or_empty() -> Vec<BypassPresetInfo> {
         .unwrap_or_default()
 }
 
-pub fn domains_for_preset_ids(ids: &[String]) -> Vec<String> {
-    let _ = ensure_loaded(false);
+fn domains_for_preset_ids_from_cache(ids: &[String]) -> Vec<String> {
     let state = match cache_lock().lock() {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -426,8 +450,20 @@ pub fn domains_for_preset_ids(ids: &[String]) -> Vec<String> {
     out
 }
 
-pub fn android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
+/// Return preset domains without touching the network.
+///
+/// The desktop connect path calls this while applying system proxy settings; a slow
+/// control-plane URL must not make the UI look frozen during connect.
+pub fn cached_domains_for_preset_ids(ids: &[String]) -> Vec<String> {
+    domains_for_preset_ids_from_cache(ids)
+}
+
+pub fn domains_for_preset_ids(ids: &[String]) -> Vec<String> {
     let _ = ensure_loaded(false);
+    domains_for_preset_ids_from_cache(ids)
+}
+
+fn android_packages_for_preset_ids_from_cache(ids: &[String]) -> Vec<String> {
     let state = match cache_lock().lock() {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -448,6 +484,11 @@ pub fn android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+pub fn android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
+    let _ = ensure_loaded(false);
+    android_packages_for_preset_ids_from_cache(ids)
 }
 
 #[cfg(test)]

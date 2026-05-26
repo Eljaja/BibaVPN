@@ -9,7 +9,7 @@ pub fn bypass_domains_for_profile(profile: &TunnelProfile) -> Vec<String> {
     if !profile.split_tunnel_enabled {
         return Vec::new();
     }
-    bypass_domains::domains_for_preset_ids(&profile.split_tunnel_preset_ids)
+    bypass_domains::cached_domains_for_preset_ids(&profile.split_tunnel_preset_ids)
 }
 
 /// Android: пакеты из пресетов API + ручной список из профиля.
