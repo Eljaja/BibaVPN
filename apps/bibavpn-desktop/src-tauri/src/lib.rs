@@ -588,7 +588,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     let http_hp = format!("127.0.0.1:{http_port}");
     let socks_hp = format!("127.0.0.1:{socks_port}");
-    let _ = bypass_domains::ensure_loaded(false);
     let split_hosts = g
         .cfg
         .active_profile()
@@ -652,7 +651,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     persist_cfg(app, &g.cfg)?;
     let json = g.cfg.start_config_json()?;
-    let _ = bypass_domains::ensure_loaded(false);
     let (split_tunnel_enabled, packages, battery) = match g.cfg.active_profile() {
         Some(p) => (
             p.split_tunnel_enabled,
@@ -858,38 +856,57 @@ struct BypassPresetsResponse {
 
 #[tauri::command]
 async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
-    match tauri::async_runtime::spawn_blocking(move || {
+    const FETCH_TIMEOUT: Duration =
+        Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
+
+    let task = tauri::async_runtime::spawn_blocking(move || {
         let configured = bypass_domains::bypass_domains_url().is_some();
         match bypass_domains::ensure_loaded(refresh) {
-            Ok(presets) => BypassPresetsResponse {
-                presets,
-                configured,
-                error: None,
-            },
+            Ok(presets) => {
+                let error = if configured && presets.is_empty() {
+                    Some(
+                        "Списки обхода недоступны (таймаут 2 с или ошибка сети)".into(),
+                    )
+                } else {
+                    None
+                };
+                BypassPresetsResponse {
+                    presets,
+                    configured,
+                    error,
+                }
+            }
             Err(e) => BypassPresetsResponse {
                 presets: bypass_domains::cached_presets_or_empty(),
                 configured,
                 error: Some(e),
             },
         }
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(e) => BypassPresetsResponse {
+    });
+
+    match tokio::time::timeout(FETCH_TIMEOUT, task).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => BypassPresetsResponse {
             presets: bypass_domains::cached_presets_or_empty(),
             configured: bypass_domains::bypass_domains_url().is_some(),
             error: Some(format!("bypass presets task: {e}")),
+        },
+        Err(_) => BypassPresetsResponse {
+            presets: bypass_domains::cached_presets_or_empty(),
+            configured: bypass_domains::bypass_domains_url().is_some(),
+            error: Some("Таймаут загрузки списков обхода (2 с)".into()),
         },
     }
 }
 
 fn prefetch_bypass_domains() {
     std::thread::spawn(|| {
-        if bypass_domains::bypass_domains_url().is_some() {
-            if let Err(e) = bypass_domains::ensure_loaded(false) {
-                warn!(target: "bibavpn_desktop", "prefetch bypass-domains: {e}");
-            }
+        if bypass_domains::bypass_domains_url().is_none() {
+            return;
+        }
+        let _ = bypass_domains::ensure_loaded(false);
+        if bypass_domains::cached_presets_or_empty().is_empty() {
+            bypass_domains::background_refresh_full();
         }
     });
 }

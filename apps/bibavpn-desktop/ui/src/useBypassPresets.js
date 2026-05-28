@@ -35,6 +35,7 @@ export function useBypassPresets() {
       setConfigured(Boolean(res.configured));
       setError(res.error || null);
     } catch (e) {
+      setPresets([]);
       setError(String(e));
     } finally {
       setLoading(false);
