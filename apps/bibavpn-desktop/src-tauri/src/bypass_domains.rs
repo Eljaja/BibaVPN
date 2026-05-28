@@ -14,6 +14,8 @@ use tracing::{info, warn};
 
 const USER_AGENT: &str = "bibavpn-desktop/1.0";
 const DEFAULT_TTL_SEC: u64 = 86_400;
+/// Max wait for connect + response body when fetching bypass lists (fail fast; use disk cache).
+pub const HTTP_TIMEOUT_SECS: u64 = 2;
 /// When the bulk JSON stalls (~17 KiB on the origin), fetch each preset via `?preset=`.
 const FALLBACK_PRESET_IDS: &[&str] = &[
     "gosuslugi",
@@ -259,10 +261,11 @@ fn parse_api_response(body: &str) -> Result<(Vec<BypassPresetInfo>, u64), String
     }
 }
 
-fn http_agent(read_timeout_secs: u64) -> ureq::Agent {
+fn http_agent() -> ureq::Agent {
+    let timeout = Duration::from_secs(HTTP_TIMEOUT_SECS);
     ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(read_timeout_secs))
-        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(timeout)
+        .timeout_connect(timeout)
         .user_agent(USER_AGENT)
         .build()
 }
@@ -298,13 +301,13 @@ fn fetch_http_body(agent: &ureq::Agent, url: &str) -> Result<String, String> {
 }
 
 fn fetch_remote_bulk(url: &str) -> Result<(Vec<BypassPresetInfo>, u64), String> {
-    let agent = http_agent(45);
+    let agent = http_agent();
     let body = fetch_http_body(&agent, url)?;
     parse_api_response(&body)
 }
 
 fn fetch_remote_presets(base_url: &str) -> Result<(Vec<BypassPresetInfo>, u64), String> {
-    let agent = http_agent(30);
+    let agent = http_agent();
     let mut presets = Vec::new();
     let mut errors = Vec::new();
     for (i, id) in FALLBACK_PRESET_IDS.iter().enumerate() {
@@ -337,19 +340,24 @@ fn fetch_remote_presets(base_url: &str) -> Result<(Vec<BypassPresetInfo>, u64), 
     Ok((presets, DEFAULT_TTL_SEC))
 }
 
+/// Single bulk request (or one preset URL). Used on the UI/connect hot path — max [`HTTP_TIMEOUT_SECS`].
 fn fetch_remote(url: &str) -> Result<(Vec<BypassPresetInfo>, u64), String> {
     if url_has_preset_filter(url) {
-        let agent = http_agent(30);
+        let agent = http_agent();
         let body = fetch_http_body(&agent, url)?;
         return parse_api_response(&body);
     }
-    match fetch_remote_bulk(url) {
+    fetch_remote_bulk(url)
+}
+
+fn refresh_from_network_with_fallback(url: &str) -> Result<(Vec<BypassPresetInfo>, u64), String> {
+    match fetch_remote(url) {
         Ok(result) => Ok(result),
         Err(bulk_err) => {
             warn!(
                 target: "bibavpn_desktop",
                 error = %bulk_err,
-                "bypass-domains bulk fetch failed, trying per-preset"
+                "bypass-domains bulk fetch failed, trying per-preset (background)"
             );
             fetch_remote_presets(url)
                 .map_err(|fallback_err| format!("{bulk_err}; per-preset fallback: {fallback_err}"))
@@ -362,6 +370,29 @@ fn cache_is_fresh(state: &CacheState) -> bool {
         return false;
     };
     at.elapsed().unwrap_or(Duration::MAX) < state.ttl
+}
+
+/// Background-only refresh (bulk, then per-preset fallback). Does not block the UI or connect path.
+pub fn background_refresh_full() {
+    let Some(url) = bypass_domains_url() else {
+        return;
+    };
+    match refresh_from_network_with_fallback(&url) {
+        Ok((presets, ttl)) => {
+            save_disk_cache(&url, ttl, &presets);
+            if let Ok(mut state) = cache_lock().lock() {
+                apply_presets(&mut state, presets.clone(), ttl, &url);
+                info!(
+                    target: "bibavpn_desktop",
+                    count = presets.len(),
+                    "bypass-domains: background refresh ok"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(target: "bibavpn_desktop", "bypass-domains background refresh: {e}");
+        }
+    }
 }
 
 /// Load presets from memory, disk, or network (in that order when stale).
@@ -410,7 +441,7 @@ pub fn ensure_loaded(force_refresh: bool) -> Result<Vec<BypassPresetInfo>, Strin
                 apply_presets(&mut state, file.presets.clone(), file.ttl_sec, &url);
                 return Ok(state.presets.clone());
             }
-            Err(e)
+            Ok(Vec::new())
         }
     }
 }
@@ -459,8 +490,7 @@ pub fn cached_domains_for_preset_ids(ids: &[String]) -> Vec<String> {
 }
 
 pub fn domains_for_preset_ids(ids: &[String]) -> Vec<String> {
-    let _ = ensure_loaded(false);
-    domains_for_preset_ids_from_cache(ids)
+    cached_domains_for_preset_ids(ids)
 }
 
 fn android_packages_for_preset_ids_from_cache(ids: &[String]) -> Vec<String> {
@@ -486,9 +516,12 @@ fn android_packages_for_preset_ids_from_cache(ids: &[String]) -> Vec<String> {
     out
 }
 
-pub fn android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
-    let _ = ensure_loaded(false);
+pub fn cached_android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
     android_packages_for_preset_ids_from_cache(ids)
+}
+
+pub fn android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
+    cached_android_packages_for_preset_ids(ids)
 }
 
 #[cfg(test)]
