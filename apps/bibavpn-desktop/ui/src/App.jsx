@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { ThemeProvider } from "./ThemeContext.jsx";
 import { useVpn } from "./useVpn.jsx";
 import { ConnectScreen } from "./screens/ConnectScreen.jsx";
@@ -21,6 +22,17 @@ function AppInner() {
   useEffect(() => {
     if (tab === "connect") setDraft(null);
   }, [tab]);
+
+  useEffect(() => {
+    let unlisten = () => {};
+    (async () => {
+      unlisten = await listen("control-plane-import", () => {
+        setDraft(null);
+        setTab("profiles");
+      });
+    })();
+    return () => unlisten();
+  }, []);
 
   useEffect(() => {
     if (tab !== "connect") setTunnelHandshake(false);

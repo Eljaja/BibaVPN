@@ -546,6 +546,7 @@ fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> R
     let snap = snapshot(app, &g);
     drop(g);
     let _ = app.emit("vpn-state", &snap);
+    let _ = app.emit("control-plane-import", ());
     show_main_window(app);
     Ok(())
 }
@@ -1099,7 +1100,18 @@ pub fn run() -> anyhow::Result<()> {
         })),
     };
 
-    let mut builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // Windows/Linux: deep links spawn a second process unless we dedupe here.
+        // The deep-link feature forwards argv to the running instance's on_open_url handler.
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }));
+    }
+
+    builder = builder
         .plugin(tauri_plugin_deep_link::init())
         .manage(state);
 
