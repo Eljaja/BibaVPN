@@ -468,8 +468,7 @@ fn disconnect_inner(state: &AppState, app: &AppHandle) {
                     }
                 }
             }
-            None =>
-            {
+            None => {
                 #[cfg(windows)]
                 if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
                     warn!(
@@ -1003,12 +1002,16 @@ fn open_portal_url(url: &str) -> Result<(), String> {
         use tauri::Manager;
         // Android: rely on VIEW intent via plugin when available; fallback to log.
         let _ = url;
-        return Err("Откройте веб-кабинет в браузере и нажмите «Открыть в BibaVPN».".into());
+        return Err(
+            "Откройте веб-кабинет в браузере и нажмите «Открыть в BibaVPN».".into(),
+        );
     }
     #[cfg(target_os = "ios")]
     {
         let _ = url;
-        return Err("Откройте веб-кабинет в браузере и нажмите «Open in BibaVPN».".into());
+        return Err(
+            "Откройте веб-кабинет в браузере и нажмите «Open in BibaVPN».".into(),
+        );
     }
     #[cfg(windows)]
     {
@@ -1055,14 +1058,17 @@ struct BypassPresetsResponse {
 
 #[tauri::command]
 async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
-    const FETCH_TIMEOUT: Duration = Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
+    const FETCH_TIMEOUT: Duration =
+        Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
 
     let task = tauri::async_runtime::spawn_blocking(move || {
         let configured = bypass_domains::bypass_domains_url().is_some();
         match bypass_domains::ensure_loaded(refresh) {
             Ok(presets) => {
                 let error = if configured && presets.is_empty() {
-                    Some("Списки обхода недоступны (таймаут 2 с или ошибка сети)".into())
+                    Some(
+                        "Списки обхода недоступны (таймаут 2 с или ошибка сети)".into(),
+                    )
                 } else {
                     None
                 };
@@ -1169,7 +1175,9 @@ pub fn run() -> anyhow::Result<()> {
         }));
     }
 
-    builder = builder.plugin(tauri_plugin_deep_link::init()).manage(state);
+    builder = builder
+        .plugin(tauri_plugin_deep_link::init())
+        .manage(state);
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
