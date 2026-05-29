@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Сборка release APK из WSL (обход отсутствия MSVC link.exe на Windows для build.rs хоста).
+# Сборка installable debug APK из WSL (обход отсутствия MSVC link.exe на Windows для build.rs хоста).
 # Перед первой сборкой: apps/scripts/dl-ndk-wsl.sh и apps/scripts/patch-windows-ndk-linux-prebuilt-for-wsl.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -19,7 +19,7 @@ if [ ! -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64" ]; then
   exit 1
 fi
 
-rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android 2>/dev/null || true
+rustup target add aarch64-linux-android armv7-linux-androideabi 2>/dev/null || true
 
 cd "$ROOT/apps/bibavpn-desktop"
 npm install
@@ -35,4 +35,4 @@ mkdir -p "$(dirname "$LP")"
 
 bash "$ROOT/apps/scripts/wsl-build-tauri-android-jni.sh"
 npm run build --prefix ./ui
-exec npx tauri android build
+exec npx tauri android build --debug --ci --apk

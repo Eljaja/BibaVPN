@@ -17,7 +17,7 @@ export ANDROID_NDK_HOME="$NDK_DIR"
 echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
 
 cd "$REPO_ROOT"
-rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android 2>/dev/null || true
+rustup target add aarch64-linux-android armv7-linux-androideabi 2>/dev/null || true
 if ! cargo ndk --version >/dev/null 2>&1; then
   echo "Installing cargo-ndk..."
   cargo install cargo-ndk --locked
@@ -44,10 +44,10 @@ else
   WIN_REPO="$(to_win_path "$REPO_ROOT")"
 fi
 if [[ -n "$WIN_REPO" ]]; then
-  WIN_APK="${WIN_REPO}\\apps\\bibavpn-desktop\\src-tauri\\gen\\android\\app\\build\\outputs\\apk\\universal\\release\\app-universal-release-unsigned.apk"
+  WIN_APK="${WIN_REPO}\\apps\\bibavpn-desktop\\src-tauri\\gen\\android\\app\\build\\outputs\\apk\\universal\\debug\\app-universal-debug.apk"
   cmd.exe /c "\"$ADB_WIN\" install -r \"$WIN_APK\""
 else
-  APK="$REPO_ROOT/apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk"
+  APK="$REPO_ROOT/apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
   adb install -r "$APK"
 fi
 

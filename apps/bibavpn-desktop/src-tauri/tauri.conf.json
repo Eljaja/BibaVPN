@@ -32,7 +32,7 @@
   "bundle": {
     "active": true,
     "android": {
-      "minSdkVersion": 29,
+      "minSdkVersion": 24,
       "autoIncrementVersionCode": false
     },
     "iOS": {

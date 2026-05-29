@@ -1,4 +1,4 @@
-"""Дописывает в Tauri AndroidManifest разрешения, AppLocales (AppCompat) и BibaVpnService."""
+"""Дописывает в Tauri AndroidManifest разрешения, TV-совместимость, AppLocales и BibaVpnService."""
 import pathlib
 import re
 import sys
@@ -10,6 +10,18 @@ PERMS = """
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+"""
+
+# Без touchscreen required=false Android TV часто отклоняет установку («Приложение не установлено»).
+TV_FEATURES = """
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.faketouch" android:required="false" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
 """
 
 # Нужен для setApplicationLocales / AppCompat; без meta лог: AppLocalesMetadataHolderService not found
@@ -39,34 +51,88 @@ SERVICE = """
         </service>
 """
 
+PICK_PACKAGE_ACTIVITY = """
+        <activity
+            android:name=".PickInstalledPackageActivity"
+            android:exported="false"
+            android:theme="@style/Theme.AppCompat.Dialog" />
+"""
+
+
+def _insert_after_internet_perm(text: str, block: str) -> str:
+    if block.strip() in text:
+        return text
+    needle = '<uses-permission android:name="android.permission.INTERNET" />'
+    if needle not in text:
+        return text
+    return text.replace(needle, needle + block, 1)
+
+
+def _ensure_tv_features(text: str) -> str:
+    if 'android.hardware.touchscreen' in text:
+        return text
+    if 'android.software.leanback' in text:
+        return text.replace(
+            '<uses-feature android:name="android.software.leanback" android:required="false" />',
+            '<uses-feature android:name="android.software.leanback" android:required="false" />' + TV_FEATURES,
+            1,
+        )
+    return _insert_after_internet_perm(text, TV_FEATURES)
+
+
+def _ensure_tv_banner(text: str) -> str:
+    if 'android:banner=' in text:
+        return text
+    return re.sub(
+        r"(<application\s)",
+        r'\1android:banner="@drawable/tv_banner" ',
+        text,
+        count=1,
+    )
+
+
+def _ensure_biba_application(text: str) -> str:
+    if 'android:name=".BibaApplication"' in text:
+        return text
+    return text.replace(
+        "<application",
+        '<application\n        android:name=".BibaApplication"',
+        1,
+    )
+
+
+def patch_manifest(text: str) -> tuple[str, bool]:
+    original = text
+    text = _insert_after_internet_perm(text, PERMS)
+    text = _ensure_tv_features(text)
+    text = _ensure_tv_banner(text)
+    text = _ensure_biba_application(text)
+
+    if "AppLocalesMetadataHolderService" not in text:
+        text = re.sub(
+            r"(<application\s[^>]*>)",
+            r"\1" + APP_LOCALES_SERVICE,
+            text,
+            count=1,
+        )
+
+    if "BibaVpnService" not in text:
+        text = re.sub(r"(</application>)", SERVICE + r"\1", text, count=1)
+
+    if "PickInstalledPackageActivity" not in text:
+        text = re.sub(r"(</application>)", PICK_PACKAGE_ACTIVITY + r"\1", text, count=1)
+
+    return text, text != original
+
 
 def main() -> None:
     path = pathlib.Path(sys.argv[1])
-    t = path.read_text(encoding="utf-8")
-    has_vpn = "BibaVpnService" in t
-    has_locales = "AppLocalesMetadataHolderService" in t
-    if has_vpn and has_locales:
+    patched, changed = patch_manifest(path.read_text(encoding="utf-8"))
+    if changed:
+        path.write_text(patched, encoding="utf-8")
+        print("manifest patched")
+    else:
         print("manifest already patched")
-        return
-    if "ACCESS_NETWORK_STATE" not in t:
-        t = t.replace(
-            '<uses-permission android:name="android.permission.INTERNET" />',
-            '<uses-permission android:name="android.permission.INTERNET" />' + PERMS,
-            1,
-        )
-    if not has_locales:
-        t = re.sub(
-            r"(<application\s[^>]*>)",
-            r"\1" + APP_LOCALES_SERVICE,
-            t,
-            count=1,
-        )
-    if not has_vpn:
-        t = re.sub(r"(</application>)", SERVICE + r"\1", t, count=1)
-    if 'android:name=".BibaApplication"' not in t:
-        t = t.replace("<application", '<application\n        android:name=".BibaApplication"', 1)
-    path.write_text(t, encoding="utf-8")
-    print("manifest patched")
 
 
 if __name__ == "__main__":

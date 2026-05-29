@@ -74,11 +74,11 @@ jobs:
         with:
           ndk-version: r26d
 
-      # Debug CI artifacts: single ABI (arm64 only) — smaller APK than universal multi-ABI.
+      # Debug CI artifact: universal APK for sideloading on Android TV boxes.
       - name: Rust toolchain (Android targets)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -110,7 +110,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          cargo ndk -t arm64-v8a \
+          cargo ndk -t arm64-v8a -t armeabi-v7a \
             -o apps/bibavpn-desktop/src-tauri/gen/android/app/src/main/jniLibs \
             build -p bibavpn-jni --release
 
@@ -125,25 +125,24 @@ jobs:
           npm run build --prefix ./ui
           attempt=1
           until [ "$attempt" -gt 3 ]; do
-            npx tauri android build --debug --ci -t aarch64 && exit 0
+            npx tauri android build --debug --ci --apk && exit 0
             attempt=$((attempt + 1))
             sleep 30
           done
           exit 1
 
-      - name: Stage arm64 debug APK (single file — no universal / multi-ABI zip)
+      - name: Stage universal debug APK
         run: |
           set -euo pipefail
           ROOT="apps/bibavpn-desktop/src-tauri/gen/android/app/build/outputs/apk"
-          apk="$(find "$ROOT" \( -path '*/arm64/debug/*.apk' -o -path '*/arm64-v8a/debug/*.apk' \) -type f 2>/dev/null | head -n1 || true)"
-          if [ -z "${apk}" ]; then
-            apk="$(find "$ROOT" -path '*/debug/*.apk' -type f 2>/dev/null | head -n1 || true)"
-          fi
-          if [ -z "${apk}" ] || [ ! -f "${apk}" ]; then
-            echo "::error::No debug APK under ${ROOT}" >&2
+          apk="$ROOT/universal/debug/app-universal-debug.apk"
+          if [ ! -f "${apk}" ]; then
+            echo "::error::No universal debug APK at ${apk}" >&2
             find "$ROOT" -type f -name '*.apk' 2>/dev/null || true
             exit 1
           fi
+          abis="$(unzip -Z1 "$apk" 'lib/*/*.so' 2>/dev/null | cut -d/ -f2 | sort -u | tr '\n' ' ' | sed 's/ $//')"
+          echo "APK ABIs: ${abis:-unknown}"
           echo "Staging CI artifact from: ${apk}"
           cp "${apk}" BibaVPN-android-debug.apk
           ls -la BibaVPN-android-debug.apk

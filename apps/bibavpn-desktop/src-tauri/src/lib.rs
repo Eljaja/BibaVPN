@@ -7,21 +7,21 @@ mod locale;
 mod logging;
 mod split_tunnel;
 
+#[cfg(target_os = "android")]
+mod proxy_android;
 #[cfg(target_os = "macos")]
 mod proxy_mac;
 #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
 mod proxy_stub;
-#[cfg(target_os = "android")]
-mod proxy_android;
 #[cfg(windows)]
 mod proxy_win;
 
+#[cfg(target_os = "android")]
+use proxy_android::{apply_proxy, read_backup, restore, ProxyBackup};
 #[cfg(target_os = "macos")]
 use proxy_mac::{apply_proxy, read_backup, restore, ProxyBackup};
 #[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
 use proxy_stub::{apply_proxy, read_backup, restore, ProxyBackup};
-#[cfg(target_os = "android")]
-use proxy_android::{apply_proxy, read_backup, restore, ProxyBackup};
 #[cfg(windows)]
 use proxy_win::{apply_proxy, read_backup, restore, ProxyBackup};
 
@@ -39,12 +39,12 @@ use std::time::{Duration, Instant};
 use bibavpn::decode_invite_v1;
 use bibavpn::local_client_options_from_json_str_with_binds;
 use bibavpn::tls_util::install_ring_crypto;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+use config::load_config_from_path;
 use config::{
     desktop_config_json_path, display_host_line, load_config_disk, normalize_loaded,
     save_config_to_path, server_card_subtitle, SavedConfig,
 };
-#[cfg(any(target_os = "android", target_os = "ios"))]
-use config::load_config_from_path;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use locale::{resolved_tray_lang, tray_strings};
 use serde::Serialize;
@@ -52,9 +52,9 @@ use serde::Serialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::{include_image, WindowEvent, Wry};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -80,9 +80,9 @@ pub(crate) struct Inner {
 }
 
 #[derive(Clone)]
-pub struct AppState {
-    pub rt: Arc<tokio::runtime::Runtime>,
-    pub inner: Arc<Mutex<Inner>>,
+struct AppState {
+    rt: Arc<tokio::runtime::Runtime>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -154,9 +154,7 @@ fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     };
     #[cfg(target_os = "android")]
     let vpn_session_uptime_secs = if connected {
-        Some(
-            android_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000,
-        )
+        Some(android_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000)
     } else {
         None
     };
@@ -273,7 +271,11 @@ fn build_tray_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn apply_tray_menu_locale(app: &AppHandle, cfg: &SavedConfig, connected: bool) -> Result<(), String> {
+fn apply_tray_menu_locale(
+    app: &AppHandle,
+    cfg: &SavedConfig,
+    connected: bool,
+) -> Result<(), String> {
     let menu = build_tray_menu(app, resolved_tray_lang(cfg)).map_err(|e| e.to_string())?;
     if let Some(tray) = app.tray_by_id("main-tray") {
         tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
@@ -313,8 +315,7 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
         let Ok(addr) = format!("127.0.0.1:{socks_port}").parse::<SocketAddr>() else {
             continue;
         };
-        let probe_ok =
-            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok();
+        let probe_ok = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok();
         if probe_ok {
             continue;
         }
@@ -587,7 +588,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     let http_hp = format!("127.0.0.1:{http_port}");
     let socks_hp = format!("127.0.0.1:{socks_port}");
-    let _ = bypass_domains::ensure_loaded(false);
     let split_hosts = g
         .cfg
         .active_profile()
@@ -735,20 +735,24 @@ fn pick_installed_package_cmd() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn measure_server_rtt_cmd(state: State<'_, AppState>) -> Result<Option<u32>, String> {
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    let Some(p) = g.cfg.active_profile() else {
+async fn measure_server_rtt_cmd(state: State<'_, AppState>) -> Result<Option<u32>, String> {
+    let target = {
+        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let Some(p) = g.cfg.active_profile() else {
+            return Ok(None);
+        };
+        let server = p.server.trim();
+        if server.is_empty() {
+            return Ok(None);
+        }
+        parse_server_tcp_target(server)
+    };
+    let Some((host, port)) = target else {
         return Ok(None);
     };
-    let server = p.server.trim();
-    if server.is_empty() {
-        return Ok(None);
-    }
-    let Some((host, port)) = parse_server_tcp_target(server) else {
-        return Ok(None);
-    };
-    drop(g);
-    Ok(measure_tcp_connect_rtt_ms(&host, port))
+    tauri::async_runtime::spawn_blocking(move || measure_tcp_connect_rtt_ms(&host, port))
+        .await
+        .map_err(|e| format!("RTT task: {e}"))
 }
 
 #[tauri::command]
@@ -786,27 +790,40 @@ fn save_config_cmd(
 }
 
 #[tauri::command]
-fn connect_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
-    if let Err(e) = connect_inner(&*state, &app) {
-        let mut g = state.inner.lock().map_err(|e2| e2.to_string())?;
-        g.last_error = Some(e.clone());
+async fn connect_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(e) = connect_inner(&state, &app) {
+            let mut g = state.inner.lock().map_err(|e2| e2.to_string())?;
+            g.last_error = Some(e.clone());
+            let snap = snapshot(&app, &g);
+            let _ = app.emit("vpn-state", &snap);
+            return Err(e);
+        }
+        let g = state.inner.lock().map_err(|e| e.to_string())?;
         let snap = snapshot(&app, &g);
         let _ = app.emit("vpn-state", &snap);
-        return Err(e);
-    }
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    let snap = snapshot(&app, &g);
-    let _ = app.emit("vpn-state", &snap);
-    Ok(snap)
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("connect task: {e}"))?
 }
 
 #[tauri::command]
-fn disconnect_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
-    disconnect_inner(&*state, &app);
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    let snap = snapshot(&app, &g);
-    let _ = app.emit("vpn-state", &snap);
-    Ok(snap)
+async fn disconnect_cmd(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StateSnapshot, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        disconnect_inner(&state, &app);
+        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let snap = snapshot(&app, &g);
+        let _ = app.emit("vpn-state", &snap);
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("disconnect task: {e}"))?
 }
 
 #[tauri::command]
@@ -847,28 +864,58 @@ struct BypassPresetsResponse {
 }
 
 #[tauri::command]
-fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
-    let configured = bypass_domains::bypass_domains_url().is_some();
-    match bypass_domains::ensure_loaded(refresh) {
-        Ok(presets) => BypassPresetsResponse {
-            presets,
-            configured,
-            error: None,
-        },
-        Err(e) => BypassPresetsResponse {
+async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
+    const FETCH_TIMEOUT: Duration =
+        Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
+
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let configured = bypass_domains::bypass_domains_url().is_some();
+        match bypass_domains::ensure_loaded(refresh) {
+            Ok(presets) => {
+                let error = if configured && presets.is_empty() {
+                    Some(
+                        "Списки обхода недоступны (таймаут 2 с или ошибка сети)".into(),
+                    )
+                } else {
+                    None
+                };
+                BypassPresetsResponse {
+                    presets,
+                    configured,
+                    error,
+                }
+            }
+            Err(e) => BypassPresetsResponse {
+                presets: bypass_domains::cached_presets_or_empty(),
+                configured,
+                error: Some(e),
+            },
+        }
+    });
+
+    match tokio::time::timeout(FETCH_TIMEOUT, task).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => BypassPresetsResponse {
             presets: bypass_domains::cached_presets_or_empty(),
-            configured,
-            error: Some(e),
+            configured: bypass_domains::bypass_domains_url().is_some(),
+            error: Some(format!("bypass presets task: {e}")),
+        },
+        Err(_) => BypassPresetsResponse {
+            presets: bypass_domains::cached_presets_or_empty(),
+            configured: bypass_domains::bypass_domains_url().is_some(),
+            error: Some("Таймаут загрузки списков обхода (2 с)".into()),
         },
     }
 }
 
 fn prefetch_bypass_domains() {
     std::thread::spawn(|| {
-        if bypass_domains::bypass_domains_url().is_some() {
-            if let Err(e) = bypass_domains::ensure_loaded(false) {
-                warn!(target: "bibavpn_desktop", "prefetch bypass-domains: {e}");
-            }
+        if bypass_domains::bypass_domains_url().is_none() {
+            return;
+        }
+        let _ = bypass_domains::ensure_loaded(false);
+        if bypass_domains::cached_presets_or_empty().is_empty() {
+            bypass_domains::background_refresh_full();
         }
     });
 }
