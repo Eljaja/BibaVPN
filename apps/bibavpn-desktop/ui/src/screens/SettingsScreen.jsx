@@ -42,7 +42,7 @@ function SettingsSection({ theme, title, children }) {
   );
 }
 
-/** @param {{ cfg: import('../vpnTypes').SavedConfig, setCfg: (fn: (c: import('../vpnTypes').SavedConfig) => import('../vpnTypes').SavedConfig) => void, boringAvailable: boolean, onBack?: () => void, onPersist: () => Promise<void>, onSave: () => Promise<void>, onApplyInvite: () => Promise<void>, lastError: string | null, onClearError: () => Promise<void> }} props */
+/** @param {{ cfg: import('../vpnTypes').SavedConfig, setCfg: (fn: (c: import('../vpnTypes').SavedConfig) => import('../vpnTypes').SavedConfig) => void, boringAvailable: boolean, onBack?: () => void, onPersist: () => Promise<void>, onSave: () => Promise<void>, onApplyInvite: () => Promise<void>, onRefreshFromControlPlane?: () => Promise<void>, lastError: string | null, onClearError: () => Promise<void> }} props */
 export function SettingsScreen({
   cfg,
   setCfg,
@@ -51,6 +51,7 @@ export function SettingsScreen({
   onPersist,
   onSave,
   onApplyInvite,
+  onRefreshFromControlPlane,
   lastError,
   onClearError,
 }) {
@@ -290,6 +291,11 @@ export function SettingsScreen({
           <Btn kind="primary" block onClick={handleApplyInvite}>
             {t("btn_apply_invite")}
           </Btn>
+          {p.control_plane_base_url && p.control_plane_instance_id ? (
+            <Btn kind="secondary" block onClick={() => onRefreshFromControlPlane?.()}>
+              {t("btn_refresh_control_plane")}
+            </Btn>
+          ) : null}
         </SettingsSection>
 
         <SettingsSection theme={theme} title={t("settings_group_endpoint")}>

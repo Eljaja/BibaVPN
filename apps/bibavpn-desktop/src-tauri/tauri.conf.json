@@ -29,6 +29,19 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["bibavpn"]
+      },
+      "mobile": [
+        {
+          "scheme": ["bibavpn"],
+          "host": "import"
+        }
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "android": {

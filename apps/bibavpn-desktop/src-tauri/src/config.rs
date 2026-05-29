@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bibavpn::local_client::DEFAULT_CLIENT_MAX_WS_BINARY;
+use bibavpn::invite_uri::InviteV1;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_VERSION: u32 = 2;
@@ -114,6 +115,14 @@ pub struct TunnelProfile {
     #[serde(default)]
     pub ws_jitter_max_ms: u8,
 
+    /// Control plane metadata (portal import).
+    #[serde(default)]
+    pub control_plane_instance_id: u64,
+    #[serde(default)]
+    pub control_plane_config_version: String,
+    #[serde(default)]
+    pub control_plane_base_url: String,
+
     // Android-only (сохраняются в профиле; в tunnel JSON не попадают, кроме socks_bind)
     /// Локальный SOCKS для `local_client` на Android. Пусто → `127.0.0.1:1080` как в `BibaVpnService::SOCKS_LOCAL`.
     /// Не показываем в UI как «настройки прокси» — поле для миграции/внутренних сценариев.
@@ -151,6 +160,108 @@ fn default_android_vpn_routing_mode() -> String {
 
 /// Значение по умолчанию для `socks_bind` в JSON на Android (см. `BibaVpnService.SOCKS_LOCAL`).
 pub const ANDROID_DEFAULT_SOCKS_BIND: &str = "127.0.0.1:1080";
+
+/// Copy decoded invite fields into a saved profile (UI + tunnel JSON hints).
+pub fn apply_invite_fields(p: &mut TunnelProfile, inv: &InviteV1) {
+    p.server = inv.server.clone();
+    p.sni = inv.sni.clone();
+    p.token = inv.token.clone();
+    p.psk = inv.psk.clone().unwrap_or_default();
+    p.proto = inv.proto;
+    p.proto_domain = inv
+        .proto_domain
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    p.decoy_max = inv.decoy_max;
+    p.max_pad = inv.max_pad;
+    p.max_ws_binary = inv.max_ws_binary;
+    p.ws_ping_secs = inv.ws_ping_secs;
+    p.insecure = inv.insecure;
+    p.tls_profile = inv.tls_profile.clone();
+    p.ws_path = inv.ws_path.clone().unwrap_or_default();
+    p.pad_mode = inv.pad_mode.clone().unwrap_or_default();
+    p.dummy_interval_secs = inv.dummy_interval_secs.unwrap_or(0);
+    p.ws_ping_jitter_percent = inv.ws_ping_jitter_percent;
+    p.ws_binary_send_jitter_ms = inv.ws_binary_send_jitter_ms;
+    p.ws_jitter_min_ms = inv.ws_jitter_min_ms;
+    p.ws_jitter_max_ms = inv.ws_jitter_max_ms;
+    p.udp_max_pad = inv.udp_max_pad.map(|x| x.to_string()).unwrap_or_default();
+    p.udp_max_ws_binary = inv
+        .udp_max_ws_binary
+        .map(|x| x.to_string())
+        .unwrap_or_default();
+    p.udp_mux_reply_timeout_secs = inv.udp_mux_reply_timeout_secs.to_string();
+    p.junk_frames = inv.junk_frames;
+    p.early_ws_frames = inv.early_ws_frames;
+    p.use_tcp_mux = inv.use_tcp_mux;
+    p.decoy_gets = inv.decoy_gets;
+    p.decoy_gets_interval_secs = inv.decoy_gets_interval_secs;
+    p.decoy_gets_paths = inv.decoy_gets_paths.clone().unwrap_or_default();
+    p.ws_host = inv.ws_host.clone().unwrap_or_default();
+    p.ws_origin = inv.ws_origin.clone().unwrap_or_default();
+    p.ws_user_agent = inv.ws_user_agent.clone().unwrap_or_default();
+    p.ws_accept_language = inv.ws_accept_language.clone().unwrap_or_default();
+    p.ws_headers = inv.ws_headers.join("\n");
+    p.fingerprint = inv.fingerprint.clone().unwrap_or_default();
+    p.stealth_profile = inv.stealth_profile.clone().unwrap_or_default();
+    p.decoy_mode = inv.decoy_mode.clone().unwrap_or_default();
+    p.desync_mode = inv.desync_mode.clone().unwrap_or_default();
+    p.tcp_fooling = inv.tcp_fooling.clone().unwrap_or_default();
+    p.tls_fragment = inv.tls_fragment;
+    p.ws_parallel = inv.ws_parallel.max(1).min(4);
+    p.idle_decoy_secs = inv.idle_decoy_secs.unwrap_or(0);
+    p.tls_stack = inv.tls_stack.clone();
+    p.reality_target = inv.reality_target.clone().unwrap_or_default();
+    p.reality_public_key = inv.reality_public_key.clone().unwrap_or_default();
+    p.reality_short_id = inv.reality_short_id.clone().unwrap_or_default();
+    p.pin_cert_pem = inv.pin_cert_pem.clone().unwrap_or_default();
+}
+
+/// Import or update a profile from control plane redeem payload.
+pub fn import_control_plane_payload(
+    cfg: &mut SavedConfig,
+    payload: &crate::control_plane_client::ImportPayload,
+    base_url: &str,
+) -> Result<(), String> {
+    use bibavpn::decode_invite_v1;
+
+    let inst_id = payload.instance_id.max(0) as u64;
+    let profile_idx = cfg
+        .profiles
+        .iter()
+        .position(|p| p.control_plane_instance_id == inst_id && inst_id > 0);
+    if profile_idx.is_none() {
+        let id = new_profile_id();
+        cfg.profiles.push(TunnelProfile {
+            id: id.clone(),
+            name: payload.display_name.clone(),
+            control_plane_instance_id: inst_id,
+            ..TunnelProfile::default()
+        });
+        cfg.active_profile_id = id;
+    } else if let Some(i) = profile_idx {
+        cfg.active_profile_id = cfg.profiles[i].id.clone();
+    }
+
+    let p = cfg
+        .active_profile_mut()
+        .ok_or_else(|| "нет активного профиля".to_string())?;
+    p.from_invite = payload.invite_uri.trim().to_string();
+    p.invite_passphrase = payload.invite_passphrase.clone();
+    p.control_plane_instance_id = inst_id;
+    p.control_plane_config_version = payload.config_version.clone();
+    p.control_plane_base_url = base_url.trim().trim_end_matches('/').to_string();
+    if !payload.display_name.trim().is_empty() {
+        p.name = payload.display_name.trim().to_string();
+    } else if !payload.server_name.trim().is_empty() {
+        p.name = payload.server_name.trim().to_string();
+    }
+    let inv = decode_invite_v1(&p.from_invite, &p.invite_passphrase)
+        .map_err(|e| format!("Ключ: {e:#}"))?;
+    apply_invite_fields(p, &inv);
+    Ok(())
+}
 
 impl Default for TunnelProfile {
     fn default() -> Self {
@@ -207,6 +318,9 @@ impl Default for TunnelProfile {
             ws_accept_language: String::new(),
             ws_jitter_min_ms: 0,
             ws_jitter_max_ms: 0,
+            control_plane_instance_id: 0,
+            control_plane_config_version: String::new(),
+            control_plane_base_url: String::new(),
             android_socks_bind: String::new(),
             android_split_tunnel_packages: Vec::new(),
             android_manual_split_packages: Vec::new(),
@@ -456,7 +570,13 @@ impl TunnelProfile {
         }
         // Как Android `buildJson`: proto_domain только в ручном режиме (не инвайт).
         let pd = self.proto_domain.trim();
-        if !use_invite && !pd.is_empty() {
+        if !use_invite {
+            if pd.is_empty() {
+                o.insert("proto_domain".to_string(), json!("default"));
+            } else {
+                o.insert("proto_domain".to_string(), json!(pd));
+            }
+        } else if !pd.is_empty() {
             o.insert("proto_domain".to_string(), json!(pd));
         }
         let sp = self.stealth_profile.trim();

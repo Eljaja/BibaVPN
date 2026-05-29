@@ -78,6 +78,12 @@ export function useVpn() {
     return /** @type {StateSnapshot} */ (s);
   }, []);
 
+  const refreshFromControlPlane = useCallback(async () => {
+    const s = await invoke("open_control_plane_refresh_cmd");
+    setSnap(/** @type {StateSnapshot} */ (s));
+    return /** @type {StateSnapshot} */ (s);
+  }, []);
+
   const clearError = useCallback(async () => {
     const s = await invoke("clear_error_cmd");
     setSnap(/** @type {StateSnapshot} */ (s));
@@ -91,6 +97,7 @@ export function useVpn() {
     connect,
     disconnect,
     applyInvite,
+    refreshFromControlPlane,
     clearError,
   };
 }

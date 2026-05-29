@@ -2,6 +2,7 @@
 
 mod bypass_domains;
 mod config;
+mod control_plane_client;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod locale;
 mod logging;
@@ -42,8 +43,8 @@ use bibavpn::tls_util::install_ring_crypto;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use config::load_config_from_path;
 use config::{
-    desktop_config_json_path, display_host_line, load_config_disk, normalize_loaded,
-    save_config_to_path, server_card_subtitle, SavedConfig,
+    apply_invite_fields, desktop_config_json_path, display_host_line, import_control_plane_payload,
+    load_config_disk, normalize_loaded, save_config_to_path, server_card_subtitle, SavedConfig,
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use locale::{resolved_tray_lang, tray_strings};
@@ -55,6 +56,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::{include_image, WindowEvent, Wry};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri_plugin_deep_link::DeepLinkExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -284,6 +286,35 @@ fn apply_tray_menu_locale(
     Ok(())
 }
 
+fn install_deep_link_handler(app: &AppHandle, state: AppState) {
+    let handle = app.clone();
+    let st = state.clone();
+    app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+            let raw = url.to_string();
+            if let Err(e) = handle_import_deeplink(&st, &handle, &raw) {
+                warn!(target: "bibavpn_desktop", "deep link: {e}");
+                let mut g = st.inner.lock().unwrap_or_else(|p| p.into_inner());
+                g.last_error = Some(e);
+                let snap = snapshot(&handle, &g);
+                let _ = handle.emit("vpn-state", &snap);
+            }
+        }
+    });
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if let Err(e) = app.deep_link().register("bibavpn") {
+        warn!(target: "bibavpn_desktop", "deep link register: {e}");
+    }
+    if let Ok(Some(urls)) = app.deep_link().get_current() {
+        for url in urls {
+            let raw = url.to_string();
+            if let Err(e) = handle_import_deeplink(&state, app, &raw) {
+                warn!(target: "bibavpn_desktop", "deep link startup: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -291,6 +322,9 @@ fn show_main_window(app: &AppHandle) {
         let _ = w.set_focus();
     }
 }
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn show_main_window(_app: &AppHandle) {}
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
@@ -457,27 +491,7 @@ fn apply_invite_to_cfg(cfg: &mut SavedConfig) -> Result<(), String> {
     }
     match decode_invite_v1(uri, pass) {
         Ok(inv) => {
-            p.server = inv.server;
-            p.sni = inv.sni;
-            p.token = inv.token;
-            p.psk = inv.psk.unwrap_or_default();
-            p.decoy_max = inv.decoy_max;
-            p.max_pad = inv.max_pad;
-            p.max_ws_binary = inv.max_ws_binary;
-            p.ws_ping_secs = inv.ws_ping_secs;
-            p.insecure = inv.insecure;
-            p.tls_profile = inv.tls_profile;
-            p.ws_path = inv.ws_path.clone().unwrap_or_default();
-            p.pad_mode = inv.pad_mode.clone().unwrap_or_default();
-            p.dummy_interval_secs = inv.dummy_interval_secs.unwrap_or(0);
-            p.ws_ping_jitter_percent = inv.ws_ping_jitter_percent;
-            p.ws_binary_send_jitter_ms = inv.ws_binary_send_jitter_ms;
-            p.udp_max_pad = inv.udp_max_pad.map(|x| x.to_string()).unwrap_or_default();
-            p.udp_max_ws_binary = inv
-                .udp_max_ws_binary
-                .map(|x| x.to_string())
-                .unwrap_or_default();
-            p.udp_mux_reply_timeout_secs = inv.udp_mux_reply_timeout_secs.to_string();
+            apply_invite_fields(p, &inv);
             Ok(())
         }
         Err(e) => {
@@ -485,6 +499,55 @@ fn apply_invite_to_cfg(cfg: &mut SavedConfig) -> Result<(), String> {
             Err(format!("Ключ: {e:#}"))
         }
     }
+}
+
+fn parse_import_deeplink(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if !trimmed.to_lowercase().starts_with("bibavpn://") {
+        return None;
+    }
+    let rest = trimmed.splitn(2, "://").nth(1)?;
+    let (host_and_path, query) = rest.split_once('?')?;
+    let host = host_and_path.trim_end_matches('/').split('/').next()?;
+    if host != "import" {
+        return None;
+    }
+    let mut token = None;
+    let mut base_url = None;
+    for part in query.split('&') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let key = urlencoding::decode(k).ok()?.into_owned();
+        let val = urlencoding::decode(v).ok()?.into_owned();
+        match key.as_str() {
+            "token" => token = Some(val),
+            "base_url" => base_url = Some(val),
+            _ => {}
+        }
+    }
+    Some((token?, base_url?))
+}
+
+fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> Result<(), String> {
+    let (token, base_url) = parse_import_deeplink(raw_url)
+        .ok_or_else(|| "Неверная ссылка импорта (ожидается bibavpn://import?...).".to_string())?;
+    let payload = control_plane_client::redeem_import(&base_url, &token)?;
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    g.last_error = None;
+    import_control_plane_payload(&mut g.cfg, &payload, &base_url)?;
+    persist_cfg(app, &g.cfg)?;
+    info!(
+        target: "bibavpn_desktop",
+        instance_id = payload.instance_id,
+        config_version = %payload.config_version,
+        "control plane import ok"
+    );
+    let snap = snapshot(app, &g);
+    drop(g);
+    let _ = app.emit("vpn-state", &snap);
+    show_main_window(app);
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -847,6 +910,71 @@ fn apply_invite_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateS
 }
 
 #[tauri::command]
+fn open_control_plane_refresh_cmd(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StateSnapshot, String> {
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    let p = g
+        .cfg
+        .active_profile()
+        .ok_or_else(|| "Нет активного профиля.".to_string())?;
+    let base = p.control_plane_base_url.trim();
+    let inst = p.control_plane_instance_id;
+    if base.is_empty() || inst == 0 {
+        return Err("Профиль не привязан к control plane. Откройте конфиг из веб-кабинета.".into());
+    }
+    let url = format!("{base}/me/instances/{inst}/open");
+    drop(g);
+    open_portal_url(&url)?;
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    Ok(snapshot(&app, &g))
+}
+
+fn open_portal_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        // Android: rely on VIEW intent via plugin when available; fallback to log.
+        let _ = url;
+        return Err(
+            "Откройте веб-кабинет в браузере и нажмите «Открыть в BibaVPN».".into(),
+        );
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = url;
+        return Err(
+            "Откройте веб-кабинет в браузере и нажмите «Open in BibaVPN».".into(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+}
+
+#[tauri::command]
 fn clear_error_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     g.last_error = None;
@@ -971,7 +1099,9 @@ pub fn run() -> anyhow::Result<()> {
         })),
     };
 
-    let mut builder = tauri::Builder::default().manage(state);
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
+        .manage(state);
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1059,6 +1189,7 @@ pub fn run() -> anyhow::Result<()> {
                     Clone::clone(&*app.state::<AppState>()),
                 );
                 prefetch_bypass_domains();
+                install_deep_link_handler(app.handle(), Clone::clone(&*app.state::<AppState>()));
                 Ok(())
             });
     }
@@ -1066,6 +1197,7 @@ pub fn run() -> anyhow::Result<()> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         builder = builder.setup(|app| {
+            install_deep_link_handler(app.handle(), Clone::clone(&*app.state::<AppState>()));
             let handle = app.handle().clone();
             match mobile_config_json_path(&handle) {
                 Ok(path) => {
@@ -1105,6 +1237,7 @@ pub fn run() -> anyhow::Result<()> {
             disconnect_cmd,
             apply_invite_cmd,
             clear_error_cmd,
+            open_control_plane_refresh_cmd,
             get_bypass_presets_cmd,
         ])
         .build(tauri::generate_context!())?;
@@ -1117,4 +1250,17 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod deeplink_tests {
+    use super::parse_import_deeplink;
+
+    #[test]
+    fn parse_import_deeplink_ok() {
+        let url = "bibavpn://import?token=abc123&base_url=https%3A%2F%2Fcp.example.com";
+        let (tok, base) = parse_import_deeplink(url).expect("parse");
+        assert_eq!(tok, "abc123");
+        assert_eq!(base, "https://cp.example.com");
+    }
 }

@@ -11,7 +11,7 @@ function cloneCfg(c) {
 }
 
 function AppInner() {
-  const { snap, busy, connect, disconnect, saveCfg, applyInvite, clearError, refresh } = useVpn();
+  const { snap, busy, connect, disconnect, saveCfg, applyInvite, refreshFromControlPlane, clearError, refresh } = useVpn();
   const [tab, setTab] = useState("connect");
   /** @type {[import('./vpnTypes').SavedConfig | null, (c: import('./vpnTypes').SavedConfig | null) => void]} */
   const [draft, setDraft] = useState(null);
@@ -132,6 +132,13 @@ function AppInner() {
         onApplyInvite={async () => {
           try {
             await applyInvite();
+          } finally {
+            setDraft(null);
+          }
+        }}
+        onRefreshFromControlPlane={async () => {
+          try {
+            await refreshFromControlPlane();
           } finally {
             setDraft(null);
           }

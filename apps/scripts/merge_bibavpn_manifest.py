@@ -58,6 +58,15 @@ PICK_PACKAGE_ACTIVITY = """
             android:theme="@style/Theme.AppCompat.Dialog" />
 """
 
+DEEPLINK_INTENT = """
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="bibavpn" android:host="import" />
+            </intent-filter>
+"""
+
 
 def _insert_after_internet_perm(text: str, block: str) -> str:
     if block.strip() in text:
@@ -121,6 +130,14 @@ def patch_manifest(text: str) -> tuple[str, bool]:
 
     if "PickInstalledPackageActivity" not in text:
         text = re.sub(r"(</application>)", PICK_PACKAGE_ACTIVITY + r"\1", text, count=1)
+
+    if 'android:scheme="bibavpn"' not in text:
+        text = re.sub(
+            r"(<activity[^>]*android:name=\"\.MainActivity\"[^>]*>)",
+            r"\1" + DEEPLINK_INTENT,
+            text,
+            count=1,
+        )
 
     return text, text != original
 
