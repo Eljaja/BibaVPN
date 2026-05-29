@@ -17,47 +17,73 @@ class PickInstalledPackageActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        title = "Приложение"
 
+        setContentView(
+            TextView(this).apply {
+                text = "Загрузка приложений…"
+                setPadding(32, 32, 32, 32)
+            }
+        )
+
+        Thread {
+            val rows = loadLauncherApps()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                setContentView(buildList(rows))
+            }
+        }.start()
+    }
+
+    private fun loadLauncherApps(): List<AppRow> {
         val pm = packageManager
         val launchIntent =
             Intent(Intent.ACTION_MAIN).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
         @Suppress("DEPRECATION")
-        val resolves =
-            pm.queryIntentActivities(launchIntent, 0)
-                .filter { it.activityInfo.packageName != packageName }
-                .distinctBy { it.activityInfo.packageName }
-                .sortedBy { ri ->
-                    ri.loadLabel(pm).toString().lowercase()
-                }
+        return pm.queryIntentActivities(launchIntent, 0)
+            .asSequence()
+            .filter { it.activityInfo.packageName != packageName }
+            .distinctBy { it.activityInfo.packageName }
+            .map { ri ->
+                AppRow(
+                    label = ri.loadLabel(pm).toString(),
+                    packageName = ri.activityInfo.packageName
+                )
+            }
+            .sortedBy { it.label.lowercase() }
+            .toList()
+    }
 
-        val rv = RecyclerView(this)
-        rv.layoutManager = LinearLayoutManager(this)
-        rv.adapter =
-            object : RecyclerView.Adapter<VH>() {
-                override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
-                    val row =
-                        LayoutInflater.from(parent.context)
-                            .inflate(android.R.layout.simple_list_item_2, parent, false)
-                    return VH(row)
-                }
+    private fun buildList(rows: List<AppRow>): RecyclerView {
+        return RecyclerView(this).apply {
+            layoutManager = LinearLayoutManager(this@PickInstalledPackageActivity)
+            adapter =
+                object : RecyclerView.Adapter<VH>() {
+                    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+                        val row =
+                            LayoutInflater.from(parent.context)
+                                .inflate(android.R.layout.simple_list_item_2, parent, false)
+                        return VH(row)
+                    }
 
-                override fun getItemCount(): Int = resolves.size
+                    override fun getItemCount(): Int = rows.size
 
-                override fun onBindViewHolder(holder: VH, position: Int) {
-                    val ri = resolves[position]
-                    val pkg = ri.activityInfo.packageName
-                    holder.text1.text = ri.loadLabel(pm).toString()
-                    holder.text2.text = pkg
-                    holder.itemView.setOnClickListener {
-                        setResult(RESULT_OK, Intent().putExtra(EXTRA_PACKAGE_NAME, pkg))
-                        finish()
+                    override fun onBindViewHolder(holder: VH, position: Int) {
+                        val row = rows[position]
+                        holder.text1.text = row.label
+                        holder.text2.text = row.packageName
+                        holder.itemView.setOnClickListener {
+                            setResult(
+                                RESULT_OK,
+                                Intent().putExtra(EXTRA_PACKAGE_NAME, row.packageName)
+                            )
+                            finish()
+                        }
                     }
                 }
-            }
-        setContentView(rv)
-        title = "Приложение"
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -70,6 +96,8 @@ class PickInstalledPackageActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_PACKAGE_NAME = "dev.bibavpn.EXTRA_SPLIT_TUNNEL_PKG"
     }
+
+    private data class AppRow(val label: String, val packageName: String)
 
     private class VH(view: View) : RecyclerView.ViewHolder(view) {
         val text1: TextView = view.findViewById(android.R.id.text1)

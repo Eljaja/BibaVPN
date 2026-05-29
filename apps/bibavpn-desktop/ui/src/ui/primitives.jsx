@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { useT } from "../ThemeContext.jsx";
 import { SEMANTIC, MONO, SANS } from "../theme.js";
 
-export function StatusDot({ state, size = 8 }) {
+export function StatusDot({ state, size = 8, animate = true }) {
   const { accent } = useT();
   const color =
     state === "connected"
@@ -12,7 +12,7 @@ export function StatusDot({ state, size = 8 }) {
         : state === "error"
           ? SEMANTIC.err
           : "#4b5761";
-  const pulse = state === "connecting";
+  const pulse = animate && state === "connecting";
   return (
     <span
       style={{
@@ -40,6 +40,7 @@ export function StatusDot({ state, size = 8 }) {
             borderRadius: "50%",
             background: color,
             animation: "biba-ping 1.2s ease-out infinite",
+            willChange: "transform, opacity",
           }}
         />
       )}
@@ -72,7 +73,7 @@ export function Btn({
     width: block ? "100%" : "auto",
     border: "1px solid transparent",
     fontWeight: 500,
-    transition: "all 120ms",
+    transition: "background-color 120ms, border-color 120ms, color 120ms, opacity 120ms",
     userSelect: "none",
   };
   let sx;

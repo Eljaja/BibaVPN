@@ -109,6 +109,14 @@ struct StateSnapshot {
     vpn_session_uptime_secs: Option<u64>,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TunnelStatus {
+    connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vpn_session_uptime_secs: Option<u64>,
+}
+
 /// TCP connect time до `profile.server` (host или host:port). IPv6 — только формат `[addr]:port`.
 fn parse_server_tcp_target(server_trimmed: &str) -> Option<(String, u16)> {
     let s = server_trimmed.trim();
@@ -460,7 +468,8 @@ fn disconnect_inner(state: &AppState, app: &AppHandle) {
                     }
                 }
             }
-            None => {
+            None =>
+            {
                 #[cfg(windows)]
                 if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
                     warn!(
@@ -826,6 +835,62 @@ fn get_state(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot
 }
 
 #[tauri::command]
+async fn get_tunnel_status_cmd(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<TunnelStatus, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = state;
+        let status = tauri::async_runtime::spawn_blocking(move || {
+            let connected = android_vpn::tunnel_is_active(&app).unwrap_or(false);
+            let vpn_session_uptime_secs = if connected {
+                Some(android_vpn::tunnel_session_elapsed_ms(&app).unwrap_or(0) / 1000)
+            } else {
+                None
+            };
+            TunnelStatus {
+                connected,
+                vpn_session_uptime_secs,
+            }
+        })
+        .await
+        .map_err(|e| format!("tunnel status task: {e}"))?;
+        return Ok(status);
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        let _ = state;
+        let status = tauri::async_runtime::spawn_blocking(move || {
+            let connected = ios_vpn::tunnel_is_active(&app).unwrap_or(false);
+            let vpn_session_uptime_secs = if connected {
+                Some(ios_vpn::tunnel_session_elapsed_ms(&app).unwrap_or(0) / 1000)
+            } else {
+                None
+            };
+            TunnelStatus {
+                connected,
+                vpn_session_uptime_secs,
+            }
+        })
+        .await
+        .map_err(|e| format!("tunnel status task: {e}"))?;
+        return Ok(status);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = app;
+        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        Ok(TunnelStatus {
+            connected: g.vpn.is_some(),
+            vpn_session_uptime_secs: None,
+        })
+    }
+}
+
+#[tauri::command]
 fn save_config_cmd(
     cfg: SavedConfig,
     state: State<'_, AppState>,
@@ -938,16 +1003,12 @@ fn open_portal_url(url: &str) -> Result<(), String> {
         use tauri::Manager;
         // Android: rely on VIEW intent via plugin when available; fallback to log.
         let _ = url;
-        return Err(
-            "Откройте веб-кабинет в браузере и нажмите «Открыть в BibaVPN».".into(),
-        );
+        return Err("Откройте веб-кабинет в браузере и нажмите «Открыть в BibaVPN».".into());
     }
     #[cfg(target_os = "ios")]
     {
         let _ = url;
-        return Err(
-            "Откройте веб-кабинет в браузере и нажмите «Open in BibaVPN».".into(),
-        );
+        return Err("Откройте веб-кабинет в браузере и нажмите «Open in BibaVPN».".into());
     }
     #[cfg(windows)]
     {
@@ -994,17 +1055,14 @@ struct BypassPresetsResponse {
 
 #[tauri::command]
 async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
-    const FETCH_TIMEOUT: Duration =
-        Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
 
     let task = tauri::async_runtime::spawn_blocking(move || {
         let configured = bypass_domains::bypass_domains_url().is_some();
         match bypass_domains::ensure_loaded(refresh) {
             Ok(presets) => {
                 let error = if configured && presets.is_empty() {
-                    Some(
-                        "Списки обхода недоступны (таймаут 2 с или ошибка сети)".into(),
-                    )
+                    Some("Списки обхода недоступны (таймаут 2 с или ошибка сети)".into())
                 } else {
                     None
                 };
@@ -1111,9 +1169,7 @@ pub fn run() -> anyhow::Result<()> {
         }));
     }
 
-    builder = builder
-        .plugin(tauri_plugin_deep_link::init())
-        .manage(state);
+    builder = builder.plugin(tauri_plugin_deep_link::init()).manage(state);
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1242,6 +1298,7 @@ pub fn run() -> anyhow::Result<()> {
     let app = builder
         .invoke_handler(tauri::generate_handler![
             get_state,
+            get_tunnel_status_cmd,
             measure_server_rtt_cmd,
             pick_installed_package_cmd,
             save_config_cmd,
