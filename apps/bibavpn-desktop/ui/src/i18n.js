@@ -108,7 +108,7 @@ const MESSAGES = {
     settings_group_platform: "Платформа",
     settings_group_ports: "Локальные порты (десктоп)",
     android_split_note:
-      "Пресеты как в приложении Android (Госуслуги, Ozon, банки и др.). Можно добавить любое приложение из списка установленных.",
+      "Пресеты: домены в обход VPN на Android 13+ (по IP при подключении); на старых версиях — обход по приложениям. Можно добавить приложение из списка установленных.",
     boring_unavailable: "Сборка без BoringTLS — значение будет проигнорировано.",
     pin_rustls_only: "pin_cert_pem только для rustls",
     tls_stack_label: "Стек TLS",
@@ -251,7 +251,7 @@ const MESSAGES = {
     settings_group_platform: "Platform",
     settings_group_ports: "Local ports (desktop)",
     android_split_note:
-      "Same presets as the Android app (Gosuslugi, Ozon, banks…). You can also pick any installed app.",
+      "Presets: domain bypass on Android 13+ (IPs resolved at connect); older Android uses per-app bypass. You can also pick any installed app.",
     boring_unavailable: "This build has no BoringTLS — value may be ignored.",
     pin_rustls_only: "pin_cert_pem is rustls-only",
     tls_stack_label: "TLS stack",

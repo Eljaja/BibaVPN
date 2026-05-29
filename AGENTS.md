@@ -533,4 +533,25 @@ require root without explicit opt-in.
 
 ---
 
+## Learned User Preferences
+
+- User often writes in Russian; match that language in replies when they do.
+- When executing an attached plan: do not edit the plan file; use pre-created todos, mark them in_progress, and finish all of them.
+- Split git changes into separate logical commits with English messages; never mention Cursor or other AI tooling in commit text.
+- Do not commit `experiments/` (local lab/DPI work; already in `.gitignore`).
+- Prefer end-to-end autonomous ops (build, deploy, smoke-test, return `biba://` + passphrase) over leaving partial scripts for the user.
+- CI should run only when relevant paths change (protocol, server, apps), not on every commit.
+- Unified Tauri UI across Windows, Android, and macOS: dark theme only, multi-profile, logs hidden from the front-end; follow `united-design-new/` for layout.
+- Android debug CI artifacts should include only the Android APK, not bundles for other platforms.
+
+## Learned Workspace Facts
+
+- Monorepo root is `biba-vpn/`; Rust VPN stack in `biba-vpn/biba-vpn/`; control plane in `biba-vpn/biba-control-plane/`. Root `.cursorrules` routes Python/control-plane work to `biba-control-plane/AGENTS.md` and `make ci`.
+- On the Windows dev machine, WSL Ubuntu is the primary path for `cargo test`, Docker compose, Android builds (NDK/adb), and SSH-based VPS deploys (RSA keys live in WSL).
+- Split-tunnel bypass domain lists are fetched from the control-plane public API; apps use `BIBA_BYPASS_DOMAINS_URL` at build/runtime (CI secret or local `.env`), not a hardcoded URL in the open repo.
+- User-facing docs should describe proto 3 only; avoid legacy v1/v2 hello/wire references that confuse readers.
+- Local DPI/fingerprint proof labs belong under gitignored `experiments/`; scope tests to owned infrastructure only.
+
+---
+
 *For humans and AI agents working on the BibaVPN repository.*

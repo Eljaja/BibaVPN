@@ -12,6 +12,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.IpPrefix
 import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
@@ -21,6 +22,8 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -644,6 +647,7 @@ class BibaVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
             builder.addDisallowedApplication(packageName)
             builder.applySplitTunnelBypasses()
+            builder.applySplitTunnelDomainBypasses()
             // Не добавляем ::/0: у многих сборок tun2socks UDP/IPv6 через TUN неполный — тогда AAAA/DNS v6 «висят».
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -752,6 +756,70 @@ class BibaVpnService : VpnService() {
                 Log.d(TAG, "split tunnel: не добавлен $pkg (${e.message})")
             }
         }
+    }
+
+    /**
+     * Домены из preset API → IPv4 excludeRoute (API 33+). Трафик к этим IP не идёт в TUN.
+     * IP фиксируются при подключении; после смены CDN переподключите VPN.
+     */
+    private fun Builder.applySplitTunnelDomainBypasses() {
+        if (!isSplitTunnelEnabled(this@BibaVpnService)) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Log.i(
+                TAG,
+                "split tunnel domains: excludeRoute requires Android 13+ (API ${Build.VERSION.SDK_INT}); use per-app bypass",
+            )
+            return
+        }
+        val hosts = normalizeBypassHosts(getSplitTunnelBypassDomains(this@BibaVpnService))
+        if (hosts.isEmpty()) return
+
+        val seenIps = LinkedHashSet<String>()
+        var excludeCount = 0
+        for (host in hosts) {
+            if (excludeCount >= MAX_DOMAIN_ROUTE_EXCLUSIONS) {
+                Log.w(TAG, "split tunnel domains: cap $MAX_DOMAIN_ROUTE_EXCLUSIONS excludeRoute(s)")
+                break
+            }
+            val addrs =
+                runCatching { InetAddress.getAllByName(host) }.getOrElse { e ->
+                    Log.w(TAG, "split tunnel: resolve $host failed: ${e.message}")
+                    return@getOrElse emptyArray()
+                }
+            for (addr in addrs) {
+                if (excludeCount >= MAX_DOMAIN_ROUTE_EXCLUSIONS) break
+                if (addr !is Inet4Address) continue
+                val ip = addr.hostAddress ?: continue
+                if (!seenIps.add(ip)) continue
+                runCatching {
+                    excludeRoute(IpPrefix(addr, 32))
+                }.onSuccess {
+                    excludeCount++
+                    Log.i(TAG, "split tunnel: excludeRoute $ip/32 ($host)")
+                }.onFailure { e ->
+                    Log.w(TAG, "split tunnel: excludeRoute $ip failed: ${e.message}")
+                }
+            }
+        }
+        Log.i(
+            TAG,
+            "split tunnel domains: $excludeCount excludeRoute(s) from ${hosts.size} host(s)",
+        )
+    }
+
+    private fun normalizeBypassHosts(raw: Set<String>): List<String> {
+        val out = LinkedHashSet<String>()
+        for (entry in raw) {
+            var s = entry.trim().lowercase()
+            if (s.isEmpty()) continue
+            if (s.startsWith("http://")) s = s.removePrefix("http://")
+            if (s.startsWith("https://")) s = s.removePrefix("https://")
+            s = s.substringBefore('/').substringBefore(':')
+            if (s.startsWith("*.")) s = s.removePrefix("*.")
+            if (s.isEmpty() || s == "localhost") continue
+            out.add(s)
+        }
+        return out.toList()
     }
 
     private fun abortVpnFromWorker(detail: String?) {
@@ -1064,6 +1132,9 @@ class BibaVpnService : VpnService() {
         private const val KEY_PENDING_AFTER_PREPARE = "pending_after_vpn_prepare"
         private const val KEY_SPLIT_TUNNEL_ENABLED = "split_tunnel_enabled"
         private const val KEY_SPLIT_TUNNEL_PACKAGES = "split_tunnel_packages"
+        private const val KEY_SPLIT_TUNNEL_DOMAINS = "split_tunnel_domains"
+        /** Лимит excludeRoute при резолве preset-доменов (защита от раздувания VPN config). */
+        private const val MAX_DOMAIN_ROUTE_EXCLUSIONS = 128
 
         /** Раздельный туннель: выбранные приложения в обход VPN (прямой IP). */
         fun isSplitTunnelEnabled(ctx: Context): Boolean =
@@ -1078,14 +1149,26 @@ class BibaVpnService : VpnService() {
                 ?.toHashSet()
                 ?: emptySet()
 
+        fun getSplitTunnelBypassDomains(ctx: Context): Set<String> =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getStringSet(KEY_SPLIT_TUNNEL_DOMAINS, null)
+                ?.toHashSet()
+                ?: emptySet()
+
         fun setSplitTunnelConfig(
             ctx: Context,
             enabled: Boolean,
             packages: Set<String>,
+            domains: Set<String> = emptySet(),
         ) {
+            val domainSet =
+                HashSet(
+                    domains.map { it.trim() }.filter { it.isNotEmpty() },
+                )
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putBoolean(KEY_SPLIT_TUNNEL_ENABLED, enabled)
                 .putStringSet(KEY_SPLIT_TUNNEL_PACKAGES, HashSet(packages))
+                .putStringSet(KEY_SPLIT_TUNNEL_DOMAINS, domainSet)
                 .apply()
         }
 

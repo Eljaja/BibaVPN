@@ -63,10 +63,12 @@ pub fn request_connect(
     json: &str,
     split_tunnel_enabled: bool,
     packages: &[String],
+    domains: &[String],
     screen_off_battery_saver: bool,
 ) -> Result<(), String> {
     let json = json.to_string();
     let packages: Vec<String> = packages.to_vec();
+    let domains: Vec<String> = domains.to_vec();
     let (tx, rx) = mpsc::sync_channel(1);
     with_main_webview_jni(app, move |env, activity| {
         let res = (|| {
@@ -75,7 +77,7 @@ pub fn request_connect(
                 .new_string(&json)
                 .map_err(|e| jni_string_err(env, e))?;
             let str_cls = load_app_class(env, activity, "java.lang.String")?;
-            let arr = env
+            let pkg_arr = env
                 .new_object_array(
                     packages.len() as jni::sys::jsize,
                     &str_cls,
@@ -84,19 +86,32 @@ pub fn request_connect(
                 .map_err(|e| jni_string_err(env, e))?;
             for (i, p) in packages.iter().enumerate() {
                 let s = env.new_string(p).map_err(|e| jni_string_err(env, e))?;
-                env.set_object_array_element(&arr, i as jni::sys::jsize, &s)
+                env.set_object_array_element(&pkg_arr, i as jni::sys::jsize, &s)
+                    .map_err(|e| jni_string_err(env, e))?;
+            }
+            let domain_arr = env
+                .new_object_array(
+                    domains.len() as jni::sys::jsize,
+                    &str_cls,
+                    JObject::null(),
+                )
+                .map_err(|e| jni_string_err(env, e))?;
+            for (i, d) in domains.iter().enumerate() {
+                let s = env.new_string(d).map_err(|e| jni_string_err(env, e))?;
+                env.set_object_array_element(&domain_arr, i as jni::sys::jsize, &s)
                     .map_err(|e| jni_string_err(env, e))?;
             }
             let out = env
                 .call_static_method(
                     &cls,
                     "requestConnect",
-                    "(Landroid/app/Activity;Ljava/lang/String;Z[Ljava/lang/String;Z)Ljava/lang/String;",
+                    "(Landroid/app/Activity;Ljava/lang/String;Z[Ljava/lang/String;[Ljava/lang/String;Z)Ljava/lang/String;",
                     &[
                         activity.into(),
                         (&j_json).into(),
                         (split_tunnel_enabled as jboolean).into(),
-                        (&arr).into(),
+                        (&pkg_arr).into(),
+                        (&domain_arr).into(),
                         (screen_off_battery_saver as jboolean).into(),
                     ],
                 )

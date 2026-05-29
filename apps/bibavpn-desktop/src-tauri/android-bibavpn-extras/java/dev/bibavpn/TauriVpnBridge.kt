@@ -46,10 +46,18 @@ object TauriVpnBridge {
         json: String,
         splitTunnelEnabled: Boolean,
         splitPackages: Array<String>,
+        splitDomains: Array<String>,
         screenOffBatterySaver: Boolean,
     ): String? {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            return requestConnectOnMain(activity, json, splitTunnelEnabled, splitPackages, screenOffBatterySaver)
+            return requestConnectOnMain(
+                activity,
+                json,
+                splitTunnelEnabled,
+                splitPackages,
+                splitDomains,
+                screenOffBatterySaver,
+            )
         }
         val out = arrayOfNulls<String?>(1)
         val latch = CountDownLatch(1)
@@ -60,6 +68,7 @@ object TauriVpnBridge {
                     json,
                     splitTunnelEnabled,
                     splitPackages,
+                    splitDomains,
                     screenOffBatterySaver,
                 )
             } catch (t: Throwable) {
@@ -85,9 +94,15 @@ object TauriVpnBridge {
         json: String,
         splitTunnelEnabled: Boolean,
         splitPackages: Array<String>,
+        splitDomains: Array<String>,
         screenOffBatterySaver: Boolean,
     ): String? {
-        BibaVpnService.setSplitTunnelConfig(activity, splitTunnelEnabled, splitPackages.toSet())
+        BibaVpnService.setSplitTunnelConfig(
+            activity,
+            splitTunnelEnabled,
+            splitPackages.toSet(),
+            splitDomains.toSet(),
+        )
         BibaVpnService.setScreenOffBatterySaver(activity, screenOffBatterySaver)
 
         val prep = VpnService.prepare(activity)

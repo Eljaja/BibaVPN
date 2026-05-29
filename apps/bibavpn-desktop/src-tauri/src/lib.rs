@@ -652,13 +652,14 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     persist_cfg(app, &g.cfg)?;
     let json = g.cfg.start_config_json()?;
     let _ = bypass_domains::ensure_loaded(false);
-    let (split_tunnel_enabled, packages, battery) = match g.cfg.active_profile() {
+    let (split_tunnel_enabled, packages, domains, battery) = match g.cfg.active_profile() {
         Some(p) => (
             p.split_tunnel_enabled,
             split_tunnel::android_split_packages_for_profile(p),
+            split_tunnel::android_split_domains_for_profile(p),
             p.android_screen_off_battery_saver,
         ),
-        None => (false, Vec::new(), false),
+        None => (false, Vec::new(), Vec::new(), false),
     };
     let remote_label = display_host_line(&g.cfg);
     drop(g);
@@ -668,6 +669,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         &json,
         split_tunnel_enabled,
         &packages,
+        &domains,
         battery,
     )?;
 
