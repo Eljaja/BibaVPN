@@ -105,7 +105,8 @@ function AppInner() {
     }
     setTunnelHandshake(true);
     try {
-      await connect();
+      const s = await connect();
+      if (s?.connected) setTunnelHandshake(false);
     } catch {
       setTunnelHandshake(false);
     }

@@ -565,25 +565,29 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         }
     }
 
-    let mut g = match state.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    let cfg = {
+        let mut g = match state.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.last_error = None;
+
+        if !g.cfg.can_connect() {
+            warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
+            return Err(
+                "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
+                    .into(),
+            );
+        }
+
+        g.cfg.clone()
     };
-    g.last_error = None;
 
-    if !g.cfg.can_connect() {
-        warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
-        return Err(
-            "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
-                .into(),
-        );
-    }
-
-    let http_port = g.cfg.local_http_port;
-    let socks_port = if g.cfg.local_socks_port == 0 {
+    let http_port = cfg.local_http_port;
+    let socks_port = if cfg.local_socks_port == 0 {
         http_port.saturating_add(1)
     } else {
-        g.cfg.local_socks_port
+        cfg.local_socks_port
     };
     if socks_port == http_port {
         warn!(target: "bibavpn_desktop", "подключение: совпадают порты HTTP и SOCKS");
@@ -594,10 +598,10 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     let http_bind = format!("127.0.0.1:{http_port}");
     let socks_bind = format!("127.0.0.1:{socks_port}");
 
-    persist_cfg(app, &g.cfg)?;
+    persist_cfg(app, &cfg)?;
 
     let backup = read_backup().map_err(|e| e.to_string())?;
-    let json = g.cfg.start_config_json()?;
+    let json = cfg.start_config_json()?;
     let opts =
         local_client_options_from_json_str_with_binds(&json, socks_bind, Some(http_bind.clone()))
             .map_err(|e| format!("{e:#}"))?;
@@ -652,8 +656,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     let http_hp = format!("127.0.0.1:{http_port}");
     let socks_hp = format!("127.0.0.1:{socks_port}");
-    let split_hosts = g
-        .cfg
+    let split_hosts = cfg
         .active_profile()
         .map(split_tunnel::bypass_domains_for_profile)
         .unwrap_or_default();
@@ -682,6 +685,10 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         socks = %socks_hp,
         "VPN включён, локальный прокси и системные настройки применены"
     );
+    let mut g = match state.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
     g.proxy_backup = Some(backup);
     g.vpn = Some(ActiveVpn {
         shutdown: shutdown_tx,
