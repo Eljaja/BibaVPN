@@ -644,17 +644,17 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         out
     });
 
-    match socks_rx.recv_timeout(Duration::from_secs(25)) {
+    match socks_rx.recv_timeout(Duration::from_secs(45)) {
         Ok(()) => {
             info!(
                 target: "bibavpn_desktop",
-                "локальный SOCKS5 слушает, можно применять системный прокси"
+                "локальный прокси и удалённый туннель готовы, можно применять системный прокси"
             );
         }
         Err(RecvTimeoutError::Timeout) => {
             warn!(
                 target: "bibavpn_desktop",
-                "таймаут 25 с: SOCKS не поднялся, отмена подключения"
+                "таймаут 45 с: локальный прокси или удалённый туннель не поднялись, отмена подключения"
             );
             let _ = shutdown_tx.send(true);
             match state.rt.block_on(join) {
@@ -663,12 +663,15 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
                 Err(e) => error!(target: "bibavpn_desktop", "join клиента: {e}"),
             }
             return Err(
-                "Локальный SOCKS не поднялся за 25 с. Смотрите лог в папке BibaVPN\\logs.".into(),
+                "Подключение не завершилось за 45 с (TLS/WSS к серверу или локальный прокси). Смотрите лог в папке BibaVPN/logs.".into(),
             );
         }
         Err(RecvTimeoutError::Disconnected) => {
             let msg = match state.rt.block_on(join) {
-                Ok(Ok(())) => "Клиент завершился до готовности SOCKS.".to_string(),
+                Ok(Ok(())) => {
+                    "Клиент завершился до готовности прокси (проверьте TLS pin, SNI, token, PSK)."
+                        .to_string()
+                }
                 Ok(Err(e)) => format!("{e:#}"),
                 Err(e) => format!("join: {e}"),
             };

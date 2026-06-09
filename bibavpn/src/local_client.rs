@@ -65,6 +65,8 @@ async fn tcp_mux_slot_has_sessions(slot: &TcpMuxSlot) -> bool {
 
 /// After the shared mux WSS dies, reopen quickly without the full outbound backoff ladder.
 const TCP_MUX_SLOT_RETRIES: u32 = 8;
+/// Fail fast when bringing the tunnel up at VPN connect; per-stream reopen keeps the full ladder.
+const STARTUP_MUX_CONNECT_ATTEMPTS: u32 = 4;
 const OPEN_STATUS_WAIT: Duration = Duration::from_millis(350);
 
 async fn sleep_mux_slot_retry(attempt: u32) {
@@ -353,10 +355,16 @@ async fn upgrade_client_tls(cfg: &ClientCfg, tcp: TcpStream) -> anyhow::Result<C
         TlsStack::Rustls => {
             let domain = ServerName::try_from(cfg.sni.clone())?;
             let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
-            let t = connector
-                .connect(domain, tcp)
-                .await
-                .context("tls (rustls)")?;
+            let pinned = cfg.pinned_certs_pem.is_some();
+            let t = connector.connect(domain, tcp).await.map_err(|e| {
+                if pinned {
+                    anyhow::anyhow!(
+                        "tls (rustls): pinned leaf certificate mismatch or handshake failed: {e}"
+                    )
+                } else {
+                    anyhow::anyhow!("tls (rustls): {e}")
+                }
+            })?;
             Ok(ClientTlsStream::Rustls(t))
         }
         TlsStack::Boring => {
@@ -587,13 +595,28 @@ async fn open_legacy_biba_channel(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tunnel: connect failed")))
 }
 
+async fn ensure_tcp_mux_ready(cfg: &Arc<ClientCfg>, tcp_mux_slot: &TcpMuxSlot) -> anyhow::Result<()> {
+    if tcp_mux_slot.lock().await.is_none() {
+        connect_tcp_mux_handle(cfg, tcp_mux_slot).await?;
+    }
+    Ok(())
+}
+
 async fn connect_tcp_mux_handle(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
 ) -> anyhow::Result<()> {
+    connect_tcp_mux_handle_attempts(cfg, tcp_mux_slot, OUTBOUND_CONNECT_ATTEMPTS).await
+}
+
+async fn connect_tcp_mux_handle_attempts(
+    cfg: &Arc<ClientCfg>,
+    tcp_mux_slot: &TcpMuxSlot,
+    max_attempts: u32,
+) -> anyhow::Result<()> {
     // Check if REALITY mode is enabled
     if cfg.reality_target.is_some() {
-        return connect_reality_tcp_mux_handle(cfg, tcp_mux_slot).await;
+        return connect_reality_tcp_mux_handle_attempts(cfg, tcp_mux_slot, max_attempts).await;
     }
 
     let _connect_serial = tcp_mux_connect_serial().lock().await;
@@ -603,7 +626,7 @@ async fn connect_tcp_mux_handle(
 
     let n = cfg.ws_parallel.max(1).min(4) as usize;
     let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
+    for attempt in 0..max_attempts {
         let res: anyhow::Result<()> = async {
             let mut sessions = Vec::with_capacity(n);
             for _ in 0..n {
@@ -667,7 +690,7 @@ async fn connect_tcp_mux_handle(
             Err(e) => {
                 *tcp_mux_slot.lock().await = None;
                 last_err = Some(e);
-                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
+                if attempt + 1 >= max_attempts {
                     break;
                 }
                 sleep_outbound_backoff(attempt).await;
@@ -678,9 +701,10 @@ async fn connect_tcp_mux_handle(
 }
 
 /// REALITY mode: one or more parallel WSS sessions (same as non-REALITY multi-WSS), each with REALITY handshake + MUX_OPEN.
-async fn connect_reality_tcp_mux_handle(
+async fn connect_reality_tcp_mux_handle_attempts(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
+    max_attempts: u32,
 ) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message;
 
@@ -691,7 +715,7 @@ async fn connect_reality_tcp_mux_handle(
 
     let n = cfg.ws_parallel.max(1).min(4) as usize;
     let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
+    for attempt in 0..max_attempts {
         let res: anyhow::Result<()> = async {
             let _target = cfg.reality_target.as_ref().expect("reality target");
             let mut sessions = Vec::with_capacity(n);
@@ -755,7 +779,7 @@ async fn connect_reality_tcp_mux_handle(
             Err(e) => {
                 *tcp_mux_slot.lock().await = None;
                 last_err = Some(e);
-                if attempt + 1 >= OUTBOUND_CONNECT_ATTEMPTS {
+                if attempt + 1 >= max_attempts {
                     break;
                 }
                 sleep_outbound_backoff(attempt).await;
@@ -767,7 +791,7 @@ async fn connect_reality_tcp_mux_handle(
 
 /// Build TLS config and run SOCKS5 (+ optional HTTP CONNECT) until `shutdown` becomes `true`.
 ///
-/// `socks_ready`: if set, `()` is sent once `socks_bind` is listening (before any `accept`).
+/// `socks_ready`: if set, `()` is sent once the remote mux WSS (when enabled) and local listeners are up.
 pub async fn run_local_client(
     opts: LocalClientOptions,
     mut shutdown: watch::Receiver<bool>,
@@ -970,6 +994,25 @@ pub async fn run_local_client(
     let udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>> = Arc::new(Mutex::new(None));
     let tcp_mux_slot: TcpMuxSlot = Arc::new(Mutex::new(None));
 
+    if cfg.use_tcp_mux {
+        info!(
+            target: "bibavpn_client",
+            server = %cfg.server_host,
+            port = cfg.server_port,
+            "opening remote multiplexed WSS"
+        );
+        connect_tcp_mux_handle_attempts(&cfg, &tcp_mux_slot, STARTUP_MUX_CONNECT_ATTEMPTS)
+            .await
+            .with_context(|| {
+                if cfg.pinned_certs_pem.is_some() {
+                    "remote tunnel connect failed (verify pin_cert_pem matches the server leaf certificate, SNI, and server reachability)"
+                } else {
+                    "remote tunnel connect failed (verify server reachability, SNI, token, and PSK)"
+                }
+            })?;
+        info!(target: "bibavpn_client", "remote multiplexed WSS ready");
+    }
+
     let socks_listener = TcpListener::bind(&opts.socks_bind)
         .await
         .with_context(|| format!("bind socks {}", opts.socks_bind))?;
@@ -1068,6 +1111,10 @@ async fn handle_socks_peer(
     match socks5::socks5_read_command(&mut local, cfg.socks_auth.as_ref()).await? {
         SocksCommand::Connect { host, port } => {
             if cfg.use_tcp_mux {
+                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot).await {
+                    let _ = socks5::socks5_reply_err(&mut local).await;
+                    return Err(e);
+                }
                 socks5::socks5_reply_ok(&mut local).await?;
                 tcp_mux_open_stream_with_retry(local, host, port, Vec::new(), cfg, tcp_mux_slot)
                     .await
@@ -1232,6 +1279,11 @@ async fn handle_http_peer(
             client_prefetch,
         }) => {
             if cfg.use_tcp_mux {
+                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot).await {
+                    let _ =
+                        http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
+                    return Err(e);
+                }
                 http_connect::reply_connect_ok(&mut local).await?;
                 tcp_mux_open_stream_with_retry(
                     local,
@@ -1282,6 +1334,11 @@ async fn handle_http_peer(
             to_origin,
         }) => {
             if cfg.use_tcp_mux {
+                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot).await {
+                    let _ =
+                        http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
+                    return Err(e);
+                }
                 tcp_mux_open_stream_with_retry(local, host, port, to_origin, cfg, tcp_mux_slot)
                     .await
             } else {
