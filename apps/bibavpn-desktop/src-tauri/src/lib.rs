@@ -327,40 +327,66 @@ fn show_main_window(app: &AppHandle) {
 fn show_main_window(_app: &AppHandle) {}
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn probe_local_http_health(http_port: u16) -> bool {
+    use std::io::{Read, Write};
+
+    let addr: SocketAddr = match format!("127.0.0.1:{http_port}").parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return false;
+    };
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+        bibavpn::http_connect::LOCAL_HEALTH_PATH
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 32];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => std::str::from_utf8(&buf[..n])
+            .map(|s| s.contains("200"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(12));
-        let (vpn_on, socks_port, http_port) = {
+        let Some((http_port, client_dead)) = (|| {
             let g = match state.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            let http = g.cfg.local_http_port;
-            let socks = if g.cfg.local_socks_port == 0 {
-                http.saturating_add(1)
-            } else {
-                g.cfg.local_socks_port
-            };
-            (g.vpn.is_some(), socks, http)
-        };
-        if !vpn_on || socks_port == http_port {
-            continue;
-        }
-        let Ok(addr) = format!("127.0.0.1:{socks_port}").parse::<SocketAddr>() else {
+            let vpn = g.vpn.as_ref()?;
+            Some((
+                g.cfg.local_http_port,
+                vpn.join.is_finished(),
+            ))
+        })() else {
             continue;
         };
-        let probe_ok = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok();
-        if probe_ok {
+        if client_dead {
+            warn!(
+                target: "bibavpn_desktop",
+                "VPN-клиент завершился неожиданно — переподключение"
+            );
+        } else if probe_local_http_health(http_port) {
             continue;
+        } else {
+            std::thread::sleep(Duration::from_secs(2));
+            if probe_local_http_health(http_port) {
+                continue;
+            }
+            warn!(
+                target: "bibavpn_desktop",
+                "локальный HTTP-прокси недоступен после сна или сбоя — переподключение VPN"
+            );
         }
-        std::thread::sleep(Duration::from_secs(2));
-        if TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok() {
-            continue;
-        }
-        warn!(
-            target: "bibavpn_desktop",
-            "локальный SOCKS недоступен после сна или сбоя — переподключение VPN"
-        );
         disconnect_inner(&state, &app);
         if let Err(e) = connect_inner(&state, &app) {
             warn!(target: "bibavpn_desktop", "автовосстановление VPN: {e}");

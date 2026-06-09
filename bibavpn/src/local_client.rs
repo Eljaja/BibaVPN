@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::client_tls_stream::ClientTlsStream;
 use crate::crypto_layer::{self, SessionCrypto};
@@ -1030,7 +1030,11 @@ pub async fn run_local_client(
                 let tms = tcp_mux_slot.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_socks_peer(sock, c, ums, tms).await {
-                        error!("socks {peer}: {e:#}");
+                        if socks5::is_benign_handshake_abort(&e) {
+                            debug!("socks {peer}: client closed before SOCKS5 handshake");
+                        } else {
+                            error!("socks {peer}: {e:#}");
+                        }
                     }
                 });
             }
@@ -1218,6 +1222,9 @@ async fn handle_http_peer(
     cfg: Arc<ClientCfg>,
     tcp_mux_slot: TcpMuxSlot,
 ) -> anyhow::Result<()> {
+    if http_connect::try_serve_health_check(&mut local).await? {
+        return Ok(());
+    }
     match http_connect::http_proxy_handshake(&mut local).await {
         Ok(http_connect::HttpProxyHandshake::Connect {
             host,
@@ -1282,6 +1289,10 @@ async fn handle_http_peer(
             }
         }
         Err(e) => {
+            if http_connect::is_benign_handshake_abort(&e) {
+                debug!("http: client closed before HTTP request line");
+                return Ok(());
+            }
             let _ = http_connect::reply_connect_error(&mut local, 400, "Bad Request").await;
             Err(e)
         }
