@@ -217,3 +217,39 @@ pub async fn socks5_reply_err(local: &mut TcpStream) -> anyhow::Result<()> {
 pub fn socket_addr_for_test(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
     Ok(format!("{host}:{port}").parse()?)
 }
+
+/// True when the peer opened TCP then closed before completing the SOCKS5 handshake
+/// (port probes, reachability checks, or clients that never send a version byte).
+pub fn is_benign_handshake_abort(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    if !msg.contains("early eof") {
+        return false;
+    }
+    msg.contains("socks version")
+        || msg.contains("methods")
+        || msg.contains("request hdr")
+        || msg.contains("rfc1929 ver")
+        || msg.contains("ulen")
+        || msg.contains("uname")
+        || msg.contains("plen")
+        || msg.contains("passwd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_benign_handshake_abort;
+    use anyhow::Context;
+
+    #[test]
+    fn benign_abort_detects_version_eof() {
+        let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let err = Err::<(), _>(err).context("socks version").unwrap_err();
+        assert!(is_benign_handshake_abort(&err));
+    }
+
+    #[test]
+    fn benign_abort_rejects_real_failures() {
+        let err = anyhow::anyhow!("unsupported socks version 4");
+        assert!(!is_benign_handshake_abort(&err));
+    }
+}
