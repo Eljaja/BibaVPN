@@ -9,6 +9,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use rand::rngs::OsRng;
 use rand::Rng;
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 /// First byte of Biba v3 opaque client hello (after WS noise/junk).
 pub const V3_HELLO_TAG: u8 = 0x03;
@@ -253,7 +254,8 @@ pub fn parse_ack(
         bail!("bad v3 ACK length");
     }
     let expected = compute_mac(psk.as_bytes(), domain, client_random, &s);
-    if tag != expected.as_slice() {
+    // Constant-time compare: avoid leaking how many leading bytes matched.
+    if tag.ct_ne(expected.as_slice()).into() {
         bail!("ACK mac mismatch");
     }
     Ok(s)
