@@ -31,6 +31,11 @@ use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 pub const REALITY_MAGIC: &[u8] = b"REAL1";
 pub const REALITY_VERSION: u8 = 1;
 
+/// Max Ping/Pong frames tolerated during the REALITY handshake before the peer
+/// is rejected. Stops a pre-auth peer from holding the loop open indefinitely or
+/// forcing unbounded Pong replies (amplification).
+const MAX_HANDSHAKE_CONTROL_FRAMES: u32 = 16;
+
 /// REALITY server configuration
 #[derive(Debug, Clone)]
 pub struct RealityServerConfig {
@@ -204,14 +209,25 @@ pub async fn server_handshake_reality<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let mut control_frames: u32 = 0;
     loop {
         let msg = match ws.next().await {
             Some(Ok(Message::Binary(b))) => b,
             Some(Ok(Message::Ping(p))) => {
+                control_frames += 1;
+                if control_frames > MAX_HANDSHAKE_CONTROL_FRAMES {
+                    bail!("too many control frames during REALITY handshake");
+                }
                 ws.send(Message::Pong(p)).await.context("REALITY pong")?;
                 continue;
             }
-            Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(Message::Pong(_))) => {
+                control_frames += 1;
+                if control_frames > MAX_HANDSHAKE_CONTROL_FRAMES {
+                    bail!("too many control frames during REALITY handshake");
+                }
+                continue;
+            }
             Some(Ok(_)) => bail!("expected binary REALITY HELLO"),
             Some(Err(e)) => Err(e).context("websocket recv")?,
             None => bail!("ws closed before REALITY HELLO"),
@@ -319,16 +335,27 @@ where
         .await
         .context("send REALITY client hello")?;
 
+    let mut control_frames: u32 = 0;
     loop {
         let msg = match ws.next().await {
             Some(Ok(Message::Binary(b))) => b,
             Some(Ok(Message::Ping(p))) => {
+                control_frames += 1;
+                if control_frames > MAX_HANDSHAKE_CONTROL_FRAMES {
+                    bail!("too many control frames during REALITY handshake");
+                }
                 ws.send(Message::Pong(p))
                     .await
                     .context("REALITY client pong")?;
                 continue;
             }
-            Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(Message::Pong(_))) => {
+                control_frames += 1;
+                if control_frames > MAX_HANDSHAKE_CONTROL_FRAMES {
+                    bail!("too many control frames during REALITY handshake");
+                }
+                continue;
+            }
             Some(Ok(_)) => bail!("expected binary server hello"),
             Some(Err(e)) => Err(e).context("websocket recv")?,
             None => bail!("server closed during REALITY handshake"),
