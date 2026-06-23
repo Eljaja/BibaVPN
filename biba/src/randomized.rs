@@ -218,6 +218,17 @@ pub fn generate_randomized_spec(id: ClientHelloId) -> Result<ClientHelloSpec> {
 
     exts.shuffle(&mut rng);
 
+    // BoringSSL-style padding pads the whole ClientHello to a target length, so
+    // it must be the final extension. The shuffle above can move it anywhere;
+    // pull any Padding extension back to the end (uTLS keeps it last as well).
+    if let Some(pos) = exts
+        .iter()
+        .position(|e| matches!(e, Extension::Padding { .. }))
+    {
+        let pad = exts.remove(pos);
+        exts.push(pad);
+    }
+
     Ok(ClientHelloSpec {
         cipher_suites: suites,
         compression_methods: vec![COMPRESSION_NONE],
