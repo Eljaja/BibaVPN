@@ -799,7 +799,17 @@ where
         } => {
             info!("OPEN {host}:{port}");
             let mut pad_st = AdaptivePadState::default();
-            let remote = match TcpStream::connect((host.as_str(), port)).await {
+            // Bound the dial so a blackholed target cannot tie up the session
+            // (and its concurrency permit) until the OS TCP timeout (~minutes).
+            let connect = timeout(mux_connect_timeout, TcpStream::connect((host.as_str(), port)))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connect timed out",
+                    ))
+                });
+            let remote = match connect {
                 Ok(remote) => remote,
                 Err(e) => {
                     if supports_open_status {

@@ -775,7 +775,8 @@ where
                                 UdpSockHolder::Ephemeral(bind_udp_for_family(want_v6).await?)
                             };
                             let sock = holder.sock_mut();
-                            sock.set_broadcast(true).ok();
+                            // Do not enable SO_BROADCAST: it let a client steer
+                            // relayed UDP at broadcast addresses (amplification).
                             if let Err(e) = sock.send_to(&payload, dest).await {
                                 last_err = Some(anyhow::Error::from(e).context("udp send"));
                                 continue;

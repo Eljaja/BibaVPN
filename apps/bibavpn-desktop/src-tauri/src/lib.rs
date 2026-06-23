@@ -969,6 +969,23 @@ fn open_control_plane_refresh_cmd(
 }
 
 fn open_portal_url(url: &str) -> Result<(), String> {
+    // `url` is built from the control-plane base URL (config / web cabinet), i.e.
+    // partly external input. Refuse anything that isn't a plain http(s) URL before
+    // handing it to a launcher. On Windows `cmd /C start` would otherwise treat
+    // shell metacharacters (& | < > ^ %) in the URL as commands; on macOS/Linux a
+    // leading '-' could be parsed as a flag by `open`/`xdg-open`.
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Недопустимый URL веб-кабинета.".into());
+    }
+    if url.len() > 2048
+        || url.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || matches!(c, '&' | '|' | '<' | '>' | '^' | '"' | '\'' | '%' | '`')
+        })
+    {
+        return Err("Недопустимый URL веб-кабинета.".into());
+    }
     #[cfg(target_os = "android")]
     {
         use tauri::Manager;
@@ -1163,6 +1180,16 @@ pub fn run() -> anyhow::Result<()> {
                 }
             })
             .setup(move |app| {
+                // If a previous run crashed while connected, the system proxy may
+                // still point at our now-dead local listener, leaving the user
+                // without working internet. Clear any residual BibaVPN proxy at
+                // startup (restore() otherwise only runs on a clean exit).
+                #[cfg(windows)]
+                {
+                    if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
+                        warn!(target: "bibavpn_desktop", "очистка остаточного прокси при старте: {e}");
+                    }
+                }
                 let tray_cfg = app
                     .state::<AppState>()
                     .inner
