@@ -29,7 +29,31 @@ use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 /// REALITY protocol magic bytes (reserved for future wire extensions).
 pub const REALITY_MAGIC: &[u8] = b"REAL1";
-pub const REALITY_VERSION: u8 = 1;
+/// Wire version. v2 adds a server confirmation MAC to SERVER_HELLO so the
+/// server proves possession of the REALITY private key (v1 only echoed the
+/// pinned public key, which a MITM that knows it could trivially replay).
+/// v2 is intentionally incompatible with v1 on both ends.
+pub const REALITY_VERSION: u8 = 2;
+
+/// BLAKE3 derive-key context for the REALITY handshake confirmation MAC.
+const REALITY_CONFIRM_CONTEXT: &str = "bibavpn reality server-confirm v2";
+
+/// Server confirmation MAC over the handshake transcript, keyed by the X25519
+/// shared secret. Only a peer holding the REALITY private key (server) or the
+/// client's ephemeral private key can derive `shared`, so a MITM that merely
+/// knows the (public) server key cannot forge it. Returned as a `blake3::Hash`
+/// whose `==` is constant-time.
+pub fn reality_confirm_mac(
+    shared: &[u8; 32],
+    client_ephemeral_pub: &[u8; 32],
+    server_static_pub: &[u8; 32],
+) -> blake3::Hash {
+    let mac_key = blake3::derive_key(REALITY_CONFIRM_CONTEXT, shared);
+    let mut h = blake3::Hasher::new_keyed(&mac_key);
+    h.update(client_ephemeral_pub);
+    h.update(server_static_pub);
+    h.finalize()
+}
 
 /// REALITY server configuration
 #[derive(Debug, Clone)]
@@ -177,13 +201,27 @@ impl rustls::client::danger::ServerCertVerifier for SpiderxInsecureVerifier {
     }
 }
 
-/// Wire bytes for REALITY SERVER_HELLO: `[version][server_x25519_pubkey:32]`.
-pub fn server_hello_from_private(private_key: &[u8; 32]) -> Vec<u8> {
+/// Wire bytes for REALITY SERVER_HELLO:
+/// `[version][server_x25519_pubkey:32][confirm_mac:32]`.
+///
+/// The MAC binds the X25519 shared secret to the transcript, proving the server
+/// holds `private_key`. Errors if the client ephemeral public key is invalid.
+pub fn server_hello_with_confirm(
+    private_key: &[u8; 32],
+    client_ephemeral_pub: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    let server_secret = StaticSecret::from(*private_key);
+    let client_public = PublicKey::try_from(*client_ephemeral_pub)
+        .map_err(|_| anyhow::anyhow!("invalid REALITY client public key"))?;
+    let shared = server_secret.diffie_hellman(&client_public);
     let server_pub = RealityServerConfig::public_key_from_private(private_key);
-    let mut response = Vec::with_capacity(1 + 32);
+    let mac = reality_confirm_mac(shared.as_bytes(), client_ephemeral_pub, &server_pub);
+
+    let mut response = Vec::with_capacity(1 + 32 + 32);
     response.push(REALITY_VERSION);
     response.extend_from_slice(&server_pub);
-    response
+    response.extend_from_slice(mac.as_bytes());
+    Ok(response)
 }
 
 fn validate_short_id(short_id: &[u8; 8], cfg: &RealityServerConfig) -> anyhow::Result<()> {
@@ -230,12 +268,9 @@ where
 
         validate_short_id(&short_id, cfg)?;
 
-        let server_secret = StaticSecret::from(cfg.private_key);
-        let client_public = PublicKey::try_from(client_pubkey)
-            .map_err(|_| anyhow::anyhow!("invalid REALITY client public key"))?;
-        let _shared = server_secret.diffie_hellman(&client_public);
-
-        let response = server_hello_from_private(&cfg.private_key);
+        // Reply with the pinned pubkey plus a MAC proving we hold the private
+        // key (binds the X25519 shared secret to the transcript).
+        let response = server_hello_with_confirm(&cfg.private_key, &client_pubkey)?;
         ws.send(Message::Binary(Bytes::from(response)))
             .await
             .context("send REALITY SERVER_HELLO")?;
@@ -333,21 +368,35 @@ where
             Some(Err(e)) => Err(e).context("websocket recv")?,
             None => bail!("server closed during REALITY handshake"),
         };
-        let server_pubkey = decode_server_hello(&msg)?;
+        let (server_pubkey, server_mac) = decode_server_hello(&msg)?;
         if server_pubkey != *expected_server_pubkey {
             bail!("REALITY: server public key mismatch (possible MITM)");
         }
         let server_public = PublicKey::from(server_pubkey);
         let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+
+        // Verify the server proved possession of the private key. A MITM that
+        // only knows the pinned public key cannot derive the shared secret and
+        // thus cannot forge this MAC. `blake3::Hash` compares in constant time.
+        let expected_mac = reality_confirm_mac(
+            shared_secret.as_bytes(),
+            ephemeral_public.as_bytes(),
+            &server_pubkey,
+        );
+        if expected_mac != blake3::Hash::from(server_mac) {
+            bail!("REALITY: server confirmation MAC invalid (server lacks the private key; possible MITM)");
+        }
+
         let mut session_key = [0u8; 32];
         session_key.copy_from_slice(shared_secret.as_bytes());
         return Ok(session_key);
     }
 }
 
-/// Decode REALITY SERVER_HELLO
-pub fn decode_server_hello(data: &[u8]) -> anyhow::Result<[u8; 32]> {
-    if data.len() < 1 + 32 {
+/// Decode REALITY SERVER_HELLO `[version][pubkey:32][confirm_mac:32]`.
+/// Returns `(server_pubkey, confirm_mac)`.
+pub fn decode_server_hello(data: &[u8]) -> anyhow::Result<([u8; 32], [u8; 32])> {
+    if data.len() < 1 + 32 + 32 {
         bail!("short SERVER_HELLO");
     }
     if data[0] != REALITY_VERSION {
@@ -355,7 +404,9 @@ pub fn decode_server_hello(data: &[u8]) -> anyhow::Result<[u8; 32]> {
     }
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&data[1..33]);
-    Ok(pubkey)
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(&data[33..65]);
+    Ok((pubkey, mac))
 }
 
 /// SpiderX: fetch a page from the REALITY target (server-side cache warm-up).
@@ -515,20 +566,49 @@ mod tests {
     }
 
     #[test]
-    fn reality_x25519_shared_secret_roundtrip() {
+    fn reality_server_hello_confirm_roundtrip() {
         let (priv_key, expected_pub) = RealityServerConfig::generate_keys();
-        let server_hello = server_hello_from_private(&priv_key);
-        let decoded_pub = decode_server_hello(&server_hello).unwrap();
-        assert_eq!(decoded_pub, expected_pub);
 
         let client_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let client_public = PublicKey::from(&client_secret);
-        let server_secret = StaticSecret::from(priv_key);
-        let server_public = PublicKey::from(expected_pub);
 
-        let c_shared = client_secret.diffie_hellman(&server_public);
-        let s_shared = server_secret.diffie_hellman(&client_public);
-        assert_eq!(c_shared.as_bytes(), s_shared.as_bytes());
+        let hello = server_hello_with_confirm(&priv_key, client_public.as_bytes()).unwrap();
+        assert_eq!(hello.len(), 1 + 32 + 32);
+        let (decoded_pub, server_mac) = decode_server_hello(&hello).unwrap();
+        assert_eq!(decoded_pub, expected_pub);
+
+        // Client side: recompute the shared secret against the pinned key and
+        // confirm the MAC matches what the server sent.
+        let server_public = PublicKey::from(expected_pub);
+        let shared = client_secret.diffie_hellman(&server_public);
+        let expected_mac =
+            reality_confirm_mac(shared.as_bytes(), client_public.as_bytes(), &expected_pub);
+        assert_eq!(expected_mac, blake3::Hash::from(server_mac));
+    }
+
+    #[test]
+    fn reality_confirm_mac_rejects_wrong_server_key() {
+        // A MITM knows the real (public) server key but not its private key.
+        // It echoes the pinned pubkey but can only MAC with a shared secret
+        // derived from its own private key, so the client's recomputed MAC
+        // (against the real pinned key) will not match.
+        let (_real_priv, real_pub) = RealityServerConfig::generate_keys();
+        let (mitm_priv, _mitm_pub) = RealityServerConfig::generate_keys();
+
+        let client_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let client_public = PublicKey::from(&client_secret);
+
+        let mitm_secret = StaticSecret::from(mitm_priv);
+        let mitm_shared = mitm_secret.diffie_hellman(&client_public);
+        let forged_mac =
+            reality_confirm_mac(mitm_shared.as_bytes(), client_public.as_bytes(), &real_pub);
+
+        let real_server_public = PublicKey::from(real_pub);
+        let client_shared = client_secret.diffie_hellman(&real_server_public);
+        let expected_mac =
+            reality_confirm_mac(client_shared.as_bytes(), client_public.as_bytes(), &real_pub);
+
+        assert_ne!(expected_mac, forged_mac);
     }
 
     #[test]
