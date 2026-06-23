@@ -1180,6 +1180,16 @@ pub fn run() -> anyhow::Result<()> {
                 }
             })
             .setup(move |app| {
+                // If a previous run crashed while connected, the system proxy may
+                // still point at our now-dead local listener, leaving the user
+                // without working internet. Clear any residual BibaVPN proxy at
+                // startup (restore() otherwise only runs on a clean exit).
+                #[cfg(windows)]
+                {
+                    if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
+                        warn!(target: "bibavpn_desktop", "очистка остаточного прокси при старте: {e}");
+                    }
+                }
                 let tray_cfg = app
                     .state::<AppState>()
                     .inner
