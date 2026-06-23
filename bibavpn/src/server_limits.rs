@@ -34,6 +34,11 @@ struct IpAuthState {
     banned_until: Option<Instant>,
 }
 
+/// Hard cap on tracked source IPs, to bound memory under IP-rotation floods
+/// (e.g. an attacker cycling through a /64). Without this the map only ever
+/// shrank on a *successful* auth, so failed handshakes grew it without bound.
+const MAX_TRACKED_IPS: usize = 100_000;
+
 pub struct AuthRateLimiter {
     cfg: AuthRateLimiterConfig,
     inner: Mutex<HashMap<IpAddr, IpAuthState>>,
@@ -71,12 +76,47 @@ impl AuthRateLimiter {
         Ok(())
     }
 
+    /// Drop entries that no longer carry state: expired (uncleared) bans and
+    /// idle windows. Keeps active bans and in-progress windows. Adjusts
+    /// `bans_active` for any expired ban it reaps.
+    fn prune_locked(&self, g: &mut HashMap<IpAddr, IpAuthState>, now: Instant) {
+        g.retain(|_, st| match st.banned_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                // Ban expired but was never cleared, so it is still counted.
+                let _ = self.bans_active.fetch_sub(1, Ordering::Relaxed);
+                false
+            }
+            None => now.duration_since(st.window_start) <= self.cfg.window,
+        });
+    }
+
     pub async fn record_failure(self: &Arc<Self>, ip: IpAddr) {
         if !self.cfg.enabled {
             return;
         }
         let mut g = self.inner.lock().await;
         let now = Instant::now();
+        if g.len() >= MAX_TRACKED_IPS && !g.contains_key(&ip) {
+            self.prune_locked(&mut g, now);
+            if g.len() >= MAX_TRACKED_IPS {
+                // Still full of active windows/bans: evict the oldest entry that
+                // is not currently banned, rather than grow past the cap.
+                let victim = g
+                    .iter()
+                    .filter(|(_, s)| s.banned_until.map_or(true, |u| now >= u))
+                    .min_by_key(|(_, s)| s.window_start)
+                    .map(|(k, _)| *k);
+                match victim {
+                    Some(k) => {
+                        g.remove(&k);
+                    }
+                    // Everything tracked is actively banned; the table is already
+                    // doing its job. Skip recording this new IP to stay bounded.
+                    None => return,
+                }
+            }
+        }
         let st = g.entry(ip).or_insert(IpAuthState {
             failures: 0,
             window_start: now,
