@@ -41,7 +41,7 @@ control opcodes, and inner UDP records in the same framing.
 That **proto-3** layout is carried over **TLS + WebSocket**; optional **stealth**
 layers sit on the outside (TLS client profile labels, padding modes, timing,
 decoys, optional multi-WSS, optional BoringSSL). **Future inner opcodes / framing**
-may evolve — see the roadmap section in **[PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification)**
+may evolve — see the roadmap section in **[PROTOCOL.md](PROTOCOL.md#target-specification-roadmap)**
 for targets that are not fully implemented here yet.
 
 **WebSocket transport** knobs (ping, frame-size cap, custom headers, early noise)
@@ -450,7 +450,7 @@ See **[SECURITY.md](SECURITY.md)** for the disclosure policy.
 
 ## Stealth, DPI, and roadmap
 
-**Long-term targets:** [roadmap section in PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification).
+**Long-term targets:** [roadmap section in PROTOCOL.md](PROTOCOL.md#target-specification-roadmap).
 **Release history:** [CHANGELOG.md](CHANGELOG.md).
 
 This table tracks **PROTOCOL.md roadmap** items against what the **current tree**
