@@ -12,13 +12,13 @@ This document specifies the on-wire layers. For install / run instructions see
 ## Contents
 
 - [Stack at a glance](#stack-at-a-glance)
-- [Biba v3 (PSK wire)](#biba-v3-psk-wire)
+- [PSK wire protocol](#psk-wire-protocol)
 - [TCP vs UDP paths](#tcp-vs-udp-paths)
 - [Wire formats (packets and frames)](#wire-formats-packets-and-frames)
 - [End-to-end picture (session flow)](#end-to-end-picture-session-flow)
 - [Encrypted invite `biba://`](#encrypted-invite-biba)
-- [BibaV4 (v1.2.0) target specification](#bibav4-v120-target-specification)
-  - [Implementation status (1.2.x on v3)](#implementation-status-12x-on-v3)
+- [Target specification (roadmap)](#target-specification-roadmap)
+  - [Implementation status](#implementation-status)
 
 ---
 
@@ -36,7 +36,7 @@ flowchart LR
     F["ver 1B | len u24 | pad_len | pad | payload"]
   end
 
-  subgraph L5["Biba v3 PSK"]
+  subgraph L5["PSK layer"]
     V2["decoy_len | random decoy | padded frame"]
     AEAD["ChaCha20-Poly1305 to ciphertext"]
     NONCE["12-byte nonce"]
@@ -61,7 +61,7 @@ flowchart LR
 ```
 
 The tunnel expects a **PSK** on both ends. **L5** uses ChaCha20-Poly1305 with
-**Biba v3** key derivation and handshake (opaque HELLO/ACK, domain-separated
+**PSK-based** key derivation and handshake (opaque HELLO/ACK, domain-separated
 KDF). Padding length for **L6** can follow **adaptive**, **uniform random**, or
 **HTTP-like size buckets** (`--pad-mode`). The **outer** TLS handshake uses
 **rustls** by default, or **BoringSSL** when the client is built with Cargo
@@ -69,9 +69,9 @@ feature **`boring-tls`** and `--tls-stack boring` (see `tls_util`, `AGENTS.md`).
 
 ---
 
-## Biba v3 (PSK wire)
+## PSK wire protocol
 
-The implementation is **v3-only**: there is no alternate v2 preamble on the
+There is a **single supported wire format**; no alternate legacy preamble on the
 wire. Session setup and control messages differ from older experiments by using
 **variable-length** handshake bytes and **single-byte inner opcodes** (carried
 inside padded frames, then encrypted — never as bare cleartext on the WebSocket).
@@ -188,7 +188,7 @@ This is what `frame::write_padded_frame` / `write_padded_frame_with_mode` emits.
  +----------+--------+---------+------------------+------------------+
 ```
 
-### 2) Biba v3 outer wrapper (inside one WebSocket Binary)
+### 2) Outer wrapper (inside one WebSocket Binary)
 
 After HELLO/ACK, each direction uses **ChaCha20-Poly1305** with a **12-byte nonce** (see `crypto_layer.rs`).
 
@@ -273,10 +273,10 @@ flowchart TB
 
   subgraph setup [Order within one WSS session]
     WFR --> U[1 GET Upgrade to configured path e.g. /ws — no token in URL]
-    U --> N[2 optional Binary noise / junk BibaV2.1]
-    N --> FB[3 First client Binary: v3 HELLO]
-    FB --> H3[4 v3 ACK variable length]
-    H3 --> AU3[5 sealed v3 AUTH + MUX/OPEN…]
+    U --> N[2 optional Binary noise / junk]
+    N --> FB[3 First client Binary: HELLO]
+    FB --> H3[4 ACK variable length]
+    H3 --> AU3[5 sealed AUTH + MUX/OPEN…]
     AU3 --> MX2[6 mux/data phase]
     MX2 --> ST[7 Stream OPEN + DATA mux records to target]
     ST --> SV[bibavpn-server connects per stream]
@@ -296,8 +296,8 @@ flowchart TB
 sealed **OPEN** (`0x02`) instead of MUX + stream records.
 
 DPI on the outside sees **TLS** and **WebSocket**; **inside** Binary is
-**nonce + AEAD**. BibaV2.1 may send **WebSocket Ping** and optional **idle dummy**
-padded frames.
+**nonce + AEAD**. The transport may send **WebSocket Ping** and optional **idle
+dummy** padded frames.
 
 ---
 
@@ -305,7 +305,7 @@ padded frames.
 
 The server can print a **single-line encrypted config** after it binds: JSON (`InviteV1`) sealed with **ChaCha20-Poly1305** and a key derived from a **passphrase** (BLAKE3 KDF). Clients and Android JNI can consume the same blob instead of spelling out `--server`, `--token`, and matching tunnel options by hand.
 
-Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`proto_domain`** (omit to let the client default the KDF label to **SNI** — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, optional **`tls_stack`** (`rustls` | `boring`), optional **`pin_cert_pem`**, optional REALITY fields (`reality_target`, `reality_public_key`, `reality_short_id`), and other tunnel fields. **`--print-invite-uri`** on the server embeds the same defaults as hand-written JSON. **`bibavpn-mint-invite`** uses environment variables (`INVITE_PROTO`, `INVITE_PROTO_DOMAIN`, …) with the same v3-first defaults. **Do not** paste real invites or passphrases into tickets or public logs.
+Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`proto_domain`** (omit to let the client default the KDF label to **SNI** — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, optional **`tls_stack`** (`rustls` | `boring`), optional **`pin_cert_pem`**, optional REALITY fields (`reality_target`, `reality_public_key`, `reality_short_id`), and other tunnel fields. **`--print-invite-uri`** on the server embeds the same defaults as hand-written JSON. **`bibavpn-mint-invite`** uses environment variables (`INVITE_PROTO`, `INVITE_PROTO_DOMAIN`, …) with the same defaults. **Do not** paste real invites or passphrases into tickets or public logs.
 
 **Server** (stdout = only the URI; passphrase must stay secret — share out-of-band):
 
@@ -331,7 +331,7 @@ Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`pro
 
 ---
 
-## Biba v3 summary
+## Wire summary
 
 - **PSK required** on client and server. **`--proto`** is **`3`** (only supported value).
 - **Handshake:** variable-length HELLO (`0x03` …) and ACK (32 + 16 MAC + padding); see [Handshake](#handshake-after-http-upgrade).
@@ -381,9 +381,9 @@ allowlists — it aligns **SNI / handshake behaviour**, not routing to the front
 
 **Tests:** `cargo test -p bibavpn --test reality_handshake` (WSS + X25519 roundtrip).
 
-## BibaV2.1 transport knobs
+## Transport shaping knobs
 
-These options shape TLS/WebSocket timing and framing; they apply on top of the v3 tunnel.
+These options shape TLS/WebSocket timing and framing; they apply on top of the tunnel.
 
 - `--ws-ping-secs`, `--ws-ping-jitter-percent`, `--ws-binary-send-jitter-ms`
 - `--ws-jitter-min-ms` / `--ws-jitter-max-ms` — per-frame send delay range (replaces
@@ -414,26 +414,26 @@ These options shape TLS/WebSocket timing and framing; they apply on top of the v
 - `--camouflage-dir`, `--camouflage-url` (`http://` upstream only) — server camouflage
 
 Wire-format changes require **both** client and server updates. Pure client-side
-or server-side **timing / TLS engine** options do not change the v3 opcodes
+or server-side **timing / TLS engine** options do not change the control opcodes
 above, but all peers must use compatible `bibavpn` versions when new flags are required.
 
 ---
 
-## BibaV4 (v1.2.0) target specification
+## Target specification (roadmap)
 
-This section is the **normative product spec** for the `v1.2.0` / BibaV4 line.
-**Backward compatibility is not required** for a *future* BibaV4 wire: BibaV4
-may still replace the Biba v3 handshake, inner opcodes, padding, mux layout, and
-invite fields. The **on-the-wire byte layout** will be documented here as
-subsystems merge; **today’s releases** in this repository still use the **Biba
-v3** opcodes in the sections above and implement many BibaV4 *behaviors* as
-client/server layers on that wire (see **Implementation status** below).
+This section is the **normative product spec** for the next wire revision.
+**Backward compatibility is not required** for that *future* wire: it may still
+replace the current handshake, inner opcodes, padding, mux layout, and invite
+fields. The **on-the-wire byte layout** will be documented here as subsystems
+merge; **today’s releases** in this repository still use the opcodes in the
+sections above and implement many of the target *behaviors* as client/server
+layers on that wire (see **Implementation status** below).
 
 **Design goal:** position BibaVPN among the stronger **single-VPS,
 DPI-resistant** tunnels in 2026 (Rust core, TLS + WebSocket, Android app), with
 focus on **DPI bypass** (not anonymity against the VPS operator).
 
-### Implementation status (1.2.x on v3)
+### Implementation status
 
 Rough mapping from the P0 / P1 bullets below to the **current tree** (not an
 exhaustive changelog):
@@ -534,5 +534,5 @@ The stock **bibavpn-client** build does **not** perform raw-socket split / disor
 - **Tests:** unit + integration for each new subsystem; **Changelog** + **release
   notes** at ship time.
 
-Invite / JSON / `proto` field will move to a **BibaV4** identifier when the wire
+Invite / JSON / `proto` field will move to a new identifier when a future wire
 lands (exact value and migration are implementation-defined in this branch).
