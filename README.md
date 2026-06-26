@@ -12,7 +12,7 @@ same workspace.
 
 **Highlights**
 
-- **Biba v3 inner wire:** opaque HELLO/ACK, ChaCha20-Poly1305, domain-separated
+- **Encrypted inner wire:** opaque HELLO/ACK, ChaCha20-Poly1305, domain-separated
   keys, sealed control frames, per-frame random decoy + padding.
 - **Looks like normal HTTPS:** browser-ordered upgrade headers, configurable TLS
   client profile (rustls default, optional BoringSSL), leaf pinning, HTTP
@@ -125,8 +125,8 @@ Point your apps at the local SOCKS5 / HTTP CONNECT endpoint:
 
 Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. Essentials:
 
-- **Required:** `--server`, `--sni`, `--token`, `--psk`. The wire is **Biba v3**
-  only; the server `--proto-domain` (default `default`) must match the client's.
+- **Required:** `--server`, `--sni`, `--token`, `--psk`. The server
+  `--proto-domain` (default `default`) must match the client's.
 - **Shape / anti-DPI:** `--decoy-max`, `--max-pad`, `--pad-mode`,
   `--dummy-interval-secs`, `--ws-ping-secs`, `--junk-frames`, `--stealth-profile`,
   `--fingerprint`, `--ws-jitter-min-ms`/`--ws-jitter-max-ms`, `--ws-parallel`,
@@ -140,7 +140,7 @@ Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. Essentials:
   outer SNI then defaults to the front host (`vk.com:443` → SNI `vk.com`) while
   TCP still connects to `--server`.
 
-Secrets never go in the URL: the token travels in the v3 sealed AUTH frame, and
+Secrets never go in the URL: the token travels in the sealed AUTH frame, and
 the WebSocket path (`--ws-path`, default `/ws`) carries no credentials.
 
 ## Build from source
@@ -165,9 +165,9 @@ then `--tls-stack boring` on the client. `--pin-cert` works on both stacks.
 
 ## Comparison
 
-Rough positioning only; stealth features land incrementally on v3.
+Rough positioning only.
 
-| | **BibaVPN (v3)** | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (Xray) |
+| | **BibaVPN** | [wstunnel](https://github.com/erebe/wstunnel) | [Hysteria2](https://v2.hysteria.network/) | **REALITY** (Xray) |
 | --- | --- | --- | --- | --- |
 | **Transport** | TLS + WSS, PSK inner | TLS + WSS, generic | QUIC | TLS fronting / proxy |
 | **DPI focus** | Explicit (fingerprints, timing, padding, decoys) | General tunneling | Throughput | Site mimicry (TLS hook) |
