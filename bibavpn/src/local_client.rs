@@ -1,6 +1,6 @@
 //! Shared SOCKS5 / HTTP CONNECT front-end for desktop binary and Android JNI.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
@@ -11,6 +11,7 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -82,6 +83,44 @@ fn tcp_mux_writer_gone(e: &anyhow::Error) -> bool {
 
 type TcpMuxSlot = TcpMuxClientSlot;
 
+/// Tracks per-session background tasks; abort on VPN shutdown so mux WSS/ping loops stop.
+#[derive(Clone)]
+struct SessionGuard {
+    shutdown: watch::Receiver<bool>,
+    tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+}
+
+impl SessionGuard {
+    fn new(shutdown: watch::Receiver<bool>) -> Self {
+        Self {
+            shutdown,
+            tasks: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.shutdown.clone()
+    }
+
+    fn push_task(&self, handle: JoinHandle<()>) {
+        if let Ok(mut g) = self.tasks.lock() {
+            g.push(handle);
+        }
+    }
+
+    fn with_tasks<R>(&self, f: impl FnOnce(&mut Vec<JoinHandle<()>>) -> R) -> R {
+        let mut g = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+
+    async fn abort_all(&self) {
+        let mut handles = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+}
+
 async fn tcp_mux_open_stream_with_retry(
     mut local: TcpStream,
     host: String,
@@ -89,10 +128,11 @@ async fn tcp_mux_open_stream_with_retry(
     tcp_uplink_prefix: Vec<u8>,
     cfg: Arc<ClientCfg>,
     tcp_mux_slot: TcpMuxSlot,
+    session: &SessionGuard,
 ) -> anyhow::Result<()> {
     for attempt in 0..TCP_MUX_SLOT_RETRIES {
         if tcp_mux_slot.lock().await.is_none() {
-            connect_tcp_mux_handle(&cfg, &tcp_mux_slot).await?;
+            connect_tcp_mux_handle(&cfg, &tcp_mux_slot, session).await?;
         }
         let h = {
             let slot = tcp_mux_slot.lock().await;
@@ -595,9 +635,13 @@ async fn open_legacy_biba_channel(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tunnel: connect failed")))
 }
 
-async fn ensure_tcp_mux_ready(cfg: &Arc<ClientCfg>, tcp_mux_slot: &TcpMuxSlot) -> anyhow::Result<()> {
+async fn ensure_tcp_mux_ready(
+    cfg: &Arc<ClientCfg>,
+    tcp_mux_slot: &TcpMuxSlot,
+    session: &SessionGuard,
+) -> anyhow::Result<()> {
     if tcp_mux_slot.lock().await.is_none() {
-        connect_tcp_mux_handle(cfg, tcp_mux_slot).await?;
+        connect_tcp_mux_handle(cfg, tcp_mux_slot, session).await?;
     }
     Ok(())
 }
@@ -605,18 +649,21 @@ async fn ensure_tcp_mux_ready(cfg: &Arc<ClientCfg>, tcp_mux_slot: &TcpMuxSlot) -
 async fn connect_tcp_mux_handle(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
+    session: &SessionGuard,
 ) -> anyhow::Result<()> {
-    connect_tcp_mux_handle_attempts(cfg, tcp_mux_slot, OUTBOUND_CONNECT_ATTEMPTS).await
+    connect_tcp_mux_handle_attempts(cfg, tcp_mux_slot, OUTBOUND_CONNECT_ATTEMPTS, session).await
 }
 
 async fn connect_tcp_mux_handle_attempts(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
     max_attempts: u32,
+    session: &SessionGuard,
 ) -> anyhow::Result<()> {
     // Check if REALITY mode is enabled
     if cfg.reality_target.is_some() {
-        return connect_reality_tcp_mux_handle_attempts(cfg, tcp_mux_slot, max_attempts).await;
+        return connect_reality_tcp_mux_handle_attempts(cfg, tcp_mux_slot, max_attempts, session)
+            .await;
     }
 
     let _connect_serial = tcp_mux_connect_serial().lock().await;
@@ -665,12 +712,16 @@ async fn connect_tcp_mux_handle_attempts(
                     dummy_interval_secs: cfg.dummy_interval_secs,
                     activity: cfg.activity.clone(),
                 };
-                let (sid, h) = tcp_mux::spawn_tcp_mux_client(
-                    ws,
-                    Some(crypto),
-                    mcfg,
-                    tcp_mux_slot.clone(),
-                );
+                let (sid, h) = session.with_tasks(|tasks| {
+                    tcp_mux::spawn_tcp_mux_client(
+                        ws,
+                        Some(crypto),
+                        mcfg,
+                        tcp_mux_slot.clone(),
+                        session.shutdown_rx(),
+                        tasks,
+                    )
+                });
                 sessions.push((sid, h));
                 info!(
                     target: "bibavpn_client",
@@ -705,6 +756,7 @@ async fn connect_reality_tcp_mux_handle_attempts(
     cfg: &Arc<ClientCfg>,
     tcp_mux_slot: &TcpMuxSlot,
     max_attempts: u32,
+    session: &SessionGuard,
 ) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message;
 
@@ -758,8 +810,16 @@ async fn connect_reality_tcp_mux_handle_attempts(
                     activity: cfg.activity.clone(),
                 };
 
-                let (sid, h) =
-                    tcp_mux::spawn_tcp_mux_client(ws, None, mcfg, tcp_mux_slot.clone());
+                let (sid, h) = session.with_tasks(|tasks| {
+                    tcp_mux::spawn_tcp_mux_client(
+                        ws,
+                        None,
+                        mcfg,
+                        tcp_mux_slot.clone(),
+                        session.shutdown_rx(),
+                        tasks,
+                    )
+                });
                 sessions.push((sid, h));
                 info!(
                     target: "bibavpn_client",
@@ -915,6 +975,8 @@ pub async fn run_local_client(
         pinned_certs_pem: opts.pinned_certs_pem.clone(),
     });
 
+    let session = SessionGuard::new(shutdown.clone());
+
     if cfg.decoy_gets {
         let ua = cfg
             .ws_user_agent
@@ -972,7 +1034,7 @@ pub async fn run_local_client(
                 "idle decoy: after {} s without tunneled traffic, issue HTTPS GET (mode {:?})",
                 idle_s, cfg.decoy_mode
             );
-            tokio::spawn(async move {
+            session.push_task(tokio::spawn(async move {
                 loop {
                     if *sd.borrow() {
                         break;
@@ -987,7 +1049,7 @@ pub async fn run_local_client(
                         }
                     }
                 }
-            });
+            }));
         }
     }
 
@@ -1001,8 +1063,13 @@ pub async fn run_local_client(
             port = cfg.server_port,
             "opening remote multiplexed WSS"
         );
-        connect_tcp_mux_handle_attempts(&cfg, &tcp_mux_slot, STARTUP_MUX_CONNECT_ATTEMPTS)
-            .await
+        connect_tcp_mux_handle_attempts(
+            &cfg,
+            &tcp_mux_slot,
+            STARTUP_MUX_CONNECT_ATTEMPTS,
+            &session,
+        )
+        .await
             .with_context(|| {
                 if cfg.pinned_certs_pem.is_some() {
                     "remote tunnel connect failed (verify pin_cert_pem matches the server leaf certificate, SNI, and server reachability)"
@@ -1029,7 +1096,8 @@ pub async fn run_local_client(
         let cfg_http = cfg.clone();
         let tcp_mux_http = tcp_mux_slot.clone();
         let mut shutdown_http = shutdown.clone();
-        tokio::spawn(async move {
+        let sess_http = session.clone();
+        session.push_task(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown_http.changed() => {
@@ -1042,8 +1110,9 @@ pub async fn run_local_client(
                             Ok((sock, peer)) => {
                                 let c = cfg_http.clone();
                                 let tms = tcp_mux_http.clone();
+                                let sess = sess_http.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_http_peer(sock, c, tms).await {
+                                    if let Err(e) = handle_http_peer(sock, c, tms, sess).await {
                                         error!("http {peer}: {e:#}");
                                     }
                                 });
@@ -1055,7 +1124,7 @@ pub async fn run_local_client(
                     }
                 }
             }
-        });
+        }));
     }
 
     loop {
@@ -1063,6 +1132,9 @@ pub async fn run_local_client(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     info!("local client shutdown");
+                    *tcp_mux_slot.lock().await = None;
+                    *udp_mux_slot.lock().await = None;
+                    session.abort_all().await;
                     return Ok(());
                 }
             }
@@ -1071,8 +1143,9 @@ pub async fn run_local_client(
                 let c = cfg.clone();
                 let ums = udp_mux_slot.clone();
                 let tms = tcp_mux_slot.clone();
+                let sess = session.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_socks_peer(sock, c, ums, tms).await {
+                    if let Err(e) = handle_socks_peer(sock, c, ums, tms, sess).await {
                         if socks5::is_benign_handshake_abort(&e) {
                             debug!("socks {peer}: client closed before SOCKS5 handshake");
                         } else {
@@ -1107,16 +1180,17 @@ async fn handle_socks_peer(
     cfg: Arc<ClientCfg>,
     udp_mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
     tcp_mux_slot: TcpMuxSlot,
+    session: SessionGuard,
 ) -> anyhow::Result<()> {
     match socks5::socks5_read_command(&mut local, cfg.socks_auth.as_ref()).await? {
         SocksCommand::Connect { host, port } => {
             if cfg.use_tcp_mux {
-                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot).await {
+                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ = socks5::socks5_reply_err(&mut local).await;
                     return Err(e);
                 }
                 socks5::socks5_reply_ok(&mut local).await?;
-                tcp_mux_open_stream_with_retry(local, host, port, Vec::new(), cfg, tcp_mux_slot)
+                tcp_mux_open_stream_with_retry(local, host, port, Vec::new(), cfg, tcp_mux_slot, &session)
                     .await
             } else {
                 let (ws, crypto, prefetched_ws_messages) =
@@ -1156,7 +1230,7 @@ async fn handle_socks_peer(
                 .context("bind udp relay")?;
             let relay_port = udp.local_addr()?.port();
             socks5::socks5_reply_udp_associate(&mut local, relay_port).await?;
-            run_socks_udp_assoc(local, udp, cfg, udp_mux_slot).await
+            run_socks_udp_assoc(local, udp, cfg, udp_mux_slot, session).await
         }
     }
 }
@@ -1167,6 +1241,7 @@ async fn run_socks_udp_assoc(
     udp: UdpSocket,
     cfg: Arc<ClientCfg>,
     mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
+    session: SessionGuard,
 ) -> anyhow::Result<()> {
     let (close_tx, mut close_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -1184,7 +1259,9 @@ async fn run_socks_udp_assoc(
     let handle = {
         let mut g = mux_slot.lock().await;
         if g.is_none() {
-            *g = Some(spawn_udp_mux_driver(cfg.udp_mux_config()));
+            *g = Some(session.with_tasks(|tasks| {
+                spawn_udp_mux_driver(cfg.udp_mux_config(), session.shutdown_rx(), tasks)
+            }));
         }
         g.as_ref().expect("udp mux just set").clone()
     };
@@ -1268,6 +1345,7 @@ async fn handle_http_peer(
     mut local: TcpStream,
     cfg: Arc<ClientCfg>,
     tcp_mux_slot: TcpMuxSlot,
+    session: SessionGuard,
 ) -> anyhow::Result<()> {
     if http_connect::try_serve_health_check(&mut local).await? {
         return Ok(());
@@ -1279,7 +1357,7 @@ async fn handle_http_peer(
             client_prefetch,
         }) => {
             if cfg.use_tcp_mux {
-                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot).await {
+                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ =
                         http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
                     return Err(e);
@@ -1292,6 +1370,7 @@ async fn handle_http_peer(
                     client_prefetch,
                     cfg,
                     tcp_mux_slot,
+                    &session,
                 )
                 .await
             } else {
@@ -1334,12 +1413,12 @@ async fn handle_http_peer(
             to_origin,
         }) => {
             if cfg.use_tcp_mux {
-                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot).await {
+                if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ =
                         http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
                     return Err(e);
                 }
-                tcp_mux_open_stream_with_retry(local, host, port, to_origin, cfg, tcp_mux_slot)
+                tcp_mux_open_stream_with_retry(local, host, port, to_origin, cfg, tcp_mux_slot, &session)
                     .await
             } else {
                 tunnel_to_biba(local, host, port, cfg, to_origin).await
@@ -1461,5 +1540,33 @@ mod parse_tests {
     #[test]
     fn parse_ws_header_requires_colon() {
         assert!(parse_ws_header("BadHeader").is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn session_guard_aborts_tracked_tasks() {
+        let (tx, rx) = watch::channel(false);
+        let session = SessionGuard::new(rx);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = hits.clone();
+        session.push_task(tokio::spawn(async move {
+            loop {
+                hits_task.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(hits.load(Ordering::Relaxed) > 0);
+        let _ = tx.send(true);
+        session.abort_all().await;
+        let after = hits.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hits.load(Ordering::Relaxed), after);
     }
 }
