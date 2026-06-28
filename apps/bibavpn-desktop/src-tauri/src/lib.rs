@@ -69,8 +69,29 @@ struct ActiveVpn {
 impl ActiveVpn {
     fn stop(self, rt: &tokio::runtime::Runtime) {
         let _ = self.shutdown.send(true);
-        let _ = rt.block_on(self.join);
+        let handle = self.join;
+        let abort = handle.abort_handle();
+        match rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), handle).await }) {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => error!(target: "bibavpn_desktop", "VPN-клиент: {e:#}"),
+            Ok(Err(e)) => error!(target: "bibavpn_desktop", "join VPN-клиента: {e}"),
+            Err(_) => {
+                abort.abort();
+                warn!(
+                    target: "bibavpn_desktop",
+                    "VPN-клиент не остановился за 5 с — задача прервана"
+                );
+            }
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VpnPhase {
+    Idle,
+    Connecting,
+    Connected,
+    Disconnecting,
 }
 
 pub(crate) struct Inner {
@@ -79,6 +100,7 @@ pub(crate) struct Inner {
     vpn: Option<ActiveVpn>,
     tunnel_server: Option<String>,
     last_error: Option<String>,
+    phase: VpnPhase,
 }
 
 #[derive(Clone)]
@@ -353,20 +375,57 @@ fn probe_local_http_health(http_port: u16) -> bool {
     }
 }
 
+fn probe_tunnel_end_to_end(http_port: u16) -> bool {
+    use std::io::{Read, Write};
+
+    let addr: SocketAddr = match format!("127.0.0.1:{http_port}").parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    let req = concat!(
+        "CONNECT connectivitycheck.gstatic.com:443 HTTP/1.1\r\n",
+        "Host: connectivitycheck.gstatic.com:443\r\n",
+        "Proxy-Connection: keep-alive\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    match stream.read(&mut buf) {
+        Ok(n) if n >= 12 => std::str::from_utf8(&buf[..n])
+            .map(|s| s.contains("200"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn tunnel_is_healthy(http_port: u16) -> bool {
+    probe_local_http_health(http_port) && probe_tunnel_end_to_end(http_port)
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
     std::thread::spawn(move || loop {
+        let tick_started = Instant::now();
         std::thread::sleep(Duration::from_secs(12));
+        let slept = tick_started.elapsed();
+        let likely_wake = slept > Duration::from_secs(20);
+
         let Some((http_port, client_dead)) = (|| {
             let g = match state.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
+            if g.phase != VpnPhase::Connected {
+                return None;
+            }
             let vpn = g.vpn.as_ref()?;
-            Some((
-                g.cfg.local_http_port,
-                vpn.join.is_finished(),
-            ))
+            Some((g.cfg.local_http_port, vpn.join.is_finished()))
         })() else {
             continue;
         };
@@ -375,19 +434,27 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
                 target: "bibavpn_desktop",
                 "VPN-клиент завершился неожиданно — переподключение"
             );
-        } else if probe_local_http_health(http_port) {
+        } else if !likely_wake && tunnel_is_healthy(http_port) {
             continue;
-        } else {
+        } else if !likely_wake {
             std::thread::sleep(Duration::from_secs(2));
-            if probe_local_http_health(http_port) {
+            if tunnel_is_healthy(http_port) {
                 continue;
             }
             warn!(
                 target: "bibavpn_desktop",
-                "локальный HTTP-прокси недоступен после сна или сбоя — переподключение VPN"
+                "туннель недоступен после сна или сбоя — переподключение VPN"
             );
+        } else {
+            warn!(
+                target: "bibavpn_desktop",
+                "пробуждение системы — проверка туннеля и прокси"
+            );
+            if tunnel_is_healthy(http_port) {
+                continue;
+            }
         }
-        disconnect_inner(&state, &app);
+        disconnect_inner(&state, &app, false);
         if let Err(e) = connect_inner(&state, &app) {
             warn!(target: "bibavpn_desktop", "автовосстановление VPN: {e}");
             let mut g = match state.inner.lock() {
@@ -410,7 +477,24 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
     });
 }
 
-fn disconnect_inner(state: &AppState, app: &AppHandle) {
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn restore_with_retry(backup: &ProxyBackup) -> Result<(), String> {
+    let mut last = None;
+    for attempt in 0..3u8 {
+        match restore(backup) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if attempt + 1 < 3 {
+                    std::thread::sleep(Duration::from_millis(250 * (u64::from(attempt) + 1)));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| "восстановление прокси не удалось".into()))
+}
+
+fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: bool) {
     #[cfg(target_os = "android")]
     {
         {
@@ -468,38 +552,60 @@ fn disconnect_inner(state: &AppState, app: &AppHandle) {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if g.phase == VpnPhase::Disconnecting {
+            return;
+        }
+        g.phase = VpnPhase::Disconnecting;
         info!(target: "bibavpn_desktop", "отключение VPN");
         g.last_error = None;
         g.tunnel_server = None;
-        let backup = g.proxy_backup.take();
-        match backup {
-            Some(backup) => {
-                if let Err(e) = restore(&backup) {
-                    warn!(target: "bibavpn_desktop", "восстановление системного прокси: {e}");
-                    g.last_error = Some(format!("Прокси: восстановление: {e}"));
-                    #[cfg(windows)]
-                    if let Err(e2) = crate::proxy_win::disable_if_residual_biba_proxy() {
-                        warn!(
-                            target: "bibavpn_desktop",
-                            "прокси: запасное отключение loopback после ошибки restore: {e2}"
-                        );
+        if restore_system_proxy {
+            let backup = g.proxy_backup.take();
+            match backup {
+                Some(backup) => {
+                    if let Err(e) = restore_with_retry(&backup) {
+                        warn!(target: "bibavpn_desktop", "восстановление системного прокси: {e}");
+                        g.last_error = Some(format!("Прокси: восстановление: {e}"));
+                        #[cfg(windows)]
+                        if let Err(e2) = crate::proxy_win::disable_if_residual_biba_proxy() {
+                            warn!(
+                                target: "bibavpn_desktop",
+                                "прокси: запасное отключение loopback после ошибки restore: {e2}"
+                            );
+                        }
+                        #[cfg(target_os = "macos")]
+                        if let Err(e2) = crate::proxy_mac::disable_biba_proxies_on_services() {
+                            warn!(
+                                target: "bibavpn_desktop",
+                                "прокси: запасное отключение на macOS после ошибки restore: {e2}"
+                            );
+                        }
                     }
                 }
-            }
-            None => {
-                #[cfg(windows)]
-                if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
-                    warn!(
-                        target: "bibavpn_desktop",
-                        "прокси: нет снимка настроек — запасная очистка loopback: {e}"
-                    );
-                    g.last_error = Some(format!("Прокси: {e}"));
+                None => {
+                    #[cfg(windows)]
+                    if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
+                        warn!(
+                            target: "bibavpn_desktop",
+                            "прокси: нет снимка настроек — запасная очистка loopback: {e}"
+                        );
+                        g.last_error = Some(format!("Прокси: {e}"));
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Err(e) = crate::proxy_mac::disable_biba_proxies_on_services() {
+                        warn!(
+                            target: "bibavpn_desktop",
+                            "прокси: нет снимка настроек — запасное отключение macOS: {e}"
+                        );
+                        g.last_error = Some(format!("Прокси: {e}"));
+                    }
                 }
             }
         }
         if let Some(vpn) = g.vpn.take() {
             vpn.stop(&state.rt);
         }
+        g.phase = VpnPhase::Idle;
         sync_tray_tooltip_i18n(app, false, &g.cfg);
         let snap = snapshot(app, &g);
         let _ = app.emit("vpn-state", &snap);
@@ -584,21 +690,32 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if g.vpn.is_some() {
+        if g.vpn.is_some() && g.phase == VpnPhase::Connected {
             drop(g);
-            disconnect_inner(state, app);
+            disconnect_inner(state, app, true);
             std::thread::sleep(Duration::from_millis(300));
         }
     }
 
-    let cfg = {
+    let (cfg, backup) = {
         let mut g = match state.inner.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        match g.phase {
+            VpnPhase::Connecting => {
+                return Err("Подключение уже выполняется.".into());
+            }
+            VpnPhase::Disconnecting => {
+                return Err("Дождитесь завершения отключения.".into());
+            }
+            _ => {}
+        }
+        g.phase = VpnPhase::Connecting;
         g.last_error = None;
 
         if !g.cfg.can_connect() {
+            g.phase = VpnPhase::Idle;
             warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
             return Err(
                 "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
@@ -606,7 +723,15 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             );
         }
 
-        g.cfg.clone()
+        let backup = if let Some(ref saved) = g.proxy_backup {
+            saved.clone()
+        } else {
+            read_backup().map_err(|e| {
+                g.phase = VpnPhase::Idle;
+                e.to_string()
+            })?
+        };
+        (g.cfg.clone(), backup)
     };
 
     let http_port = cfg.local_http_port;
@@ -616,6 +741,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         cfg.local_socks_port
     };
     if socks_port == http_port {
+        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.phase = VpnPhase::Idle;
         warn!(target: "bibavpn_desktop", "подключение: совпадают порты HTTP и SOCKS");
         return Err(
             "Порт SOCKS5 должен отличаться от HTTP (или оставьте SOCKS = 0 для HTTP+1).".into(),
@@ -626,7 +753,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     persist_cfg(app, &cfg)?;
 
-    let backup = read_backup().map_err(|e| e.to_string())?;
     let json = cfg.start_config_json()?;
     let opts =
         local_client_options_from_json_str_with_binds(&json, socks_bind, Some(http_bind.clone()))
@@ -662,6 +788,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
                 Ok(Err(e)) => error!(target: "bibavpn_desktop", "клиент после таймаута: {e:#}"),
                 Err(e) => error!(target: "bibavpn_desktop", "join клиента: {e}"),
             }
+            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.phase = VpnPhase::Idle;
             return Err(
                 "Подключение не завершилось за 45 с (TLS/WSS к серверу или локальный прокси). Смотрите лог в папке BibaVPN/logs.".into(),
             );
@@ -679,6 +807,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
                 target: "bibavpn_desktop",
                 "SOCKS не стартовал (канал закрыт): {msg}"
             );
+            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.phase = VpnPhase::Idle;
             return Err(msg);
         }
     }
@@ -704,6 +834,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         warn!(target: "bibavpn_desktop", "системный прокси: {e}");
         let _ = shutdown_tx.send(true);
         let _ = state.rt.block_on(join);
+        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.phase = VpnPhase::Idle;
         return Err(format!("Системный прокси: {e}"));
     }
 
@@ -724,6 +856,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         join,
     });
     g.tunnel_server = Some(remote_label);
+    g.phase = VpnPhase::Connected;
     sync_tray_tooltip_i18n(app, true, &g.cfg);
     Ok(())
 }
@@ -731,7 +864,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 #[cfg(target_os = "android")]
 fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     if android_vpn::tunnel_is_active(app).unwrap_or(false) {
-        disconnect_inner(state, app);
+        disconnect_inner(state, app, true);
         std::thread::sleep(Duration::from_millis(300));
     }
 
@@ -786,7 +919,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 #[cfg(target_os = "ios")]
 fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     if ios_vpn::tunnel_is_active(app).unwrap_or(false) {
-        disconnect_inner(state, app);
+        disconnect_inner(state, app, true);
         std::thread::sleep(Duration::from_millis(300));
     }
 
@@ -916,7 +1049,7 @@ async fn disconnect_cmd(
 ) -> Result<StateSnapshot, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        disconnect_inner(&state, &app);
+        disconnect_inner(&state, &app, true);
         let g = state.inner.lock().map_err(|e| e.to_string())?;
         let snap = snapshot(&app, &g);
         let _ = app.emit("vpn-state", &snap);
@@ -1150,6 +1283,7 @@ pub fn run() -> anyhow::Result<()> {
             vpn: None,
             tunnel_server: None,
             last_error: None,
+            phase: VpnPhase::Idle,
         })),
     };
 
@@ -1211,7 +1345,7 @@ pub fn run() -> anyhow::Result<()> {
                         "show" => show_main_window(app),
                         "quit" => {
                             let st = app.state::<AppState>();
-                            disconnect_inner(&*st, app);
+                            disconnect_inner(&*st, app, true);
                             app.exit(0);
                         }
                         "on" => {
@@ -1233,7 +1367,7 @@ pub fn run() -> anyhow::Result<()> {
                         "off" => {
                             let st = app.state::<AppState>();
                             let h = app.clone();
-                            disconnect_inner(&*st, &h);
+                            disconnect_inner(&*st, &h, true);
                             let g = st.inner.lock().unwrap_or_else(|e| e.into_inner());
                             let snap = snapshot(&h, &g);
                             let _ = h.emit("vpn-state", &snap);
@@ -1320,7 +1454,7 @@ pub fn run() -> anyhow::Result<()> {
     app.run(|app_handle, event| {
         if let RunEvent::Exit = event {
             let st = app_handle.state::<AppState>();
-            disconnect_inner(&*st, app_handle);
+            disconnect_inner(&*st, app_handle, true);
         }
     });
 

@@ -337,13 +337,49 @@ fn apply_to_service(
 }
 
 pub fn restore(backup: &ProxyBackup) -> Result<(), String> {
-    let mut last = Ok(());
+    let mut errs = Vec::new();
     for s in &backup.services {
         if let Err(e) = restore_service(s) {
-            last = Err(e);
+            errs.push(e);
         }
     }
-    last
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("; "))
+    }
+}
+
+/// Отключить loopback-прокси BibaVPN на управляемых сервисах, если снимок настроек потерян.
+pub fn disable_biba_proxies_on_services() -> Result<(), String> {
+    let services = services_for_proxy()?;
+    let mut errs = Vec::new();
+    for service in services {
+        let web = parse_proxy_state("-getwebproxy", &service);
+        let secure = parse_proxy_state("-getsecurewebproxy", &service);
+        let loopback = |slot: &ProxySlot| {
+            slot.enabled
+                && matches!(
+                    slot.server.trim().to_ascii_lowercase().as_str(),
+                    "127.0.0.1" | "localhost"
+                )
+        };
+        if loopback(&web) {
+            if let Err(e) = run_netsetup(&["-setwebproxystate", &service, "off"]) {
+                errs.push(e);
+            }
+        }
+        if loopback(&secure) {
+            if let Err(e) = run_netsetup(&["-setsecurewebproxystate", &service, "off"]) {
+                errs.push(e);
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("; "))
+    }
 }
 
 fn restore_service(s: &ServiceProxyBackup) -> Result<(), String> {
