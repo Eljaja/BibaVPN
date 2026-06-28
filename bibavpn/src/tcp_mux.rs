@@ -15,7 +15,8 @@ use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -777,6 +778,8 @@ pub fn spawn_tcp_mux_client<S>(
     crypto: Option<SharedCrypto>,
     mut cfg: MuxClientConfig,
     tcp_mux_slot: TcpMuxClientSlot,
+    mut shutdown: watch::Receiver<bool>,
+    tasks: &mut Vec<JoinHandle<()>>,
 ) -> (u64, TcpMuxClientHandle)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -791,7 +794,10 @@ where
         let tx_d = tx.clone();
         let cfg_d = cfg.clone();
         let crypto_d = crypto.clone();
-        tokio::spawn(mux_client_dummy_task(tx_d, cfg_d, crypto_d));
+        let mut sd_d = shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            mux_client_dummy_task(tx_d, cfg_d, crypto_d, sd_d).await;
+        }));
     }
     let tx_reader = tx.clone();
     let down: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
@@ -802,7 +808,8 @@ where
     let cfg_w = cfg.clone();
     let cfg_r = cfg.clone();
 
-    tokio::spawn(async move {
+    let mut sd_w = shutdown.clone();
+    tasks.push(tokio::spawn(async move {
         let mut ping_sleep: Option<Pin<Box<tokio::time::Sleep>>> = if cfg_w.ws_ping_secs > 0 {
             Some(Box::pin(sleep(ws_ping_period_duration(
                 cfg_w.ws_ping_secs,
@@ -817,10 +824,19 @@ where
         let send_j = cfg_w.send_jitter();
 
         loop {
+            if *sd_w.borrow() {
+                break;
+            }
             let cmd = match ping_sleep.as_mut() {
                 Some(sleep_pin) => {
                     tokio::select! {
                         cmd = rx.recv() => cmd,
+                        _ = sd_w.changed() => {
+                            if *sd_w.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
                         _ = sleep_pin.as_mut() => {
                             if ws_sink.send(Message::Ping(Bytes::new())).await.is_err() {
                                 break;
@@ -833,7 +849,17 @@ where
                         }
                     }
                 }
-                None => rx.recv().await,
+                None => {
+                    tokio::select! {
+                        cmd = rx.recv() => cmd,
+                        _ = sd_w.changed() => {
+                            if *sd_w.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
             };
             let Some(first) = cmd else { break };
             let mut stop = false;
@@ -920,11 +946,15 @@ where
             }
         }
         remove_mux_session(&slot_w, session_id).await;
-    });
+    }));
 
-    tokio::spawn(mux_client_reader_loop(
-        ws_rx, crypto_r, cfg_r, down_r, tx_reader, session_id, slot_r,
-    ));
+    let mut sd_r = shutdown;
+    tasks.push(tokio::spawn(async move {
+        mux_client_reader_loop(
+            ws_rx, crypto_r, cfg_r, down_r, tx_reader, session_id, slot_r, sd_r,
+        )
+        .await;
+    }));
 
     let handle = TcpMuxClientHandle {
         tx,
@@ -943,13 +973,29 @@ async fn mux_client_reader_loop<S>(
     out_tx: mpsc::Sender<MuxWriteCmd>,
     session_id: u64,
     tcp_mux_slot: TcpMuxClientSlot,
+    mut shutdown: watch::Receiver<bool>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use crate::log_ratelimit::LogEvery;
     static DECODE_WARN: LogEvery = LogEvery::new(8, 64);
     let mut decode_failures: u32 = 0;
-    while let Some(m) = ws_rx.next().await {
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let m = tokio::select! {
+            m = ws_rx.next() => m,
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(m) = m else {
+            break;
+        };
         let Ok(m) = m else { break };
         match m {
             Message::Binary(b) => {
@@ -1145,9 +1191,13 @@ async fn mux_client_dummy_task(
     tx: mpsc::Sender<MuxWriteCmd>,
     cfg: MuxClientConfig,
     crypto: Option<SharedCrypto>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut wire = Vec::with_capacity(cfg.max_ws_binary.min(256 * 1024));
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let lo = cfg
             .dummy_interval_secs
             .saturating_mul(1)
@@ -1159,7 +1209,15 @@ async fn mux_client_dummy_task(
             .saturating_div(2)
             .max(lo);
         let secs = rand::thread_rng().gen_range(lo..=hi);
-        sleep(Duration::from_secs(secs)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_secs(secs)) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        }
         wire.clear();
         if write_padded_frame_with_mode(&mut wire, &[], cfg.max_pad, cfg.pad_mode).is_err() {
             continue;

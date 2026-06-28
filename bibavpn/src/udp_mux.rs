@@ -13,7 +13,8 @@ use rand::Rng;
 use rand::RngCore;
 use rustls::pki_types::ServerName;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -259,24 +260,35 @@ impl UdpMuxHandle {
 }
 
 /// Start background driver; returns handle for submitting UDP requests.
-pub fn spawn_udp_mux_driver(cfg: UdpMuxConfig) -> UdpMuxHandle {
+pub fn spawn_udp_mux_driver(
+    cfg: UdpMuxConfig,
+    mut shutdown: watch::Receiver<bool>,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> UdpMuxHandle {
     let (tx, rx) = mpsc::channel(UDP_MUX_CMD_QUEUE_CAP);
-    tokio::spawn(async move {
-        if let Err(e) = run_udp_mux_driver_forever(cfg, rx).await {
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = run_udp_mux_driver_forever(cfg, rx, shutdown).await {
             error!("udp mux client: {e:#}");
         }
-    });
+    }));
     UdpMuxHandle { tx }
 }
 
 async fn run_udp_mux_driver_forever(
     cfg: UdpMuxConfig,
     mut cmd_rx: mpsc::Receiver<ClientUdpCmd>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     loop {
-        let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg).await?;
-        let shutdown = run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await?;
-        if shutdown {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg, &mut shutdown).await?;
+        let stop = run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await?;
+        if stop {
+            return Ok(());
+        }
+        if *shutdown.borrow() {
             return Ok(());
         }
     }
@@ -284,17 +296,28 @@ async fn run_udp_mux_driver_forever(
 
 async fn connect_udp_mux_ws_resilient(
     cfg: &UdpMuxConfig,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<(
     WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     SharedCrypto,
 )> {
     let mut streak = 0u32;
     loop {
+        if *shutdown.borrow() {
+            anyhow::bail!("udp mux: shutdown");
+        }
         match connect_udp_mux_ws(cfg).await {
             Ok(x) => return Ok(x),
             Err(e) => {
                 warn!("udp mux connect failed (streak {streak}): {e:#}");
-                sleep_outbound_backoff(streak.min(10)).await;
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            anyhow::bail!("udp mux: shutdown");
+                        }
+                    }
+                    _ = sleep_outbound_backoff(streak.min(10)) => {}
+                }
                 streak = streak.saturating_add(1);
             }
         }
