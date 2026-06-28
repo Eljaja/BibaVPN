@@ -43,6 +43,8 @@ pub struct AuthRateLimiter {
     cfg: AuthRateLimiterConfig,
     inner: Mutex<HashMap<IpAddr, IpAuthState>>,
     pub bans_active: AtomicU64,
+    pub auth_failures_total: AtomicU64,
+    pub auth_bans_issued_total: AtomicU64,
 }
 
 impl AuthRateLimiter {
@@ -51,6 +53,8 @@ impl AuthRateLimiter {
             cfg,
             inner: Mutex::new(HashMap::new()),
             bans_active: AtomicU64::new(0),
+            auth_failures_total: AtomicU64::new(0),
+            auth_bans_issued_total: AtomicU64::new(0),
         })
     }
 
@@ -134,11 +138,13 @@ impl AuthRateLimiter {
             st.window_start = now;
         }
         st.failures = st.failures.saturating_add(1);
+        self.auth_failures_total.fetch_add(1, Ordering::Relaxed);
         if st.failures >= self.cfg.max_failures {
             st.banned_until = Some(now + self.cfg.ban);
             st.failures = 0;
             st.window_start = now;
             self.bans_active.fetch_add(1, Ordering::Relaxed);
+            self.auth_bans_issued_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -205,12 +211,24 @@ impl PreAuthBudgetTracker {
 /// Counts live TLS/WSS sessions (increment when `handle_one` starts after permit, decrement on return).
 pub struct ServerStats {
     pub active_sessions: AtomicU64,
+    pub handshake_timeouts_total: AtomicU64,
+    pub auth_rejected_banned_total: AtomicU64,
+    pub sessions_rejected_busy_total: AtomicU64,
+    pub handshakes_success_total: AtomicU64,
+    pub session_errors_total: AtomicU64,
+    pub started_at: Instant,
 }
 
 impl ServerStats {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             active_sessions: AtomicU64::new(0),
+            handshake_timeouts_total: AtomicU64::new(0),
+            auth_rejected_banned_total: AtomicU64::new(0),
+            sessions_rejected_busy_total: AtomicU64::new(0),
+            handshakes_success_total: AtomicU64::new(0),
+            session_errors_total: AtomicU64::new(0),
+            started_at: Instant::now(),
         })
     }
 
@@ -223,6 +241,26 @@ impl ServerStats {
 
     pub fn active_sessions(&self) -> u64 {
         self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    pub fn inc_handshake_timeout(&self) {
+        self.handshake_timeouts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_auth_rejected_banned(&self) {
+        self.auth_rejected_banned_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_sessions_rejected_busy(&self) {
+        self.sessions_rejected_busy_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_handshake_success(&self) {
+        self.handshakes_success_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_session_error(&self) {
+        self.session_errors_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 
