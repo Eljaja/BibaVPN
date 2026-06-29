@@ -167,6 +167,7 @@ Full layout for `**apps/`** (desktop, Android, JNI crate, scripts): **[apps/AGEN
 | `bibavpn/src/protocol.rs`                           | Proto-3 sealed opcodes, `UDP_MUX_OPEN`, `UDP_REQ`/`UDP_REP` (`0x05`/`0x06`), ATYP helpers                            |
 | `bibavpn/src/tls_util.rs`, `frame.rs`, `stealth.rs` | Cipher/ALPN + `TlsStack` + record-fragment notes (`tls_util.rs`); `PadMode`; WS upgrade (UA / Sec-CH / `Accept-Language`) |
 | `bibavpn/src/server_limits.rs`                      | `AuthRateLimiter`, `PreAuthBudget`, `ServerStats` / `SessionGuard`                                                 |
+| `bibavpn/src/server_metrics.rs`                     | Prometheus text render + optional HTTP `/metrics` and `/healthz` on `--metrics-listen`; optional `--metrics-password` Basic Auth |
 | `bibavpn/src/transport_capabilities.rs`             | `log_server_listen_caps` / `log_client_transport_caps`; effective desync helpers                                    |
 | `bibavpn/src/logging.rs`                           | Tracing init (`LogConfig`, idempotent second init); `bibavpn/src/log_ratelimit.rs` — hot-path log cadence          |
 | `bibavpn/src/desync.rs`                            | TCP post-connect hints, TLS fragment notes, decoy RTT jitter; **re-export** `effective_desync_mode`, `DesyncApplied` |

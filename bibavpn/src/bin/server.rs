@@ -11,6 +11,7 @@ use bibavpn::logging::{self, LogConfig, LogFormat};
 use bibavpn::server_limits::{
     AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget, ServerStats,
 };
+use bibavpn::server_metrics::{spawn_metrics_listener, MetricsAuth};
 use bibavpn::transport_capabilities::log_server_listen_caps;
 use bibavpn::udp_mux::UdpSocketPool;
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
@@ -47,6 +48,7 @@ struct ServerConnParams {
     peer: SocketAddr,
     session_id: u64,
     auth: Arc<AuthRateLimiter>,
+    stats: Arc<ServerStats>,
     pre_auth: PreAuthBudget,
     handshake_timeout: Duration,
     mux_connect_timeout: Duration,
@@ -230,6 +232,18 @@ struct Args {
     /// Emit periodic stats every N seconds (0 = off).
     #[arg(long, default_value_t = 0)]
     stats_interval_secs: u64,
+
+    /// Optional Prometheus listener (`host:port`). Serves `GET /metrics` and `GET /healthz`. Off by default; bind loopback in production.
+    #[arg(long)]
+    metrics_listen: Option<String>,
+
+    /// HTTP Basic Auth password for the metrics listener (user defaults to `metrics`). Requires `--metrics-listen`.
+    #[arg(long, requires = "metrics_listen")]
+    metrics_password: Option<String>,
+
+    /// HTTP Basic Auth username for the metrics listener (default `metrics`).
+    #[arg(long, default_value = "metrics", requires = "metrics_password")]
+    metrics_user: String,
 
     /// REALITY mode: target to steal TLS from (e.g., vk.com:443)
     #[arg(long)]
@@ -571,6 +585,19 @@ async fn main() -> anyhow::Result<()> {
         args.udp_socket_pool_size,
     );
 
+    if let Some(ref metrics_listen) = args.metrics_listen {
+        let metrics_auth = match args.metrics_password.as_deref() {
+            Some(pw) if !pw.is_empty() => MetricsAuth::basic(args.metrics_user.trim(), pw),
+            _ => MetricsAuth::disabled(),
+        };
+        spawn_metrics_listener(
+            metrics_listen.clone(),
+            Arc::clone(&stats),
+            Arc::clone(&auth),
+            metrics_auth,
+        );
+    }
+
     if args.stats_interval_secs > 0 {
         let stats_c = Arc::clone(&stats);
         let auth_c = Arc::clone(&auth);
@@ -628,6 +655,7 @@ async fn main() -> anyhow::Result<()> {
                         Ok(Ok(p)) => Some(p),
                         Ok(Err(_)) => return,
                         Err(_) => {
+                            stats.inc_sessions_rejected_busy();
                             debug!(
                                 target: "bibavpn_server",
                                 %peer,
@@ -641,6 +669,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             if let Err(e) = auth.check_allowed(peer.ip()).await {
+                stats.inc_auth_rejected_banned();
                 debug!(
                     target: "bibavpn_security",
                     %peer,
@@ -657,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
                 peer,
                 session_id,
                 auth,
+                stats: Arc::clone(&stats),
                 pre_auth,
                 handshake_timeout,
                 mux_connect_timeout,
@@ -691,6 +721,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             {
+                stats.inc_session_error();
                 error!(
                     target: "bibavpn_server",
                     %peer,
@@ -733,6 +764,7 @@ async fn server_handshake_v3_after_first_hello<S>(
     decoy_max: u8,
     proto_domain: &str,
     auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
     handshake_timeout: Duration,
@@ -754,12 +786,13 @@ where
     ));
     let auth_c = Arc::clone(auth);
     let wait = async {
-        server_wait_v3_auth(ws, &crypto, token, &auth_c, peer_ip, pre_auth).await
+        server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer_ip, pre_auth).await
     };
     match timeout(handshake_timeout, wait).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => {
+            stats.inc_handshake_timeout();
             auth.record_failure(peer_ip).await;
             anyhow::bail!("handshake timeout waiting for v3 AUTH (REALITY path)");
         }
@@ -1032,6 +1065,7 @@ async fn handle_one(
                 decoy_max,
                 domain_trim,
                 auth,
+                &params.stats,
                 peer_ip,
                 pre_auth,
                 handshake_timeout,
@@ -1080,6 +1114,7 @@ async fn handle_one(
         decoy_max,
         domain_trim,
         auth,
+        &params.stats,
         peer_ip,
         pre_auth,
         handshake_timeout,
@@ -1177,6 +1212,7 @@ async fn server_handshake_v3<S>(
     decoy_max: u8,
     proto_domain: &str,
     auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
     handshake_timeout: Duration,
@@ -1226,7 +1262,8 @@ where
                         decoy_max,
                     ));
                     let auth_c = Arc::clone(&auth_f);
-                    server_wait_v3_auth(ws, &crypto, token, &auth_c, peer, pre_auth).await?;
+                    server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer, pre_auth)
+                        .await?;
                     return Ok(crypto);
                 }
                 Message::Ping(p) => {
@@ -1242,6 +1279,7 @@ where
         Ok(Ok(crypto)) => Ok(crypto),
         Ok(Err(e)) => Err(e),
         Err(_) => {
+            stats.inc_handshake_timeout();
             auth_f.record_failure(peer).await;
             anyhow::bail!("handshake timeout");
         }
@@ -1253,6 +1291,7 @@ async fn server_wait_v3_auth<S>(
     crypto: &SharedCrypto,
     expected_token: &str,
     auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
 ) -> anyhow::Result<()>
@@ -1295,6 +1334,7 @@ where
                     anyhow::bail!("v3 auth token mismatch");
                 }
                 auth.record_success(peer_ip).await;
+                stats.inc_handshake_success();
                 return Ok(());
             }
             Message::Ping(p) => {
