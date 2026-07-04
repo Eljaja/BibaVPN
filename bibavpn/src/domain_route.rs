@@ -15,7 +15,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where a connection should egress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +150,60 @@ pub fn decide(host: &str, bypass: &[String], map: &DomainRouteMap, now_secs: u64
         }
     }
     Route::Tunnel
+}
+
+// ---------------------------------------------------------------------------
+// Process-global glue (mirrors `outbound_protect`'s global-hook pattern), so the
+// UDP relay and the SOCKS CONNECT path can share one map + bypass list without
+// threading them through every config struct.
+// ---------------------------------------------------------------------------
+
+static GLOBAL_MAP: OnceLock<DomainRouteMap> = OnceLock::new();
+static GLOBAL_BYPASS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The shared IP→domain map fed by the UDP DNS snoop.
+pub fn global_map() -> &'static DomainRouteMap {
+    GLOBAL_MAP.get_or_init(DomainRouteMap::new)
+}
+
+/// Install the bypass domain list (empty disables domain split routing entirely).
+pub fn set_bypass_domains(domains: &[String]) {
+    let cleaned: Vec<String> = domains
+        .iter()
+        .map(|d| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    *GLOBAL_BYPASS.lock().unwrap_or_else(|p| p.into_inner()) = cleaned;
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// SOCKS/CONNECT convenience: should this target bypass the tunnel (go direct)?
+/// Cheap no-op when no bypass domains are configured.
+pub fn should_bypass(host: &str) -> bool {
+    let bypass = GLOBAL_BYPASS.lock().unwrap_or_else(|p| p.into_inner());
+    if bypass.is_empty() {
+        return false;
+    }
+    decide(host, bypass.as_slice(), global_map(), now_secs()) == Route::Direct
+}
+
+/// UDP-relay convenience: learn IP→domain from a DNS response. No-op when domain
+/// split routing isn't configured.
+pub fn record_dns(dns_msg: &[u8]) {
+    if GLOBAL_BYPASS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty()
+    {
+        return;
+    }
+    global_map().record_dns_response(dns_msg, now_secs());
 }
 
 /// Minimal DNS response parser: returns the first question name (lowercased) and the

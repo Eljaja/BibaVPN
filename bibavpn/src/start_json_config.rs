@@ -31,6 +31,10 @@ struct StartJson {
     socks_auth_user: Option<String>,
     #[serde(default)]
     socks_auth_password: Option<String>,
+    /// Domains that should bypass the tunnel (split routing). On full-TUN clients
+    /// (mobile) these are matched via the DNS snoop; see `domain_route`.
+    #[serde(default)]
+    split_bypass_domains: Vec<String>,
     http_proxy: Option<String>,
     #[serde(default)]
     insecure: bool,
@@ -215,6 +219,8 @@ pub fn local_client_options_from_json_str_with_binds(
 }
 
 fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
+    // Install domain split-routing bypass list (empty = disabled).
+    crate::domain_route::set_bypass_domains(&j.split_bypass_domains);
     let invite_uri = j
         .from_invite
         .as_ref()
