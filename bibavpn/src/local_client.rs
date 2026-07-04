@@ -1175,6 +1175,18 @@ pub fn parse_ws_header(line: &str) -> anyhow::Result<(String, String)> {
     Ok((k.trim().to_string(), v.trim().to_string()))
 }
 
+/// Split-tunnel bypass: relay a CONNECT straight to the target from the device,
+/// outside the tunnel. On Android the outbound socket is protected via the
+/// installed `outbound_protect` hook, so it does not loop back into the TUN.
+async fn direct_bypass_relay(mut local: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+    let mut remote = crate::outbound_protect::tcp_connect_host_protected(host, port)
+        .await
+        .map_err(|e| anyhow::anyhow!("direct bypass connect {host}:{port}: {e}"))?;
+    let _ = remote.set_nodelay(true);
+    tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
+    Ok(())
+}
+
 async fn handle_socks_peer(
     mut local: TcpStream,
     cfg: Arc<ClientCfg>,
@@ -1184,6 +1196,13 @@ async fn handle_socks_peer(
 ) -> anyhow::Result<()> {
     match socks5::socks5_read_command(&mut local, cfg.socks_auth.as_ref()).await? {
         SocksCommand::Connect { host, port } => {
+            // Domain-based split tunnel: if the target resolves (via the DNS
+            // snoop) or literally matches a bypass domain, connect directly
+            // (outside the tunnel). No-op unless bypass domains are configured.
+            if crate::domain_route::should_bypass(&host) {
+                socks5::socks5_reply_ok(&mut local).await?;
+                return direct_bypass_relay(local, &host, port).await;
+            }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ = socks5::socks5_reply_err(&mut local).await;

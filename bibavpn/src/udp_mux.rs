@@ -651,6 +651,12 @@ async fn run_udp_mux_one_session(
                             }
                         };
                         let (xid, sh, sp, pl) = rep;
+                        // Snoop DNS answers to learn IP->domain for domain-based
+                        // split routing on full-TUN clients (mobile). No-op unless
+                        // bypass domains are configured. See `domain_route`.
+                        if sp == 53 {
+                            crate::domain_route::record_dns(&pl);
+                        }
                         if let Some(tx) = pending.remove(&xid) {
                             match crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl) {
                                 Ok(body) => { let _ = tx.send(Ok(body)); }

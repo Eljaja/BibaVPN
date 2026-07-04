@@ -11,6 +11,7 @@ pub mod tls_boring;
 pub mod crypto_layer;
 pub mod desync;
 pub mod decoy_traffic;
+pub mod domain_route;
 pub mod frame;
 pub mod http_connect;
 pub mod incoming;
