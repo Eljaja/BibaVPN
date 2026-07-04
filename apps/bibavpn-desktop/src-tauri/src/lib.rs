@@ -375,6 +375,7 @@ fn probe_local_http_health(http_port: u16) -> bool {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn probe_tunnel_end_to_end(http_port: u16) -> bool {
     use std::io::{Read, Write};
 
@@ -404,6 +405,7 @@ fn probe_tunnel_end_to_end(http_port: u16) -> bool {
     }
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn tunnel_is_healthy(http_port: u16) -> bool {
     probe_local_http_health(http_port) && probe_tunnel_end_to_end(http_port)
 }
