@@ -395,12 +395,74 @@ Connection: close\r\n\
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Duration;
 
     #[test]
     fn guess_mime_common_extensions() {
         assert!(guess_mime("html").contains("text/html"));
         assert!(guess_mime("CSS").contains("text/css"));
         assert_eq!(guess_mime("bin"), "application/octet-stream");
+    }
+
+    /// `read_http_head` waits for `\r\n\r\n` with no deadline of its own, so the caller
+    /// must impose one: the server bounds this call with `--handshake-timeout-secs`
+    /// because the concurrency permit is already held here.
+    #[tokio::test]
+    async fn partial_http_head_never_completes_and_the_caller_deadline_fires() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        // Request line + one header, never the terminating CRLF CRLF.
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.org\r\n")
+            .await
+            .unwrap();
+        let res = tokio::time::timeout(
+            Duration::from_millis(50),
+            accept_websocket_or_camouflage(
+                server,
+                "/ws",
+                false,
+                "tok",
+                CamouflageServeConfig::default(),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a peer that never finishes the head must not resolve"
+        );
+        // Keep the peer half alive until here; dropping it earlier would be EOF, not a stall.
+        drop(client);
+    }
+
+    /// The timeout must not change the camouflage path: a complete probe is still served.
+    #[tokio::test]
+    async fn complete_http_head_still_gets_camouflage_response() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            accept_websocket_or_camouflage(
+                server,
+                "/ws",
+                false,
+                "tok",
+                CamouflageServeConfig::default(),
+                None,
+            )
+            .await
+        });
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.org\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut resp))
+            .await
+            .expect("camouflage answers well inside the handshake deadline")
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp[..n]);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        let out = srv.await.expect("join").expect("accept");
+        assert!(out.is_none(), "a plain GET is not a websocket upgrade");
     }
 
     #[test]

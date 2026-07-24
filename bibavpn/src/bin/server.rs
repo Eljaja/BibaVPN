@@ -208,7 +208,8 @@ struct Args {
     #[arg(long, default_value_t = 262144)]
     handshake_max_junk_bytes: usize,
 
-    /// Overall v3 handshake wait (HELLO..AUTH) timeout in seconds.
+    /// Per-phase pre-tunnel timeout in seconds: TLS accept, WS upgrade / camouflage HTTP head,
+    /// REALITY exchange, and the v3 handshake wait (HELLO..AUTH).
     #[arg(long, default_value_t = 15)]
     handshake_timeout_secs: u64,
 
@@ -953,6 +954,41 @@ where
     Ok(())
 }
 
+/// Bound one pre-tunnel setup phase (TLS accept, WS upgrade / camouflage HTTP head,
+/// REALITY exchange) with `dur`.
+///
+/// The concurrency permit and the session guard are taken before any peer I/O, so a
+/// peer that opens a socket and then stalls would otherwise hold a slot until it gives
+/// up: a handful of silent sockets can exhaust `--max-concurrent-sessions`. Expiry is
+/// counted as a handshake timeout and returns an error, which releases both.
+/// No `auth.record_failure`: a peer that never spoke has not failed authentication.
+async fn with_setup_timeout<T, F>(
+    phase: &'static str,
+    dur: Duration,
+    stats: &Arc<ServerStats>,
+    peer: SocketAddr,
+    session_id: u64,
+    fut: F,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match timeout(dur, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            let secs = dur.as_secs();
+            stats.inc_handshake_timeout();
+            debug!(
+                target: "bibavpn_server",
+                %peer,
+                session_id,
+                "pre-tunnel timeout in {phase} after {secs}s; releasing concurrency permit"
+            );
+            anyhow::bail!("{phase} timeout after {secs}s");
+        }
+    }
+}
+
 async fn handle_one(
     tcp: TcpStream,
     acceptor: TlsAcceptor,
@@ -987,11 +1023,34 @@ async fn handle_one(
     );
     let _span_enter = span.enter();
 
-    let tls = acceptor.accept(tcp).await.context("tls accept")?;
+    let tls = with_setup_timeout(
+        "tls accept",
+        params.handshake_timeout,
+        &params.stats,
+        params.peer,
+        params.session_id,
+        async move { acceptor.accept(tcp).await.context("tls accept") },
+    )
+    .await?;
 
-    let Some((mut ws, ws_kind)) =
-        accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo, Some(params.peer))
-            .await?
+    // Covers the HTTP head read (`incoming::read_http_head` has no deadline of its own)
+    // plus writing the camouflage answer; a real probe is served long before it expires.
+    let Some((mut ws, ws_kind)) = with_setup_timeout(
+        "websocket upgrade / camouflage http",
+        params.handshake_timeout,
+        &params.stats,
+        params.peer,
+        params.session_id,
+        accept_websocket_or_camouflage(
+            tls,
+            &ws_path,
+            legacy_path_auth,
+            &token,
+            camo,
+            Some(params.peer),
+        ),
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -1018,18 +1077,38 @@ async fn handle_one(
 
     if let Some(ref reality_cfg) = reality_config {
         info!("REALITY mode: app tunnel after X25519");
-        server_handshake_reality(&mut ws, reality_cfg)
-            .await
-            .context("REALITY handshake")?;
+        with_setup_timeout(
+            "REALITY handshake",
+            handshake_timeout,
+            &params.stats,
+            params.peer,
+            params.session_id,
+            async {
+                server_handshake_reality(&mut ws, reality_cfg)
+                    .await
+                    .context("REALITY handshake")
+            },
+        )
+        .await?;
 
         let domain_trim = proto_domain.trim();
         if domain_trim.is_empty() {
             anyhow::bail!("--proto-domain must not be empty");
         }
 
-        let next = read_next_binary_after_reality(&mut ws)
-            .await
-            .context("after REALITY: first application frame")?;
+        let next = with_setup_timeout(
+            "first frame after REALITY",
+            handshake_timeout,
+            &params.stats,
+            params.peer,
+            params.session_id,
+            async {
+                read_next_binary_after_reality(&mut ws)
+                    .await
+                    .context("after REALITY: first application frame")
+            },
+        )
+        .await?;
 
         if is_v3_mux_open(next.as_ref()) {
             info!("REALITY: TCP mux (plaintext mux records)");
