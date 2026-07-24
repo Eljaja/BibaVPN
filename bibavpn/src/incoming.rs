@@ -60,7 +60,7 @@ where
             WsHandshakeKind::NewPath
         } else if legacy_path_auth {
             let legacy = format!("/b/{token}");
-            if path == legacy.as_str() {
+            if crate::crypto_layer::secret_eq(path, legacy.as_str()) {
                 WsHandshakeKind::LegacyPath
             } else {
                 write_camouflage_status(&mut stream, 404, camouflage::NOT_FOUND_HTML).await?;

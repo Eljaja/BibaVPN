@@ -38,6 +38,7 @@ pub mod udp_mux;
 pub mod ws_auth;
 pub mod ws_bridge;
 
+pub use crypto_layer::secret_eq;
 pub use frame::{
     read_padded_frame, read_padded_frame_borrow, read_padded_frame_into, write_padded_frame,
     write_padded_frame_with_mode, write_padded_frame_with_mode_state, AdaptivePadState, FrameError,
