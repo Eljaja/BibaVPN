@@ -1,5 +1,6 @@
 //! Shared SOCKS5 / HTTP CONNECT front-end for desktop binary and Android JNI.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::Context;
@@ -299,6 +300,8 @@ struct ClientCfg {
     /// Mux read/write activity for `idle_decoy_secs` (only set when that feature is on).
     activity: Option<Arc<ActivityTracker>>,
     socks_auth: Option<(String, String)>,
+    /// Operator-configured SOCKS listener bind; the UDP ASSOCIATE relay reuses its interface.
+    socks_bind: String,
     tls_stack: TlsStack,
     /// Used to reject Boring + pin until that combination is supported.
     pinned_certs_pem: Option<Vec<u8>>,
@@ -976,6 +979,7 @@ pub async fn run_local_client(
         idle_decoy_secs: opts.idle_decoy_secs,
         activity,
         socks_auth: opts.socks_auth.clone(),
+        socks_bind: opts.socks_bind.clone(),
         tls_stack: opts.tls_stack,
         pinned_certs_pem: opts.pinned_certs_pem.clone(),
     });
@@ -1249,13 +1253,66 @@ async fn handle_socks_peer(
             }
         }
         SocksCommand::UdpAssociate { .. } => {
-            let udp = UdpSocket::bind("0.0.0.0:0")
+            let ctrl_local_ip = local.local_addr().context("socks local_addr")?.ip();
+            let bind = socks_udp_relay_bind(&cfg.socks_bind, ctrl_local_ip);
+            let udp = UdpSocket::bind(bind)
                 .await
-                .context("bind udp relay")?;
+                .with_context(|| format!("bind udp relay {bind}"))?;
             let relay_port = udp.local_addr()?.port();
             socks5::socks5_reply_udp_associate(&mut local, relay_port).await?;
             run_socks_udp_assoc(local, udp, cfg, udp_mux_slot, session).await
         }
+    }
+}
+
+/// Normalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) so a dual-stack control
+/// connection and an IPv4 relay socket compare equal.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+/// Bind address for a UDP ASSOCIATE relay: same interface as the SOCKS
+/// listener, ephemeral port. Falls back to the control connection's local IP
+/// when `socks_bind` carries a hostname instead of a literal IP. An
+/// unspecified `socks_bind` (`0.0.0.0` / `[::]`, used for containerized
+/// clients) stays unspecified — there the source filter in
+/// `run_socks_udp_assoc` is what keeps the relay closed.
+fn socks_udp_relay_bind(socks_bind: &str, ctrl_local_ip: IpAddr) -> SocketAddr {
+    let ip = parse_host_port(socks_bind)
+        .ok()
+        .and_then(|(host, _)| {
+            let h = host.trim();
+            let h = h
+                .strip_prefix('[')
+                .and_then(|inner| inner.strip_suffix(']'))
+                .unwrap_or(h);
+            h.parse::<IpAddr>().ok()
+        })
+        .unwrap_or(ctrl_local_ip);
+    SocketAddr::new(ip, 0)
+}
+
+/// RFC 1928: only the client that opened the association may use its relay.
+/// The client may pick a source port different from its TCP control
+/// connection, so the IP decides; the port is latched on the first accepted
+/// datagram and required afterwards.
+fn socks_udp_source_allowed(
+    ctrl_peer_ip: IpAddr,
+    latched_port: Option<u16>,
+    src: SocketAddr,
+) -> bool {
+    if canonical_ip(src.ip()) != canonical_ip(ctrl_peer_ip) {
+        return false;
+    }
+    match latched_port {
+        Some(p) => p == src.port(),
+        None => true,
     }
 }
 
@@ -1267,6 +1324,10 @@ async fn run_socks_udp_assoc(
     mux_slot: Arc<Mutex<Option<UdpMuxHandle>>>,
     session: SessionGuard,
 ) -> anyhow::Result<()> {
+    use crate::log_ratelimit::LogEvery;
+    static UDP_SRC_DROP: LogEvery = LogEvery::new(4, 512);
+
+    let ctrl_peer = ctrl.peer_addr().context("socks ctrl peer_addr")?;
     let (close_tx, mut close_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64];
@@ -1299,6 +1360,8 @@ async fn run_socks_udp_assoc(
         cfg.udp_mux_reply_timeout_secs
     };
     let reply_timeout = Duration::from_secs(reply_timeout_secs);
+    // Latched on the first datagram accepted from the association owner.
+    let mut client_port: Option<u16> = None;
 
     loop {
         tokio::select! {
@@ -1308,6 +1371,17 @@ async fn run_socks_udp_assoc(
             }
             r = udp.recv_from(&mut mbuf) => {
                 let (n, peer) = r.context("socks udp recv")?;
+                if !socks_udp_source_allowed(ctrl_peer.ip(), client_port, peer) {
+                    if UDP_SRC_DROP.should_emit() {
+                        tracing::warn!(
+                            "socks udp: dropped datagram from {peer} (association owner {ctrl_peer})"
+                        );
+                    }
+                    continue;
+                }
+                if client_port.is_none() {
+                    client_port = Some(peer.port());
+                }
                 let data = mbuf[..n].to_vec();
                 let udp = udp.clone();
                 let handle = handle.clone();
@@ -1564,6 +1638,112 @@ mod parse_tests {
     #[test]
     fn parse_ws_header_requires_colon() {
         assert!(parse_ws_header("BadHeader").is_err());
+    }
+}
+
+#[cfg(test)]
+mod socks_udp_relay_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn relay_bind_follows_socks_listener_ip() {
+        let fallback = v4(203, 0, 113, 9);
+        assert_eq!(
+            socks_udp_relay_bind("127.0.0.1:1080", fallback),
+            SocketAddr::new(v4(127, 0, 0, 1), 0)
+        );
+        assert_eq!(
+            socks_udp_relay_bind("192.168.1.5:1080", fallback),
+            SocketAddr::new(v4(192, 168, 1, 5), 0)
+        );
+    }
+
+    #[test]
+    fn relay_bind_handles_ipv6_and_unspecified() {
+        let fallback = v4(203, 0, 113, 9);
+        assert_eq!(
+            socks_udp_relay_bind("[::1]:1080", fallback),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
+        );
+        // Unspecified binds stay unspecified (container deployments).
+        assert_eq!(
+            socks_udp_relay_bind("0.0.0.0:1080", fallback),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        );
+        assert_eq!(
+            socks_udp_relay_bind("[::]:1080", fallback),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        );
+    }
+
+    #[test]
+    fn relay_bind_falls_back_for_hostname_or_garbage() {
+        let fallback = v4(127, 0, 0, 1);
+        assert_eq!(
+            socks_udp_relay_bind("localhost:1080", fallback),
+            SocketAddr::new(fallback, 0)
+        );
+        assert_eq!(
+            socks_udp_relay_bind("not-a-bind", fallback),
+            SocketAddr::new(fallback, 0)
+        );
+    }
+
+    #[test]
+    fn udp_source_same_ip_accepted_other_ip_rejected() {
+        let owner = v4(127, 0, 0, 1);
+        // Same IP, any source port before latching.
+        assert!(socks_udp_source_allowed(
+            owner,
+            None,
+            SocketAddr::new(v4(127, 0, 0, 1), 40000)
+        ));
+        // Different IP is never accepted.
+        assert!(!socks_udp_source_allowed(
+            owner,
+            None,
+            SocketAddr::new(v4(192, 168, 1, 9), 40000)
+        ));
+        assert!(!socks_udp_source_allowed(
+            owner,
+            Some(40000),
+            SocketAddr::new(v4(192, 168, 1, 9), 40000)
+        ));
+    }
+
+    #[test]
+    fn udp_source_port_is_latched_after_first_datagram() {
+        let owner = v4(10, 0, 0, 2);
+        assert!(socks_udp_source_allowed(
+            owner,
+            Some(51234),
+            SocketAddr::new(v4(10, 0, 0, 2), 51234)
+        ));
+        assert!(!socks_udp_source_allowed(
+            owner,
+            Some(51234),
+            SocketAddr::new(v4(10, 0, 0, 2), 51235)
+        ));
+    }
+
+    #[test]
+    fn udp_source_matches_ipv4_mapped_control_peer() {
+        let mapped = IpAddr::V6(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped());
+        assert!(socks_udp_source_allowed(
+            mapped,
+            None,
+            SocketAddr::new(v4(127, 0, 0, 1), 40000)
+        ));
+        assert!(!socks_udp_source_allowed(
+            mapped,
+            None,
+            SocketAddr::new(v4(127, 0, 0, 2), 40000)
+        ));
     }
 }
 
