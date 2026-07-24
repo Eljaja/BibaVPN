@@ -44,6 +44,14 @@ class BibaVpnService : VpnService() {
     @Volatile
     private var tunnelTeardownDoneBeforeDestroy: Boolean = false
 
+    /** Разбор стека идёт в воркере ([enqueueTeardownWorker]) — не запускать второй. */
+    @Volatile
+    private var teardownInProgress: Boolean = false
+
+    /** Поток текущего разбора: [onDestroy] ждёт его недолго, чтобы `nativeStop` успел. */
+    @Volatile
+    private var teardownThread: Thread? = null
+
     private val tunLock = Any()
     private var tun2socksThread: Thread? = null
     /** Java держит свой dup TUN fd; в Go отдаём отдельный dup, чтобы не спорить за ownership с fdsan. */
@@ -451,10 +459,10 @@ class BibaVpnService : VpnService() {
             ACTION_STOP -> {
                 networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
                 networkRestartRunnable = null
-                stopTunnelAndNative()
-                tunnelTeardownDoneBeforeDestroy = true
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                enqueueTeardownWorker("ACTION_STOP") {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
                 return START_NOT_STICKY
             }
             ACTION_SYNC_WAKE_LOCK -> {
@@ -627,7 +635,19 @@ class BibaVpnService : VpnService() {
             VpnProtect.vpn = null
         }
         if (!tunnelTeardownDoneBeforeDestroy) {
+            // Страховка: разбор не начинали (сервис снят системой, а не через STOP).
+            // Уносить в воркер поздно — процесс может умереть сразу после onDestroy;
+            // сверху время здесь ограничивает STOP_JOIN_TIMEOUT в JNI.
             stopTunnelAndNative()
+        } else {
+            // Разбор уже идёт в воркере: ждём его недолго, иначе daemon-поток убьют
+            // вместе с процессом на середине nativeStop.
+            teardownThread?.let { t ->
+                try {
+                    t.join(3000)
+                } catch (_: InterruptedException) {
+                }
+            }
         }
         super.onDestroy()
     }
@@ -831,10 +851,57 @@ class BibaVpnService : VpnService() {
                 )
             android.widget.Toast.makeText(applicationContext, msg, android.widget.Toast.LENGTH_LONG)
                 .show()
-            stopTunnelAndNative()
-            tunnelTeardownDoneBeforeDestroy = true
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            enqueueTeardownWorker("abort") {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
+    /**
+     * Разбор стека вне главного потока.
+     *
+     * [stopTunnelAndNative] блокирует надолго: `tunLock` может держать воркер перезапуска,
+     * ожидающий `Engine.start` до 25 с, затем идут `Engine.stop` + `join(8000)` у потока
+     * tun2socks и `nativeStop` (join клиентского потока, ограничен 5 с в JNI). На главном
+     * потоке это ANR — то же самое, из-за чего [enqueueBootstrapWorker] уже уносит
+     * `nativeStart` в отдельный поток.
+     *
+     * Флаг [tunnelTeardownDoneBeforeDestroy] и `setTunnelActive(false)` ставим сразу, до
+     * ухода в воркер: тогда [onDestroy] не начнёт второй разбор, а триггеры перезапуска
+     * (SCREEN_ON / USER_PRESENT / смена сети) сразу видят неактивный туннель.
+     *
+     * @param onDone выполняется на главном потоке после завершения разбора.
+     */
+    private fun enqueueTeardownWorker(reason: String, onDone: (() -> Unit)? = null) {
+        if (teardownInProgress) {
+            Log.i(TAG, "$reason: teardown already in progress")
+            return
+        }
+        teardownInProgress = true
+        tunnelTeardownDoneBeforeDestroy = true
+        setTunnelActive(false)
+        Thread(
+            {
+                try {
+                    Log.i(TAG, "$reason: teardown begin (worker)")
+                    stopTunnelAndNative()
+                    Log.i(TAG, "$reason: teardown done")
+                } catch (e: Throwable) {
+                    Log.e(TAG, "$reason: teardown", e)
+                } finally {
+                    teardownThread = null
+                    mainHandler.post {
+                        teardownInProgress = false
+                        onDone?.invoke()
+                    }
+                }
+            },
+            "biba-teardown",
+        ).also {
+            it.isDaemon = true
+            teardownThread = it
+            it.start()
         }
     }
 
