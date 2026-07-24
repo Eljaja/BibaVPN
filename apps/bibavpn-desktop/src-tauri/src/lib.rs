@@ -496,6 +496,56 @@ fn restore_with_retry(backup: &ProxyBackup) -> Result<(), String> {
     Err(last.unwrap_or_else(|| "восстановление прокси не удалось".into()))
 }
 
+/// Восстановление системного прокси и запасная очистка остатков.
+/// Долгая блокирующая работа (ретраи с sleep 250/500 мс, реестр Windows /
+/// `networksetup` на macOS) — вызывать только без удержания Mutex состояния.
+/// Возвращает текст ошибки для `last_error`, если что-то не удалось.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn restore_proxy_blocking(backup: Option<ProxyBackup>) -> Option<String> {
+    match backup {
+        Some(backup) => {
+            if let Err(e) = restore_with_retry(&backup) {
+                warn!(target: "bibavpn_desktop", "восстановление системного прокси: {e}");
+                #[cfg(windows)]
+                if let Err(e2) = crate::proxy_win::disable_if_residual_biba_proxy() {
+                    warn!(
+                        target: "bibavpn_desktop",
+                        "прокси: запасное отключение loopback после ошибки restore: {e2}"
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                if let Err(e2) = crate::proxy_mac::disable_biba_proxies_on_services() {
+                    warn!(
+                        target: "bibavpn_desktop",
+                        "прокси: запасное отключение на macOS после ошибки restore: {e2}"
+                    );
+                }
+                return Some(format!("Прокси: восстановление: {e}"));
+            }
+            None
+        }
+        None => {
+            #[cfg(windows)]
+            if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
+                warn!(
+                    target: "bibavpn_desktop",
+                    "прокси: нет снимка настроек — запасная очистка loopback: {e}"
+                );
+                return Some(format!("Прокси: {e}"));
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(e) = crate::proxy_mac::disable_biba_proxies_on_services() {
+                warn!(
+                    target: "bibavpn_desktop",
+                    "прокси: нет снимка настроек — запасное отключение macOS: {e}"
+                );
+                return Some(format!("Прокси: {e}"));
+            }
+            None
+        }
+    }
+}
+
 fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: bool) {
     #[cfg(target_os = "android")]
     {
@@ -553,63 +603,51 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if g.phase == VpnPhase::Disconnecting {
-            return;
-        }
-        g.phase = VpnPhase::Disconnecting;
-        info!(target: "bibavpn_desktop", "отключение VPN");
-        g.last_error = None;
-        g.tunnel_server = None;
-        if restore_system_proxy {
-            let backup = g.proxy_backup.take();
-            match backup {
-                Some(backup) => {
-                    if let Err(e) = restore_with_retry(&backup) {
-                        warn!(target: "bibavpn_desktop", "восстановление системного прокси: {e}");
-                        g.last_error = Some(format!("Прокси: восстановление: {e}"));
-                        #[cfg(windows)]
-                        if let Err(e2) = crate::proxy_win::disable_if_residual_biba_proxy() {
-                            warn!(
-                                target: "bibavpn_desktop",
-                                "прокси: запасное отключение loopback после ошибки restore: {e2}"
-                            );
-                        }
-                        #[cfg(target_os = "macos")]
-                        if let Err(e2) = crate::proxy_mac::disable_biba_proxies_on_services() {
-                            warn!(
-                                target: "bibavpn_desktop",
-                                "прокси: запасное отключение на macOS после ошибки restore: {e2}"
-                            );
-                        }
-                    }
-                }
-                None => {
-                    #[cfg(windows)]
-                    if let Err(e) = crate::proxy_win::disable_if_residual_biba_proxy() {
-                        warn!(
-                            target: "bibavpn_desktop",
-                            "прокси: нет снимка настроек — запасная очистка loopback: {e}"
-                        );
-                        g.last_error = Some(format!("Прокси: {e}"));
-                    }
-                    #[cfg(target_os = "macos")]
-                    if let Err(e) = crate::proxy_mac::disable_biba_proxies_on_services() {
-                        warn!(
-                            target: "bibavpn_desktop",
-                            "прокси: нет снимка настроек — запасное отключение macOS: {e}"
-                        );
-                        g.last_error = Some(format!("Прокси: {e}"));
-                    }
-                }
+        // Фаза 1 (под Mutex): только смена фазы и изъятие ресурсов — никаких
+        // системных вызовов. Всё блокирующее ниже выполняется без удержания
+        // Mutex: restore прокси ретраится со sleep 250/500 мс, а vpn.stop()
+        // ждёт клиента до 5 с. Под локом это подвешивало status/tray/connect,
+        // т.е. и весь UI — та же причина, что и в ветке Android (глобальный
+        // lock + UI-поток).
+        let (backup, vpn) = {
+            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if g.phase == VpnPhase::Disconnecting {
+                return;
             }
-        }
-        if let Some(vpn) = g.vpn.take() {
+            g.phase = VpnPhase::Disconnecting;
+            info!(target: "bibavpn_desktop", "отключение VPN");
+            g.last_error = None;
+            g.tunnel_server = None;
+            // Снимок настроек забираем только если его собираются восстанавливать:
+            // при restore_system_proxy == false (watchdog после сна) он должен
+            // остаться в состоянии для повторного подключения.
+            let backup = if restore_system_proxy {
+                g.proxy_backup.take()
+            } else {
+                None
+            };
+            (backup, g.vpn.take())
+        };
+
+        // Фаза 2 (без Mutex): долгие системные операции.
+        let pending_error = if restore_system_proxy {
+            restore_proxy_blocking(backup)
+        } else {
+            None
+        };
+        if let Some(vpn) = vpn {
             vpn.stop(&state.rt);
+        }
+
+        // Фаза 3 (под Mutex): фиксация результата, трей и снапшот.
+        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = pending_error {
+            g.last_error = Some(e);
         }
         g.phase = VpnPhase::Idle;
         sync_tray_tooltip_i18n(app, false, &g.cfg);
         let snap = snapshot(app, &g);
+        drop(g);
         let _ = app.emit("vpn-state", &snap);
     }
 }
