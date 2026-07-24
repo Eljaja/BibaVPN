@@ -101,6 +101,9 @@ bibavpn_handshakes_success_total {handshakes_success_total}
 # HELP bibavpn_session_errors_total Accepted sessions that ended with an error after TLS accept.
 # TYPE bibavpn_session_errors_total counter
 bibavpn_session_errors_total {session_errors_total}
+# HELP bibavpn_accepts_failed_total Failed accept(2) calls the listener loop recovered from.
+# TYPE bibavpn_accepts_failed_total counter
+bibavpn_accepts_failed_total {accepts_failed_total}
 # HELP bibavpn_process_start_time_seconds Start time of the process since the Unix epoch.
 # TYPE bibavpn_process_start_time_seconds gauge
 bibavpn_process_start_time_seconds {process_start}
@@ -127,6 +130,9 @@ bibavpn_process_start_time_seconds {process_start}
             .load(std::sync::atomic::Ordering::Relaxed),
         session_errors_total = stats
             .session_errors_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        accepts_failed_total = stats
+            .accepts_failed_total
             .load(std::sync::atomic::Ordering::Relaxed),
         process_start = process_start,
     )
@@ -285,12 +291,14 @@ mod tests {
             ..Default::default()
         });
         stats.inc_handshake_success();
+        stats.inc_accept_failed();
         auth.auth_failures_total
             .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
 
         let text = render_prometheus(&stats, &auth);
         assert!(text.contains("bibavpn_active_sessions 0"));
         assert!(text.contains("bibavpn_handshakes_success_total 1"));
+        assert!(text.contains("bibavpn_accepts_failed_total 1"));
         assert!(text.contains("bibavpn_auth_failures_total 2"));
         assert!(text.contains("# TYPE bibavpn_active_sessions gauge"));
         assert!(text.contains("# TYPE bibavpn_auth_failures_total counter"));

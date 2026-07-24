@@ -216,6 +216,8 @@ pub struct ServerStats {
     pub sessions_rejected_busy_total: AtomicU64,
     pub handshakes_success_total: AtomicU64,
     pub session_errors_total: AtomicU64,
+    /// Failed `accept(2)` calls the listener loop recovered from.
+    pub accepts_failed_total: AtomicU64,
     pub started_at: Instant,
 }
 
@@ -228,6 +230,7 @@ impl ServerStats {
             sessions_rejected_busy_total: AtomicU64::new(0),
             handshakes_success_total: AtomicU64::new(0),
             session_errors_total: AtomicU64::new(0),
+            accepts_failed_total: AtomicU64::new(0),
             started_at: Instant::now(),
         })
     }
@@ -261,6 +264,10 @@ impl ServerStats {
 
     pub fn inc_session_error(&self) {
         self.session_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_accept_failed(&self) {
+        self.accepts_failed_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 
