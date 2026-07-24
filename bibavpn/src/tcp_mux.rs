@@ -57,6 +57,11 @@ impl std::fmt::Display for MuxWriterStopped {
 impl std::error::Error for MuxWriterStopped {}
 
 static UNKNOWN_MUX_DATA_LOG: AtomicU64 = AtomicU64::new(0);
+static DUP_OPEN_LOG: crate::log_ratelimit::LogEvery = crate::log_ratelimit::LogEvery::new(8, 64);
+static SERVER_FLAGS_LOG: crate::log_ratelimit::LogEvery =
+    crate::log_ratelimit::LogEvery::new(8, 64);
+static CLIENT_FLAGS_LOG: crate::log_ratelimit::LogEvery =
+    crate::log_ratelimit::LogEvery::new(8, 64);
 
 pub fn is_mux_open(data: &[u8]) -> bool {
     data == MUX_OPEN_MAGIC
@@ -115,12 +120,87 @@ const MUX_SERVER_MAX_STREAMS: usize = 256;
 const MUX_SERVER_INFLIGHT: usize = 512;
 const MUX_PENDING_OPEN_BYTES: usize = 256 * 1024;
 
+/// A stream id may be reused by the peer (buggy client, or wrap-around). Each accepted
+/// `MUX_FLAG_OPEN` gets a fresh epoch so a dying stream can tell whether the map entry for
+/// its id is still its own before removing it.
 enum ServerStreamState {
     Opening {
+        epoch: u64,
         buffered: Vec<Vec<u8>>,
         buffered_bytes: usize,
     },
-    Open(mpsc::Sender<Vec<u8>>),
+    Open {
+        epoch: u64,
+        tx: mpsc::Sender<Vec<u8>>,
+    },
+}
+
+impl ServerStreamState {
+    fn epoch(&self) -> u64 {
+        match self {
+            ServerStreamState::Opening { epoch, .. } => *epoch,
+            ServerStreamState::Open { epoch, .. } => *epoch,
+        }
+    }
+}
+
+/// True when the entry currently mapped to a stream id (if any) still belongs to `epoch`.
+fn mux_cleanup_should_remove(current: Option<u64>, epoch: u64) -> bool {
+    current == Some(epoch)
+}
+
+/// Per-stream cleanup: drop the map entry only if it is still this stream's generation.
+async fn mux_remove_stream_if_epoch(
+    streams: &Arc<Mutex<HashMap<u32, ServerStreamState>>>,
+    sid: u32,
+    epoch: u64,
+) {
+    let mut g = streams.lock().await;
+    if mux_cleanup_should_remove(g.get(&sid).map(|s| s.epoch()), epoch) {
+        g.remove(&sid);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuxOpenDecision {
+    Accept,
+    /// `sid` is already tracked; never overwrite a live entry (RST + drop the record).
+    RejectDuplicate,
+    RejectMaxStreams,
+}
+
+fn mux_open_decision(already_tracked: bool, tracked_streams: usize) -> MuxOpenDecision {
+    if already_tracked {
+        MuxOpenDecision::RejectDuplicate
+    } else if tracked_streams >= MUX_SERVER_MAX_STREAMS {
+        MuxOpenDecision::RejectMaxStreams
+    } else {
+        MuxOpenDecision::Accept
+    }
+}
+
+/// Receive-side flag classification. Flags are a bitmask: a record carrying
+/// `DATA|CLOSE` must still deliver its payload before the close is applied.
+/// Send side never combines flags, so this is tolerance only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MuxFlags {
+    open: bool,
+    data: bool,
+    close: bool,
+    reset: bool,
+    /// Bits outside the known set (or no bits at all): warn, but still act on known bits.
+    unknown: bool,
+}
+
+fn classify_mux_flags(flags: u8) -> MuxFlags {
+    const KNOWN: u8 = MUX_FLAG_OPEN | MUX_FLAG_DATA | MUX_FLAG_CLOSE | MUX_FLAG_RST | MUX_FLAG_WIN;
+    MuxFlags {
+        open: flags & MUX_FLAG_OPEN != 0,
+        data: flags & MUX_FLAG_DATA != 0,
+        close: flags & MUX_FLAG_CLOSE != 0,
+        reset: flags & MUX_FLAG_RST != 0,
+        unknown: flags == 0 || flags & !KNOWN != 0,
+    }
 }
 
 /// Server: after `MUX_OPEN`, dispatch logical streams.
@@ -227,6 +307,8 @@ where
     let srv_t_in = s_timing;
 
     let up = async move {
+        // Bumped for every accepted OPEN; identifies one generation of a stream id.
+        let mut next_epoch: u64 = 0;
         while let Some(m) = ws_rx.next().await {
             let m = m.context("websocket read")?;
             match m {
@@ -245,175 +327,219 @@ where
                         continue;
                     }
                     let (sid, flags, payload) = decode_mux_record(&inner)?;
-                    match flags {
-                        MUX_FLAG_OPEN => {
-                            let permit = sem
-                                .clone()
-                                .acquire_owned()
-                                .await
-                                .map_err(|_| anyhow::anyhow!("mux sem"))?;
-                            let (host, port) = match decode_mux_open_target(&payload) {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    error!("mux open target: {e:#}");
-                                    let _ = permit;
-                                    continue;
+                    let act = classify_mux_flags(flags);
+                    if act.unknown && SERVER_FLAGS_LOG.should_emit() {
+                        warn!(
+                            target: "bibavpn_mux",
+                            stream_id = sid,
+                            "mux: unknown flags {flags:#x}"
+                        );
+                    }
+                    if act.open {
+                        // OPEN carries the target address as its payload, so it is never
+                        // combined with DATA on the wire; other bits are ignored here.
+                        let permit = sem
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| anyhow::anyhow!("mux sem"))?;
+                        let (host, port) = match decode_mux_open_target(&payload) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                error!("mux open target: {e:#}");
+                                drop(permit);
+                                continue;
+                            }
+                        };
+                        let epoch = {
+                            let mut map = streams.lock().await;
+                            match mux_open_decision(map.contains_key(&sid), map.len()) {
+                                MuxOpenDecision::Accept => {
+                                    next_epoch = next_epoch.wrapping_add(1);
+                                    map.insert(
+                                        sid,
+                                        ServerStreamState::Opening {
+                                            epoch: next_epoch,
+                                            buffered: Vec::new(),
+                                            buffered_bytes: 0,
+                                        },
+                                    );
+                                    Some(next_epoch)
                                 }
-                            };
-                            {
-                                let mut map = streams.lock().await;
-                                if map.len() >= MUX_SERVER_MAX_STREAMS {
-                                    let _ = permit;
+                                MuxOpenDecision::RejectDuplicate => {
+                                    if DUP_OPEN_LOG.should_emit() {
+                                        warn!(
+                                            target: "bibavpn_mux",
+                                            stream_id = sid,
+                                            "mux: duplicate OPEN for tracked stream (sending RST)"
+                                        );
+                                    }
+                                    None
+                                }
+                                MuxOpenDecision::RejectMaxStreams => {
                                     warn!("mux: max streams");
+                                    None
+                                }
+                            }
+                        };
+                        let Some(epoch) = epoch else {
+                            drop(permit);
+                            let _ = mux_server_send_record(
+                                &ws_out_srv,
+                                sid,
+                                MUX_FLAG_RST,
+                                &[],
+                                max_pad,
+                                pad_mode,
+                                &crypto,
+                                max_ws_binary,
+                                &adaptive_in,
+                                jitter_in,
+                                srv_t_in,
+                            )
+                            .await;
+                            continue;
+                        };
+                        let ws_tx = ws_out_srv.clone();
+                        let streams_open = streams.clone();
+                        let crypto_clone = crypto.clone();
+                        let adaptive_spawn = adaptive_in.clone();
+                        let j_spawn = jitter_in;
+                        let st_spawn = srv_t_in;
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let remote = match tokio::time::timeout(
+                                mux_connect_timeout,
+                                TcpStream::connect((host.as_str(), port)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(t)) => t,
+                                Ok(Err(e)) => {
+                                    error!("mux connect {host}:{port}: {e:#}");
+                                    mux_remove_stream_if_epoch(&streams_open, sid, epoch).await;
                                     let _ = mux_server_send_record(
-                                        &ws_out_srv,
+                                        &ws_tx,
                                         sid,
                                         MUX_FLAG_RST,
                                         &[],
                                         max_pad,
                                         pad_mode,
-                                        &crypto,
+                                        &crypto_clone,
                                         max_ws_binary,
-                                        &adaptive_in,
-                                        jitter_in,
-                                        srv_t_in,
+                                        &adaptive_spawn,
+                                        j_spawn,
+                                        st_spawn,
                                     )
                                     .await;
-                                    continue;
+                                    return;
                                 }
-                                map.insert(
-                                    sid,
-                                    ServerStreamState::Opening {
-                                        buffered: Vec::new(),
-                                        buffered_bytes: 0,
-                                    },
-                                );
-                            }
-                            let ws_tx = ws_out_srv.clone();
-                            let streams_open = streams.clone();
-                            let crypto_clone = crypto.clone();
-                            let adaptive_spawn = adaptive_in.clone();
-                            let j_spawn = jitter_in;
-                            let st_spawn = srv_t_in;
+                                Err(_) => {
+                                    error!("mux connect {host}:{port}: timeout {:?}", mux_connect_timeout);
+                                    mux_remove_stream_if_epoch(&streams_open, sid, epoch).await;
+                                    let _ = mux_server_send_record(
+                                        &ws_tx,
+                                        sid,
+                                        MUX_FLAG_RST,
+                                        &[],
+                                        max_pad,
+                                        pad_mode,
+                                        &crypto_clone,
+                                        max_ws_binary,
+                                        &adaptive_spawn,
+                                        j_spawn,
+                                        st_spawn,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            };
+                            let _ = remote.set_nodelay(true);
+                            let (r, w) = remote.into_split();
+                            let (wtx, mut wrx) = mpsc::channel::<Vec<u8>>(256);
+                            let pending = {
+                                let mut g = streams_open.lock().await;
+                                match g.remove(&sid) {
+                                    Some(ServerStreamState::Opening {
+                                        epoch: e, buffered, ..
+                                    }) if e == epoch => {
+                                        g.insert(
+                                            sid,
+                                            ServerStreamState::Open {
+                                                epoch,
+                                                tx: wtx.clone(),
+                                            },
+                                        );
+                                        buffered
+                                    }
+                                    // Entry belongs to another generation of this id: leave it alone.
+                                    Some(other) => {
+                                        g.insert(sid, other);
+                                        return;
+                                    }
+                                    None => return,
+                                }
+                            };
+                            let streams_write = streams_open.clone();
                             tokio::spawn(async move {
-                                let _permit = permit;
-                                let remote = match tokio::time::timeout(
-                                    mux_connect_timeout,
-                                    TcpStream::connect((host.as_str(), port)),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(t)) => t,
-                                    Ok(Err(e)) => {
-                                        error!("mux connect {host}:{port}: {e:#}");
-                                        streams_open.lock().await.remove(&sid);
-                                        let _ = mux_server_send_record(
-                                            &ws_tx,
-                                            sid,
-                                            MUX_FLAG_RST,
-                                            &[],
-                                            max_pad,
-                                            pad_mode,
-                                            &crypto_clone,
-                                            max_ws_binary,
-                                            &adaptive_spawn,
-                                            j_spawn,
-                                            st_spawn,
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                    Err(_) => {
-                                        error!("mux connect {host}:{port}: timeout {:?}", mux_connect_timeout);
-                                        streams_open.lock().await.remove(&sid);
-                                        let _ = mux_server_send_record(
-                                            &ws_tx,
-                                            sid,
-                                            MUX_FLAG_RST,
-                                            &[],
-                                            max_pad,
-                                            pad_mode,
-                                            &crypto_clone,
-                                            max_ws_binary,
-                                            &adaptive_spawn,
-                                            j_spawn,
-                                            st_spawn,
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                };
-                                let _ = remote.set_nodelay(true);
-                                let (r, w) = remote.into_split();
-                                let (wtx, mut wrx) = mpsc::channel::<Vec<u8>>(256);
-                                let pending = {
-                                    let mut g = streams_open.lock().await;
-                                    match g.remove(&sid) {
-                                        Some(ServerStreamState::Opening { buffered, .. }) => {
-                                            g.insert(sid, ServerStreamState::Open(wtx.clone()));
-                                            buffered
-                                        }
-                                        Some(ServerStreamState::Open(_)) | None => return,
-                                    }
-                                };
-                                let streams_write = streams_open.clone();
-                                tokio::spawn(async move {
-                                    let mut w = w;
-                                    while let Some(data) = wrx.recv().await {
-                                        if w.write_all(&data).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    streams_write.lock().await.remove(&sid);
-                                });
-                                for data in pending {
-                                    if wtx.send(data).await.is_err() {
-                                        streams_open.lock().await.remove(&sid);
-                                        return;
+                                let mut w = w;
+                                while let Some(data) = wrx.recv().await {
+                                    if w.write_all(&data).await.is_err() {
+                                        break;
                                     }
                                 }
-                                if let Err(e) = mux_server_stream_read_loop(
-                                    sid,
-                                    r,
-                                    ws_tx,
-                                    streams_open,
-                                    max_pad,
-                                    pad_mode,
-                                    crypto_clone,
-                                    max_ws_binary,
-                                    adaptive_spawn,
-                                    j_spawn,
-                                    st_spawn,
-                                    max_chunk,
-                                )
-                                .await
-                                {
-                                    error!("mux read sid {sid}: {e:#}");
-                                }
+                                mux_remove_stream_if_epoch(&streams_write, sid, epoch).await;
                             });
-                        }
-                        MUX_FLAG_DATA => {
-                            let mut maybe_tx = None;
+                            for data in pending {
+                                if wtx.send(data).await.is_err() {
+                                    mux_remove_stream_if_epoch(&streams_open, sid, epoch).await;
+                                    return;
+                                }
+                            }
+                            if let Err(e) = mux_server_stream_read_loop(
+                                sid,
+                                epoch,
+                                r,
+                                ws_tx,
+                                streams_open,
+                                max_pad,
+                                pad_mode,
+                                crypto_clone,
+                                max_ws_binary,
+                                adaptive_spawn,
+                                j_spawn,
+                                st_spawn,
+                                max_chunk,
+                            )
+                            .await
+                            {
+                                error!("mux read sid {sid}: {e:#}");
+                            }
+                        });
+                    } else {
+                        if act.data {
+                            let mut maybe_tx: Option<(u64, mpsc::Sender<Vec<u8>>)> = None;
                             let mut payload_opt = Some(payload);
                             let mut rst = false;
+                            let mut overflow = false;
                             let mut unknown_stream_data = false;
                             {
                                 let mut g = streams.lock().await;
                                 match g.get_mut(&sid) {
-                                    Some(ServerStreamState::Open(tx)) => {
-                                        maybe_tx = Some(tx.clone());
+                                    Some(ServerStreamState::Open { epoch, tx }) => {
+                                        maybe_tx = Some((*epoch, tx.clone()));
                                     }
                                     Some(ServerStreamState::Opening {
                                         buffered,
                                         buffered_bytes,
+                                        ..
                                     }) => {
                                         let payload_len =
                                             payload_opt.as_ref().map(|p| p.len()).unwrap_or(0);
                                         if buffered_bytes.saturating_add(payload_len)
                                             > MUX_PENDING_OPEN_BYTES
                                         {
-                                            g.remove(&sid);
-                                            rst = true;
+                                            overflow = true;
                                         } else {
                                             *buffered_bytes += payload_len;
                                             buffered
@@ -427,14 +553,19 @@ where
                                             .unwrap_or(false);
                                     }
                                 }
+                                if overflow {
+                                    // Same lock as the match above, so this is the current generation.
+                                    g.remove(&sid);
+                                    rst = true;
+                                }
                             }
-                            if let Some(tx) = maybe_tx {
+                            if let Some((epoch, tx)) = maybe_tx {
                                 if tx
                                     .send(payload_opt.expect("payload present"))
                                     .await
                                     .is_err()
                                 {
-                                    streams.lock().await.remove(&sid);
+                                    mux_remove_stream_if_epoch(&streams, sid, epoch).await;
                                 }
                             } else if rst {
                                 let _ = mux_server_send_record(
@@ -477,11 +608,12 @@ where
                                 .await;
                             }
                         }
-                        MUX_FLAG_CLOSE | MUX_FLAG_RST => {
+                        // Applied after any DATA in the same record. Peer-driven, so whatever
+                        // entry is mapped now is the generation being closed.
+                        // `MUX_FLAG_WIN` stays a no-op: no side sends window updates.
+                        if act.close || act.reset {
                             streams.lock().await.remove(&sid);
                         }
-                        MUX_FLAG_WIN => {}
-                        _ => warn!(target: "bibavpn_mux", "mux: unknown flags {flags:#x}"),
                     }
                 }
                 Message::Ping(p) => {
@@ -553,6 +685,7 @@ async fn mux_server_send_record(
 
 async fn mux_server_stream_read_loop(
     sid: u32,
+    epoch: u64,
     mut tcp_read: OwnedReadHalf,
     ws_out: mpsc::Sender<Message>,
     streams: Arc<Mutex<HashMap<u32, ServerStreamState>>>,
@@ -606,7 +739,7 @@ async fn mux_server_stream_read_loop(
         server_out,
     )
     .await;
-    streams.lock().await.remove(&sid);
+    mux_remove_stream_if_epoch(&streams, sid, epoch).await;
     Ok(())
 }
 
@@ -1077,34 +1210,41 @@ async fn mux_client_reader_loop<S>(
                     }
                     continue;
                 };
-                if flags == MUX_FLAG_DATA && !payload.is_empty() {
+                let act = classify_mux_flags(flags);
+                if act.unknown && CLIENT_FLAGS_LOG.should_emit() {
+                    warn!(
+                        target: "bibavpn_mux",
+                        stream_id = sid,
+                        session_id,
+                        "mux client: unknown flags {flags:#x}"
+                    );
+                }
+                if act.data && !payload.is_empty() {
                     if let Some(a) = &cfg.activity {
                         a.touch();
                     }
                 }
-                match flags {
-                    MUX_FLAG_DATA => {
-                        let tx = {
-                            let g = down.lock().await;
-                            g.get(&sid).cloned()
-                        };
-                        if let Some(tx) = tx {
-                            if tx.send(payload).await.is_err() {
-                                down.lock().await.remove(&sid);
-                            }
-                        } else if !payload.is_empty() {
-                            tracing::debug!(
-                                target: "bibavpn_mux",
-                                stream_id = sid,
-                                session_id,
-                                "mux client: DATA for unknown stream (dropping)"
-                            );
+                if act.data {
+                    let tx = {
+                        let g = down.lock().await;
+                        g.get(&sid).cloned()
+                    };
+                    if let Some(tx) = tx {
+                        if tx.send(payload).await.is_err() {
+                            down.lock().await.remove(&sid);
                         }
+                    } else if !payload.is_empty() {
+                        tracing::debug!(
+                            target: "bibavpn_mux",
+                            stream_id = sid,
+                            session_id,
+                            "mux client: DATA for unknown stream (dropping)"
+                        );
                     }
-                    MUX_FLAG_CLOSE | MUX_FLAG_RST => {
-                        down.lock().await.remove(&sid);
-                    }
-                    _ => {}
+                }
+                // After DATA from the same record; `MUX_FLAG_WIN` is a no-op (no flow control).
+                if act.close || act.reset {
+                    down.lock().await.remove(&sid);
                 }
             }
             Message::Ping(p) => {
@@ -1393,5 +1533,106 @@ mod open_target_tests {
         assert_eq!(sid, 99);
         assert_eq!(flags, MUX_FLAG_DATA);
         assert_eq!(out, payload);
+    }
+}
+
+#[cfg(test)]
+mod stream_epoch_tests {
+    use super::*;
+
+    fn opening(epoch: u64) -> ServerStreamState {
+        ServerStreamState::Opening {
+            epoch,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn state_carries_epoch() {
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        assert_eq!(ServerStreamState::Open { epoch: 42, tx }.epoch(), 42);
+        assert_eq!(opening(9).epoch(), 9);
+    }
+
+    #[test]
+    fn cleanup_only_removes_own_generation() {
+        assert!(mux_cleanup_should_remove(Some(7), 7));
+        assert!(!mux_cleanup_should_remove(Some(8), 7));
+        assert!(!mux_cleanup_should_remove(None, 7));
+    }
+
+    #[test]
+    fn old_stream_cleanup_keeps_reused_sid_entry() {
+        // sid 5 was re-opened as epoch 2 after the epoch 1 stream died; the dying
+        // stream's cleanup must not evict the live entry.
+        let mut map: HashMap<u32, ServerStreamState> = HashMap::new();
+        map.insert(5, opening(2));
+        if mux_cleanup_should_remove(map.get(&5).map(|s| s.epoch()), 1) {
+            map.remove(&5);
+        }
+        assert_eq!(map.get(&5).map(|s| s.epoch()), Some(2));
+        // The current generation's own cleanup still removes it.
+        if mux_cleanup_should_remove(map.get(&5).map(|s| s.epoch()), 2) {
+            map.remove(&5);
+        }
+        assert!(map.get(&5).is_none());
+    }
+
+    #[test]
+    fn duplicate_open_is_rejected_not_overwritten() {
+        assert_eq!(mux_open_decision(false, 0), MuxOpenDecision::Accept);
+        assert_eq!(mux_open_decision(true, 1), MuxOpenDecision::RejectDuplicate);
+        // Duplicate check wins over the cap check (both answer with RST).
+        assert_eq!(
+            mux_open_decision(true, MUX_SERVER_MAX_STREAMS),
+            MuxOpenDecision::RejectDuplicate
+        );
+        assert_eq!(
+            mux_open_decision(false, MUX_SERVER_MAX_STREAMS),
+            MuxOpenDecision::RejectMaxStreams
+        );
+        assert_eq!(
+            mux_open_decision(false, MUX_SERVER_MAX_STREAMS - 1),
+            MuxOpenDecision::Accept
+        );
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    #[test]
+    fn single_flags_classify() {
+        let o = classify_mux_flags(MUX_FLAG_OPEN);
+        assert!(o.open && !o.data && !o.close && !o.reset && !o.unknown);
+        let d = classify_mux_flags(MUX_FLAG_DATA);
+        assert!(d.data && !d.open && !d.close && !d.reset && !d.unknown);
+        let c = classify_mux_flags(MUX_FLAG_CLOSE);
+        assert!(c.close && !c.data && !c.reset && !c.unknown);
+        let r = classify_mux_flags(MUX_FLAG_RST);
+        assert!(r.reset && !r.data && !r.close && !r.unknown);
+        // WIN is accepted and ignored (no flow control implemented).
+        let w = classify_mux_flags(MUX_FLAG_WIN);
+        assert!(!w.open && !w.data && !w.close && !w.reset && !w.unknown);
+    }
+
+    #[test]
+    fn data_combined_with_close_or_rst_still_delivers() {
+        let dc = classify_mux_flags(MUX_FLAG_DATA | MUX_FLAG_CLOSE);
+        assert!(dc.data && dc.close && !dc.reset && !dc.unknown);
+        let dr = classify_mux_flags(MUX_FLAG_DATA | MUX_FLAG_RST);
+        assert!(dr.data && dr.reset && !dr.close && !dr.unknown);
+    }
+
+    #[test]
+    fn unknown_bits_warn_but_keep_known_flags() {
+        let d = classify_mux_flags(MUX_FLAG_DATA | 0x80);
+        assert!(d.data && d.unknown);
+        let z = classify_mux_flags(0);
+        assert!(z.unknown && !z.open && !z.data && !z.close && !z.reset);
+        let u = classify_mux_flags(0x20);
+        assert!(u.unknown && !u.data && !u.close);
     }
 }
