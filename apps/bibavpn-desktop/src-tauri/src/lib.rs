@@ -685,6 +685,134 @@ fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> R
     Ok(())
 }
 
+/// RAII-охрана фазы подключения: если [`connect_inner`] вышел с ошибкой (или паникой)
+/// уже после того, как фаза стала [`VpnPhase::Connecting`], фаза возвращается в
+/// [`VpnPhase::Idle`]. Без этого любой ранний `return`/`?` навсегда оставлял бы
+/// приложение в состоянии «Подключение уже выполняется.» — до перезапуска процесса.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct ConnectingPhaseGuard {
+    inner: Arc<Mutex<Inner>>,
+    armed: bool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl ConnectingPhaseGuard {
+    /// Создаётся невооружённой: пока не вызван [`Self::arm`], `Drop` ничего не делает
+    /// (фаза ещё не наша — например, подключение уже выполняет другой поток).
+    fn new(inner: &Arc<Mutex<Inner>>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            armed: false,
+        }
+    }
+
+    /// Вызывать сразу после `phase = Connecting`; мьютекс лочить не нужно.
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Успешный путь: фаза уже [`VpnPhase::Connected`], сбрасывать нечего.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl Drop for ConnectingPhaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Мьютекс мог быть отравлен паникой — восстанавливаемся, как и весь остальной код;
+        // паниковать в Drop нельзя.
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Фазу мог уже переключить disconnect_inner — чужое состояние не перетираем.
+        if g.phase == VpnPhase::Connecting {
+            g.phase = VpnPhase::Idle;
+        }
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod connecting_phase_guard_tests {
+    use super::{ConnectingPhaseGuard, Inner, SavedConfig, VpnPhase};
+    use std::sync::{Arc, Mutex};
+
+    fn state_in_phase(phase: VpnPhase) -> Arc<Mutex<Inner>> {
+        Arc::new(Mutex::new(Inner {
+            cfg: SavedConfig::default(),
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: None,
+            last_error: None,
+            phase,
+        }))
+    }
+
+    fn phase_of(inner: &Arc<Mutex<Inner>>) -> VpnPhase {
+        inner.lock().unwrap_or_else(|p| p.into_inner()).phase
+    }
+
+    #[test]
+    fn armed_guard_resets_connecting_to_idle() {
+        let inner = state_in_phase(VpnPhase::Connecting);
+        {
+            let mut guard = ConnectingPhaseGuard::new(&inner);
+            guard.arm();
+        }
+        assert_eq!(phase_of(&inner), VpnPhase::Idle);
+    }
+
+    #[test]
+    fn disarmed_guard_keeps_connected() {
+        let inner = state_in_phase(VpnPhase::Connecting);
+        {
+            let mut guard = ConnectingPhaseGuard::new(&inner);
+            guard.arm();
+            inner.lock().expect("lock").phase = VpnPhase::Connected;
+            guard.disarm();
+        }
+        assert_eq!(phase_of(&inner), VpnPhase::Connected);
+    }
+
+    /// Ранний выход «Подключение уже выполняется.» не должен ронять фазу чужой попытки.
+    #[test]
+    fn never_armed_guard_is_noop() {
+        let inner = state_in_phase(VpnPhase::Connecting);
+        drop(ConnectingPhaseGuard::new(&inner));
+        assert_eq!(phase_of(&inner), VpnPhase::Connecting);
+    }
+
+    /// disconnect_inner успел переключить фазу — охрана не перетирает Disconnecting.
+    #[test]
+    fn armed_guard_keeps_foreign_phase() {
+        let inner = state_in_phase(VpnPhase::Disconnecting);
+        {
+            let mut guard = ConnectingPhaseGuard::new(&inner);
+            guard.arm();
+        }
+        assert_eq!(phase_of(&inner), VpnPhase::Disconnecting);
+    }
+
+    /// Паника под мьютексом не должна оставлять фазу в Connecting.
+    #[test]
+    fn armed_guard_survives_poisoned_mutex() {
+        let inner = state_in_phase(VpnPhase::Connecting);
+        let poisoner = Arc::clone(&inner);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("lock");
+            panic!("отравляем мьютекс");
+        })
+        .join();
+        assert!(inner.is_poisoned());
+        {
+            let mut guard = ConnectingPhaseGuard::new(&inner);
+            guard.arm();
+        }
+        assert_eq!(phase_of(&inner), VpnPhase::Idle);
+    }
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     {
@@ -698,6 +826,10 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(300));
         }
     }
+
+    // Охрану создаём до захвата мьютекса: её Drop сам лочит state.inner, поэтому
+    // создание внутри блока с живым MutexGuard дало бы самоблокировку.
+    let mut phase_guard = ConnectingPhaseGuard::new(&state.inner);
 
     let (cfg, backup) = {
         let mut g = match state.inner.lock() {
@@ -714,10 +846,11 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             _ => {}
         }
         g.phase = VpnPhase::Connecting;
+        // Дальше любой выход с ошибкой обязан вернуть фазу в Idle — это делает Drop охраны.
+        phase_guard.arm();
         g.last_error = None;
 
         if !g.cfg.can_connect() {
-            g.phase = VpnPhase::Idle;
             warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
             return Err(
                 "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
@@ -728,10 +861,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         let backup = if let Some(ref saved) = g.proxy_backup {
             saved.clone()
         } else {
-            read_backup().map_err(|e| {
-                g.phase = VpnPhase::Idle;
-                e.to_string()
-            })?
+            read_backup().map_err(|e| e.to_string())?
         };
         (g.cfg.clone(), backup)
     };
@@ -743,8 +873,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         cfg.local_socks_port
     };
     if socks_port == http_port {
-        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.phase = VpnPhase::Idle;
         warn!(target: "bibavpn_desktop", "подключение: совпадают порты HTTP и SOCKS");
         return Err(
             "Порт SOCKS5 должен отличаться от HTTP (или оставьте SOCKS = 0 для HTTP+1).".into(),
@@ -790,8 +918,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
                 Ok(Err(e)) => error!(target: "bibavpn_desktop", "клиент после таймаута: {e:#}"),
                 Err(e) => error!(target: "bibavpn_desktop", "join клиента: {e}"),
             }
-            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-            g.phase = VpnPhase::Idle;
             return Err(
                 "Подключение не завершилось за 45 с (TLS/WSS к серверу или локальный прокси). Смотрите лог в папке BibaVPN/logs.".into(),
             );
@@ -809,8 +935,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
                 target: "bibavpn_desktop",
                 "SOCKS не стартовал (канал закрыт): {msg}"
             );
-            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-            g.phase = VpnPhase::Idle;
             return Err(msg);
         }
     }
@@ -836,8 +960,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         warn!(target: "bibavpn_desktop", "системный прокси: {e}");
         let _ = shutdown_tx.send(true);
         let _ = state.rt.block_on(join);
-        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.phase = VpnPhase::Idle;
         return Err(format!("Системный прокси: {e}"));
     }
 
@@ -859,6 +981,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     });
     g.tunnel_server = Some(remote_label);
     g.phase = VpnPhase::Connected;
+    // Фаза доведена до Connected — сбрасывать в Idle на выходе больше не нужно.
+    phase_guard.disarm();
     sync_tray_tooltip_i18n(app, true, &g.cfg);
     Ok(())
 }
