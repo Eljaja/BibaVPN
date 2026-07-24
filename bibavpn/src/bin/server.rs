@@ -1324,7 +1324,7 @@ where
                 };
                 let inner = read_padded_frame_into(raw).context("v3 auth frame")?;
                 let tok = decode_v3_auth(&inner).context("decode v3 auth")?;
-                if tok != expected_token {
+                if !crypto_layer::secret_eq(tok.as_str(), expected_token) {
                     auth.record_failure(peer_ip).await;
                     warn!(
                         target: "bibavpn_security",

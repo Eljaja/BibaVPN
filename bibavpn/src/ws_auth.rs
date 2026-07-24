@@ -8,6 +8,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::crypto_layer::secret_eq;
 use crate::protocol::{decode_auth, is_auth_frame};
 use crate::server_limits::{PreAuthBudget, PreAuthBudgetTracker};
 
@@ -36,7 +37,7 @@ where
                     }
                     if is_auth_frame(b.as_ref()) {
                         let tok = decode_auth(b.as_ref())?;
-                        if tok == expected_token {
+                        if secret_eq(tok.as_str(), expected_token) {
                             return Ok::<_, anyhow::Error>(());
                         }
                         anyhow::bail!("auth token mismatch");
