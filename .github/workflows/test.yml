@@ -1,0 +1,94 @@
+# Manual: Actions → Tests → Run workflow. Also runs on push/PR when Rust sources change.
+#
+# The build workflows compile the crates but never `cargo test`, and `cargo build`
+# does not even type-check `#[cfg(test)]` code — so unit tests could break (or fail
+# to compile) unnoticed. Each job runs the tests on the platform where that crate is
+# already known to build: core crates on Linux (same as the Docker images),
+# bibavpn-desktop on Windows (same as Desktop Windows).
+name: Tests
+
+run-name: Tests · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
+
+on:
+  workflow_dispatch:
+
+  workflow_call:
+
+  push:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
+      - "apps/bibavpn-desktop/**"
+      - "!apps/bibavpn-desktop/**/*.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/test.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "bibavpn/**"
+      - "!bibavpn/**/*.md"
+      - "biba/**"
+      - "!biba/**/*.md"
+      - "apps/bibavpn-desktop/**"
+      - "!apps/bibavpn-desktop/**/*.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/test.yml"
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: cargo test (bibavpn, biba)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Covers the library, both binaries (bibavpn-server / bibavpn-client) and
+      # the integration tests under bibavpn/tests.
+      - name: cargo test -p bibavpn -p biba
+        run: cargo test -p bibavpn -p biba --locked
+
+  desktop:
+    name: cargo test (bibavpn-desktop)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      BIBA_BYPASS_DOMAINS_URL: ${{ secrets.BIBA_BYPASS_DOMAINS_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/bibavpn-desktop/ui/package-lock.json
+
+      # tauri-build needs the frontend dist to exist, same as the Desktop Windows build.
+      - name: Install UI deps & build frontend
+        working-directory: apps/bibavpn-desktop/ui
+        run: npm install --no-audit --no-fund && npm run build
+
+      - name: cargo test -p bibavpn-desktop
+        run: cargo test -p bibavpn-desktop --locked
