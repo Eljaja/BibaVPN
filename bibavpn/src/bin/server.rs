@@ -532,6 +532,23 @@ async fn main() -> anyhow::Result<()> {
             short_ids.len()
         );
 
+        // `is_short_id_allowed` is permissive for an empty list or an all-zero
+        // entry: any short ID passes. Clients still have to pass the REALITY
+        // AUTH frame, but the operator should know the ID is not pinned.
+        let wildcard_short_id = short_ids.iter().any(|id| id.iter().all(|&b| b == 0));
+        if short_ids.is_empty() || wildcard_short_id {
+            let reason = if short_ids.is_empty() {
+                "empty allowlist"
+            } else {
+                "all-zeros wildcard entry"
+            };
+            warn!(
+                target: "bibavpn_security",
+                reason,
+                "REALITY short-ID allowlist accepts ANY short ID; pin clients with --reality-short-ids"
+            );
+        }
+
         Some(RealityServerConfig {
             private_key: privkey_arr,
             target: target.clone(),
@@ -1018,9 +1035,34 @@ async fn handle_one(
 
     if let Some(ref reality_cfg) = reality_config {
         info!("REALITY mode: app tunnel after X25519");
-        server_handshake_reality(&mut ws, reality_cfg)
-            .await
-            .context("REALITY handshake")?;
+        // REALITY authenticates only the server, so the client must prove it
+        // knows the session token (MAC bound to this handshake) *before* any
+        // application frame is honoured — otherwise this is an open proxy.
+        match timeout(
+            handshake_timeout,
+            server_handshake_reality(&mut ws, reality_cfg, &token),
+        )
+        .await
+        {
+            Ok(Ok(_session_key)) => {
+                auth.record_success(peer_ip).await;
+            }
+            Ok(Err(e)) => {
+                auth.record_failure(peer_ip).await;
+                warn!(
+                    target: "bibavpn_security",
+                    %peer_ip,
+                    session_id = params.session_id,
+                    "REALITY handshake/AUTH rejected: {e:#}"
+                );
+                return Err(e).context("REALITY handshake");
+            }
+            Err(_) => {
+                params.stats.inc_handshake_timeout();
+                auth.record_failure(peer_ip).await;
+                anyhow::bail!("handshake timeout waiting for REALITY AUTH");
+            }
+        }
 
         let domain_trim = proto_domain.trim();
         if domain_trim.is_empty() {
@@ -1033,6 +1075,7 @@ async fn handle_one(
 
         if is_v3_mux_open(next.as_ref()) {
             info!("REALITY: TCP mux (plaintext mux records)");
+            params.stats.inc_handshake_success();
             return bibavpn::tcp_mux::bridge_ws_tcp_mux_server(
                 ws,
                 max_pad,

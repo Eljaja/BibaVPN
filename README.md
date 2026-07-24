@@ -138,7 +138,9 @@ Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. Essentials:
 - **REALITY (optional):** server `--reality-target`, `--reality-private-key`;
   client/invite `reality_target`, `reality_public_key`, `reality_short_id`. The
   outer SNI then defaults to the front host (`vk.com:443` → SNI `vk.com`) while
-  TCP still connects to `--server`.
+  TCP still connects to `--server`. The client must also prove knowledge of
+  `--token` in a mandatory AUTH frame right after the REALITY exchange (a MAC —
+  the token itself never goes on the wire).
 
 Secrets never go in the URL: the token travels in the sealed AUTH frame, and
 the WebSocket path (`--ws-path`, default `/ws`) carries no credentials.

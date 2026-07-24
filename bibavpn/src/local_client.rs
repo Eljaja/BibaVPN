@@ -360,7 +360,8 @@ pub fn normalize_ws_path(s: &str) -> String {
     }
 }
 
-/// REALITY handshake: send client hello with public key + short ID, receive server hello
+/// REALITY handshake: client hello (public key + short ID), server hello, then
+/// the mandatory AUTH frame proving knowledge of `cfg.token`.
 async fn reality_client_handshake<S>(
     ws: &mut WebSocketStream<S>,
     cfg: &ClientCfg,
@@ -374,11 +375,15 @@ where
 
     let short_id = cfg.reality_short_id.unwrap_or_else(|| rand::random::<[u8; 8]>());
 
-    let session_key =
-        crate::reality::reality_client_exchange_verify(ws, &server_expected_pubkey, &short_id)
-            .await?;
+    let session_key = crate::reality::reality_client_exchange_verify(
+        ws,
+        &server_expected_pubkey,
+        &short_id,
+        &cfg.token,
+    )
+    .await?;
 
-    info!("REALITY handshake complete, session key derived, server verified");
+    info!("REALITY handshake complete, session key derived, server verified, AUTH sent");
 
     Ok((session_key, short_id))
 }

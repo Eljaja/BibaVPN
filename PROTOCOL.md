@@ -256,8 +256,9 @@ Top to bottom: **from the app to bytes inside one tunnel frame**. The hop from t
 **Default TCP (multiplexed):** **one to four** **TLS + WSS** sessions per client
 process (round-robin assignment of new streams when `--ws-parallel` is 2–4); many
 SOCKS connections become **mux streams** on those sockets. The same **1..=4** count
-applies in **REALITY** mode: each session runs REALITY (X25519) then the mux phase
-(plaintext `MUX_OPEN` on the REALITY path — see `local_client` / `reality` modules).
+applies in **REALITY** mode: each session runs REALITY (X25519 + mandatory client
+**AUTH** MAC) then the mux phase (plaintext `MUX_OPEN` on the REALITY path — see
+`local_client` / `reality` modules).
 
 ```mermaid
 flowchart TB
@@ -351,8 +352,22 @@ on your VPS.
 1. Client → VPS: **TLS** (SNI = front domain from `reality_target`) + **WSS** upgrade on `--ws-path`.
 2. **REALITY binary exchange** on the WebSocket (before v3 PSK on this path):
    - Client → server: `[version:1][client_ephemeral_x25519:32][short_id:8]`
-   - Server → client: `[version:1][server_long_term_x25519:32]` (must match invite `reality_public_key`)
-3. Client sends plaintext **`MUX_OPEN`**; mux streams carry target TCP (no v3 HELLO/AUTH on this path).
+   - Server → client: `[version:1][server_long_term_x25519:32][confirm_mac:32]` — the pubkey must
+     match invite `reality_public_key`, and the MAC (keyed BLAKE3 over both pubkeys, keyed by the
+     X25519 shared secret) proves the server holds the private key.
+3. **Mandatory client AUTH** (`[version:1][0xa1][mac:32]`): keyed BLAKE3 over
+   `client_ephemeral_pub || server_pub`, keyed by `shared_secret || token`. The **token never goes on
+   the wire** and the MAC is bound to this handshake, so it cannot be replayed into another session.
+   The server compares in constant time and **drops the connection before any application frame** if
+   it does not match (counted by the auth rate limiter / ban list like a v3 AUTH failure).
+4. Client sends plaintext **`MUX_OPEN`**; mux streams carry target TCP (no v3 HELLO/AUTH on this path).
+
+Step 3 is **required in every REALITY session**, including the REALITY + v3 PSK (UDP mux) path where
+a v3 `HELLO` follows instead of `MUX_OPEN`. REALITY itself authenticates only the *server*; without
+this step anyone able to reach the port and complete the WSS upgrade would get full proxying (the
+short-ID allowlist is permissive by default — see `--reality-short-ids`). Adding the frame does not
+change the HELLO / SERVER_HELLO layout, so `REALITY_VERSION` stays **2**; older clients/servers fail
+the handshake immediately (breaking change on the REALITY path only).
 
 **Server CLI**
 
@@ -362,6 +377,10 @@ bibavpn-server \
   --reality-private-key "$REALITY_PRIV_B64" \
   --reality-short-ids '0123456789abcdef'   # optional; omit = any; 000…000 = wildcard
 ```
+
+Omitting `--reality-short-ids` (or listing `0000000000000000`) accepts **any** short ID; the server
+logs a `WARN` on `bibavpn_security` at startup. Clients still have to pass the REALITY AUTH frame
+with the right `--token`, so this is a fingerprinting/pinning weakness, not an open proxy.
 
 Generate keys in Rust (`RealityServerConfig::generate_keys()`), or from any X25519 tool; publish
 the **public** key and a **short ID** in the client invite. **SpiderX** (background GETs to the
@@ -374,12 +393,14 @@ target) starts automatically when REALITY is enabled — warms camouflage agains
 | `reality_target` | Front reference, e.g. `vk.com:443` — sets outer **SNI** unless `--sni` overrides |
 | `reality_public_key` | Base64, 32-byte X25519 public key (pin against MITM) |
 | `reality_short_id` | 16 hex digits (8 bytes); must match server allowlist when configured |
+| `token` | Session token — also keys the mandatory REALITY **AUTH** MAC (step 3) |
 
 **Build note:** outer TLS may use **`--tls-stack rustls`** (default) or **`boring`** (build with
 `--features boring-tls`). **`--pin-cert`** works on both. REALITY does **not** replace VPS IP
 allowlists — it aligns **SNI / handshake behaviour**, not routing to the front site's IP.
 
-**Tests:** `cargo test -p bibavpn --test reality_handshake` (WSS + X25519 roundtrip).
+**Tests:** `cargo test -p bibavpn --test reality_handshake` (WSS + X25519 roundtrip, forged server
+rejected, wrong/missing client AUTH rejected).
 
 ## Transport shaping knobs
 
@@ -441,7 +462,8 @@ exhaustive changelog):
 - **P0 TLS:** optional **BoringSSL** build (`boring-tls` + `--tls-stack boring`)
   for record-size control and production **`--pin-cert`** on the Boring path;
   **`rustls` remains the default** and does not provide full JA3 parity by itself.
-- **P0 REALITY (WSS):** X25519 exchange after WSS; pinned pubkey in invite; auto SNI from
+- **P0 REALITY (WSS):** X25519 exchange after WSS; pinned pubkey in invite; **mandatory client AUTH
+  MAC** (token, bound to the handshake) before any application frame; auto SNI from
   `reality_target`; integration test `reality_handshake.rs`. **Not** Xray TLS-hook REALITY.
 - **P0 RTT:** **delayed ACK** and **RTT mask jitter** on the server; **1–4 WSS** +
   **round-robin** in `tcp_mux` (v3 and REALITY both use the same pool pattern).
