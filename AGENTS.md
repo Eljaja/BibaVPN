@@ -316,8 +316,10 @@ logs a one-line summary via `transport_capabilities::log_server_listen_caps`):
   accept waits **up to 5 seconds** for a permit; if none is available, the TCP
   is dropped and a `bibavpn_security` line records the timeout (server busy).
 - **`--no-auth-rate-limit`** / **`--auth-max-failures`** /
-  **`--auth-failure-window-secs`** / **`--auth-ban-secs`** — per-IP limits on
-  failed tunnel `AUTH` (see `server_limits::AuthRateLimiter`).
+  **`--auth-failure-window-secs`** / **`--auth-ban-secs`** — per-source limits
+  on failed tunnel `AUTH` (see `server_limits::AuthRateLimiter`). Counted per
+  bucket, **IPv4 /32** and **IPv6 /64** (`server_limits::auth_limit_key`), so a
+  routed IPv6 prefix cannot rotate source addresses to dodge the ban.
 - **`--handshake-max-junk-bytes`** (+ internal frame/decrypt budgets) — bounds
   pre-`AUTH` noise before `AUTH` completes (`server_limits::PreAuthBudget`).
 - **`--udp-socket-pool-size`** — reuse up to N UDP sockets on the UDP mux path
