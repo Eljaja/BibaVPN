@@ -408,7 +408,7 @@ async fn connect_udp_mux_ws(
         let short_id = cfg
             .reality_short_id
             .unwrap_or_else(|| rand::random::<[u8; 8]>());
-        crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id)
+        crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id, &cfg.token)
             .await
             .context("REALITY handshake (udp mux)")?;
     }
