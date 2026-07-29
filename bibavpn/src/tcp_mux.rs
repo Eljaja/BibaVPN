@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::crypto_layer::SessionCrypto;
 use crate::frame::{AdaptivePadState, PadMode};
@@ -300,6 +300,8 @@ where
     };
 
     let streams: Arc<Mutex<HashMap<u32, ServerStreamState>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Kept out of the `up` future so the session can drop every stream on teardown.
+    let streams_teardown = streams.clone();
     let sem = Arc::new(Semaphore::new(MUX_SERVER_INFLIGHT));
     let crypto_in = crypto.clone();
     let adaptive_in = server_adaptive.clone();
@@ -488,6 +490,8 @@ where
                                         break;
                                     }
                                 }
+                                // Send FIN promptly instead of waiting for the drop.
+                                let _ = w.shutdown().await;
                                 mux_remove_stream_if_epoch(&streams_write, sid, epoch).await;
                             });
                             for data in pending {
@@ -627,7 +631,25 @@ where
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::try_join!(writer, up)?;
+    let joined = tokio::try_join!(writer, up);
+    // Session teardown: drop every remaining stream entry. That releases the last
+    // `wtx` for each stream, so its writer task ends, shuts down the write half and
+    // closes the target socket. Without this, streams still open when the session
+    // died kept their sockets alive (CLOSE-WAIT) until the process exited.
+    let leaked = {
+        let mut g = streams_teardown.lock().await;
+        let n = g.len();
+        g.clear();
+        n
+    };
+    if leaked > 0 {
+        debug!(
+            target: "bibavpn_mux",
+            streams = leaked,
+            "mux session teardown: released open streams"
+        );
+    }
+    joined?;
     Ok(())
 }
 
@@ -700,31 +722,43 @@ async fn mux_server_stream_read_loop(
 ) -> anyhow::Result<()> {
     let read_cap = max_chunk.saturating_mul(8).min(512 * 1024).max(max_chunk);
     let mut buf = vec![0u8; read_cap];
-    loop {
-        let n = tcp_read.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    // The pump runs in an inner future so that cleanup below happens on *every*
+    // exit path. Returning early from here (e.g. `mux ws queue: channel closed`
+    // once the session's outbound queue is gone) used to skip the map removal,
+    // which kept this stream's `wtx` alive forever: the writer task then never
+    // finished and held the target socket's write half, leaking the fd in
+    // CLOSE-WAIT once the peer closed.
+    let pump = async {
+        loop {
+            let n = tcp_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let mut off = 0usize;
+            while off < n {
+                let take = (n - off).min(max_chunk);
+                mux_server_send_record(
+                    &ws_out,
+                    sid,
+                    MUX_FLAG_DATA,
+                    &buf[off..off + take],
+                    max_pad,
+                    pad_mode,
+                    &crypto,
+                    max_ws_binary,
+                    &adaptive,
+                    ws_send_jitter,
+                    server_out,
+                )
+                .await?;
+                off += take;
+            }
         }
-        let mut off = 0usize;
-        while off < n {
-            let take = (n - off).min(max_chunk);
-            mux_server_send_record(
-                &ws_out,
-                sid,
-                MUX_FLAG_DATA,
-                &buf[off..off + take],
-                max_pad,
-                pad_mode,
-                &crypto,
-                max_ws_binary,
-                &adaptive,
-                ws_send_jitter,
-                server_out,
-            )
-            .await?;
-            off += take;
-        }
-    }
+        Ok::<_, anyhow::Error>(())
+    };
+    let res = pump.await;
+    // Best effort: the queue may already be gone, which is exactly the case that
+    // used to leak.
     let _ = mux_server_send_record(
         &ws_out,
         sid,
@@ -740,7 +774,7 @@ async fn mux_server_stream_read_loop(
     )
     .await;
     mux_remove_stream_if_epoch(&streams, sid, epoch).await;
-    Ok(())
+    res
 }
 
 // --- Client: shared WebSocket ---
@@ -1454,6 +1488,121 @@ impl AsyncRead for MuxCliTcpRead {
                 Pin::new(&mut p.inner).poll_read(cx, buf)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fd_leak_tests {
+    use super::*;
+
+    /// Regression: when the session's outbound WS queue is gone, the per-stream read
+    /// loop returns early. That path used to skip the map removal, so the stream's
+    /// `wtx` stayed alive, its writer task never finished, and the target socket's
+    /// write half was held forever (fd stuck in CLOSE-WAIT). Cleanup must run on
+    /// every exit path.
+    #[tokio::test]
+    async fn read_loop_releases_stream_when_ws_queue_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (target, _) = listener.accept().await.unwrap();
+        // Split like the mux server does: read half to the pump, write half to a task.
+        let (r, w) = target.into_split();
+
+        let sid = 7u32;
+        let epoch = 1u64;
+        let streams: Arc<Mutex<HashMap<u32, ServerStreamState>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (wtx, mut wrx) = mpsc::channel::<Vec<u8>>(4);
+        streams
+            .lock()
+            .await
+            .insert(sid, ServerStreamState::Open { epoch, tx: wtx });
+
+        // Outbound queue with a dropped receiver: every send fails ("mux ws queue").
+        let (ws_out, ws_out_rx) = mpsc::channel::<Message>(1);
+        drop(ws_out_rx);
+
+        // Give the pump something to forward so it reaches the failing send.
+        peer.write_all(b"hello").await.unwrap();
+
+        let res = mux_server_stream_read_loop(
+            sid,
+            epoch,
+            r,
+            ws_out,
+            streams.clone(),
+            0,
+            PadMode::Random,
+            None,
+            65_536,
+            Arc::new(StdMutex::new(AdaptivePadState::default())),
+            WsSendJitter::default(),
+            ServerWsOutTiming::default(),
+            1024,
+        )
+        .await;
+
+        assert!(res.is_err(), "sending on a closed queue must surface an error");
+        assert!(
+            streams.lock().await.get(&sid).is_none(),
+            "stream entry must be removed on the error path, else the socket leaks"
+        );
+        // The map held the only sender: dropping it must end the writer task.
+        assert!(
+            wrx.recv().await.is_none(),
+            "writer channel must close so the write half is released"
+        );
+        drop(w);
+    }
+
+    /// The happy path must still clean up (and report success).
+    #[tokio::test]
+    async fn read_loop_releases_stream_on_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (target, _) = listener.accept().await.unwrap();
+        let (r, w) = target.into_split();
+
+        let sid = 3u32;
+        let epoch = 5u64;
+        let streams: Arc<Mutex<HashMap<u32, ServerStreamState>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (wtx, mut wrx) = mpsc::channel::<Vec<u8>>(4);
+        streams
+            .lock()
+            .await
+            .insert(sid, ServerStreamState::Open { epoch, tx: wtx });
+
+        // Live queue: drain it so sends succeed.
+        let (ws_out, mut ws_out_rx) = mpsc::channel::<Message>(8);
+        tokio::spawn(async move { while ws_out_rx.recv().await.is_some() {} });
+
+        // Peer closes -> the pump sees EOF.
+        drop(peer);
+
+        let res = mux_server_stream_read_loop(
+            sid,
+            epoch,
+            r,
+            ws_out,
+            streams.clone(),
+            0,
+            PadMode::Random,
+            None,
+            65_536,
+            Arc::new(StdMutex::new(AdaptivePadState::default())),
+            WsSendJitter::default(),
+            ServerWsOutTiming::default(),
+            1024,
+        )
+        .await;
+
+        assert!(res.is_ok(), "clean EOF must not be an error: {res:?}");
+        assert!(streams.lock().await.get(&sid).is_none());
+        assert!(wrx.recv().await.is_none());
+        drop(w);
     }
 }
 
