@@ -101,6 +101,11 @@ pub(crate) struct Inner {
     tunnel_server: Option<String>,
     last_error: Option<String>,
     phase: VpnPhase,
+    /// The watchdog tore the tunnel down (sleep / network change) and has not got
+    /// it back yet. The system proxy is deliberately left in place (fail-closed),
+    /// so the watchdog must keep retrying instead of giving up after one attempt.
+    /// Cleared by a successful connect or an explicit user disconnect.
+    recovery_pending: bool,
 }
 
 #[derive(Clone)]
@@ -411,24 +416,98 @@ fn tunnel_is_healthy(http_port: u16) -> bool {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+/// Backoff for repeated recovery attempts: 2s → 5s → 10s → 20s → 30s (capped),
+/// on top of the watchdog's own 12 s tick.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn next_recovery_backoff(current: Duration) -> Duration {
+    let next = match current.as_secs() {
+        0 => 2,
+        s if s < 5 => 5,
+        s if s < 10 => 10,
+        s if s < 20 => 20,
+        _ => 30,
+    };
+    Duration::from_secs(next)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
+        let mut retry_backoff = Duration::from_secs(0);
+        loop {
         let tick_started = Instant::now();
         std::thread::sleep(Duration::from_secs(12));
         let slept = tick_started.elapsed();
         let likely_wake = slept > Duration::from_secs(20);
 
-        let Some((http_port, client_dead)) = (|| {
+        // Two cases matter: a live session to health-check, and a recovery that
+        // has not succeeded yet. The latter used to be dropped entirely — after a
+        // failed post-wake reconnect the phase is Idle, so the watchdog skipped
+        // every later tick and never tried again, leaving the system proxy
+        // pointing at a local port with nothing behind it (no traffic at all).
+        enum Tick {
+            Check { http_port: u16, client_dead: bool },
+            Retry,
+        }
+        let tick = {
             let g = match state.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            if g.phase != VpnPhase::Connected {
-                return None;
+            match g.phase {
+                VpnPhase::Connected => g.vpn.as_ref().map(|vpn| Tick::Check {
+                    http_port: g.cfg.local_http_port,
+                    client_dead: vpn.join.is_finished(),
+                }),
+                VpnPhase::Idle if g.recovery_pending => Some(Tick::Retry),
+                _ => None,
             }
-            let vpn = g.vpn.as_ref()?;
-            Some((g.cfg.local_http_port, vpn.join.is_finished()))
-        })() else {
+        };
+        let Some(tick) = tick else {
+            retry_backoff = Duration::from_secs(0);
+            continue;
+        };
+
+        if let Tick::Retry = tick {
+            // Keep trying to restore the tunnel; the proxy stays applied
+            // (fail-closed) so nothing leaks around the VPN meanwhile.
+            if retry_backoff > Duration::from_secs(0) {
+                std::thread::sleep(retry_backoff);
+            }
+            match connect_inner(&state, &app) {
+                Ok(()) => {
+                    retry_backoff = Duration::from_secs(0);
+                    info!(
+                        target: "bibavpn_desktop",
+                        "туннель восстановлен после сна/смены сети"
+                    );
+                }
+                Err(e) => {
+                    retry_backoff = next_recovery_backoff(retry_backoff);
+                    warn!(
+                        target: "bibavpn_desktop",
+                        backoff_secs = retry_backoff.as_secs(),
+                        "автовосстановление VPN не удалось: {e}"
+                    );
+                    let mut g = match state.inner.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    g.last_error =
+                        Some(format!("Нет связи с сервером, переподключение… ({e})"));
+                    let snap = snapshot(&app, &g);
+                    drop(g);
+                    let _ = app.emit("vpn-state", &snap);
+                }
+            }
+            continue;
+        }
+
+        let Tick::Check {
+            http_port,
+            client_dead,
+        } = tick
+        else {
             continue;
         };
         if client_dead {
@@ -456,18 +535,34 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
                 continue;
             }
         }
-        disconnect_inner(&state, &app, false);
-        if let Err(e) = connect_inner(&state, &app) {
-            warn!(target: "bibavpn_desktop", "автовосстановление VPN: {e}");
+        // Mark the recovery *before* tearing the tunnel down: if the reconnect
+        // below fails, later ticks must keep retrying (the system proxy stays
+        // applied, so without a retry the user is left with no traffic at all).
+        {
             let mut g = match state.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            g.last_error = Some(format!("После сна: {e}"));
+            g.recovery_pending = true;
+        }
+        disconnect_inner(&state, &app, false);
+        if let Err(e) = connect_inner(&state, &app) {
+            retry_backoff = next_recovery_backoff(retry_backoff);
+            warn!(
+                target: "bibavpn_desktop",
+                backoff_secs = retry_backoff.as_secs(),
+                "автовосстановление VPN: {e}"
+            );
+            let mut g = match state.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            g.last_error = Some(format!("Нет связи с сервером, переподключение… ({e})"));
             let snap = snapshot(&app, &g);
             drop(g);
             let _ = app.emit("vpn-state", &snap);
         } else {
+            retry_backoff = Duration::from_secs(0);
             let g = match state.inner.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
@@ -475,6 +570,7 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
             let snap = snapshot(&app, &g);
             drop(g);
             let _ = app.emit("vpn-state", &snap);
+        }
         }
     });
 }
@@ -618,6 +714,12 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             info!(target: "bibavpn_desktop", "отключение VPN");
             g.last_error = None;
             g.tunnel_server = None;
+            if restore_system_proxy {
+                // Явное отключение пользователем: авто-восстановление отменяется,
+                // иначе watchdog будет драться с пользователем и поднимать туннель
+                // обратно.
+                g.recovery_pending = false;
+            }
             // Снимок настроек забираем только если его собираются восстанавливать:
             // при restore_system_proxy == false (watchdog после сна) он должен
             // остаться в состоянии для повторного подключения.
@@ -772,6 +874,32 @@ impl Drop for ConnectingPhaseGuard {
 }
 
 #[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod recovery_backoff_tests {
+    use super::next_recovery_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        let mut d = Duration::from_secs(0);
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            d = next_recovery_backoff(d);
+            seen.push(d.as_secs());
+        }
+        assert_eq!(seen, vec![2, 5, 10, 20, 30, 30], "must ramp up and cap");
+    }
+
+    #[test]
+    fn backoff_resets_from_zero() {
+        assert_eq!(
+            next_recovery_backoff(Duration::from_secs(0)).as_secs(),
+            2,
+            "a fresh recovery starts at the shortest delay"
+        );
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
 mod connecting_phase_guard_tests {
     use super::{ConnectingPhaseGuard, Inner, SavedConfig, VpnPhase};
     use std::sync::{Arc, Mutex};
@@ -784,6 +912,7 @@ mod connecting_phase_guard_tests {
             tunnel_server: None,
             last_error: None,
             phase,
+            recovery_pending: false,
         }))
     }
 
@@ -1019,6 +1148,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     });
     g.tunnel_server = Some(remote_label);
     g.phase = VpnPhase::Connected;
+    // Туннель снова живой: авто-восстановление завершено.
+    g.recovery_pending = false;
     // Фаза доведена до Connected — сбрасывать в Idle на выходе больше не нужно.
     phase_guard.disarm();
     sync_tray_tooltip_i18n(app, true, &g.cfg);
@@ -1448,6 +1579,7 @@ pub fn run() -> anyhow::Result<()> {
             tunnel_server: None,
             last_error: None,
             phase: VpnPhase::Idle,
+            recovery_pending: false,
         })),
     };
 
