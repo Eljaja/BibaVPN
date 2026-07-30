@@ -30,13 +30,41 @@ pub fn init_process_limits() {
     }
 }
 
+/// `networksetup` can wedge indefinitely (right after wake, while the network
+/// service is in flux). It is called dozens of times per connect/disconnect, so a
+/// single stuck invocation would block the caller forever — bound it.
+const NETSETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn run_netsetup(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(NETSETUP)
+    let mut child = Command::new(NETSETUP)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
+        .map_err(|e| format!("networksetup: {e}"))?;
+    let deadline = std::time::Instant::now() + NETSETUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{} {:?}: не ответил за {} с (зависание системной утилиты)",
+                        NETSETUP,
+                        args,
+                        NETSETUP_TIMEOUT.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("networksetup: {e}")),
+        }
+    }
+    let out = child
+        .wait_with_output()
         .map_err(|e| format!("networksetup: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
