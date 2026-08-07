@@ -100,6 +100,11 @@ jobs:
           npm ci
           npm ci --prefix ./ui
 
+      - name: Fetch split-tunnel list for compile-time embed
+        env:
+          BIBA_BYPASS_DOMAINS_REQUIRED: ${{ github.event_name == 'workflow_call' && '1' || '0' }}
+        run: bash .github/scripts/ci-fetch-bypass-domains.sh
+
       - name: Initialize Tauri Android project
         run: |
           bash apps/scripts/tauri-android-init-local.sh
