@@ -10,18 +10,28 @@ mod split_tunnel;
 
 #[cfg(target_os = "android")]
 mod proxy_android;
+#[cfg(target_os = "linux")]
+mod proxy_linux;
 #[cfg(target_os = "macos")]
 mod proxy_mac;
-#[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "android", target_os = "macos", target_os = "linux"))
+))]
 mod proxy_stub;
 #[cfg(windows)]
 mod proxy_win;
 
 #[cfg(target_os = "android")]
 use proxy_android::{apply_proxy, read_backup, restore, ProxyBackup};
+#[cfg(target_os = "linux")]
+use proxy_linux::{apply_proxy, read_backup, restore, ProxyBackup};
 #[cfg(target_os = "macos")]
 use proxy_mac::{apply_proxy, read_backup, restore, ProxyBackup};
-#[cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "android", target_os = "macos", target_os = "linux"))
+))]
 use proxy_stub::{apply_proxy, read_backup, restore, ProxyBackup};
 #[cfg(windows)]
 use proxy_win::{apply_proxy, read_backup, restore, ProxyBackup};
@@ -616,6 +626,13 @@ fn restore_proxy_blocking(backup: Option<ProxyBackup>) -> Option<String> {
                         "прокси: запасное отключение на macOS после ошибки restore: {e2}"
                     );
                 }
+                #[cfg(target_os = "linux")]
+                if let Err(e2) = crate::proxy_linux::disable_if_residual_biba_proxy() {
+                    warn!(
+                        target: "bibavpn_desktop",
+                        "прокси: запасное отключение loopback на Linux после ошибки restore: {e2}"
+                    );
+                }
                 return Some(format!("Прокси: восстановление: {e}"));
             }
             None
@@ -634,6 +651,14 @@ fn restore_proxy_blocking(backup: Option<ProxyBackup>) -> Option<String> {
                 warn!(
                     target: "bibavpn_desktop",
                     "прокси: нет снимка настроек — запасное отключение macOS: {e}"
+                );
+                return Some(format!("Прокси: {e}"));
+            }
+            #[cfg(target_os = "linux")]
+            if let Err(e) = crate::proxy_linux::disable_if_residual_biba_proxy() {
+                warn!(
+                    target: "bibavpn_desktop",
+                    "прокси: нет снимка настроек — запасная очистка loopback Linux: {e}"
                 );
                 return Some(format!("Прокси: {e}"));
             }
@@ -1479,7 +1504,7 @@ async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
         Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
 
     let task = tauri::async_runtime::spawn_blocking(move || {
-        let configured = bypass_domains::bypass_domains_url().is_some();
+        let configured = bypass_domains::bypass_source_configured();
         match bypass_domains::ensure_loaded(refresh) {
             Ok(presets) => {
                 let error = if configured && presets.is_empty() {
@@ -1507,12 +1532,12 @@ async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => BypassPresetsResponse {
             presets: bypass_domains::cached_presets_or_empty(),
-            configured: bypass_domains::bypass_domains_url().is_some(),
+            configured: bypass_domains::bypass_source_configured(),
             error: Some(format!("bypass presets task: {e}")),
         },
         Err(_) => BypassPresetsResponse {
             presets: bypass_domains::cached_presets_or_empty(),
-            configured: bypass_domains::bypass_domains_url().is_some(),
+            configured: bypass_domains::bypass_source_configured(),
             error: Some("Таймаут загрузки списков обхода (2 с)".into()),
         },
     }
@@ -1520,7 +1545,7 @@ async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
 
 fn prefetch_bypass_domains() {
     std::thread::spawn(|| {
-        if bypass_domains::bypass_domains_url().is_none() {
+        if !bypass_domains::bypass_source_configured() {
             return;
         }
         let _ = bypass_domains::ensure_loaded(false);

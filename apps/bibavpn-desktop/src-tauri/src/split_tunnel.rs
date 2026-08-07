@@ -1,10 +1,12 @@
-//! Split-tunnel: домены в обход системного HTTP-прокси (Windows ProxyOverride / macOS bypass).
-//! Списки доменов берутся из API [`crate::bypass_domains`] (не захардкожены в репозитории).
+//! Split-tunnel: домены в обход системного HTTP-прокси
+//! (Windows ProxyOverride / macOS bypass / Linux GSettings `ignore-hosts`).
+//! Списки доменов — из API / disk cache / compile-time embed ([`crate::bypass_domains`]).
 
 use crate::bypass_domains;
 use crate::config::TunnelProfile;
 
-/// Домены для WinInet ProxyOverride / macOS bypass (без обязательных loopback — их добавляет платформа).
+/// Домены для WinInet ProxyOverride / macOS bypass / Linux ignore-hosts
+/// (без обязательных loopback — их добавляет платформа).
 pub fn bypass_domains_for_profile(profile: &TunnelProfile) -> Vec<String> {
     if !profile.split_tunnel_enabled {
         return Vec::new();
