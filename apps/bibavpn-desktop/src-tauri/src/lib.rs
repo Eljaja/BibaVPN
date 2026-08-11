@@ -1203,8 +1203,11 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     }
 
     persist_cfg(app, &g.cfg)?;
-    let json = g.cfg.start_config_json()?;
+    // Must run before `start_config_json()`: that builds `split_bypass_domains` for the
+    // tunnel client's DNS-snoop split routing out of the in-memory preset cache, so a cold
+    // cache here means an empty bypass list and silently no domain split at all.
     let _ = bypass_domains::ensure_loaded(false);
+    let json = g.cfg.start_config_json()?;
     let (split_tunnel_enabled, packages, domains, battery) = match g.cfg.active_profile() {
         Some(p) => (
             p.split_tunnel_enabled,

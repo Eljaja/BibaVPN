@@ -638,6 +638,19 @@ impl TunnelProfile {
             o.insert("ws_accept_language".to_string(), json!(wal));
         }
 
+        // Domain split routing handled inside the tunnel client (`bibavpn::domain_route`):
+        // the DNS snoop learns IP -> domain from answers flowing through the UDP relay, so a
+        // SOCKS CONNECT that only carries an IP (full-TUN on mobile) still matches. Unlike the
+        // Android `excludeRoute` path this works on every API level, covers IPv6, re-learns CDN
+        // addresses live, and is not capped at 128 routes. Empty when split tunnel is off.
+        //
+        // Reads the in-memory preset cache, so callers must `bypass_domains::ensure_loaded()`
+        // *before* building this JSON or the list comes back empty.
+        let split_domains = crate::split_tunnel::bypass_domains_for_profile(self);
+        if !split_domains.is_empty() {
+            o.insert("split_bypass_domains".to_string(), json!(split_domains));
+        }
+
         serde_json::to_string(&Value::Object(o)).map_err(|e| e.to_string())
     }
 }
@@ -942,5 +955,40 @@ pub fn server_card_subtitle(cfg: &SavedConfig) -> String {
         }
     } else {
         "Не задан сервер".to_string()
+    }
+}
+
+#[cfg(test)]
+mod split_bypass_json_tests {
+    use super::TunnelProfile;
+
+    fn profile() -> TunnelProfile {
+        TunnelProfile {
+            server: "vpn.example.com:8443".to_string(),
+            token: "t".to_string(),
+            ..TunnelProfile::default()
+        }
+    }
+
+    /// The tunnel client treats an absent `split_bypass_domains` as "domain split off", so the
+    /// key must never appear just because the section exists in the profile.
+    #[test]
+    fn omitted_when_split_tunnel_disabled() {
+        let mut p = profile();
+        p.split_tunnel_enabled = false;
+        p.split_tunnel_preset_ids = vec!["banks".to_string()];
+        let json = p.start_config_json().expect("build start json");
+        assert!(!json.contains("split_bypass_domains"), "got: {json}");
+    }
+
+    /// Enabled but nothing selected resolves to an empty list — emit no key rather than `[]`,
+    /// so the client takes its cheap "bypass disabled" path.
+    #[test]
+    fn omitted_when_no_presets_selected() {
+        let mut p = profile();
+        p.split_tunnel_enabled = true;
+        p.split_tunnel_preset_ids = Vec::new();
+        let json = p.start_config_json().expect("build start json");
+        assert!(!json.contains("split_bypass_domains"), "got: {json}");
     }
 }
