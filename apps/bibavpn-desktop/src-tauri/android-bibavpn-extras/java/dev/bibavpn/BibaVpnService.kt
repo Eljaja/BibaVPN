@@ -667,7 +667,7 @@ class BibaVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
             builder.addDisallowedApplication(packageName)
             builder.applySplitTunnelBypasses()
-            builder.applySplitTunnelDomainBypasses()
+            // Domain presets: enforced in the tunnel client (DNS map + TLS SNI peek), not excludeRoute.
             // Не добавляем ::/0: у многих сборок tun2socks UDP/IPv6 через TUN неполный — тогда AAAA/DNS v6 «висят».
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {

@@ -109,7 +109,7 @@ const MESSAGES = {
     settings_group_platform: "Платформа",
     settings_group_ports: "Локальные порты (десктоп)",
     android_split_note:
-      "Пресеты: домены в обход VPN на Android 13+ (по IP при подключении); на старых версиях — обход по приложениям. Можно добавить приложение из списка установленных.",
+      "Пресеты: домены в обход VPN на всех версиях Android (через клиент туннеля); также можно выбрать приложения из списка установленных.",
     boring_unavailable: "Сборка без BoringTLS — значение будет проигнорировано.",
     pin_rustls_only: "pin_cert_pem только для rustls",
     tls_stack_label: "Стек TLS",
@@ -253,7 +253,7 @@ const MESSAGES = {
     settings_group_platform: "Platform",
     settings_group_ports: "Local ports (desktop)",
     android_split_note:
-      "Presets: domain bypass on Android 13+ (IPs resolved at connect); older Android uses per-app bypass. You can also pick any installed app.",
+      "Presets: domain bypass on all Android versions (via the tunnel client); you can also pick installed apps to bypass.",
     boring_unavailable: "This build has no BoringTLS — value may be ignored.",
     pin_rustls_only: "pin_cert_pem is rustls-only",
     tls_stack_label: "TLS stack",

@@ -183,6 +183,23 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// True when a non-empty bypass domain list is installed.
+pub fn bypass_domains_active() -> bool {
+    !GLOBAL_BYPASS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty()
+}
+
+/// Match `domain` against the installed bypass list (suffix rules). No-op when empty.
+pub fn matches_active_bypass(domain: &str) -> bool {
+    let bypass = GLOBAL_BYPASS.lock().unwrap_or_else(|p| p.into_inner());
+    if bypass.is_empty() {
+        return false;
+    }
+    matches_bypass(domain, bypass.as_slice())
+}
+
 /// SOCKS/CONNECT convenience: should this target bypass the tunnel (go direct)?
 /// Cheap no-op when no bypass domains are configured.
 pub fn should_bypass(host: &str) -> bool {
@@ -191,6 +208,120 @@ pub fn should_bypass(host: &str) -> bool {
         return false;
     }
     decide(host, bypass.as_slice(), global_map(), now_secs()) == Route::Direct
+}
+
+/// TLS extension type for server_name (RFC 6066).
+const TLS_EXT_SERVER_NAME: u16 = 0;
+/// SNI `host_name` name type.
+const SNI_HOST_NAME: u8 = 0;
+
+/// Parse the first TLS record in `record` and return the ClientHello SNI hostname.
+/// Returns `None` on malformed input, non-handshake records, missing SNI, or when
+/// the SNI is an IP literal (v4/v6). Pure — no I/O.
+pub fn extract_client_hello_sni(record: &[u8]) -> Option<String> {
+    if record.len() < 5 || record[0] != 0x16 {
+        return None;
+    }
+    let rec_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    let end = 5usize.checked_add(rec_len)?;
+    if record.len() < end {
+        return None;
+    }
+    parse_handshake_client_hello_sni(&record[5..end])
+}
+
+fn parse_handshake_client_hello_sni(hs: &[u8]) -> Option<String> {
+    if hs.len() < 4 || hs[0] != 0x01 {
+        return None;
+    }
+    let hs_len = u32::from_be_bytes([0, hs[1], hs[2], hs[3]]) as usize;
+    let body_end = 4usize.checked_add(hs_len)?;
+    if hs.len() < body_end {
+        return None;
+    }
+    parse_client_hello_body_sni(&hs[4..body_end])
+}
+
+fn parse_client_hello_body_sni(body: &[u8]) -> Option<String> {
+    let mut pos = 2usize; // legacy version
+    pos = pos.checked_add(32)?; // random
+    if pos >= body.len() {
+        return None;
+    }
+    let sid_len = body[pos] as usize;
+    pos = pos.checked_add(1)?.checked_add(sid_len)?;
+    if pos.checked_add(2)? > body.len() {
+        return None;
+    }
+    let cs_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos = pos.checked_add(2)?.checked_add(cs_len)?;
+    if pos >= body.len() {
+        return None;
+    }
+    let comp_len = body[pos] as usize;
+    pos = pos.checked_add(1)?.checked_add(comp_len)?;
+    if pos.checked_add(2)? > body.len() {
+        return None;
+    }
+    let ext_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    pos = pos.checked_add(2)?;
+    let ext_end = pos.checked_add(ext_len)?;
+    if ext_end > body.len() {
+        return None;
+    }
+    parse_extensions_sni(&body[pos..ext_end])
+}
+
+fn parse_extensions_sni(exts: &[u8]) -> Option<String> {
+    let mut pos = 0usize;
+    while pos.checked_add(4)? <= exts.len() {
+        let etype = u16::from_be_bytes([exts[pos], exts[pos + 1]]);
+        let elen = u16::from_be_bytes([exts[pos + 2], exts[pos + 3]]) as usize;
+        pos = pos.checked_add(4)?;
+        let edata_end = pos.checked_add(elen)?;
+        if edata_end > exts.len() {
+            return None;
+        }
+        let edata = &exts[pos..edata_end];
+        if etype == TLS_EXT_SERVER_NAME {
+            if let Some(sni) = parse_sni_extension(edata) {
+                return Some(sni);
+            }
+        }
+        pos = edata_end;
+    }
+    None
+}
+
+fn parse_sni_extension(data: &[u8]) -> Option<String> {
+    if data.len() < 2 {
+        return None;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let list_end = 2usize.checked_add(list_len)?;
+    if list_end > data.len() {
+        return None;
+    }
+    let mut pos = 2usize;
+    while pos.checked_add(3)? <= list_end {
+        let name_type = data[pos];
+        let name_len = u16::from_be_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        pos = pos.checked_add(3)?;
+        let name_end = pos.checked_add(name_len)?;
+        if name_end > list_end {
+            return None;
+        }
+        if name_type == SNI_HOST_NAME {
+            let name = String::from_utf8_lossy(&data[pos..name_end]);
+            let host = name.trim_end_matches('.');
+            if host.is_empty() || host.parse::<IpAddr>().is_ok() {
+                return None;
+            }
+            return Some(host.to_ascii_lowercase());
+        }
+        pos = name_end;
+    }
+    None
 }
 
 /// UDP-relay convenience: learn IP→domain from a DNS response. No-op when domain
@@ -452,5 +583,82 @@ mod tests {
         let map = DomainRouteMap::new();
         assert_eq!(decide("example.com", &[], &map, 0), Route::Tunnel);
         assert_eq!(map.len(), 0);
+    }
+
+    /// Build a minimal TLS handshake record containing a ClientHello with one SNI.
+    fn tls_client_hello_with_sni(sni: &str) -> Vec<u8> {
+        let mut ch = Vec::new();
+        ch.push(0x01); // ClientHello
+        let len_pos = ch.len();
+        ch.extend_from_slice(&[0, 0, 0]); // handshake length placeholder
+        let body_start = ch.len();
+        ch.extend_from_slice(&[0x03, 0x03]); // legacy version
+        ch.extend_from_slice(&[0u8; 32]); // random
+        ch.push(0); // session id length
+        ch.extend_from_slice(&[0, 2, 0x13, 0x01]); // one cipher suite
+        ch.extend_from_slice(&[1, 0]); // compression: null
+        let sni_bytes = sni.as_bytes();
+        let sni_list_len = 1 + 2 + sni_bytes.len();
+        let sni_ext_data_len = 2 + sni_list_len;
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&0u16.to_be_bytes()); // server_name
+        exts.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
+        exts.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+        exts.push(0); // host_name
+        exts.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+        exts.extend_from_slice(sni_bytes);
+        ch.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        ch.extend_from_slice(&exts);
+        let body_len = ch.len() - body_start;
+        ch[len_pos] = 0;
+        ch[len_pos + 1] = ((body_len >> 8) & 0xff) as u8;
+        ch[len_pos + 2] = (body_len & 0xff) as u8;
+        let mut record = Vec::new();
+        record.push(0x16); // handshake
+        record.extend_from_slice(&[0x03, 0x01]); // legacy record version
+        record.extend_from_slice(&(ch.len() as u16).to_be_bytes());
+        record.extend_from_slice(&ch);
+        record
+    }
+
+    #[test]
+    fn extract_sni_from_valid_client_hello() {
+        let record = tls_client_hello_with_sni("example.com");
+        assert_eq!(
+            extract_client_hello_sni(&record).as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn extract_sni_truncated_or_non_handshake() {
+        let record = tls_client_hello_with_sni("example.com");
+        assert!(extract_client_hello_sni(&record[..4]).is_none());
+        let mut app_data = record.clone();
+        app_data[0] = 0x17; // application data
+        assert!(extract_client_hello_sni(&app_data).is_none());
+        let mut no_ext = tls_client_hello_with_sni("example.com");
+        // Strip extensions block (last bytes) to simulate no SNI.
+        no_ext.truncate(no_ext.len().saturating_sub(20));
+        assert!(extract_client_hello_sni(&no_ext).is_none());
+    }
+
+    #[test]
+    fn extract_sni_ignores_ip_literals() {
+        let v4 = tls_client_hello_with_sni("93.184.216.34");
+        assert!(extract_client_hello_sni(&v4).is_none());
+        let v6 = tls_client_hello_with_sni("2001:db8::1");
+        assert!(extract_client_hello_sni(&v6).is_none());
+    }
+
+    #[test]
+    fn sni_suffix_matches_bypass_list() {
+        let bypass = vec!["example.com".to_string()];
+        let record = tls_client_hello_with_sni("a.example.com");
+        let sni = extract_client_hello_sni(&record).expect("sni");
+        assert!(matches_bypass(&sni, &bypass));
+        let other = tls_client_hello_with_sni("notexample.com");
+        let sni2 = extract_client_hello_sni(&other).expect("sni");
+        assert!(!matches_bypass(&sni2, &bypass));
     }
 }
