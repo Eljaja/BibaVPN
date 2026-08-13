@@ -887,6 +887,7 @@ async fn server_handshake_v3_after_first_hello<S>(
     psk: &str,
     decoy_max: u8,
     proto_domain: &str,
+    reality_dh: &[u8; 32],
     auth: &Arc<AuthRateLimiter>,
     stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
@@ -901,11 +902,12 @@ where
     ws.send(Message::Binary(Bytes::from(ack)))
         .await
         .context("send v3 ACK (REALITY follow-up)")?;
-    let crypto = Arc::new(SessionCrypto::new(
+    let crypto = Arc::new(SessionCrypto::new_with_reality_dh(
         psk,
         proto_domain,
         &c,
         &s_rand,
+        reality_dh,
         decoy_max,
     ));
     let auth_c = Arc::clone(auth);
@@ -1205,14 +1207,15 @@ async fn handle_one(
         // application frame is honoured — otherwise this is an open proxy.
         // Bounded like the other pre-tunnel phases, but with its own arms: this
         // one is an auth step, so it also feeds the per-IP rate limiter.
-        match timeout(
+        let session_key = match timeout(
             handshake_timeout,
             server_handshake_reality(&mut ws, reality_cfg, &token),
         )
         .await
         {
-            Ok(Ok(_session_key)) => {
+            Ok(Ok(sk)) => {
                 auth.record_success(peer_ip).await;
+                sk
             }
             Ok(Err(e)) => {
                 auth.record_failure(peer_ip).await;
@@ -1229,7 +1232,7 @@ async fn handle_one(
                 auth.record_failure(peer_ip).await;
                 anyhow::bail!("handshake timeout waiting for REALITY AUTH");
             }
-        }
+        };
 
         let domain_trim = proto_domain.trim();
         if domain_trim.is_empty() {
@@ -1284,6 +1287,7 @@ async fn handle_one(
                 secret,
                 decoy_max,
                 domain_trim,
+                &session_key,
                 auth,
                 &params.stats,
                 peer_ip,

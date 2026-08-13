@@ -404,14 +404,18 @@ async fn connect_udp_mux_ws(
         .await
         .context("websocket")?;
 
-    if let Some(pk) = cfg.reality_public_key {
+    let reality_dh = if let Some(pk) = cfg.reality_public_key {
         let short_id = cfg
             .reality_short_id
             .unwrap_or_else(|| rand::random::<[u8; 8]>());
-        crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id, &cfg.token)
-            .await
-            .context("REALITY handshake (udp mux)")?;
-    }
+        Some(
+            crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id, &cfg.token)
+                .await
+                .context("REALITY handshake (udp mux)")?,
+        )
+    } else {
+        None
+    };
 
     send_noise_binaries(&mut ws, u32::from(cfg.early_ws_frames), cfg.max_ws_binary).await?;
     send_noise_binaries(&mut ws, cfg.junk_frames, cfg.max_ws_binary)
@@ -438,13 +442,23 @@ async fn connect_udp_mux_ws(
             Message::Binary(b) => {
                 let s_rand =
                     crypto_layer::parse_ack(secret, dom.as_str(), b.as_ref(), &c_rand)?;
-                let crypto = Arc::new(SessionCrypto::new(
-                    secret,
-                    dom.as_str(),
-                    &c_rand,
-                    &s_rand,
-                    cfg.decoy_max,
-                ));
+                let crypto = Arc::new(match reality_dh.as_ref() {
+                    Some(dh) => SessionCrypto::new_with_reality_dh(
+                        secret,
+                        dom.as_str(),
+                        &c_rand,
+                        &s_rand,
+                        dh,
+                        cfg.decoy_max,
+                    ),
+                    None => SessionCrypto::new(
+                        secret,
+                        dom.as_str(),
+                        &c_rand,
+                        &s_rand,
+                        cfg.decoy_max,
+                    ),
+                });
                 let mut udp_adaptive = AdaptivePadState::default();
                 let auth_inner = encode_v3_auth(&cfg.token).context("encode v3 AUTH (udp mux)")?;
                 let mut wire = Vec::new();
