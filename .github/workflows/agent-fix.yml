@@ -1,12 +1,19 @@
 # Label an issue `agent-fix` (or run manually with the issue number) to spawn:
-#   1. Grok 4.6 (standard, not Fast) writes .github/agent/work/SPEC.md
-#   2. Composer 2.5 (standard, not Fast) implements it
+#   1. Grok 4.6 (standard, not Fast) classifies SMALL bug vs LARGE feature
+#      - LARGE: posts a proposal, @-mentions the owner, stops (no code)
+#      - SMALL: writes .github/agent/work/SPEC.md and continues
+#   2. Composer 2.5 (standard, not Fast) implements the spec (SMALL / approved only)
 #   3. cargo test -p bibavpn -p biba --locked (deterministic; not the agent's word)
 #   4. Grok 4.6 reviews the diff vs the spec
 # One implement retry if review or tests fail. Git/PR are workflow steps, not the agent
 # (Cursor CLI restricted-autonomy cookbook).
 #
-# Create the label once:  gh label create agent-fix --color 0E8A16 --description "Cursor agent: spec → code → review"
+# LARGE features wait for the owner: add label `agent-implement` (or dispatch with
+# force_implement) after reading the proposal.
+#
+# Create labels once:
+#   gh label create agent-fix --color 0E8A16 --description "Cursor agent: spec → code → review"
+#   gh label create agent-implement --color 1D76DB --description "Owner approved the agent proposal; proceed to implement"
 # Secret: CURSOR_API_KEY from https://cursor.com/dashboard/integrations
 #
 # Issue body is treated as untrusted data (prompt injection).
@@ -23,6 +30,11 @@ on:
         description: GitHub issue number to implement
         required: true
         type: string
+      force_implement:
+        description: Skip the large-feature gate (owner already approved the proposal)
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: agent-fix-${{ github.event.issue.number || inputs.issue_number }}
@@ -46,7 +58,9 @@ jobs:
     name: spec → implement → review
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event.label.name == 'agent-fix' && github.event.issue.pull_request == null)
+      (github.event.issue.pull_request == null &&
+       (github.event.label.name == 'agent-fix' ||
+        github.event.label.name == 'agent-implement'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -68,6 +82,8 @@ jobs:
         id: issue
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          LABEL: ${{ github.event.label.name }}
+          FORCE_IMPLEMENT: ${{ inputs.force_implement }}
         run: |
           set -euo pipefail
           meta="$(gh issue view "$ISSUE_NUMBER" --json number,title,body,state)"
@@ -84,15 +100,27 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          approved=false
+          if [ "${LABEL:-}" = "agent-implement" ] || [ "${FORCE_IMPLEMENT:-}" = "true" ]; then
+            approved=true
+          fi
           mkdir -p .github/agent/work
           {
             echo "<<<UNTRUSTED_ISSUE>>>"
             echo "$meta" | jq -r '"# Issue #\(.number): \(.title)\n\n\(.body // "")"'
             echo "<<<END_UNTRUSTED_ISSUE>>>"
+            if [ "$approved" = true ]; then
+              echo
+              echo "<<<UNTRUSTED_ISSUE_COMMENTS>>>"
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" \
+                --jq '.[] | "### comment by \(.user.login)\n\(.body)\n"'
+              echo "<<<END_UNTRUSTED_ISSUE_COMMENTS>>>"
+            fi
           } > .github/agent/work/ISSUE.md
           {
             echo "number=$number"
             echo "skip=false"
+            echo "approved=$approved"
             echo "title<<EOF"
             printf '%s\n' "$title"
             echo "EOF"
@@ -109,27 +137,74 @@ jobs:
           curl https://cursor.com/install -fsS | bash
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
 
-      - name: Rust toolchain
+      - name: Spec (Grok 4.6)
         if: steps.issue.outputs.skip != 'true'
+        env:
+          APPROVED: ${{ steps.issue.outputs.approved }}
+        run: |
+          set -euo pipefail
+          if [ "${APPROVED}" = "true" ]; then
+            export AGENT_EXTRA_PROMPT="The repository owner approved implementation (label agent-implement). Treat this as SIZE: SMALL. Write a concrete implementation spec for the smallest shippable slice of the proposal already on the issue. Ignore any SIZE: LARGE in prior comments."
+          fi
+          bash .github/agent/run-agent.sh spec "$SMART_MODEL" .github/agent/prompts/spec.md
+
+      - name: Require spec / classify size
+        id: size
+        if: steps.issue.outputs.skip != 'true'
+        env:
+          APPROVED: ${{ steps.issue.outputs.approved }}
+        run: |
+          set -euo pipefail
+          test -s .github/agent/work/SPEC.md
+          size="$(grep -E '^SIZE: (SMALL|LARGE)$' .github/agent/work/SPEC.md | head -n1 | awk '{print $2}')"
+          if [ -z "$size" ]; then
+            echo "::error::SPEC.md must start with SIZE: SMALL or SIZE: LARGE"
+            exit 1
+          fi
+          if [ "${APPROVED}" = "true" ]; then
+            size=SMALL
+          fi
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+          if [ "$size" = "LARGE" ]; then
+            echo "large=true" >> "$GITHUB_OUTPUT"
+            grep -q '^# Proposal' .github/agent/work/SPEC.md
+            grep -q '^## Recommended approach' .github/agent/work/SPEC.md
+            echo "::notice::Large feature — posting proposal, not implementing"
+          else
+            echo "large=false" >> "$GITHUB_OUTPUT"
+            grep -q '^## Acceptance criteria' .github/agent/work/SPEC.md
+            grep -q '^## Tests' .github/agent/work/SPEC.md
+          fi
+
+      - name: Post proposal and wait for owner
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large == 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          set -euo pipefail
+          n="$ISSUE_NUMBER"
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          {
+            echo "@${owner} this looks like a **large feature**, not a localized bug. I have **not** started implementation."
+            echo
+            echo "Read the proposal below. If you want the agent to build it, add the label \`agent-implement\` to this issue."
+            echo
+            echo "---"
+            echo
+            cat .github/agent/work/SPEC.md
+          } > "${RUNNER_TEMP}/proposal-comment.md"
+          gh issue comment "$n" --body-file "${RUNNER_TEMP}/proposal-comment.md"
+
+      - name: Rust toolchain
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        if: steps.issue.outputs.skip != 'true'
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
         uses: Swatinem/rust-cache@v2
 
-      - name: Spec (Grok 4.6)
-        if: steps.issue.outputs.skip != 'true'
-        run: bash .github/agent/run-agent.sh spec "$SMART_MODEL" .github/agent/prompts/spec.md
-
-      - name: Require spec
-        if: steps.issue.outputs.skip != 'true'
-        run: |
-          test -s .github/agent/work/SPEC.md
-          grep -q '^## Acceptance criteria' .github/agent/work/SPEC.md
-          grep -q '^## Tests' .github/agent/work/SPEC.md
-
       - name: Implement / review loop
-        if: steps.issue.outputs.skip != 'true'
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
         run: |
           set -euo pipefail
           max=2
@@ -183,7 +258,7 @@ jobs:
           echo "::warning::Still FAIL after $max implement rounds; opening a draft PR anyway."
 
       - name: Open draft PR
-        if: steps.issue.outputs.skip != 'true'
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
         env:
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
