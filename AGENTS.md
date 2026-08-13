@@ -161,7 +161,8 @@ Full layout for `**apps/`** (desktop, Android, JNI crate, scripts): **[apps/AGEN
 | `bibavpn/src/bin/client.rs`                         | Client CLI; invite merge for `ws_path`, `pad_mode`, `dummy_interval_secs`, decoy flags                             |
 | `bibavpn/src/bin/mint_invite.rs`                    | `bibavpn-mint-invite`: print `biba://` (`INVITE_PROTO` / `INVITE_PROTO_DOMAIN`; defaults match `--proto 3`)                 |
 | `bibavpn/src/crypto_layer.rs`                       | Proto-3 tunnel: BLAKE3 derive, opaque HELLO/ACK (variable trailing padding), MAC, domain-aware `SessionCrypto` (per-direction **AtomicU64** nonces; `Sync` seal/open), decoy |
-| `bibavpn/src/incoming.rs`                           | Read HTTP request on TLS; WebSocket 101 + `WebSocketStream::from_partially_read`; or serve camouflage GET/HEAD     |
+| `bibavpn/src/incoming.rs`                           | Read HTTP request on TLS; WebSocket 101 + `WsConn` wrap after `from_partially_read`; or serve camouflage GET/HEAD     |
+| `bibavpn/src/transport/`                            | Outer duplex seam: `OuterMsg` + `WsConn` (WebSocket only today); mux/handshake use `OuterMsg`, not `WebSocketStream` |
 | `bibavpn/src/camouflage.rs`                         | Shared HTML / 404 bodies for rejects and static fallbacks                                                          |
 | `bibavpn/src/ws_auth.rs`                            | Server waits for sealed `AUTH` (timeout, pre-`AUTH` junk/decrypt budgets via `PreAuthBudget` in `server_limits.rs`)   |
 | `bibavpn/src/tcp_mux.rs`                            | Mux wire format, client handle, server bridge, optional idle dummy, multi-WSS pool + RR                            |

@@ -33,6 +33,7 @@ pub mod log_ratelimit;
 pub mod logging;
 pub mod server_limits;
 pub mod server_metrics;
+pub mod transport;
 pub mod transport_capabilities;
 pub mod udp_mux;
 pub mod ws_auth;

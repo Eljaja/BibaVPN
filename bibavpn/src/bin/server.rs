@@ -40,8 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+use bibavpn::transport::{OuterMsg, WsConn};
 use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
@@ -858,7 +857,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn read_next_binary_after_reality<S>(ws: &mut WebSocketStream<S>) -> anyhow::Result<Bytes>
+async fn read_next_binary_after_reality<S>(ws: &mut WsConn<S>) -> anyhow::Result<Bytes>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -869,19 +868,19 @@ where
             .context("eof after REALITY")?
             .context("ws error after REALITY")?;
         match m {
-            Message::Binary(b) => return Ok(b),
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong after REALITY")?;
+            OuterMsg::Data(b) => return Ok(b),
+            OuterMsg::Ping(p) => {
+                ws.send(OuterMsg::Pong(p)).await.context("pong after REALITY")?;
             }
-            Message::Pong(_) => {}
-            Message::Close(_) => anyhow::bail!("closed after REALITY"),
+            OuterMsg::Pong(_) => {}
+            OuterMsg::Close => anyhow::bail!("closed after REALITY"),
             _ => {}
         }
     }
 }
 
 async fn server_handshake_v3_after_first_hello<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     first_hello: &[u8],
     token: &str,
     psk: &str,
@@ -898,7 +897,7 @@ where
 {
     let c = crypto_layer::parse_hello_v3(first_hello).context("parse v3 HELLO")?;
     let (ack, s_rand) = crypto_layer::build_ack(psk, proto_domain, &c)?;
-    ws.send(Message::Binary(Bytes::from(ack)))
+    ws.send(OuterMsg::Data(Bytes::from(ack)))
         .await
         .context("send v3 ACK (REALITY follow-up)")?;
     let crypto = Arc::new(SessionCrypto::new(
@@ -925,7 +924,7 @@ where
 }
 
 async fn run_session_after_v3_handshake<S>(
-    mut ws: WebSocketStream<S>,
+    mut ws: WsConn<S>,
     crypto: SharedCrypto,
     udp_mux_max_pad: u8,
     udp_mux_max_ws_binary: usize,
@@ -984,7 +983,7 @@ where
                             .is_ok()
                             {
                                 if let Ok(blob) = crypto.seal_server_to_client(&wire) {
-                                    let _ = ws.send(Message::Binary(Bytes::from(blob))).await;
+                                    let _ = ws.send(OuterMsg::Data(Bytes::from(blob))).await;
                                 }
                             }
                         }
@@ -1008,7 +1007,7 @@ where
                 let blob = crypto
                     .seal_server_to_client(&wire)
                     .context("seal OPEN_OK v3")?;
-                ws.send(Message::Binary(Bytes::from(blob)))
+                ws.send(OuterMsg::Data(Bytes::from(blob)))
                     .await
                     .context("send OPEN_OK v3")?;
             }
@@ -1373,18 +1372,18 @@ where
         host: String,
         port: u16,
         supports_open_status: bool,
-        ws: WebSocketStream<S>,
+        ws: WsConn<S>,
     },
     UdpMux {
-        ws: WebSocketStream<S>,
+        ws: WsConn<S>,
     },
     Mux {
-        ws: WebSocketStream<S>,
+        ws: WsConn<S>,
     },
 }
 
 async fn wait_first_channel<S>(
-    mut ws: WebSocketStream<S>,
+    mut ws: WsConn<S>,
     crypto: &SharedCrypto,
 ) -> anyhow::Result<FirstChannel<S>>
 where
@@ -1393,7 +1392,7 @@ where
     while let Some(m) = ws.next().await {
         let m = m.context("ws read")?;
         match m {
-            Message::Binary(b) => {
+            OuterMsg::Data(b) => {
                 let raw = crypto
                     .open_client_to_server(b.as_ref())
                     .context("decrypt v3 control")?;
@@ -1413,12 +1412,12 @@ where
                     return Ok(FirstChannel::Mux { ws });
                 }
             }
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p))
+            OuterMsg::Ping(p) => {
+                ws.send(OuterMsg::Pong(p))
                     .await
                     .context("pong during OPEN wait")?;
             }
-            Message::Close(_) => anyhow::bail!("closed before channel open"),
+            OuterMsg::Close => anyhow::bail!("closed before channel open"),
             _ => {}
         }
     }
@@ -1426,7 +1425,7 @@ where
 }
 
 async fn server_handshake_v3<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     token: &str,
     psk: Option<&str>,
     decoy_max: u8,
@@ -1455,7 +1454,7 @@ where
                 .context("eof during handshake")?
                 .context("ws error")?;
             match m {
-                Message::Binary(b) => {
+                OuterMsg::Data(b) => {
                     if b.is_empty() || b.as_ref()[0] != crypto_layer::V3_HELLO_TAG {
                         junk_frames = junk_frames.saturating_add(1);
                         junk_bytes = junk_bytes.saturating_add(b.len());
@@ -1471,7 +1470,7 @@ where
                     let secret = psk.context("Biba v3 requires server --psk")?;
                     info!("Biba v3 PSK mode, decoy_max={decoy_max}");
                     let (ack, s_rand) = crypto_layer::build_ack(secret, domain.as_str(), &c)?;
-                    ws.send(Message::Binary(Bytes::from(ack)))
+                    ws.send(OuterMsg::Data(Bytes::from(ack)))
                         .await
                         .context("send v3 ACK")?;
                     let crypto = Arc::new(SessionCrypto::new(
@@ -1486,11 +1485,11 @@ where
                         .await?;
                     return Ok(crypto);
                 }
-                Message::Ping(p) => {
-                    ws.send(Message::Pong(p)).await.context("pong")?;
+                OuterMsg::Ping(p) => {
+                    ws.send(OuterMsg::Pong(p)).await.context("pong")?;
                 }
-                Message::Pong(_) => {}
-                Message::Close(_) => anyhow::bail!("closed during handshake"),
+                OuterMsg::Pong(_) => {}
+                OuterMsg::Close => anyhow::bail!("closed during handshake"),
                 _ => {}
             }
         }
@@ -1507,7 +1506,7 @@ where
 }
 
 async fn server_wait_v3_auth<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     crypto: &SharedCrypto,
     expected_token: &str,
     auth: &Arc<AuthRateLimiter>,
@@ -1527,7 +1526,7 @@ where
             .context("eof before v3 AUTH")?
             .context("ws read")?;
         match m {
-            Message::Binary(b) => {
+            OuterMsg::Data(b) => {
                 if let Err(e) = tracker.note_binary_frame(b.len(), pre_auth) {
                     auth.record_failure(peer_ip).await;
                     return Err(e);
@@ -1557,11 +1556,11 @@ where
                 stats.inc_handshake_success();
                 return Ok(());
             }
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong")?;
+            OuterMsg::Ping(p) => {
+                ws.send(OuterMsg::Pong(p)).await.context("pong")?;
             }
-            Message::Pong(_) => {}
-            Message::Close(_) => anyhow::bail!("closed before v3 AUTH"),
+            OuterMsg::Pong(_) => {}
+            OuterMsg::Close => anyhow::bail!("closed before v3 AUTH"),
             _ => {}
         }
     }

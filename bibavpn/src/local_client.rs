@@ -14,8 +14,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+use crate::transport::{OuterMsg, WsConn};
 use tracing::{debug, error, info};
 
 use crate::client_tls_stream::ClientTlsStream;
@@ -366,7 +365,7 @@ pub fn normalize_ws_path(s: &str) -> String {
 /// REALITY handshake: client hello (public key + short ID), server hello, then
 /// the mandatory AUTH frame proving knowledge of `cfg.token`.
 async fn reality_client_handshake<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     cfg: &ClientCfg,
 ) -> anyhow::Result<([u8; 32], [u8; 8])>
 where
@@ -393,7 +392,7 @@ where
 
 type SharedCrypto = Arc<SessionCrypto>;
 
-type ClientWs = WebSocketStream<ClientTlsStream>;
+type ClientWs = WsConn<ClientTlsStream>;
 
 async fn upgrade_client_tls(cfg: &ClientCfg, tcp: TcpStream) -> anyhow::Result<ClientTlsStream> {
     desync::after_tcp_connect(&tcp, cfg.desync_mode, cfg.tcp_fooling).await?;
@@ -487,10 +486,8 @@ async fn dial_outer_wss(cfg: &ClientCfg, log_context: &str) -> anyhow::Result<Cl
         context = log_context,
         "outer WSS up"
     );
-    Ok(ws)
+    Ok(WsConn::from_websocket(ws))
 }
-
-/// One attempt: TCP + TLS + WS + noise + v3 hello + sealed AUTH.
 async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, SharedCrypto)> {
     anyhow::ensure!(cfg.proto >= 3, "only Biba protocol v3 is supported (use --proto 3)");
     anyhow::ensure!(cfg.psk.is_some(), "Biba v3 requires --psk (or invite psk)");
@@ -511,13 +508,13 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
     let secret = cfg.psk.as_ref().expect("psk checked");
     let dom = effective_proto_domain(cfg);
     let (c_rand, hello) = crypto_layer::build_hello_v3();
-    ws.send(Message::Binary(Bytes::from(hello)))
+    ws.send(OuterMsg::Data(Bytes::from(hello)))
         .await
         .context("send v3 HELLO")?;
     loop {
         let m = ws.next().await.context("eof before ACK")??;
         match m {
-            Message::Binary(b) => {
+            OuterMsg::Data(b) => {
                 let s_rand =
                     crypto_layer::parse_ack(secret, dom.as_str(), b.as_ref(), &c_rand)?;
                 let crypto = Arc::new(SessionCrypto::new(
@@ -541,32 +538,32 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
                 let blob = crypto
                     .seal_client_to_server(&wire)
                     .context("seal v3 AUTH")?;
-                ws.send(Message::Binary(Bytes::from(blob)))
+                ws.send(OuterMsg::Data(Bytes::from(blob)))
                     .await
                     .context("send v3 AUTH")?;
                 return Ok((ws, crypto));
             }
-            Message::Pong(_) => continue,
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong")?;
+            OuterMsg::Pong(_) => continue,
+            OuterMsg::Ping(p) => {
+                ws.send(OuterMsg::Pong(p)).await.context("pong")?;
             }
-            Message::Close(_) => anyhow::bail!("ws closed before ACK"),
+            OuterMsg::Close => anyhow::bail!("ws closed before ACK"),
             _ => {}
         }
     }
 }
 
 async fn wait_open_status_or_payload<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     crypto: &SharedCrypto,
-) -> anyhow::Result<Vec<Message>>
+) -> anyhow::Result<Vec<OuterMsg>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     loop {
         let m = ws.next().await.context("eof before OPEN result")??;
         match m {
-            Message::Binary(b) => {
+            OuterMsg::Data(b) => {
                 let raw = crypto
                     .open_server_to_client(b.as_ref())
                     .context("decrypt OPEN status")?;
@@ -577,15 +574,15 @@ where
                 if let Ok(err) = decode_v3_open_err(&inner) {
                     anyhow::bail!("remote OPEN failed: {err}");
                 }
-                return Ok(vec![Message::Binary(Bytes::from(inner))]);
+                return Ok(vec![OuterMsg::Data(Bytes::from(inner))]);
             }
-            Message::Ping(p) => {
-                ws.send(Message::Pong(p))
+            OuterMsg::Ping(p) => {
+                ws.send(OuterMsg::Pong(p))
                     .await
                     .context("pong during OPEN wait")?;
             }
-            Message::Pong(_) => {}
-            Message::Close(_) => anyhow::bail!("closed before OPEN result"),
+            OuterMsg::Pong(_) => {}
+            OuterMsg::Close => anyhow::bail!("closed before OPEN result"),
             other => return Ok(vec![other]),
         }
     }
@@ -595,7 +592,7 @@ async fn open_legacy_biba_channel(
     cfg: &Arc<ClientCfg>,
     host: &str,
     port: u16,
-) -> anyhow::Result<(ClientWs, SharedCrypto, Vec<Message>)> {
+) -> anyhow::Result<(ClientWs, SharedCrypto, Vec<OuterMsg>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         match one_try_wss_session(cfg).await {
@@ -617,7 +614,7 @@ async fn open_legacy_biba_channel(
                 if blob.len() > cfg.max_ws_binary {
                     anyhow::bail!("sealed OPEN exceeds --max-ws-binary");
                 }
-                ws.send(Message::Binary(Bytes::from(blob)))
+                ws.send(OuterMsg::Data(Bytes::from(blob)))
                     .await
                     .context("send OPEN v3")?;
                 let prefetched = match timeout(
@@ -703,7 +700,7 @@ async fn connect_tcp_mux_handle_attempts(
                 if blob.len() > cfg.max_ws_binary {
                     anyhow::bail!("sealed MUX_OPEN exceeds --max-ws-binary");
                 }
-                ws.send(Message::Binary(Bytes::from(blob)))
+                ws.send(OuterMsg::Data(Bytes::from(blob)))
                     .await
                     .context("send MUX_OPEN v3")?;
                 let mcfg = MuxClientConfig {
@@ -766,8 +763,6 @@ async fn connect_reality_tcp_mux_handle_attempts(
     max_attempts: u32,
     session: &SessionGuard,
 ) -> anyhow::Result<()> {
-    use tokio_tungstenite::tungstenite::Message;
-
     let _connect_serial = tcp_mux_connect_serial().lock().await;
     if tcp_mux_slot_has_sessions(tcp_mux_slot).await {
         return Ok(());
@@ -799,7 +794,7 @@ async fn connect_reality_tcp_mux_handle_attempts(
                 );
 
                 let open = encode_v3_mux_open();
-                ws.send(Message::Binary(Bytes::from(open)))
+                ws.send(OuterMsg::Data(Bytes::from(open)))
                     .await
                     .context("send MUX_OPEN v3 (REALITY)")?;
 
@@ -1538,7 +1533,7 @@ fn junk_upper_bound(max_ws_binary: usize) -> usize {
 }
 
 async fn send_noise_binaries<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     count: u32,
     max_ws_binary: usize,
 ) -> anyhow::Result<()>
@@ -1559,7 +1554,7 @@ where
         if v.len() > max_ws_binary {
             anyhow::bail!("noise frame exceeds --max-ws-binary");
         }
-        ws.send(Message::Binary(Bytes::from(v))).await?;
+        ws.send(OuterMsg::Data(Bytes::from(v))).await?;
     }
     Ok(())
 }

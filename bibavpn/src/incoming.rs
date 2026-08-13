@@ -9,9 +9,9 @@ use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
-use tokio_tungstenite::WebSocketStream;
 
 use crate::camouflage;
+use crate::transport::WsConn;
 
 /// Same meaning as server bin `WsAcceptKind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub async fn accept_websocket_or_camouflage<S>(
     token: &str,
     camo: CamouflageServeConfig,
     peer: Option<SocketAddr>,
-) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind)>>
+) -> anyhow::Result<Option<(WsConn<S>, WsHandshakeKind)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -100,9 +100,15 @@ Sec-WebSocket-Accept: {accept}\r\n\
         let mut ws_cfg = WebSocketConfig::default();
         ws_cfg.write_buffer_size = 256 * 1024;
         ws_cfg.max_write_buffer_size = 1024 * 1024;
-        let ws =
-            WebSocketStream::from_partially_read(stream, remainder, Role::Server, Some(ws_cfg))
-                .await;
+        let ws = WsConn::from_websocket(
+            tokio_tungstenite::WebSocketStream::from_partially_read(
+                stream,
+                remainder,
+                Role::Server,
+                Some(ws_cfg),
+            )
+            .await,
+        );
         return Ok(Some((ws, kind)));
     }
 

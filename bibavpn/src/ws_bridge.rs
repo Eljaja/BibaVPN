@@ -14,8 +14,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+use crate::transport::{OuterMsg, WsConn};
 
 use crate::crypto_layer::SessionCrypto;
 use crate::frame::{AdaptivePadState, PadMode};
@@ -89,8 +88,8 @@ impl AsyncRead for BridgedTcpRead {
 ///
 /// `server_out_timing`: server-only; extra delay before each WS binary toward the client (ignored for `TunnelEnd::Client`).
 pub async fn bridge_ws_tcp_padded<S>(
-    ws: WebSocketStream<S>,
-    prefetched_ws_messages: Vec<Message>,
+    ws: WsConn<S>,
+    prefetched_ws_messages: Vec<OuterMsg>,
     tcp: TcpStream,
     tcp_uplink_prefix: Vec<u8>,
     max_pad: u8,
@@ -121,11 +120,11 @@ where
             .max(256);
 
     let (mut ws_sink, mut ws_rx) = ws.split();
-    let mut prefetched_ws_messages: VecDeque<Message> = prefetched_ws_messages.into();
+    let mut prefetched_ws_messages: VecDeque<OuterMsg> = prefetched_ws_messages.into();
 
     // One writer owns the WebSocket sink; producers use an async channel (no Mutex on send path).
     const WS_OUT_CAP: usize = 512;
-    let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(WS_OUT_CAP);
+    let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<OuterMsg>(WS_OUT_CAP);
     let ws_out_up = ws_out_tx.clone();
     let ws_out_dn = ws_out_tx.clone();
     let ws_out_dummy = ws_out_tx.clone();
@@ -152,7 +151,7 @@ where
                         m = ws_out_rx.recv() => m,
                         _ = sleep_pin.as_mut() => {
                             ws_sink
-                                .send(Message::Ping(bytes::Bytes::new()))
+                                .send(OuterMsg::Ping(bytes::Bytes::new()))
                                 .await
                                 .context("ws ping")?;
                             *sleep_pin = Box::pin(sleep(ws_ping_period_duration(
@@ -204,7 +203,7 @@ where
                 }
             };
             match m {
-                Message::Binary(b) => {
+                OuterMsg::Data(b) => {
                     if is_open_ok(b.as_ref()) {
                         continue;
                     }
@@ -245,11 +244,11 @@ where
                         }
                     }
                 }
-                Message::Ping(p) => {
-                    ws_out_up.send(Message::Pong(p)).await.context("ws pong")?;
+                OuterMsg::Ping(p) => {
+                    ws_out_up.send(OuterMsg::Pong(p)).await.context("ws pong")?;
                 }
-                Message::Pong(_) => {}
-                Message::Close(_) => {
+                OuterMsg::Pong(_) => {}
+                OuterMsg::Close => {
                     shutdown_up.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -319,7 +318,7 @@ where
                     }
                 }
                 ws_out_dn
-                    .send(Message::Binary(blob))
+                    .send(OuterMsg::Data(blob))
                     .await
                     .context("websocket send queue")?;
                 off += take;
@@ -378,7 +377,7 @@ where
                 maybe_server_ack_and_rtt_mask(st_dummy).await;
             }
             maybe_ws_send_jitter(send_jitter).await;
-            let _ = ws_out_dummy.send(Message::Binary(blob)).await;
+            let _ = ws_out_dummy.send(OuterMsg::Data(blob)).await;
         }
     };
 
