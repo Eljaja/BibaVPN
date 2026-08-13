@@ -42,7 +42,7 @@ use crate::tcp_mux::{
 };
 use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile, TlsStack};
 use crate::udp_mux::{spawn_udp_mux_driver, UdpMuxConfig, UdpMuxHandle};
-use crate::ws_bridge::{self, TunnelEnd};
+use crate::ws_bridge::{self, TunnelEnd, WsBridgePrefetch};
 use crate::{
     read_padded_frame_into, write_padded_frame_with_mode_state, socks5,
     socks5::SocksCommand,
@@ -556,10 +556,29 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
     }
 }
 
+/// Result of classifying the first decrypted server frame after client `OPEN`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpenWait {
+    Ok,
+    Err(String),
+    Payload(Vec<u8>),
+}
+
+/// Classify unpadded inner bytes from the first post-`OPEN` server binary.
+pub(crate) fn classify_open_wait_inner(inner: &[u8]) -> OpenWait {
+    if is_v3_open_ok(inner) {
+        OpenWait::Ok
+    } else if let Ok(err) = decode_v3_open_err(inner) {
+        OpenWait::Err(err)
+    } else {
+        OpenWait::Payload(inner.to_vec())
+    }
+}
+
 async fn wait_open_status_or_payload<S>(
     ws: &mut WebSocketStream<S>,
     crypto: &SharedCrypto,
-) -> anyhow::Result<Vec<Message>>
+) -> anyhow::Result<Vec<WsBridgePrefetch>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -571,13 +590,13 @@ where
                     .open_server_to_client(b.as_ref())
                     .context("decrypt OPEN status")?;
                 let inner = read_padded_frame_into(raw).context("padded OPEN status")?;
-                if is_v3_open_ok(&inner) {
-                    return Ok(Vec::new());
+                match classify_open_wait_inner(&inner) {
+                    OpenWait::Ok => return Ok(Vec::new()),
+                    OpenWait::Err(err) => anyhow::bail!("remote OPEN failed: {err}"),
+                    OpenWait::Payload(payload) => {
+                        return Ok(vec![WsBridgePrefetch::OpenedPayload(payload)]);
+                    }
                 }
-                if let Ok(err) = decode_v3_open_err(&inner) {
-                    anyhow::bail!("remote OPEN failed: {err}");
-                }
-                return Ok(vec![Message::Binary(Bytes::from(inner))]);
             }
             Message::Ping(p) => {
                 ws.send(Message::Pong(p))
@@ -586,7 +605,7 @@ where
             }
             Message::Pong(_) => {}
             Message::Close(_) => anyhow::bail!("closed before OPEN result"),
-            other => return Ok(vec![other]),
+            other => return Ok(vec![WsBridgePrefetch::Ws(other)]),
         }
     }
 }
@@ -595,7 +614,7 @@ async fn open_legacy_biba_channel(
     cfg: &Arc<ClientCfg>,
     host: &str,
     port: u16,
-) -> anyhow::Result<(ClientWs, SharedCrypto, Vec<Message>)> {
+) -> anyhow::Result<(ClientWs, SharedCrypto, Vec<WsBridgePrefetch>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         match one_try_wss_session(cfg).await {
@@ -1599,6 +1618,91 @@ pub const DEFAULT_CLIENT_MAX_WS_BINARY: usize = DEFAULT_MAX_WS_BINARY;
 
 /// Default SOCKS UDP-mux reply wait (seconds). Server embeds this in `biba://` invites for clients.
 pub const DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS: u64 = 130;
+
+#[cfg(test)]
+mod open_wait_tests {
+    use super::*;
+    use crate::crypto_layer::{build_ack, build_hello_v3, SessionCrypto};
+    use crate::frame::write_padded_frame;
+    use crate::protocol::{encode_v3_open_err, encode_v3_open_ok};
+    use std::sync::Arc;
+
+    fn session() -> Arc<SessionCrypto> {
+        let (c, _hello) = build_hello_v3();
+        let psk = "open-wait-psk";
+        let dom = "open.wait";
+        let (_ack, s) = build_ack(psk, dom, &c).unwrap();
+        Arc::new(SessionCrypto::new(psk, dom, &c, &s, 8))
+    }
+
+    fn seal_server_payload(crypto: &SessionCrypto, inner: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_padded_frame(&mut wire, inner, 8).unwrap();
+        crypto.seal_server_to_client(&wire).unwrap()
+    }
+
+    fn open_and_classify(crypto: &SessionCrypto, sealed: &[u8]) -> OpenWait {
+        let raw = crypto.open_server_to_client(sealed).unwrap();
+        let inner = read_padded_frame_into(raw).unwrap();
+        classify_open_wait_inner(&inner)
+    }
+
+    #[test]
+    fn open_ok_then_data_classify() {
+        let crypto = session();
+        let open_ok = encode_v3_open_ok();
+        let sealed_ok = seal_server_payload(&crypto, &open_ok);
+        assert_eq!(open_and_classify(&crypto, &sealed_ok), OpenWait::Ok);
+
+        let data = b"chunk";
+        let sealed_data = seal_server_payload(&crypto, data);
+        assert_eq!(
+            open_and_classify(&crypto, &sealed_data),
+            OpenWait::Payload(data.to_vec())
+        );
+        // Plaintext from classify must not decrypt again (documents the prefetch handoff).
+        assert!(crypto.open_server_to_client(data).is_err());
+    }
+
+    #[test]
+    fn early_payload_without_open_ok() {
+        let crypto = session();
+        let early = b"early";
+        let sealed = seal_server_payload(&crypto, early);
+        match open_and_classify(&crypto, &sealed) {
+            OpenWait::Payload(p) => assert_eq!(p, early),
+            other => panic!("expected payload, got {other:?}"),
+        }
+        assert!(crypto.open_server_to_client(early).is_err());
+    }
+
+    #[test]
+    fn open_err_classifies_as_error() {
+        let crypto = session();
+        let err_inner = encode_v3_open_err("host unreachable").unwrap();
+        let sealed = seal_server_payload(&crypto, &err_inner);
+        match open_and_classify(&crypto, &sealed) {
+            OpenWait::Err(msg) => assert_eq!(msg, "host unreachable"),
+            other => panic!("expected err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefetch_opened_payload_is_not_reopened() {
+        let crypto = session();
+        let data = b"handoff";
+        let sealed = seal_server_payload(&crypto, data);
+        let OpenWait::Payload(opened) = open_and_classify(&crypto, &sealed) else {
+            panic!("expected payload");
+        };
+        let prefetch = vec![WsBridgePrefetch::OpenedPayload(opened.clone())];
+        assert!(matches!(
+            &prefetch[0],
+            WsBridgePrefetch::OpenedPayload(p) if p == data
+        ));
+        assert!(crypto.open_server_to_client(&opened).is_err());
+    }
+}
 
 #[cfg(test)]
 mod parse_tests {

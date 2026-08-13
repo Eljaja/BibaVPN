@@ -1014,7 +1014,7 @@ where
             }
             bibavpn::ws_bridge::bridge_ws_tcp_padded(
                 ws,
-                Vec::new(),
+                Vec::<bibavpn::ws_bridge::WsBridgePrefetch>::new(),
                 remote,
                 Vec::new(),
                 max_pad,
