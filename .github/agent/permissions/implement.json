@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**/*)",
+      "Write(**/*)",
+      "Shell(cargo)",
+      "Shell(rustc)",
+      "Shell(rustup)",
+      "Shell(ls)",
+      "Shell(find)",
+      "Shell(rg)",
+      "Shell(grep)",
+      "Shell(cat)",
+      "Shell(head)",
+      "Shell(mkdir)"
+    ],
+    "deny": [
+      "Shell(git)",
+      "Shell(gh)",
+      "Shell(rm)",
+      "Write(.github/agent/work/SPEC.md)",
+      "Write(.github/agent/work/ISSUE.md)",
+      "Write(.github/workflows/**)",
+      "Write(.github/agent/permissions/**)",
+      "Write(.github/agent/prompts/**)",
+      "Read(.env*)",
+      "Write(.env*)",
+      "Write(**/*.pem)",
+      "Write(**/*.key)",
+      "Write(.git/**)"
+    ]
+  }
+}

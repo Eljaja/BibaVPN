@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**/*)",
+      "Write(.github/agent/work/REVIEW.md)",
+      "Shell(ls)",
+      "Shell(find)",
+      "Shell(rg)",
+      "Shell(grep)",
+      "Shell(cat)",
+      "Shell(head)",
+      "Shell(git:diff*)",
+      "Shell(git:status*)",
+      "Shell(git:log*)"
+    ],
+    "deny": [
+      "Shell(gh)",
+      "Shell(git:commit*)",
+      "Shell(git:push*)",
+      "Shell(git:checkout*)",
+      "Shell(rm)",
+      "Write(bibavpn/**)",
+      "Write(apps/**)",
+      "Write(biba/**)",
+      "Write(Cargo.toml)",
+      "Write(Cargo.lock)",
+      "Write(.github/agent/work/SPEC.md)",
+      "Read(.env*)",
+      "Write(.env*)",
+      "Write(**/*.pem)",
+      "Write(**/*.key)"
+    ]
+  }
+}
