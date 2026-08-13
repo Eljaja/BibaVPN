@@ -132,7 +132,7 @@ Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. Essentials:
   `--fingerprint`, `--ws-jitter-min-ms`/`--ws-jitter-max-ms`, `--ws-parallel`,
   `--tls-stack` (rustls default; `boring` needs the `boring-tls` build).
 - **Server timing:** `--ack-profile`, `--server-ack-delay-*-ms`, `--rtt-mask-jitter-ms`.
-- **Camouflage (server):** `--camouflage-dir <path>` or `--camouflage-url http://…`.
+- **Camouflage (server):** `--camouflage-dir <path>` or `--camouflage-url http://…`; add `--camouflage-allow-private` for loopback/private origins.
 - **TLS trust (client):** real CA by default, `--pin-cert <pem>` to pin the leaf,
   `--insecure` **lab only**.
 - **REALITY (optional):** server `--reality-target`, `--reality-private-key`;

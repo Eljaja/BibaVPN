@@ -255,7 +255,7 @@ that record splitting is not implemented (`desync::note_tls_fragment_requested`)
 - **Server:** `--handshake-timeout-secs` (per pre-tunnel phase: TLS accept, WS
 upgrade / camouflage HTTP head, REALITY exchange, HELLO…`AUTH`; default **15**),
 `--mux-connect-timeout-secs` (per mux stream outbound TCP connect, default **10**)
-- Server `--camouflage-dir`, `--camouflage-url` (`http://` upstream only)
+- Server `--camouflage-dir`, `--camouflage-url` (`http://` upstream only), `--camouflage-allow-private` (loopback/private origins)
 - **Logging (CLI):** server and client `--log-level`, `--log-format plain|json`;
 server optional `--log-filter` (full `tracing_subscriber` directive when you need
 more than the default target set)

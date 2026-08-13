@@ -1,9 +1,9 @@
 //! First request on a TLS stream: WebSocket upgrade vs plain HTTP (camouflage).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Context;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -25,7 +25,16 @@ pub struct CamouflageServeConfig {
     pub static_dir: Option<PathBuf>,
     /// Plaintext reverse proxy origin only: `http://host:port` (no TLS to origin in this build).
     pub reverse_proxy: Option<String>,
+    /// When false (default), refuse loopback / private / link-local camouflage origins.
+    pub allow_private: bool,
 }
+
+/// Max bytes copied from the camouflage origin to the client (not configurable via CLI).
+const CAMOUFLAGE_ORIGIN_MAX_BYTES: usize = 1024 * 1024;
+/// Max time for camouflage origin connect + read (not configurable via CLI).
+const CAMOUFLAGE_ORIGIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Max rewritten request-target length sent upstream.
+const CAMOUFLAGE_MAX_REQUEST_TARGET: usize = 2048;
 
 /// Read HTTP headers, then either complete WebSocket handshake or serve camouflage HTTP.
 pub async fn accept_websocket_or_camouflage<S>(
@@ -289,7 +298,9 @@ async fn serve_camouflage_http<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     if let Some(origin) = camo.reverse_proxy.as_deref() {
         // Reverse proxy streams the origin's own bytes: never rewrite its headers.
-        if let Err(e) = forward_http_get(stream, req.method, req.path, origin).await {
+        if let Err(e) =
+            forward_http_get(stream, req.method, req.path, origin, camo.allow_private).await
+        {
             tracing::warn!(
                 target: "bibavpn_camouflage",
                 ?peer,
@@ -567,13 +578,173 @@ async fn write_file_response<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Minimal GET forward to `http://host:port` origin (same path + query as client).
+/// Sanitize a client request-target for the camouflage reverse proxy.
+/// Returns the rewritten origin-form `/path?query` or `None` if rejected.
+fn sanitize_camouflage_request_target(target: &str) -> Option<String> {
+    if target.is_empty() {
+        return None;
+    }
+    if target.starts_with("//")
+        || target.starts_with("http://")
+        || target.starts_with("https://")
+        || target == "*"
+        || !target.starts_with('/')
+    {
+        return None;
+    }
+    if target.bytes().any(|b| {
+        b == b'\\' || b == b'\r' || b == b'\n' || b == 0 || b == b' '
+    }) {
+        return None;
+    }
+
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (target, None),
+    };
+
+    for bad in ["%2e", "%2E", "%2f", "%2F", "%5c", "%5C"] {
+        if path.contains(bad) {
+            return None;
+        }
+    }
+
+    for seg in path.split('/') {
+        if seg == ".." {
+            return None;
+        }
+    }
+
+    let mut out = if path.is_empty() || path == "/" {
+        "/".to_string()
+    } else {
+        path.to_string()
+    };
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    if out.len() > CAMOUFLAGE_MAX_REQUEST_TARGET {
+        return None;
+    }
+    Some(out)
+}
+
+/// True when the address is loopback, RFC1918, link-local, CGNAT, unspecified, multicast, or broadcast.
+fn is_blocked_camouflage_origin(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_camouflage_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_camouflage_ipv4(v4);
+            }
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            let o = v6.octets();
+            // unique local fc00::/7
+            if o[0] == 0xfc || o[0] == 0xfd {
+                return true;
+            }
+            // link-local fe80::/10
+            (o[0] == 0xfe) && (o[1] & 0xc0) == 0x80
+        }
+    }
+}
+
+fn is_blocked_camouflage_ipv4(v4: Ipv4Addr) -> bool {
+    if v4.is_unspecified() || v4.is_loopback() || v4.is_multicast() || v4.is_broadcast() {
+        return true;
+    }
+    let o = v4.octets();
+    if o[0] == 10 {
+        return true;
+    }
+    if o[0] == 172 && (16..=31).contains(&o[1]) {
+        return true;
+    }
+    if o[0] == 192 && o[1] == 168 {
+        return true;
+    }
+    if o[0] == 169 && o[1] == 254 {
+        return true;
+    }
+    // CGNAT 100.64.0.0/10
+    o[0] == 100 && (64..=127).contains(&o[1])
+}
+
+async fn camouflage_origin_resolvable(host: &str, port: u16, allow_private: bool) -> anyhow::Result<()> {
+    if allow_private {
+        return Ok(());
+    }
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .context("camouflage upstream resolve")?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("camouflage upstream: no addresses");
+    }
+    if addrs
+        .iter()
+        .all(|a| is_blocked_camouflage_origin(a.ip()))
+    {
+        tracing::warn!(
+            target: "bibavpn_security",
+            host = %host,
+            "camouflage reverse-proxy: private/reserved origin refused"
+        );
+        anyhow::bail!("camouflage upstream: private origin denied");
+    }
+    Ok(())
+}
+
+fn check_camouflage_peer(peer: SocketAddr, allow_private: bool) -> anyhow::Result<()> {
+    if allow_private || !is_blocked_camouflage_origin(peer.ip()) {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "bibavpn_security",
+        peer = %peer,
+        "camouflage reverse-proxy: private/reserved peer refused"
+    );
+    anyhow::bail!("camouflage upstream: private peer denied")
+}
+
+/// Minimal GET forward to `http://host:port` origin (sanitized path + query only).
 async fn forward_http_get<S: AsyncWrite + AsyncRead + Unpin>(
     client_tls: &mut S,
     method: &str,
     path: &str,
     origin: &str,
+    allow_private: bool,
 ) -> anyhow::Result<()> {
+    forward_http_get_inner(
+        client_tls,
+        method,
+        path,
+        origin,
+        allow_private,
+        CAMOUFLAGE_ORIGIN_TIMEOUT,
+    )
+    .await
+}
+
+async fn forward_http_get_inner<S: AsyncWrite + AsyncRead + Unpin>(
+    client_tls: &mut S,
+    method: &str,
+    path: &str,
+    origin: &str,
+    allow_private: bool,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let sanitized = sanitize_camouflage_request_target(path).ok_or_else(|| {
+        tracing::warn!(
+            target: "bibavpn_security",
+            "camouflage reverse-proxy: rejected request-target"
+        );
+        anyhow::anyhow!("camouflage: rejected request-target")
+    })?;
+
     let uri = origin
         .parse::<http::Uri>()
         .context("camouflage-url parse")?;
@@ -588,9 +759,18 @@ async fn forward_http_get<S: AsyncWrite + AsyncRead + Unpin>(
     let port = authority.port_u16().unwrap_or(80);
     let host_header = authority.as_str();
 
-    let mut upstream = tokio::net::TcpStream::connect((host, port))
+    camouflage_origin_resolvable(host, port, allow_private).await?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let connect_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut upstream = tokio::time::timeout(connect_remaining, tokio::net::TcpStream::connect((host, port)))
         .await
+        .context("camouflage upstream connect timeout")?
         .context("camouflage upstream tcp")?;
+
+    if let Ok(peer) = upstream.peer_addr() {
+        check_camouflage_peer(peer, allow_private)?;
+    }
 
     let req = format!(
         "{method} {path} HTTP/1.1\r\n\
@@ -604,18 +784,55 @@ Connection: close\r\n\
         } else {
             "GET"
         },
-        path = path,
+        path = sanitized,
         host_header = host_header,
     );
     upstream.write_all(req.as_bytes()).await?;
 
     let mut buf = vec![0u8; 65536];
+    let mut origin_bytes = 0usize;
+    let mut client_bytes_written = 0usize;
     loop {
-        let n = upstream.read(&mut buf).await?;
-        if n == 0 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            if client_bytes_written == 0 {
+                anyhow::bail!("camouflage upstream read timeout");
+            }
+            break;
+        }
+        let read_res = tokio::time::timeout(remaining, upstream.read(&mut buf)).await;
+        let n = match read_res {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                if client_bytes_written == 0 {
+                    return Err(e.into());
+                }
+                break;
+            }
+            Err(_) => {
+                if client_bytes_written == 0 {
+                    anyhow::bail!("camouflage upstream read timeout");
+                }
+                break;
+            }
+        };
+
+        let next_total = origin_bytes.saturating_add(n);
+        if next_total > CAMOUFLAGE_ORIGIN_MAX_BYTES {
+            if client_bytes_written == 0 {
+                anyhow::bail!("camouflage upstream response too large");
+            }
+            let room = CAMOUFLAGE_ORIGIN_MAX_BYTES.saturating_sub(origin_bytes);
+            if room > 0 {
+                client_tls.write_all(&buf[..room.min(n)]).await?;
+                client_bytes_written += room.min(n);
+            }
             break;
         }
         client_tls.write_all(&buf[..n]).await?;
+        origin_bytes = next_total;
+        client_bytes_written += n;
     }
     client_tls.flush().await?;
     Ok(())
@@ -1018,5 +1235,391 @@ mod tests {
         assert!(serve_static_file(&base, "/sub").await.is_none());
         assert!(serve_static_file(&base, "/missing.html").await.is_none());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sanitize_camouflage_request_target_accepts_and_rewrites() {
+        assert_eq!(
+            sanitize_camouflage_request_target("/"),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            sanitize_camouflage_request_target("/foo?x=1"),
+            Some("/foo?x=1".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_camouflage_request_target_rejects_unsafe() {
+        let reject = [
+            "http://127.0.0.1/foo",
+            "https://evil/x",
+            "//evil/x",
+            "*",
+            "\\foo",
+            "/a/../b",
+            "/a/%2e%2e/b",
+            "/a%2f../b",
+            "/secret\r\nX-Injected: yes",
+        ];
+        for t in reject {
+            assert_eq!(sanitize_camouflage_request_target(t), None, "expected reject: {t}");
+        }
+    }
+
+    #[test]
+    fn is_blocked_camouflage_origin_private_ranges() {
+        let blocked = [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "::1",
+            "fe80::1",
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_blocked_camouflage_origin(ip), "expected blocked: {s}");
+        }
+        let allowed = ["8.8.8.8", "2001:4860:4860::8888"];
+        for s in allowed {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_blocked_camouflage_origin(ip), "expected allowed: {s}");
+        }
+    }
+
+    async fn spawn_camouflage_origin(
+        bind: &str,
+    ) -> (u16, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let log_c = log.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let log_c = log_c.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    if let Ok(n) = sock.read(&mut buf).await {
+                        if n > 0 {
+                            let line = String::from_utf8_lossy(&buf[..n]).to_string();
+                            log_c.lock().await.push(line);
+                        }
+                    }
+                    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                    let _ = sock.write_all(resp).await;
+                });
+            }
+        });
+        (port, log)
+    }
+
+    #[tokio::test]
+    async fn absolute_form_request_is_not_forwarded_to_origin() {
+        let (port, log) = spawn_camouflage_origin("127.0.0.1:0").await;
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let camo = CamouflageServeConfig {
+            reverse_proxy: Some(origin),
+            allow_private: true,
+            ..Default::default()
+        };
+        let srv = tokio::spawn(async move {
+            serve_camouflage_http(
+                &mut server,
+                CamoRequest {
+                    method: "GET",
+                    path: "http://127.0.0.1/secret",
+                    range: None,
+                },
+                &camo,
+                None,
+            )
+            .await
+        });
+        let mut resp = vec![0u8; 8192];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut resp))
+            .await
+            .expect("response within deadline")
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp[..n]);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "fallback expected: {text}");
+        srv.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let lines = log.lock().await;
+        assert!(
+            lines.is_empty() || !lines.iter().any(|l| l.contains("http://")),
+            "origin must not see absolute URI: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_form_request_uses_rewritten_path_and_host() {
+        let (port, log) = spawn_camouflage_origin("127.0.0.1:0").await;
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let camo = CamouflageServeConfig {
+            reverse_proxy: Some(origin.clone()),
+            allow_private: true,
+            ..Default::default()
+        };
+        let srv = tokio::spawn(async move {
+            serve_camouflage_http(
+                &mut server,
+                CamoRequest {
+                    method: "GET",
+                    path: "/ok",
+                    range: None,
+                },
+                &camo,
+                None,
+            )
+            .await
+        });
+        let mut resp = vec![0u8; 8192];
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.read(&mut resp))
+            .await
+            .expect("response within deadline");
+        srv.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let lines = log.lock().await;
+        assert!(!lines.is_empty(), "origin should receive a request");
+        let req = &lines[0];
+        assert!(req.starts_with("GET /ok HTTP/1.1"), "got: {req}");
+        let authority = origin
+            .parse::<http::Uri>()
+            .unwrap()
+            .authority()
+            .unwrap()
+            .as_str()
+            .to_string();
+        assert!(
+            req.contains(&format!("Host: {authority}\r\n")),
+            "Host must match origin authority: {req}"
+        );
+        assert!(!req.contains("http://"), "must not forward absolute URI: {req}");
+    }
+
+    #[tokio::test]
+    async fn private_origin_denied_without_allow_private() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(tokio::sync::Mutex::new(false));
+        let accepted_c = accepted.clone();
+        tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                *accepted_c.lock().await = true;
+            }
+        });
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let camo = CamouflageServeConfig {
+            reverse_proxy: Some(origin),
+            allow_private: false,
+            ..Default::default()
+        };
+        let srv = tokio::spawn(async move {
+            serve_camouflage_http(
+                &mut server,
+                CamoRequest {
+                    method: "GET",
+                    path: "/",
+                    range: None,
+                },
+                &camo,
+                None,
+            )
+            .await
+        });
+        let mut resp = vec![0u8; 8192];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut resp))
+            .await
+            .expect("fallback within deadline")
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp[..n]);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "fallback expected: {text}");
+        srv.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!*accepted.lock().await, "private origin must not be connected");
+    }
+
+    #[tokio::test]
+    async fn private_origin_allowed_with_flag() {
+        let (port, log) = spawn_camouflage_origin("127.0.0.1:0").await;
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let camo = CamouflageServeConfig {
+            reverse_proxy: Some(origin),
+            allow_private: true,
+            ..Default::default()
+        };
+        let srv = tokio::spawn(async move {
+            serve_camouflage_http(
+                &mut server,
+                CamoRequest {
+                    method: "GET",
+                    path: "/",
+                    range: None,
+                },
+                &camo,
+                None,
+            )
+            .await
+        });
+        let mut resp = vec![0u8; 8192];
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.read(&mut resp))
+            .await
+            .expect("response within deadline");
+        srv.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let lines = log.lock().await;
+        assert!(!lines.is_empty(), "request should be forwarded");
+        assert!(lines[0].starts_with("GET / HTTP/1.1"), "got: {}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn huge_origin_response_is_capped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let head = b"HTTP/1.1 200 OK\r\nContent-Length: 2097152\r\n\r\n";
+                    let _ = sock.write_all(head).await;
+                    let chunk = vec![b'x'; 65536];
+                    for _ in 0..40 {
+                        if sock.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut client, mut server) = tokio::io::duplex(4 * 1024 * 1024);
+        let camo = CamouflageServeConfig {
+            reverse_proxy: Some(origin),
+            allow_private: true,
+            ..Default::default()
+        };
+        let srv = tokio::spawn(async move {
+            serve_camouflage_http(
+                &mut server,
+                CamoRequest {
+                    method: "GET",
+                    path: "/big",
+                    range: None,
+                },
+                &camo,
+                None,
+            )
+            .await
+        });
+        let mut total = 0usize;
+        let mut buf = vec![0u8; 65536];
+        let read_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = read_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let n = match tokio::time::timeout(remaining, client.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            };
+            total += n;
+        }
+        srv.await.unwrap();
+        assert!(
+            total <= CAMOUFLAGE_ORIGIN_MAX_BYTES + 8192,
+            "client read should stop near cap, got {total} bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_origin_hits_inner_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _hold = stream;
+                std::future::pending::<()>().await;
+            }
+        });
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let camo = CamouflageServeConfig {
+            reverse_proxy: Some(origin),
+            allow_private: true,
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let srv = tokio::spawn(async move {
+            serve_camouflage_http(
+                &mut server,
+                CamoRequest {
+                    method: "GET",
+                    path: "/slow",
+                    range: None,
+                },
+                &camo,
+                None,
+            )
+            .await
+        });
+        let mut resp = vec![0u8; 8192];
+        let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut resp))
+            .await
+            .expect("must not hang indefinitely")
+            .unwrap_or(0);
+        srv.await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "should finish near inner timeout, took {:?}",
+            start.elapsed()
+        );
+        if n > 0 {
+            let text = String::from_utf8_lossy(&resp[..n]);
+            assert!(
+                text.starts_with("HTTP/1.1 200 OK") || text.starts_with("HTTP/1.1"),
+                "partial or fallback response: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_http_get_inner_respects_test_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _hold = stream;
+                std::future::pending::<()>().await;
+            }
+        });
+        let origin = format!("http://127.0.0.1:{port}");
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let start = std::time::Instant::now();
+        let res = forward_http_get_inner(
+            &mut server,
+            "GET",
+            "/stall",
+            &origin,
+            true,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(res.is_err(), "stall must time out");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(client);
     }
 }

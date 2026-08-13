@@ -175,6 +175,10 @@ struct Args {
     #[arg(long)]
     camouflage_url: Option<String>,
 
+    /// Allow `--camouflage-url` origins on loopback / private / link-local addresses.
+    #[arg(long, default_value_t = false)]
+    camouflage_allow_private: bool,
+
     /// Inner frame padding mode: `adaptive` (default), `random`, or `http-buckets`.
     #[arg(long, default_value = "adaptive")]
     pad_mode: String,
@@ -557,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
     let dummy_interval_secs = args.dummy_interval_secs;
     let camouflage_dir = args.camouflage_dir.clone();
     let camouflage_url = args.camouflage_url.clone();
+    let camouflage_allow_private = args.camouflage_allow_private;
 
     // ===== REALITY Mode Setup =====
     let reality_config: Option<RealityServerConfig> = if let (Some(target), Some(privkey_b64)) = (
@@ -758,6 +763,7 @@ async fn main() -> anyhow::Result<()> {
         let camo = CamouflageServeConfig {
             static_dir: camouflage_dir.clone(),
             reverse_proxy: camouflage_url.clone(),
+            allow_private: camouflage_allow_private,
         };
         let psk_conn = psk.clone();
         let proto_domain = args.proto_domain.clone();
