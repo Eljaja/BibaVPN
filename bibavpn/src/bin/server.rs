@@ -10,7 +10,8 @@ use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig, W
 use bibavpn::log_ratelimit::LogEvery;
 use bibavpn::logging::{self, LogConfig, LogFormat};
 use bibavpn::server_limits::{
-    AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget, ServerStats,
+    account_pre_hello_binary, AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget,
+    PreHelloJunkTracker, ServerStats, MAX_PRE_HELLO_BYTES, MAX_PRE_HELLO_FRAMES,
 };
 use bibavpn::server_metrics::{spawn_metrics_listener, MetricsAuth};
 use bibavpn::transport_capabilities::log_server_listen_caps;
@@ -1444,10 +1445,7 @@ where
     let auth_f = Arc::clone(auth);
     let peer = peer_ip;
     let fut = async {
-        let mut junk_frames = 0u32;
-        let mut junk_bytes = 0usize;
-        const MAX_PRE_HELLO_FRAMES: u32 = 256;
-        const MAX_PRE_HELLO_BYTES: usize = 256 * 1024;
+        let mut pre_hello = PreHelloJunkTracker::default();
         loop {
             let m = ws
                 .next()
@@ -1456,17 +1454,14 @@ where
                 .context("ws error")?;
             match m {
                 Message::Binary(b) => {
-                    if b.is_empty() || b.as_ref()[0] != crypto_layer::V3_HELLO_TAG {
-                        junk_frames = junk_frames.saturating_add(1);
-                        junk_bytes = junk_bytes.saturating_add(b.len());
-                        if junk_frames > MAX_PRE_HELLO_FRAMES || junk_bytes > MAX_PRE_HELLO_BYTES {
-                            anyhow::bail!("too much pre-handshake data before v3 HELLO");
-                        }
-                        continue;
-                    }
-                    let c = match crypto_layer::parse_hello_v3(b.as_ref()) {
-                        Ok(x) => x,
-                        Err(_) => continue,
+                    let c = match account_pre_hello_binary(
+                        b.as_ref(),
+                        &mut pre_hello,
+                        MAX_PRE_HELLO_FRAMES,
+                        MAX_PRE_HELLO_BYTES,
+                    )? {
+                        Some(c) => c,
+                        None => continue,
                     };
                     let secret = psk.context("Biba v3 requires server --psk")?;
                     info!("Biba v3 PSK mode, decoy_max={decoy_max}");
