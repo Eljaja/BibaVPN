@@ -217,6 +217,8 @@ jobs:
           Automated agent-fix. Linked to issue #${n}. Draft — do not merge without a human review.
 
           Review: ${verdict}
+
+          PR CI is Tests only, and only the jobs whose paths changed. Android, Desktop, iOS, and Docker build on push to main.
           EOF
           )"
           gh pr create --draft --assignee "$GITHUB_ACTOR" --title "fix: ${title}" --body "$body"
