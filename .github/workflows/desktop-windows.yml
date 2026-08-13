@@ -1,4 +1,5 @@
 # Manual: Actions → Desktop Windows → Run workflow. Also runs on push/PR when core VPN library or desktop app paths change.
+# Draft PRs skip this build (agent-fix). Mark Ready for review to run.
 name: Desktop Windows
 
 run-name: Desktop Windows · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -26,6 +27,7 @@ on:
       - ".github/workflows/desktop-windows.yml"
       - ".github/scripts/ci-fetch-bypass-domains.sh"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, master]
     paths:
       - "bibavpn/**"
@@ -46,6 +48,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: windows-latest
     timeout-minutes: 60
     env:

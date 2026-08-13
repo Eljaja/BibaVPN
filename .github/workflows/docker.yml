@@ -21,6 +21,7 @@
 #
 # Path gating: workflow skips docs-only / desktop-only / app-only commits.
 # Per-image matrix: server and client images build independently when only one side changed.
+# Draft PRs skip image builds (agent-fix). Mark Ready for review to run.
 name: Docker images
 
 on:
@@ -44,6 +45,7 @@ on:
       - "docker-compose.bibavpn-check.yml"
       - ".github/workflows/docker.yml"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
     paths:
@@ -71,6 +73,7 @@ concurrency:
 
 jobs:
   changes:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -145,7 +148,7 @@ jobs:
 
   build-push:
     needs: changes
-    if: needs.changes.outputs.matrix != '[]'
+    if: needs.changes.result == 'success' && needs.changes.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

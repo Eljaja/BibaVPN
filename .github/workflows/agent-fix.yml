@@ -217,6 +217,8 @@ jobs:
           Automated agent-fix. Linked to issue #${n}. Draft — do not merge without a human review.
 
           Review: ${verdict}
+
+          Platform CI (Tests, Android, Desktop, iOS, Docker) starts when this PR is marked Ready for review. Agent fix already ran cargo test -p bibavpn -p biba.
           EOF
           )"
           gh pr create --draft --assignee "$GITHUB_ACTOR" --title "fix: ${title}" --body "$body"

@@ -1,4 +1,5 @@
 # Manual: Actions → Android → Run workflow. Also runs on push/PR when core VPN (protocol/server/client lib), JNI, or Tauri Android paths change.
+# Draft PRs skip this build (agent-fix). Mark Ready for review to run.
 name: Android
 
 run-name: Android · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -28,6 +29,7 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/android.yml"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, master]
     paths:
       - "bibavpn/**"
@@ -50,6 +52,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:

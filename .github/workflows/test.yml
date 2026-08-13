@@ -5,6 +5,7 @@
 # to compile) unnoticed. Each job runs the tests on the platform where that crate is
 # already known to build: core crates on Linux (same as the Docker images),
 # bibavpn-desktop on Windows (same as Desktop Windows).
+# Draft PRs skip jobs (agent-fix opens drafts). Mark Ready for review to run.
 name: Tests
 
 run-name: Tests · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -28,6 +29,7 @@ on:
       - "rust-toolchain.toml"
       - ".github/workflows/test.yml"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, master]
     paths:
       - "bibavpn/**"
@@ -48,6 +50,7 @@ concurrency:
 jobs:
   core:
     name: cargo test (bibavpn, biba)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -66,6 +69,7 @@ jobs:
 
   desktop:
     name: cargo test (bibavpn-desktop)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: windows-latest
     timeout-minutes: 60
     env:
