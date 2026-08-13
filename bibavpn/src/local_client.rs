@@ -9,7 +9,7 @@ use rand::rngs::OsRng;
 use rand::Rng;
 use rand::RngCore;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::task::JoinHandle;
@@ -1187,11 +1187,19 @@ pub fn parse_ws_header(line: &str) -> anyhow::Result<(String, String)> {
 /// Split-tunnel bypass: relay a CONNECT straight to the target from the device,
 /// outside the tunnel. On Android the outbound socket is protected via the
 /// installed `outbound_protect` hook, so it does not loop back into the TUN.
-async fn direct_bypass_relay(mut local: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+async fn direct_bypass_relay(
+    mut local: TcpStream,
+    host: &str,
+    port: u16,
+    prefetch: &[u8],
+) -> anyhow::Result<()> {
     let mut remote = crate::outbound_protect::tcp_connect_host_protected(host, port)
         .await
         .map_err(|e| anyhow::anyhow!("direct bypass connect {host}:{port}: {e}"))?;
     let _ = remote.set_nodelay(true);
+    if !prefetch.is_empty() {
+        remote.write_all(prefetch).await?;
+    }
     tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
     Ok(())
 }
@@ -1210,7 +1218,7 @@ async fn handle_socks_peer(
             // (outside the tunnel). No-op unless bypass domains are configured.
             if crate::domain_route::should_bypass(&host) {
                 socks5::socks5_reply_ok(&mut local).await?;
-                return direct_bypass_relay(local, &host, port).await;
+                return direct_bypass_relay(local, &host, port, &[]).await;
             }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
@@ -1454,6 +1462,10 @@ async fn handle_http_peer(
             port,
             client_prefetch,
         }) => {
+            if crate::domain_route::should_bypass(&host) {
+                http_connect::reply_connect_ok(&mut local).await?;
+                return direct_bypass_relay(local, &host, port, &client_prefetch).await;
+            }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ =
@@ -1510,6 +1522,9 @@ async fn handle_http_peer(
             port,
             to_origin,
         }) => {
+            if crate::domain_route::should_bypass(&host) {
+                return direct_bypass_relay(local, &host, port, &to_origin).await;
+            }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ =
@@ -1744,6 +1759,281 @@ mod socks_udp_relay_tests {
             None,
             SocketAddr::new(v4(127, 0, 0, 2), 40000)
         ));
+    }
+}
+
+#[cfg(test)]
+mod http_bypass_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    fn bypass_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct BypassDomainsGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl BypassDomainsGuard {
+        fn with(domains: &[&str]) -> Self {
+            let lock = bypass_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+            crate::domain_route::set_bypass_domains(
+                &domains.iter().map(|d| (*d).to_string()).collect::<Vec<_>>(),
+            );
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for BypassDomainsGuard {
+        fn drop(&mut self) {
+            crate::domain_route::set_bypass_domains(&[]);
+        }
+    }
+
+    fn test_http_proxy_cfg() -> Arc<ClientCfg> {
+        let tls = client_tls_config(&ClientTlsParams {
+            insecure: true,
+            profile: TlsClientProfile::default(),
+            pinned_certs_pem: None,
+        })
+        .expect("test tls config");
+        Arc::new(ClientCfg {
+            server_host: "127.0.0.1".to_string(),
+            server_port: 1,
+            sni: "127.0.0.1".to_string(),
+            token: "test-token".to_string(),
+            insecure_tls: true,
+            tls,
+            max_pad: 64,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            psk: Some("test-psk".to_string()),
+            decoy_max: 32,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_extra_headers: Arc::new(Vec::new()),
+            max_ws_binary: DEFAULT_MAX_WS_BINARY,
+            ws_ping_secs: 25,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            udp_mux_max_pad: 64,
+            udp_mux_max_ws_binary: DEFAULT_MAX_WS_BINARY,
+            udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
+            tls_profile: TlsClientProfile::default(),
+            ws_path: "/ws".to_string(),
+            use_tcp_mux: true,
+            pad_mode: PadMode::Adaptive,
+            dummy_interval_secs: 0,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 0,
+            decoy_gets_paths: Vec::new(),
+            proto: 3,
+            proto_domain: "default".to_string(),
+            reality_target: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            decoy_mode: DecoyMode::default(),
+            desync_mode: DesyncMode::default(),
+            tcp_fooling: TcpFooling::default(),
+            tls_fragment: false,
+            ws_parallel: 1,
+            idle_decoy_secs: 0,
+            activity: None,
+            socks_auth: None,
+            socks_bind: "127.0.0.1:1080".to_string(),
+            tls_stack: TlsStack::Rustls,
+            pinned_certs_pem: None,
+        })
+    }
+
+    fn test_session() -> SessionGuard {
+        let (_tx, rx) = watch::channel(false);
+        SessionGuard::new(rx)
+    }
+
+    async fn spawn_http_proxy_handler(
+        cfg: Arc<ClientCfg>,
+        tcp_mux_slot: TcpMuxSlot,
+        session: SessionGuard,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind http proxy test listener");
+        let addr = listener.local_addr().expect("proxy local_addr");
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = handle_http_peer(sock, cfg, tcp_mux_slot, session).await;
+            }
+        });
+        addr
+    }
+
+    async fn spawn_echo_origin(
+        expected_prefix: Vec<u8>,
+        marker: &'static [u8],
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind origin listener");
+        let addr = listener.local_addr().expect("origin local_addr");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("origin accept");
+            let mut buf = vec![0u8; 4096];
+            let mut got = Vec::new();
+            while got.len() < expected_prefix.len() {
+                let n = sock.read(&mut buf).await.expect("origin read");
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expected_prefix);
+            sock.write_all(marker).await.expect("origin write marker");
+            sock.shutdown().await.ok();
+            let _ = tx.send(());
+        });
+        (addr, rx)
+    }
+
+    fn response_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[tokio::test]
+    async fn http_connect_bypass_uses_direct_relay_with_prefetch() {
+        let _guard = BypassDomainsGuard::with(&["localhost"]);
+        let prefetch = b"TLS_CLIENT_HELLO_PREFIX";
+        let marker = b"ROUNDTRIP_OK";
+        let (origin_addr, origin_done) =
+            spawn_echo_origin(prefetch.to_vec(), marker).await;
+        let origin_port = origin_addr.port();
+
+        let cfg = test_http_proxy_cfg();
+        let tcp_mux_slot: TcpMuxSlot = Arc::new(tokio::sync::Mutex::new(None));
+        let session = test_session();
+        let proxy_addr = spawn_http_proxy_handler(cfg, tcp_mux_slot, session).await;
+
+        let mut client = TcpStream::connect(proxy_addr)
+            .await
+            .expect("connect proxy");
+        let req = format!(
+            "CONNECT localhost:{origin_port} HTTP/1.1\r\nHost: localhost:{origin_port}\r\n\r\n"
+        );
+        let mut payload = Vec::from(req.as_bytes());
+        payload.extend_from_slice(prefetch);
+        client.write_all(&payload).await.expect("write CONNECT+prefetch");
+
+        let mut resp = vec![0u8; 512];
+        let n = timeout(Duration::from_secs(5), client.read(&mut resp))
+            .await
+            .expect("read response timeout")
+            .expect("read response");
+        assert!(
+            resp[..n].starts_with(b"HTTP/1.1 200"),
+            "expected 200 Connection Established, got {:?}",
+            std::str::from_utf8(&resp[..n])
+        );
+
+        let mut marker_buf = [0u8; 32];
+        let n2 = timeout(Duration::from_secs(5), client.read(&mut marker_buf))
+            .await
+            .expect("read marker timeout")
+            .expect("read marker");
+        assert_eq!(&marker_buf[..n2], marker);
+
+        origin_done.await.expect("origin handler");
+    }
+
+    #[tokio::test]
+    async fn http_connect_non_bypass_host_returns_502_without_origin() {
+        let _guard = BypassDomainsGuard::with(&["localhost"]);
+        let origin = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind origin");
+        let origin_port = origin.local_addr().expect("origin addr").port();
+
+        let cfg = test_http_proxy_cfg();
+        let tcp_mux_slot: TcpMuxSlot = Arc::new(tokio::sync::Mutex::new(None));
+        let session = test_session();
+        let proxy_addr = spawn_http_proxy_handler(cfg, tcp_mux_slot, session).await;
+
+        let origin_task = tokio::spawn(async move {
+            timeout(Duration::from_millis(500), origin.accept()).await
+        });
+
+        let mut client = TcpStream::connect(proxy_addr)
+            .await
+            .expect("connect proxy");
+        let req = format!(
+            "CONNECT not-bypassed.example:{origin_port} HTTP/1.1\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.expect("write CONNECT");
+
+        let mut resp = vec![0u8; 256];
+        let n = timeout(Duration::from_secs(180), client.read(&mut resp))
+            .await
+            .expect("read 502 timeout")
+            .expect("read 502");
+        let resp_s = std::str::from_utf8(&resp[..n]).expect("utf8 response");
+        assert!(
+            resp_s.contains("502"),
+            "expected 502 Bad Gateway, got {resp_s:?}"
+        );
+
+        let accept_res = origin_task.await.expect("origin task join");
+        assert!(
+            accept_res.is_err(),
+            "origin must not accept a connection for non-bypass host"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_forward_bypass_rewrites_request_without_connect_ok() {
+        let _guard = BypassDomainsGuard::with(&["localhost"]);
+        let expected = b"GET /path HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let marker = b"DIRECT_HTTP_OK";
+        let (origin_addr, origin_done) = spawn_echo_origin(expected.to_vec(), marker).await;
+        let origin_port = origin_addr.port();
+
+        let cfg = test_http_proxy_cfg();
+        let tcp_mux_slot: TcpMuxSlot = Arc::new(tokio::sync::Mutex::new(None));
+        let session = test_session();
+        let proxy_addr = spawn_http_proxy_handler(cfg, tcp_mux_slot, session).await;
+
+        let mut client = TcpStream::connect(proxy_addr)
+            .await
+            .expect("connect proxy");
+        let req = format!(
+            "GET http://localhost:{origin_port}/path HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.expect("write GET");
+
+        let mut first = vec![0u8; 256];
+        let n = timeout(Duration::from_secs(5), client.read(&mut first))
+            .await
+            .expect("read origin response timeout")
+            .expect("read origin response");
+        assert_eq!(
+            &first[..n],
+            marker,
+            "client should receive origin bytes directly, not HTTP/1.1 200"
+        );
+        assert!(
+            !response_contains(&first[..n], b"Connection Established"),
+            "ForwardHttp bypass must not emit CONNECT 200"
+        );
+
+        origin_done.await.expect("origin handler");
     }
 }
 
