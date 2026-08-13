@@ -22,6 +22,7 @@ pub mod protocol;
 mod retry;
 pub use retry::ServerWsOutTiming;
 pub mod socks5;
+pub mod startup_secrets;
 pub mod start_json_config;
 pub mod stealth;
 pub mod stealth_v12;
@@ -58,6 +59,11 @@ pub use reality::{
 };
 pub use start_json_config::{
     local_client_options_from_json_str, local_client_options_from_json_str_with_binds,
+};
+pub use startup_secrets::{
+    client_reality_configured, is_token_denylisted, log_lab_mode_enabled,
+    log_reality_without_psk, require_psk, resolve_cli_token, server_reality_configured,
+    validate_resolved_token, LAB_DEFAULT_TOKEN,
 };
 pub use stealth::browser_websocket_request;
 pub use stealth_v12::{

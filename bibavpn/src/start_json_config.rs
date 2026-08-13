@@ -14,6 +14,9 @@ use crate::local_client::{
 use crate::logging::{self, LogConfig, LogFormat};
 use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
 use crate::client_policy::tls_profile_from_invite;
+use crate::startup_secrets::{
+    client_reality_configured, require_psk, validate_resolved_token,
+};
 use crate::tls_util::{TlsClientProfile, TlsStack};
 use crate::{decode_invite_v1, InviteV1, PadMode};
 
@@ -21,7 +24,7 @@ use crate::{decode_invite_v1, InviteV1, PadMode};
 struct StartJson {
     #[serde(default)]
     server: String,
-    /// Omitted or null: use invite token, or `"change-me"` when no invite.
+    /// Omitted or null: use invite token when `from_invite` is set; otherwise required.
     #[serde(default)]
     token: Option<String>,
     sni: Option<String>,
@@ -346,8 +349,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| "change-me".to_string())
+            .ok_or_else(|| anyhow::anyhow!("token is required when not using invite"))?
     };
+    validate_resolved_token(&token)?;
 
     let psk = if let Some(ref inv) = invite_pair {
         let from_j = j
@@ -689,6 +693,10 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         }
     }
 
+    let reality_configured =
+        client_reality_configured(reality_target.as_deref(), reality_public_key.as_ref());
+    require_psk(psk.as_deref(), reality_configured, false)?;
+
     let sni = crate::reality::effective_tls_sni(&sni, reality_target.as_deref());
 
     let socks_bind = invite_pair
@@ -801,6 +809,93 @@ mod merge_tests {
 
     const BASE: &str =
         r#"{"server":"127.0.0.1:8443","token":"t","psk":"0123456789abcdef0123456789abcdef"}"#;
+
+    #[test]
+    fn json_without_token_or_invite_fails() {
+        let j = r#"{"server":"127.0.0.1:8443","psk":"0123456789abcdef0123456789abcdef"}"#;
+        assert!(local_client_options_from_json_str(j).is_err());
+    }
+
+    #[test]
+    fn json_denylisted_token_fails() {
+        let j = r#"{"server":"127.0.0.1:8443","token":"change-me","psk":"0123456789abcdef0123456789abcdef"}"#;
+        assert!(local_client_options_from_json_str(j).is_err());
+    }
+
+    #[test]
+    fn json_token_without_psk_or_reality_fails() {
+        let j = r#"{"server":"127.0.0.1:8443","token":"t"}"#;
+        assert!(local_client_options_from_json_str(j).is_err());
+    }
+
+    #[test]
+    fn invite_without_json_token_ok() {
+        use crate::invite_uri::{encode_invite_v1, InviteV1};
+
+        let inv = InviteV1 {
+            v: 1,
+            server: "10.0.0.2:443".into(),
+            sni: "vpn.example.com".into(),
+            token: "tok".into(),
+            proto: 3,
+            proto_domain: None,
+            psk: Some("0123456789abcdef0123456789abcdef".into()),
+            decoy_max: 8,
+            max_pad: 64,
+            max_ws_binary: 1400,
+            ws_ping_secs: 25,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            udp_max_pad: None,
+            udp_max_ws_binary: None,
+            udp_mux_reply_timeout_secs: 130,
+            insecure: true,
+            tls_profile: "default".into(),
+            ws_path: None,
+            pad_mode: None,
+            dummy_interval_secs: None,
+            http_proxy: None,
+            socks_bind: None,
+            socks_auth_user: None,
+            socks_auth_password: None,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_headers: vec![],
+            use_tcp_mux: true,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 30,
+            decoy_gets_paths: None,
+            fingerprint: None,
+            stealth_profile: None,
+            decoy_mode: None,
+            desync_mode: None,
+            tcp_fooling: None,
+            tls_fragment: false,
+            ws_parallel: 1,
+            idle_decoy_secs: None,
+            tls_stack: "rustls".into(),
+            reality_target: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            pin_cert_pem: None,
+            server_ack_delay_min_ms: None,
+            server_ack_delay_max_ms: None,
+            rtt_mask_jitter_ms: None,
+            ack_profile: None,
+        };
+        let uri = encode_invite_v1(&inv, "passphrase-test").unwrap();
+        let j = format!(
+            r#"{{"from_invite":"{uri}","invite_passphrase":"passphrase-test"}}"#
+        );
+        let o = local_client_options_from_json_str(&j).unwrap();
+        assert_eq!(o.token, "tok");
+    }
 
     #[test]
     fn proto_domain_defaults_to_default_label() {

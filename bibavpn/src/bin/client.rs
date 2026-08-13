@@ -17,6 +17,10 @@ use bibavpn::stealth_v12::{
     preset,
 };
 use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile, TlsStack};
+use bibavpn::startup_secrets::{
+    client_reality_configured, log_lab_mode_enabled, log_reality_without_psk, require_psk,
+    resolve_cli_token, validate_resolved_token,
+};
 use bibavpn::client_policy::tls_profile_from_invite;
 use clap::Parser;
 use base64::Engine;
@@ -45,8 +49,16 @@ struct Args {
     )]
     server: Option<String>,
 
-    #[arg(long, default_value = "change-me", conflicts_with = "from_invite")]
-    token: String,
+    #[arg(
+        long,
+        conflicts_with = "from_invite",
+        required_unless_present_any = ["from_invite", "lab"]
+    )]
+    token: Option<String>,
+
+    /// Local demos only: allow missing `--token` (uses `change-me`), skip token denylist, relax PSK when REALITY is configured.
+    #[arg(long, default_value_t = false)]
+    lab: bool,
 
     #[arg(long)]
     sni: Option<String>,
@@ -246,6 +258,9 @@ async fn main() -> anyhow::Result<()> {
     if args.from_invite.is_some() != args.invite_passphrase.is_some() {
         anyhow::bail!("use --from-invite and --invite-passphrase together");
     }
+    if args.lab {
+        log_lab_mode_enabled();
+    }
 
     let inv_opt = if let Some(uri) = args.from_invite.as_ref() {
         let pass = args
@@ -316,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
             h,
             p,
             sni,
-            args.token.clone(),
+            resolve_cli_token(args.token.as_deref(), args.lab)?,
             args.max_pad,
             args.junk_frames,
             args.early_ws_frames,
@@ -335,6 +350,17 @@ async fn main() -> anyhow::Result<()> {
             args.proto,
             args.proto_domain.clone(),
         )
+    };
+
+    let token = if inv_opt.is_some() {
+        if args.lab {
+            token
+        } else {
+            validate_resolved_token(&token)?;
+            token
+        }
+    } else {
+        token
     };
 
     let stealth_for_merge: Option<StealthProfile> = (|| -> anyhow::Result<Option<StealthProfile>> {
@@ -520,6 +546,13 @@ async fn main() -> anyhow::Result<()> {
                 "REALITY mode requires both target and public key (CLI or biba://)"
             );
         }
+    }
+
+    let reality_configured =
+        client_reality_configured(reality_target.as_deref(), reality_public_key.as_ref());
+    require_psk(psk.as_deref(), reality_configured, args.lab)?;
+    if reality_configured && psk.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        log_reality_without_psk();
     }
 
     let decoy_gets = if let Some(ref pr) = pr_opt {
