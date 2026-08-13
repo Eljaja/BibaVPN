@@ -14,7 +14,11 @@ extern "C" {
  */
 int32_t bibavpn_ffi_start(const char *config_json_utf8, char **err_out);
 
-/** Stop client if running; idempotent. */
+/**
+ * Stop client if running; idempotent.
+ * Returns within ~5s even if the client thread is stuck (shutdown is signalled,
+ * then the join is bounded — same as Android JNI `nativeStop`).
+ */
 void bibavpn_ffi_stop(void);
 
 /**

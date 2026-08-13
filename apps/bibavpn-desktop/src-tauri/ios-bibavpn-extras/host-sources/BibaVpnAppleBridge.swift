@@ -149,7 +149,7 @@ public func bibavpn_ios_tunnel_is_active() -> Bool {
             guard let p = m.protocolConfiguration as? NETunnelProviderProtocol else { continue }
             guard p.providerBundleIdentifier == tunnelBundleId else { continue }
             switch m.connection.status {
-            case .connected, .connecting, .reasserting:
+            case .connected:
                 on = true
             default:
                 break

@@ -13,6 +13,52 @@ use tracing_subscriber::EnvFilter;
 struct NativeState {
     shutdown_tx: Option<watch::Sender<bool>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Closed by the client thread's own sender when its body (and therefore the
+    /// tokio runtime drop) has finished. Gives [`stop_client_bounded`] the timed
+    /// join that `JoinHandle` does not offer.
+    done_rx: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+/// How long a stop waits for the client thread before detaching it.
+/// Mirrors the Android JNI bound in `apps/bibavpn-jni/src/lib.rs`.
+const STOP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Signal shutdown and wait for the client thread, but never longer than
+/// [`STOP_JOIN_TIMEOUT`].
+///
+/// Dropping the runtime waits for outstanding `spawn_blocking` work (e.g.
+/// `lookup_host`/getaddrinfo on a dead network), so the wait has to be bounded.
+/// The shutdown signal has already been sent, so a detached thread still winds
+/// down on its own.
+fn stop_client_bounded(s: &mut NativeState) {
+    if let Some(tx) = s.shutdown_tx.take() {
+        let _ = tx.send(true);
+    }
+    let handle = s.thread.take();
+    let Some(rx) = s.done_rx.take() else {
+        // No completion channel (older state): fall back to a plain join.
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+        return;
+    };
+    match rx.recv_timeout(STOP_JOIN_TIMEOUT) {
+        // Sender dropped: the thread body returned, so `join` is immediate.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Some(h) = handle {
+                let _ = h.join();
+            }
+        }
+        // Nobody ever sends on this channel; treat anything else as "still
+        // running" and detach rather than risk blocking the caller.
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                "stop: client thread still running after {:?}; detaching (shutdown already signalled)",
+                STOP_JOIN_TIMEOUT
+            );
+            drop(handle);
+        }
+    }
 }
 
 static STATE: Mutex<Option<NativeState>> = Mutex::new(None);
@@ -101,12 +147,7 @@ pub unsafe extern "C" fn bibavpn_ffi_start(
             .unwrap_or(true);
         if thread_done {
             if let Some(mut s) = guard.take() {
-                if let Some(tx) = s.shutdown_tx.take() {
-                    let _ = tx.send(true);
-                }
-                if let Some(h) = s.thread.take() {
-                    let _ = h.join();
-                }
+                stop_client_bounded(&mut s);
             }
         } else {
             tracing::warn!("bibavpn_ffi_start: already running");
@@ -132,7 +173,11 @@ pub unsafe extern "C" fn bibavpn_ffi_start(
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Never sent on: the receiver observes the *drop* of this sender, which
+    // happens when the closure below returns — after the runtime is dropped.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::spawn(move || {
+        let _done_tx = done_tx;
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -155,6 +200,7 @@ pub unsafe extern "C" fn bibavpn_ffi_start(
     *guard = Some(NativeState {
         shutdown_tx: Some(shutdown_tx),
         thread: Some(thread),
+        done_rx: Some(done_rx),
     });
     drop(guard);
 
@@ -181,12 +227,7 @@ pub unsafe extern "C" fn bibavpn_ffi_start(
                 }
             };
             if let Some(mut s) = guard.take() {
-                if let Some(tx) = s.shutdown_tx.take() {
-                    let _ = tx.send(true);
-                }
-                if let Some(h) = s.thread.take() {
-                    let _ = h.join();
-                }
+                stop_client_bounded(&mut s);
             }
             unsafe { set_err(err_out, msg) };
             -5
@@ -208,11 +249,72 @@ pub extern "C" fn bibavpn_ffi_stop() {
         None => return,
     };
 
-    if let Some(tx) = s.shutdown_tx.take() {
-        let _ = tx.send(true);
+    stop_client_bounded(&mut s);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_idle_when_state_none() {
+        let start = std::time::Instant::now();
+        bibavpn_ffi_stop();
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
     }
-    if let Some(h) = s.thread.take() {
-        let _ = h.join();
+
+    #[test]
+    fn stop_client_bounded_detaches_stuck_thread_within_timeout() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let thread = std::thread::spawn(move || {
+            let _done_tx = done_tx;
+            let _shutdown_rx = shutdown_rx;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        });
+        let mut state = NativeState {
+            shutdown_tx: Some(shutdown_tx),
+            thread: Some(thread),
+            done_rx: Some(done_rx),
+        };
+        let start = std::time::Instant::now();
+        stop_client_bounded(&mut state);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= STOP_JOIN_TIMEOUT,
+            "expected at least {:?}, got {:?}",
+            STOP_JOIN_TIMEOUT,
+            elapsed
+        );
+        assert!(
+            elapsed < STOP_JOIN_TIMEOUT + std::time::Duration::from_secs(2),
+            "expected bounded stop within ~7s, got {:?}",
+            elapsed
+        );
+        assert!(state.thread.is_none());
+    }
+
+    #[test]
+    fn stop_client_bounded_joins_finished_thread() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _done_tx = done_tx;
+        });
+        let mut state = NativeState {
+            shutdown_tx: None,
+            thread: Some(thread),
+            done_rx: Some(done_rx),
+        };
+        let start = std::time::Instant::now();
+        stop_client_bounded(&mut state);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "finished thread should join quickly, took {:?}",
+            start.elapsed()
+        );
+        assert!(state.thread.is_none());
     }
 }
 

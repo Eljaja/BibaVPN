@@ -50,9 +50,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func completeTunnelForwarding(sessionJson: String, completionHandler: @escaping (Error?) -> Void) {
         // Example proxy URL after parity inject (`socks_auth_*`, like [`BibaVpnService.kt`](../../android-bibavpn-extras/java/dev/bibavpn/BibaVpnService.kt)):
         _ = Self.tun2socksProxyURL(fromSessionJson: sessionJson)
-        NSLog("[BibaVPN] Tunnel Rust SOCKS ready — integrate Tun2socksEngine here for full routing")
+        NSLog("[BibaVPN] Tunnel Rust SOCKS ready — Tun2socks not wired; refusing Connected without forwarding")
 
-        completionHandler(nil)
+        bibavpn_ffi_stop()
+        let msg =
+            "Packet forwarding is not implemented on iOS (Tun2socks not wired). The tunnel cannot start."
+        completionHandler(
+            NSError(
+                domain: "BibaVPN",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: msg],
+            ),
+        )
     }
 
     override func stopTunnel(with _: NEProviderStopReason, completionHandler: @escaping () -> Void) {
