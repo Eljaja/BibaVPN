@@ -18,6 +18,7 @@ path = "src/bin/mint_invite.rs"
 
 [dependencies]
 anyhow = "1.0"
+argon2 = "0.5"
 base64 = "0.22"
 biba = { path = "../biba", features = ["rustls"] }
 blake3 = "1.5"
