@@ -259,7 +259,8 @@ struct Args {
     #[arg(long)]
     reality_short_ids: Option<String>,
 
-    /// REALITY mode: server names for SNI (comma-separated). Default: extracted from target.
+    /// REALITY mode: enforced TLS SNI / HTTP Host allowlist (comma-separated).
+    /// Default: host from `--reality-target`. An empty list accepts any name (startup WARN).
     #[arg(long)]
     reality_server_names: Option<String>,
 }
@@ -577,8 +578,20 @@ async fn main() -> anyhow::Result<()> {
         let server_names = args
             .reality_server_names
             .as_ref()
-            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_else(|| vec![extract_sni(target)]);
+
+        if server_names.is_empty() {
+            warn!(
+                target: "bibavpn_security",
+                "REALITY server-name allowlist is empty; accepting ANY TLS SNI / HTTP Host"
+            );
+        }
 
         let short_ids: Vec<[u8; 8]> = args
             .reality_short_ids
@@ -1156,9 +1169,11 @@ async fn handle_one(
     )
     .await?;
 
+    let tls_sni = tls.get_ref().1.server_name().map(str::to_string);
+
     // Covers the HTTP head read (`incoming::read_http_head` has no deadline of its own)
     // plus writing the camouflage answer; a real probe is served long before it expires.
-    let Some((mut ws, ws_kind)) = with_setup_timeout(
+    let Some((mut ws, ws_kind, http_host)) = with_setup_timeout(
         "websocket upgrade / camouflage http",
         params.handshake_timeout,
         &params.stats,
@@ -1207,7 +1222,13 @@ async fn handle_one(
         // one is an auth step, so it also feeds the per-IP rate limiter.
         match timeout(
             handshake_timeout,
-            server_handshake_reality(&mut ws, reality_cfg, &token),
+            server_handshake_reality(
+                &mut ws,
+                reality_cfg,
+                &token,
+                tls_sni.as_deref(),
+                http_host.as_deref(),
+            ),
         )
         .await
         {

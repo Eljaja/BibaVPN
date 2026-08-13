@@ -376,7 +376,14 @@ bibavpn-server \
   --reality-target 'vk.com:443' \
   --reality-private-key "$REALITY_PRIV_B64" \
   --reality-short-ids '0123456789abcdef'   # optional; omit = any; 000…000 = wildcard
+  --reality-server-names 'vk.com'          # optional; enforced TLS SNI / HTTP Host allowlist
 ```
+
+Omitting `--reality-server-names` defaults to the host from `--reality-target` (e.g. `vk.com`)
+and is **enforced** — sessions whose TLS SNI and/or HTTP `Host` are not in the list are dropped
+in the REALITY handshake before mux. Passing the flag with an empty list after parsing (e.g.
+`--reality-server-names ''` or only commas) accepts **any** name; the server logs a `WARN` on
+`bibavpn_security` at startup.
 
 Omitting `--reality-short-ids` (or listing `0000000000000000`) accepts **any** short ID; the server
 logs a `WARN` on `bibavpn_security` at startup. Clients still have to pass the REALITY AUTH frame

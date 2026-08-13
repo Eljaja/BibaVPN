@@ -35,7 +35,7 @@ pub async fn accept_websocket_or_camouflage<S>(
     token: &str,
     camo: CamouflageServeConfig,
     peer: Option<SocketAddr>,
-) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind)>>
+) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind, Option<String>)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -74,6 +74,7 @@ where
         };
 
         let key = header_line(&req, "Sec-WebSocket-Key").context("websocket: missing key")?;
+        let http_host = header_line(&req, "Host");
         let ver = header_line(&req, "Sec-WebSocket-Version").unwrap_or_else(|| "13".to_string());
         if ver != "13" {
             write_camouflage_status(&mut stream, 400).await?;
@@ -103,7 +104,7 @@ Sec-WebSocket-Accept: {accept}\r\n\
         let ws =
             WebSocketStream::from_partially_read(stream, remainder, Role::Server, Some(ws_cfg))
                 .await;
-        return Ok(Some((ws, kind)));
+        return Ok(Some((ws, kind, http_host)));
     }
 
     // Plain HTTP

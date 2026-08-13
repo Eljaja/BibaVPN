@@ -318,6 +318,72 @@ fn validate_short_id(short_id: &[u8; 8], cfg: &RealityServerConfig) -> anyhow::R
     );
 }
 
+/// Normalize a presented TLS SNI or HTTP `Host` for allowlist comparison: trim and
+/// strip a trailing `:port` when the suffix is decimal digits.
+pub fn normalize_server_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return host.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Whether the outer TLS SNI and/or HTTP `Host` are allowed by `server_names`.
+///
+/// An empty allowlist accepts any name (including absent SNI/Host). A non-empty
+/// list requires every presented identifier to match (case-insensitive, after
+/// normalization); if neither SNI nor Host is present, the session is rejected.
+pub fn is_server_name_allowed(
+    tls_sni: Option<&str>,
+    http_host: Option<&str>,
+    allowed: &[String],
+) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+
+    let normalized_allowed: Vec<String> = allowed
+        .iter()
+        .map(|s| normalize_server_name(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if normalized_allowed.is_empty() {
+        return true;
+    }
+
+    let mut presented = Vec::new();
+    if let Some(sni) = tls_sni.map(str::trim).filter(|s| !s.is_empty()) {
+        presented.push(normalize_server_name(sni));
+    }
+    if let Some(host) = http_host.map(str::trim).filter(|s| !s.is_empty()) {
+        presented.push(normalize_server_name(host));
+    }
+    if presented.is_empty() {
+        return false;
+    }
+
+    presented.iter().all(|name| {
+        normalized_allowed
+            .iter()
+            .any(|allowed_name| allowed_name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn validate_server_names(
+    tls_sni: Option<&str>,
+    http_host: Option<&str>,
+    cfg: &RealityServerConfig,
+) -> anyhow::Result<()> {
+    if is_server_name_allowed(tls_sni, http_host, &cfg.server_names) {
+        return Ok(());
+    }
+    bail!(
+        "REALITY: TLS SNI / HTTP Host not in server allowlist (configure --reality-server-names)"
+    );
+}
+
 /// Next binary frame during a REALITY handshake, answering Ping and skipping
 /// Pong within `MAX_HANDSHAKE_CONTROL_FRAMES`. `what` names the expected frame
 /// in error messages; `control_frames` is the budget shared by all handshake
@@ -364,10 +430,14 @@ pub async fn server_handshake_reality<S>(
     ws: &mut WebSocketStream<S>,
     cfg: &RealityServerConfig,
     token: &str,
+    tls_sni: Option<&str>,
+    http_host: Option<&str>,
 ) -> anyhow::Result<[u8; 32]>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    validate_server_names(tls_sni, http_host, cfg)?;
+
     let mut control_frames: u32 = 0;
     let msg = next_handshake_binary(ws, &mut control_frames, "REALITY HELLO").await?;
 
@@ -690,6 +760,39 @@ mod tests {
         let allowed = [[8, 7, 6, 5, 4, 3, 2, 1]];
         assert!(!is_short_id_allowed(&id, &allowed));
         assert!(is_short_id_allowed(&allowed[0], &allowed));
+    }
+
+    #[test]
+    fn server_name_allowed_empty_list_accepts_any() {
+        let allowed: Vec<String> = vec![];
+        assert!(is_server_name_allowed(None, None, &allowed));
+        assert!(is_server_name_allowed(Some("evil.example"), None, &allowed));
+    }
+
+    #[test]
+    fn server_name_allowed_listed_match_case_and_port() {
+        let allowed = vec!["VK.com".into()];
+        assert!(is_server_name_allowed(Some("vk.com"), None, &allowed));
+        assert!(is_server_name_allowed(None, Some("VK.COM:443"), &allowed));
+        assert!(is_server_name_allowed(Some("vk.com:443"), Some("vk.com"), &allowed));
+    }
+
+    #[test]
+    fn server_name_rejects_mismatch() {
+        let allowed = vec!["vk.com".into()];
+        assert!(!is_server_name_allowed(Some("127.0.0.1"), None, &allowed));
+        assert!(!is_server_name_allowed(
+            Some("vk.com"),
+            Some("other.example"),
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn server_name_rejects_missing_when_listed() {
+        let allowed = vec!["vk.com".into()];
+        assert!(!is_server_name_allowed(None, None, &allowed));
+        assert!(!is_server_name_allowed(Some(""), Some("   "), &allowed));
     }
 
     #[test]

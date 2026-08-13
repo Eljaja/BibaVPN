@@ -225,7 +225,7 @@ the mux record header when chunking TCP).
 - `--early-ws-frames`, `--junk-frames`
 - `--pin-cert` (client) — incompatible with `--insecure`; supported on **rustls** and **boring** (`boring-tls` build)
 - `--reality-target`, `--reality-public-key`, `--reality-short-id` (client) — WSS REALITY front mode; invite JSON mirrors these fields
-- Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any + startup `WARN`; all-zero entry = wildcard + startup `WARN`), `--reality-server-names` (optional SNI allowlist; default = host from target). `--token` is **required** on the REALITY path too: it keys the client AUTH MAC.
+- Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any + startup `WARN`; all-zero entry = wildcard + startup `WARN`), `--reality-server-names` (optional enforced TLS SNI / HTTP Host allowlist; default = host from target; empty list = any + startup `WARN`). `--token` is **required** on the REALITY path too: it keys the client AUTH MAC.
 - `--ws-path` / server `--ws-path` — WebSocket path; token via `AUTH`
 (default `/ws`)
 - Client `--proto` (only `**3`** is supported) and `--proto-domain` (KDF label;
