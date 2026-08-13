@@ -961,6 +961,7 @@ pub fn server_card_subtitle(cfg: &SavedConfig) -> String {
 #[cfg(test)]
 mod split_bypass_json_tests {
     use super::TunnelProfile;
+    use crate::bypass_domains::{seed_test_cache, BypassPresetInfo};
 
     fn profile() -> TunnelProfile {
         TunnelProfile {
@@ -990,5 +991,24 @@ mod split_bypass_json_tests {
         p.split_tunnel_preset_ids = Vec::new();
         let json = p.start_config_json().expect("build start json");
         assert!(!json.contains("split_bypass_domains"), "got: {json}");
+    }
+
+    #[test]
+    fn present_when_cache_seeded_and_presets_selected() {
+        seed_test_cache(vec![
+            BypassPresetInfo {
+                id: "banks".to_string(),
+                label: "Banks".to_string(),
+                source: None,
+                domains: vec!["sberbank.ru".to_string()],
+                android_packages: vec![],
+            },
+        ]);
+        let mut p = profile();
+        p.split_tunnel_enabled = true;
+        p.split_tunnel_preset_ids = vec!["banks".to_string()];
+        let json = p.start_config_json().expect("build start json");
+        assert!(json.contains("split_bypass_domains"), "got: {json}");
+        assert!(json.contains("sberbank.ru"), "got: {json}");
     }
 }
