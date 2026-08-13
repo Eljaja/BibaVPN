@@ -26,6 +26,10 @@ on:
       - "!biba/**/*.md"
       - "apps/bibavpn-desktop/**"
       - "!apps/bibavpn-desktop/**/*.md"
+      - "apps/bibavpn-jni/**"
+      - "!apps/bibavpn-jni/**/*.md"
+      - "apps/bibavpn-ffi/**"
+      - "!apps/bibavpn-ffi/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -40,6 +44,10 @@ on:
       - "!biba/**/*.md"
       - "apps/bibavpn-desktop/**"
       - "!apps/bibavpn-desktop/**/*.md"
+      - "apps/bibavpn-jni/**"
+      - "!apps/bibavpn-jni/**/*.md"
+      - "apps/bibavpn-ffi/**"
+      - "!apps/bibavpn-ffi/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -55,6 +63,7 @@ jobs:
     outputs:
       core: ${{ steps.plan.outputs.core }}
       desktop: ${{ steps.plan.outputs.desktop }}
+      mobile: ${{ steps.plan.outputs.mobile }}
     steps:
       - uses: actions/checkout@v4
 
@@ -80,20 +89,32 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - '.github/workflows/test.yml'
+            mobile:
+              - 'apps/bibavpn-jni/**'
+              - '!apps/bibavpn-jni/**/*.md'
+              - 'apps/bibavpn-ffi/**'
+              - '!apps/bibavpn-ffi/**/*.md'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/test.yml'
 
       - name: Plan which test jobs to run
         id: plan
         env:
           FILTER_CORE: ${{ steps.filter.outputs.core }}
           FILTER_DESKTOP: ${{ steps.filter.outputs.desktop }}
+          FILTER_MOBILE: ${{ steps.filter.outputs.mobile }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
             echo "core=true" >> "$GITHUB_OUTPUT"
             echo "desktop=true" >> "$GITHUB_OUTPUT"
+            echo "mobile=true" >> "$GITHUB_OUTPUT"
           else
             echo "core=${FILTER_CORE:-false}" >> "$GITHUB_OUTPUT"
             echo "desktop=${FILTER_DESKTOP:-false}" >> "$GITHUB_OUTPUT"
+            echo "mobile=${FILTER_MOBILE:-false}" >> "$GITHUB_OUTPUT"
           fi
 
   core:
@@ -146,3 +167,21 @@ jobs:
 
       - name: cargo test -p bibavpn-desktop
         run: cargo test -p bibavpn-desktop --locked
+
+  mobile:
+    name: cargo test (bibavpn-jni, bibavpn-ffi)
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test -p bibavpn-jni -p bibavpn-ffi
+        run: cargo test -p bibavpn-jni -p bibavpn-ffi --locked
