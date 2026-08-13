@@ -556,6 +556,7 @@ class BibaVpnService : VpnService() {
 
     /** nativeStart ждёт bind SOCKS в Rust — не блокируем main thread (ANR). */
     private fun enqueueBootstrapWorker(sessionJson: String) {
+        clearLastConnectError()
         val worker =
             Thread(
                 {
@@ -575,6 +576,7 @@ class BibaVpnService : VpnService() {
                                 Log.w(TAG, "nativeStart: $err — оставляем сервис как есть")
                                 return@Thread
                             }
+                            setLastConnectError(err)
                             setTunnelActive(false)
                             mainHandler.post {
                                 android.widget.Toast.makeText(
@@ -591,6 +593,7 @@ class BibaVpnService : VpnService() {
                         Log.i(TAG, "worker: nativeStart OK — startVpnTunnel")
                         if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
                             Log.e(TAG, "startVpnTunnel returned false — nativeStop + stopSelf")
+                            setLastConnectError("vpn_tunnel_start_failed")
                             setTunnelActive(false)
                             synchronized(nativeLifecycleLock) {
                                 BibaNative.nativeStop()
@@ -602,6 +605,7 @@ class BibaVpnService : VpnService() {
                             return@Thread
                         }
                     } catch (e: Throwable) {
+                        setLastConnectError(e.message ?: e.javaClass.simpleName)
                         setTunnelActive(false)
                         Log.e(TAG, "vpn start thread", e)
                         mainHandler.post {
@@ -1151,6 +1155,22 @@ class BibaVpnService : VpnService() {
         var isTunnelActive: Boolean = false
             private set
 
+        /** Последняя ошибка connect/bootstrap для overlay в Rust snapshot (не активный туннель). */
+        @Volatile
+        private var lastConnectError: String? = null
+
+        @JvmStatic
+        fun lastConnectError(): String? = lastConnectError
+
+        @JvmStatic
+        fun clearLastConnectError() {
+            lastConnectError = null
+        }
+
+        private fun setLastConnectError(msg: String) {
+            lastConnectError = msg
+        }
+
         /** Якорь [SystemClock.elapsedRealtime] в момент [setTunnelActive](true); 0 если туннеля нет. */
         @Volatile
         private var tunnelConnectedSinceElapsed: Long = 0L
@@ -1166,6 +1186,7 @@ class BibaVpnService : VpnService() {
             if (active) {
                 isTunnelActive = true
                 tunnelConnectedSinceElapsed = SystemClock.elapsedRealtime()
+                clearLastConnectError()
             } else {
                 isTunnelActive = false
                 tunnelConnectedSinceElapsed = 0L

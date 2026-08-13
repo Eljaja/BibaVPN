@@ -8,6 +8,7 @@ import android.os.Handler
 import android.util.Log
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Вызовы из Rust (Tauri) через JNI. Рефлексия к [app.tauri.plugin.PluginManager], чтобы модуль
@@ -26,6 +27,15 @@ object TauriVpnBridge {
     @JvmStatic
     fun tunnelSessionElapsedMillis(): Long = BibaVpnService.tunnelSessionElapsedMillis()
 
+    /** Последняя ошибка bootstrap (nativeStart / TUN); null если нет или туннель уже активен. */
+    @JvmStatic
+    fun lastConnectError(): String? = BibaVpnService.lastConnectError()
+
+    @JvmStatic
+    fun clearLastConnectError() {
+        BibaVpnService.clearLastConnectError()
+    }
+
     @JvmStatic
     fun requestDisconnect(context: android.content.Context) {
         val app = context.applicationContext
@@ -37,7 +47,7 @@ object TauriVpnBridge {
     }
 
     /**
-     * @return null при успешной постановке в очередь (сервис стартовал или запущен диалог VPN);
+     * @return null при успешной постановке в очередь (сервис стартовал после разрешения VPN);
      *   не-null — строка ошибки для показа/лога в Rust.
      */
     @JvmStatic
@@ -50,46 +60,47 @@ object TauriVpnBridge {
         screenOffBatterySaver: Boolean,
     ): String? {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            return requestConnectOnMain(
-                activity,
-                json,
-                splitTunnelEnabled,
-                splitPackages,
-                splitDomains,
-                screenOffBatterySaver,
-            )
-        }
-        val out = arrayOfNulls<String?>(1)
-        val latch = CountDownLatch(1)
-        activity.runOnUiThread {
-            try {
-                out[0] = requestConnectOnMain(
-                    activity,
-                    json,
-                    splitTunnelEnabled,
-                    splitPackages,
-                    splitDomains,
-                    screenOffBatterySaver,
-                )
-            } catch (t: Throwable) {
-                Log.e(TAG, "requestConnect", t)
-                out[0] = t.message ?: "requestConnect_exception"
-            } finally {
-                latch.countDown()
+            val holder = arrayOfNulls<String?>(1)
+            val latch = CountDownLatch(1)
+            Thread {
+                try {
+                    holder[0] =
+                        requestConnectWorker(
+                            activity,
+                            json,
+                            splitTunnelEnabled,
+                            splitPackages,
+                            splitDomains,
+                            screenOffBatterySaver,
+                        )
+                } catch (t: Throwable) {
+                    Log.e(TAG, "requestConnect", t)
+                    holder[0] = t.message ?: "requestConnect_exception"
+                } finally {
+                    latch.countDown()
+                }
+            }.start()
+            return try {
+                if (!latch.await(125, TimeUnit.SECONDS)) {
+                    "connect_ui_thread_timeout"
+                } else {
+                    holder[0]
+                }
+            } catch (e: InterruptedException) {
+                "connect_interrupted"
             }
         }
-        return try {
-            if (!latch.await(60, TimeUnit.SECONDS)) {
-                "connect_ui_thread_timeout"
-            } else {
-                out[0]
-            }
-        } catch (e: InterruptedException) {
-            "connect_interrupted"
-        }
+        return requestConnectWorker(
+            activity,
+            json,
+            splitTunnelEnabled,
+            splitPackages,
+            splitDomains,
+            screenOffBatterySaver,
+        )
     }
 
-    private fun requestConnectOnMain(
+    private fun requestConnectWorker(
         activity: Activity,
         json: String,
         splitTunnelEnabled: Boolean,
@@ -97,43 +108,73 @@ object TauriVpnBridge {
         splitDomains: Array<String>,
         screenOffBatterySaver: Boolean,
     ): String? {
-        BibaVpnService.setSplitTunnelConfig(
-            activity,
-            splitTunnelEnabled,
-            splitPackages.toSet(),
-            splitDomains.toSet(),
-        )
-        BibaVpnService.setScreenOffBatterySaver(activity, screenOffBatterySaver)
-
-        val prep = VpnService.prepare(activity)
-        if (prep != null) {
-            BibaVpnService.stashPendingConnectJson(activity, json)
-            BibaVpnService.saveConfig(activity, json)
-            val started =
-                startVpnPermissionFlow(
-                    activity,
-                    prep,
-                    onOk = {
-                        val j =
-                            BibaVpnService.takePendingConnectJson(activity)
-                                ?: BibaVpnService.getLastConfigJson(activity)
-                                ?: json
-                        BibaVpnService.clearPendingConnectJson(activity)
-                        BibaVpnService.startWithJson(activity, j)
-                    },
-                    onDenied = {
-                        BibaVpnService.clearPendingConnectJson(activity)
-                    },
-                )
-            if (!started) {
-                BibaVpnService.clearPendingConnectJson(activity)
-                return "vpn_permission_ui_unavailable"
+        val prepLatch = CountDownLatch(1)
+        val resultHolder = arrayOfNulls<String?>(1)
+        val released = AtomicBoolean(false)
+        fun finish(code: String?) {
+            if (released.compareAndSet(false, true)) {
+                resultHolder[0] = code
+                prepLatch.countDown()
             }
-            return null
         }
 
-        BibaVpnService.startWithJson(activity, json)
-        return null
+        activity.runOnUiThread {
+            try {
+                BibaVpnService.setSplitTunnelConfig(
+                    activity,
+                    splitTunnelEnabled,
+                    splitPackages.toSet(),
+                    splitDomains.toSet(),
+                )
+                BibaVpnService.setScreenOffBatterySaver(activity, screenOffBatterySaver)
+
+                val prep = VpnService.prepare(activity)
+                if (prep != null) {
+                    BibaVpnService.stashPendingConnectJson(activity, json)
+                    BibaVpnService.saveConfig(activity, json)
+                    val started =
+                        startVpnPermissionFlow(
+                            activity,
+                            prep,
+                            onOk = {
+                                val j =
+                                    BibaVpnService.takePendingConnectJson(activity)
+                                        ?: BibaVpnService.getLastConfigJson(activity)
+                                        ?: json
+                                BibaVpnService.clearPendingConnectJson(activity)
+                                BibaVpnService.startWithJson(activity, j)
+                                finish(null)
+                            },
+                            onDenied = {
+                                BibaVpnService.clearPendingConnectJson(activity)
+                                finish("vpn_permission_denied")
+                            },
+                        )
+                    if (!started) {
+                        BibaVpnService.clearPendingConnectJson(activity)
+                        finish("vpn_permission_ui_unavailable")
+                    }
+                    return@runOnUiThread
+                }
+
+                BibaVpnService.startWithJson(activity, json)
+                finish(null)
+            } catch (t: Throwable) {
+                Log.e(TAG, "requestConnectWorker", t)
+                finish(t.message ?: "requestConnect_exception")
+            }
+        }
+
+        return try {
+            if (!prepLatch.await(120, TimeUnit.SECONDS)) {
+                BibaVpnService.clearPendingConnectJson(activity)
+                "vpn_permission_timeout"
+            } else {
+                resultHolder[0]
+            }
+        } catch (e: InterruptedException) {
+            "connect_interrupted"
+        }
     }
 
     private fun getTauriPluginManager(activity: Activity): Any? {
