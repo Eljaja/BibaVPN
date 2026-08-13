@@ -106,13 +106,14 @@ logs a `WARN` at startup). Client / invite: `reality_target`,
 non-REALITY). Test: `cargo test -p bibavpn --test reality_handshake`.
 
 **REALITY client AUTH is required** in every REALITY session, on both the `MUX_OPEN` and the
-REALITY + v3 (UDP mux) sub-paths: `[version:1][0xa1][mac:32]` right after `SERVER_HELLO`, where the
-MAC is keyed BLAKE3 over `client_ephemeral_pub || server_pub` keyed by `shared_secret || token`
-(`reality_client_auth_mac`). The X25519 exchange only authenticates the **server**, so before this
-frame existed the REALITY TCP path was an **open proxy**. The token is never sent on the wire; the
-server compares in constant time and records failures with the auth rate limiter, like a v3 AUTH
-mismatch. Adding a frame does not change the HELLO / SERVER_HELLO layout, so `REALITY_VERSION`
-stays `2` — but old and new peers no longer interoperate on the REALITY path.
+REALITY + v3 (UDP mux) sub-paths: `[version:1=0x03][0xa1][mac:32]` right after `SERVER_HELLO`, where the
+MAC is keyed BLAKE3 over `client_ephemeral_pub || server_pub || unix_secs_be || nonce` keyed by
+`shared_secret || token` (`reality_client_auth_mac`). The X25519 exchange only authenticates the **server**,
+so before this frame existed the REALITY TCP path was an **open proxy**. The token is never sent on the wire;
+the server compares in constant time and records failures with the auth rate limiter, like a v3 AUTH
+mismatch. Client HELLO v3 adds a unix timestamp and 16-byte nonce; the server rejects skew outside
+`±max_time_diff` (default **90 s**, `--reality-max-time-diff-secs`) and replays of seen nonces.
+**`REALITY_VERSION` is 3** — v2 REALITY peers no longer interoperate.
 
 Typical traffic path (TCP, mux):
 
@@ -225,7 +226,7 @@ the mux record header when chunking TCP).
 - `--early-ws-frames`, `--junk-frames`
 - `--pin-cert` (client) — incompatible with `--insecure`; supported on **rustls** and **boring** (`boring-tls` build)
 - `--reality-target`, `--reality-public-key`, `--reality-short-id` (client) — WSS REALITY front mode; invite JSON mirrors these fields
-- Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any + startup `WARN`; all-zero entry = wildcard + startup `WARN`), `--reality-server-names` (optional SNI allowlist; default = host from target). `--token` is **required** on the REALITY path too: it keys the client AUTH MAC.
+- Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any + startup `WARN`; all-zero entry = wildcard + startup `WARN`), `--reality-server-names` (optional SNI allowlist; default = host from target), `--reality-max-time-diff-secs` (default **90**, range 1..=3600 — HELLO timestamp skew and nonce replay window). `--token` is **required** on the REALITY path too: it keys the client AUTH MAC.
 - `--ws-path` / server `--ws-path` — WebSocket path; token via `AUTH`
 (default `/ws`)
 - Client `--proto` (only `**3`** is supported) and `--proto-domain` (KDF label;

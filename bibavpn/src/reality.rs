@@ -13,12 +13,13 @@
 //!
 //! SpiderX background fetches keep server-side camouflage warm against the REALITY target.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use rand::Rng;
+use rand::{Rng, RngCore};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::DigitallySignedStruct;
 use subtle::ConstantTimeEq;
@@ -33,21 +34,23 @@ use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 /// REALITY protocol magic bytes (reserved for future wire extensions).
 pub const REALITY_MAGIC: &[u8] = b"REAL1";
-/// Wire version. v2 adds a server confirmation MAC to SERVER_HELLO so the
-/// server proves possession of the REALITY private key (v1 only echoed the
-/// pinned public key, which a MITM that knows it could trivially replay).
-/// v2 is intentionally incompatible with v1 on both ends.
-///
-/// The mandatory client AUTH frame is an **added** frame after SERVER_HELLO and
-/// does not change the HELLO / SERVER_HELLO layout, so the version stays at 2;
-/// a peer that omits or mis-frames it is rejected on the spot anyway.
-pub const REALITY_VERSION: u8 = 2;
+/// Wire version. v2 adds a server confirmation MAC to SERVER_HELLO. v3 extends
+/// client HELLO with a unix timestamp and nonce, binds both into the AUTH MAC,
+/// and rejects replays within `max_time_diff`. Incompatible with v2 on both ends.
+pub const REALITY_VERSION: u8 = 3;
+
+/// Fixed wire size of client HELLO v3:
+/// `[version][ephemeral:32][short_id:8][unix_secs:8 BE][nonce:16]`.
+pub const REALITY_CLIENT_HELLO_LEN: usize = 1 + 32 + 8 + 8 + 16;
 
 /// BLAKE3 derive-key context for the REALITY handshake confirmation MAC.
 const REALITY_CONFIRM_CONTEXT: &str = "bibavpn reality server-confirm v2";
 
 /// BLAKE3 derive-key context for the mandatory client AUTH MAC.
-const REALITY_CLIENT_AUTH_CONTEXT: &str = "bibavpn reality client-auth v1";
+const REALITY_CLIENT_AUTH_CONTEXT: &str = "bibavpn reality client-auth v2";
+
+/// Max seen nonces retained in the process-wide REALITY replay cache.
+const REALITY_REPLAY_CACHE_CAP: usize = 65536;
 
 /// Frame tag of the client AUTH frame (byte 1, after the version byte).
 pub const REALITY_CLIENT_AUTH_TAG: u8 = 0xa1;
@@ -73,9 +76,9 @@ pub fn reality_confirm_mac(
 }
 
 /// Client AUTH MAC over the handshake transcript, keyed by the X25519 shared
-/// secret **and** the session token. The token never touches the wire, and the
-/// MAC is bound to both public keys, so it cannot be replayed into another
-/// session (different ephemeral key → different shared secret → different MAC).
+/// secret **and** the session token. The token never touches the wire. The MAC
+/// binds both public keys plus the HELLO timestamp and nonce so a captured
+/// handshake cannot be replayed within `max_time_diff`.
 ///
 /// The X25519 exchange alone only authenticates the *server*
 /// (see `reality_confirm_mac`); this MAC is what authenticates the *client*.
@@ -84,6 +87,8 @@ pub fn reality_client_auth_mac(
     token: &str,
     client_ephemeral_pub: &[u8; 32],
     server_static_pub: &[u8; 32],
+    unix_secs: u64,
+    nonce: &[u8; 16],
 ) -> [u8; 32] {
     // Key material = shared secret || token. `shared` is fixed-width, so the
     // concatenation is unambiguous. Knowing only one of the two is not enough.
@@ -94,7 +99,89 @@ pub fn reality_client_auth_mac(
     let mut h = blake3::Hasher::new_keyed(&mac_key);
     h.update(client_ephemeral_pub);
     h.update(server_static_pub);
+    h.update(&unix_secs.to_be_bytes());
+    h.update(nonce);
     *h.finalize().as_bytes()
+}
+
+/// Parsed REALITY client HELLO v3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealityClientHello {
+    pub client_pubkey: [u8; 32],
+    pub short_id: [u8; 8],
+    pub unix_secs: u64,
+    pub nonce: [u8; 16],
+}
+
+/// Returns true when `|now - unix_secs| <= max_time_diff`.
+pub fn reality_timestamp_in_window(
+    now: u64,
+    unix_secs: u64,
+    max_time_diff: u64,
+) -> anyhow::Result<()> {
+    let delta = now.abs_diff(unix_secs);
+    if delta > max_time_diff {
+        bail!(
+            "REALITY: HELLO timestamp outside allowed window (skew {delta}s > max_time_diff {max_time_diff}s)"
+        );
+    }
+    Ok(())
+}
+
+/// Process-wide sliding-window cache of authenticated HELLO nonces.
+#[derive(Debug, Default)]
+pub struct RealityReplayCache {
+    inner: Mutex<RealityReplayCacheInner>,
+}
+
+#[derive(Debug, Default)]
+struct RealityReplayCacheInner {
+    entries: Vec<([u8; 16], u64)>,
+}
+
+impl RealityReplayCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reject if `nonce` was already authenticated within the sliding window;
+    /// otherwise insert. Expired entries are dropped first.
+    pub fn check_and_insert(
+        &self,
+        nonce: &[u8; 16],
+        hello_unix_secs: u64,
+        now: u64,
+        max_time_diff: u64,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.inner.lock().expect("REALITY replay cache mutex");
+        guard
+            .entries
+            .retain(|(_, ts)| ts.saturating_add(max_time_diff) >= now);
+
+        if guard.entries.iter().any(|(seen, _)| seen == nonce) {
+            bail!("REALITY: replay detected (HELLO nonce already seen)");
+        }
+
+        if guard.entries.len() >= REALITY_REPLAY_CACHE_CAP {
+            if let Some(idx) = guard
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(i, _)| i)
+            {
+                guard.entries.remove(idx);
+            }
+        }
+
+        guard.entries.push((*nonce, hello_unix_secs));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().expect("REALITY replay cache mutex").entries.len()
+    }
 }
 
 /// Wire bytes for the client AUTH frame: `[version][tag][mac:32]`.
@@ -364,30 +451,27 @@ pub async fn server_handshake_reality<S>(
     ws: &mut WebSocketStream<S>,
     cfg: &RealityServerConfig,
     token: &str,
+    replay_cache: &RealityReplayCache,
 ) -> anyhow::Result<[u8; 32]>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before REALITY HELLO")?
+        .as_secs();
+
     let mut control_frames: u32 = 0;
     let msg = next_handshake_binary(ws, &mut control_frames, "REALITY HELLO").await?;
 
-    if msg.len() < 1 + 32 + 8 {
-        bail!("short REALITY HELLO");
-    }
-    if msg[0] != REALITY_VERSION {
-        bail!("unsupported REALITY version: {}", msg[0]);
-    }
-
-    let client_pubkey: [u8; 32] = msg[1..33].try_into().unwrap();
-    let mut short_id = [0u8; 8];
-    short_id.copy_from_slice(&msg[33..41]);
-
-    validate_short_id(&short_id, cfg)?;
+    let hello = decode_client_hello(msg.as_ref())?;
+    validate_short_id(&hello.short_id, cfg)?;
+    reality_timestamp_in_window(now, hello.unix_secs, cfg.max_time_diff)?;
 
     // Reply with the pinned pubkey plus a MAC proving we hold the private
     // key (binds the X25519 shared secret to the transcript).
     let (response, shared) =
-        server_hello_with_confirm_and_shared(&cfg.private_key, &client_pubkey)?;
+        server_hello_with_confirm_and_shared(&cfg.private_key, &hello.client_pubkey)?;
     ws.send(Message::Binary(Bytes::from(response)))
         .await
         .context("send REALITY SERVER_HELLO")?;
@@ -395,10 +479,19 @@ where
     let server_pub = RealityServerConfig::public_key_from_private(&cfg.private_key);
     let auth = next_handshake_binary(ws, &mut control_frames, "REALITY client AUTH").await?;
     let got = decode_client_auth(auth.as_ref())?;
-    let expected = reality_client_auth_mac(&shared, token, &client_pubkey, &server_pub);
+    let expected = reality_client_auth_mac(
+        &shared,
+        token,
+        &hello.client_pubkey,
+        &server_pub,
+        hello.unix_secs,
+        &hello.nonce,
+    );
     if !bool::from(got[..].ct_eq(&expected[..])) {
         bail!("REALITY: client AUTH MAC invalid (unknown token)");
     }
+
+    replay_cache.check_and_insert(&hello.nonce, hello.unix_secs, now, cfg.max_time_diff)?;
     Ok(shared)
 }
 
@@ -453,13 +546,44 @@ pub async fn connect_reality_client(
     Ok(ws)
 }
 
-/// Encode REALITY client HELLO: `[version][ephemeral_pubkey:32][short_id:8]`.
-pub fn encode_client_hello(short_id: &[u8; 8], client_pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(1 + 32 + 8);
+/// Encode REALITY client HELLO v3:
+/// `[version][ephemeral_pubkey:32][short_id:8][unix_secs:8 BE][nonce:16]`.
+pub fn encode_client_hello(
+    short_id: &[u8; 8],
+    client_pubkey: &[u8; 32],
+    unix_secs: u64,
+    nonce: &[u8; 16],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(REALITY_CLIENT_HELLO_LEN);
     msg.push(REALITY_VERSION);
     msg.extend_from_slice(client_pubkey);
     msg.extend_from_slice(short_id);
+    msg.extend_from_slice(&unix_secs.to_be_bytes());
+    msg.extend_from_slice(nonce);
     msg
+}
+
+/// Decode REALITY client HELLO v3.
+pub fn decode_client_hello(data: &[u8]) -> anyhow::Result<RealityClientHello> {
+    if data.len() < REALITY_CLIENT_HELLO_LEN {
+        bail!("short REALITY HELLO");
+    }
+    if data[0] != REALITY_VERSION {
+        bail!("unsupported REALITY version: {}", data[0]);
+    }
+    let mut client_pubkey = [0u8; 32];
+    client_pubkey.copy_from_slice(&data[1..33]);
+    let mut short_id = [0u8; 8];
+    short_id.copy_from_slice(&data[33..41]);
+    let unix_secs = u64::from_be_bytes(data[41..49].try_into().unwrap());
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&data[49..65]);
+    Ok(RealityClientHello {
+        client_pubkey,
+        short_id,
+        unix_secs,
+        nonce,
+    })
 }
 
 /// Client REALITY HELLO + verify server pubkey (X25519 ephemeral), then send the
@@ -473,9 +597,21 @@ pub async fn reality_client_exchange_verify<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before REALITY HELLO")?
+        .as_secs();
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
     let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
-    let client_hello = encode_client_hello(short_id, ephemeral_public.as_bytes());
+    let client_hello = encode_client_hello(
+        short_id,
+        ephemeral_public.as_bytes(),
+        unix_secs,
+        &nonce,
+    );
     ws.send(Message::Binary(Bytes::from(client_hello)))
         .await
         .context("send REALITY client hello")?;
@@ -512,6 +648,8 @@ where
         token,
         ephemeral_public.as_bytes(),
         &server_pubkey,
+        unix_secs,
+        &nonce,
     );
     ws.send(Message::Binary(Bytes::from(encode_client_auth(&auth_mac))))
         .await
@@ -745,6 +883,8 @@ mod tests {
         let (priv_key, server_pub) = RealityServerConfig::generate_keys();
         let client_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let client_public = PublicKey::from(&client_secret);
+        let unix_secs = 1_700_000_000;
+        let nonce = [9u8; 16];
 
         let (_hello, server_shared) =
             server_hello_with_confirm_and_shared(&priv_key, client_public.as_bytes()).unwrap();
@@ -756,12 +896,16 @@ mod tests {
             "s3cret-token",
             client_public.as_bytes(),
             &server_pub,
+            unix_secs,
+            &nonce,
         );
         let expected = reality_client_auth_mac(
             &server_shared,
             "s3cret-token",
             client_public.as_bytes(),
             &server_pub,
+            unix_secs,
+            &nonce,
         );
         assert_eq!(sent, expected);
 
@@ -778,14 +922,67 @@ mod tests {
         let (priv_key, server_pub) = RealityServerConfig::generate_keys();
         let client_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let client_public = PublicKey::from(&client_secret);
+        let unix_secs = 1_700_000_000;
+        let nonce = [4u8; 16];
         let (_hello, shared) =
             server_hello_with_confirm_and_shared(&priv_key, client_public.as_bytes()).unwrap();
 
-        let forged =
-            reality_client_auth_mac(&shared, "guessed", client_public.as_bytes(), &server_pub);
-        let expected =
-            reality_client_auth_mac(&shared, "real-token", client_public.as_bytes(), &server_pub);
+        let forged = reality_client_auth_mac(
+            &shared,
+            "guessed",
+            client_public.as_bytes(),
+            &server_pub,
+            unix_secs,
+            &nonce,
+        );
+        let expected = reality_client_auth_mac(
+            &shared,
+            "real-token",
+            client_public.as_bytes(),
+            &server_pub,
+            unix_secs,
+            &nonce,
+        );
         assert_ne!(forged, expected);
+    }
+
+    #[test]
+    fn client_auth_mac_differs_when_timestamp_or_nonce_changes() {
+        let (priv_key, server_pub) = RealityServerConfig::generate_keys();
+        let client_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let client_public = PublicKey::from(&client_secret);
+        let (_hello, shared) =
+            server_hello_with_confirm_and_shared(&priv_key, client_public.as_bytes()).unwrap();
+        let base = reality_client_auth_mac(
+            &shared,
+            "token",
+            client_public.as_bytes(),
+            &server_pub,
+            100,
+            &[1u8; 16],
+        );
+        assert_ne!(
+            base,
+            reality_client_auth_mac(
+                &shared,
+                "token",
+                client_public.as_bytes(),
+                &server_pub,
+                101,
+                &[1u8; 16],
+            )
+        );
+        assert_ne!(
+            base,
+            reality_client_auth_mac(
+                &shared,
+                "token",
+                client_public.as_bytes(),
+                &server_pub,
+                100,
+                &[2u8; 16],
+            )
+        );
     }
 
     /// Replaying a captured AUTH frame into another session fails: the MAC is
@@ -794,20 +991,34 @@ mod tests {
     fn client_auth_mac_rejects_other_session_key() {
         let (priv_key, server_pub) = RealityServerConfig::generate_keys();
         let token = "real-token";
+        let unix_secs = 1_700_000_000;
+        let nonce = [6u8; 16];
 
         let first_client = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let first_pub = PublicKey::from(&first_client);
         let (_h1, first_shared) =
             server_hello_with_confirm_and_shared(&priv_key, first_pub.as_bytes()).unwrap();
-        let captured =
-            reality_client_auth_mac(&first_shared, token, first_pub.as_bytes(), &server_pub);
+        let captured = reality_client_auth_mac(
+            &first_shared,
+            token,
+            first_pub.as_bytes(),
+            &server_pub,
+            unix_secs,
+            &nonce,
+        );
 
         let second_client = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
         let second_pub = PublicKey::from(&second_client);
         let (_h2, second_shared) =
             server_hello_with_confirm_and_shared(&priv_key, second_pub.as_bytes()).unwrap();
-        let expected =
-            reality_client_auth_mac(&second_shared, token, second_pub.as_bytes(), &server_pub);
+        let expected = reality_client_auth_mac(
+            &second_shared,
+            token,
+            second_pub.as_bytes(),
+            &server_pub,
+            unix_secs,
+            &nonce,
+        );
 
         assert_ne!(captured, expected);
     }
@@ -834,10 +1045,71 @@ mod tests {
     fn client_hello_wire_layout() {
         let sid = [7u8; 8];
         let pk = [3u8; 32];
-        let wire = encode_client_hello(&sid, &pk);
-        assert_eq!(wire.len(), 41);
+        let unix_secs = 1_700_000_123u64;
+        let nonce = [8u8; 16];
+        let wire = encode_client_hello(&sid, &pk, unix_secs, &nonce);
+        assert_eq!(wire.len(), REALITY_CLIENT_HELLO_LEN);
         assert_eq!(wire[0], REALITY_VERSION);
         assert_eq!(&wire[1..33], &pk);
         assert_eq!(&wire[33..41], &sid);
+        assert_eq!(u64::from_be_bytes(wire[41..49].try_into().unwrap()), unix_secs);
+        assert_eq!(&wire[49..65], &nonce);
+
+        let decoded = decode_client_hello(&wire).unwrap();
+        assert_eq!(decoded.client_pubkey, pk);
+        assert_eq!(decoded.short_id, sid);
+        assert_eq!(decoded.unix_secs, unix_secs);
+        assert_eq!(decoded.nonce, nonce);
+
+        assert!(decode_client_hello(&wire[..64]).is_err());
+        let mut bad_ver = wire.clone();
+        bad_ver[0] = REALITY_VERSION.wrapping_sub(1);
+        assert!(decode_client_hello(&bad_ver).is_err());
+    }
+
+    #[test]
+    fn reality_timestamp_in_window_accepts_and_rejects() {
+        let max = 90u64;
+        let now = 1_000_000u64;
+        reality_timestamp_in_window(now, now, max).unwrap();
+        reality_timestamp_in_window(now, now - max, max).unwrap();
+        reality_timestamp_in_window(now, now + max, max).unwrap();
+        assert!(reality_timestamp_in_window(now, now - max - 1, max).is_err());
+        assert!(reality_timestamp_in_window(now, now + max + 1, max).is_err());
+    }
+
+    #[test]
+    fn replay_cache_rejects_duplicate_and_expires() {
+        let cache = RealityReplayCache::new();
+        let max = 90u64;
+        let hello_ts = 1_000u64;
+        let nonce = [1u8; 16];
+
+        cache
+            .check_and_insert(&nonce, hello_ts, hello_ts, max)
+            .unwrap();
+        assert!(cache
+            .check_and_insert(&nonce, hello_ts, hello_ts, max)
+            .is_err());
+
+        let after_window = hello_ts + max + 1;
+        cache
+            .check_and_insert(&nonce, hello_ts, after_window, max)
+            .unwrap();
+    }
+
+    #[test]
+    fn replay_cache_cap_does_not_grow_unbounded() {
+        let cache = RealityReplayCache::new();
+        let max = 3600u64;
+        let now = 10_000u64;
+        for i in 0..=REALITY_REPLAY_CACHE_CAP {
+            let mut nonce = [0u8; 16];
+            nonce[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            cache
+                .check_and_insert(&nonce, now, now, max)
+                .unwrap();
+        }
+        assert!(cache.len() <= REALITY_REPLAY_CACHE_CAP);
     }
 }

@@ -135,7 +135,8 @@ Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. Essentials:
 - **Camouflage (server):** `--camouflage-dir <path>` or `--camouflage-url http://…`.
 - **TLS trust (client):** real CA by default, `--pin-cert <pem>` to pin the leaf,
   `--insecure` **lab only**.
-- **REALITY (optional):** server `--reality-target`, `--reality-private-key`;
+- **REALITY (optional):** server `--reality-target`, `--reality-private-key`,
+  `--reality-max-time-diff-secs` (default 90 s HELLO skew / replay window);
   client/invite `reality_target`, `reality_public_key`, `reality_short_id`. The
   outer SNI then defaults to the front host (`vk.com:443` → SNI `vk.com`) while
   TCP still connects to `--server`. The client must also prove knowledge of

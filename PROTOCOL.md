@@ -351,23 +351,24 @@ on your VPS.
 
 1. Client → VPS: **TLS** (SNI = front domain from `reality_target`) + **WSS** upgrade on `--ws-path`.
 2. **REALITY binary exchange** on the WebSocket (before v3 PSK on this path):
-   - Client → server: `[version:1][client_ephemeral_x25519:32][short_id:8]`
-   - Server → client: `[version:1][server_long_term_x25519:32][confirm_mac:32]` — the pubkey must
+   - Client → server: `[version:1=0x03][client_ephemeral_x25519:32][short_id:8][unix_secs:u64 BE][nonce:16]` (65 bytes fixed)
+   - Server → client: `[version:1=0x03][server_long_term_x25519:32][confirm_mac:32]` — the pubkey must
      match invite `reality_public_key`, and the MAC (keyed BLAKE3 over both pubkeys, keyed by the
      X25519 shared secret) proves the server holds the private key.
-3. **Mandatory client AUTH** (`[version:1][0xa1][mac:32]`): keyed BLAKE3 over
-   `client_ephemeral_pub || server_pub`, keyed by `shared_secret || token`. The **token never goes on
-   the wire** and the MAC is bound to this handshake, so it cannot be replayed into another session.
-   The server compares in constant time and **drops the connection before any application frame** if
-   it does not match (counted by the auth rate limiter / ban list like a v3 AUTH failure).
+3. **Mandatory client AUTH** (`[version:1=0x03][0xa1][mac:32]`): keyed BLAKE3 over
+   `client_ephemeral_pub || server_pub || unix_secs_be || nonce`, keyed by `shared_secret || token`.
+   The **token never goes on the wire**; the MAC binds this handshake transcript including freshness,
+   and the server rejects HELLO timestamps outside `±max_time_diff` (default **90 s**) and replays
+   of the same nonce while it remains in the sliding window. The server compares in constant time and
+   **drops the connection before any application frame** if the MAC does not match (counted by the
+   auth rate limiter / ban list like a v3 AUTH failure).
 4. Client sends plaintext **`MUX_OPEN`**; mux streams carry target TCP (no v3 HELLO/AUTH on this path).
 
 Step 3 is **required in every REALITY session**, including the REALITY + v3 PSK (UDP mux) path where
 a v3 `HELLO` follows instead of `MUX_OPEN`. REALITY itself authenticates only the *server*; without
 this step anyone able to reach the port and complete the WSS upgrade would get full proxying (the
-short-ID allowlist is permissive by default — see `--reality-short-ids`). Adding the frame does not
-change the HELLO / SERVER_HELLO layout, so `REALITY_VERSION` stays **2**; older clients/servers fail
-the handshake immediately (breaking change on the REALITY path only).
+short-ID allowlist is permissive by default — see `--reality-short-ids`). **`REALITY_VERSION` is 3**;
+v2 peers fail immediately on version mismatch (breaking change on the REALITY path only).
 
 **Server CLI**
 
@@ -376,6 +377,7 @@ bibavpn-server \
   --reality-target 'vk.com:443' \
   --reality-private-key "$REALITY_PRIV_B64" \
   --reality-short-ids '0123456789abcdef'   # optional; omit = any; 000…000 = wildcard
+  --reality-max-time-diff-secs 90            # default 90; allowed 1..=3600
 ```
 
 Omitting `--reality-short-ids` (or listing `0000000000000000`) accepts **any** short ID; the server
