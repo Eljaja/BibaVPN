@@ -1,5 +1,5 @@
 # Cross-compile bibavpn-ffi for iOS (Rust ↔ Packet Tunnel static library).
-# Draft PRs skip this build (agent-fix). Mark Ready for review to run.
+# Push to main when FFI/core paths change. Not on pull_request — tests live in test.yml.
 name: iOS FFI
 
 run-name: iOS FFI · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -20,20 +20,6 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/ios.yml"
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main, master]
-    paths:
-      - "bibavpn/**"
-      - "!bibavpn/**/*.md"
-      - "biba/**"
-      - "!biba/**/*.md"
-      - "apps/bibavpn-ffi/**"
-      - "!apps/bibavpn-ffi/**/*.md"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".github/workflows/ios.yml"
 
 concurrency:
   group: ios-ffi-${{ github.ref }}
@@ -41,7 +27,6 @@ concurrency:
 
 jobs:
   bibavpn-ffi-ios:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: macos-latest
     timeout-minutes: 45
     steps:

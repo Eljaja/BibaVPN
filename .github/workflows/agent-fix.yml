@@ -218,7 +218,7 @@ jobs:
 
           Review: ${verdict}
 
-          Platform CI (Tests, Android, Desktop, iOS, Docker) starts when this PR is marked Ready for review. Agent fix already ran cargo test -p bibavpn -p biba.
+          PR CI is Tests only, and only the jobs whose paths changed. Android, Desktop, iOS, and Docker build on push to main.
           EOF
           )"
           gh pr create --draft --assignee "$GITHUB_ACTOR" --title "fix: ${title}" --body "$body"

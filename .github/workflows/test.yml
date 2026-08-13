@@ -1,11 +1,13 @@
-# Manual: Actions → Tests → Run workflow. Also runs on push/PR when Rust sources change.
+# Manual: Actions → Tests → Run workflow.
 #
 # The build workflows compile the crates but never `cargo test`, and `cargo build`
 # does not even type-check `#[cfg(test)]` code — so unit tests could break (or fail
 # to compile) unnoticed. Each job runs the tests on the platform where that crate is
 # already known to build: core crates on Linux (same as the Docker images),
 # bibavpn-desktop on Windows (same as Desktop Windows).
-# Draft PRs skip jobs (agent-fix opens drafts). Mark Ready for review to run.
+#
+# Jobs are path-gated: a protocol-only change does not start the Windows desktop
+# test runner. Unrelated paths do not start this workflow at all.
 name: Tests
 
 run-name: Tests · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -48,9 +50,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.plan.outputs.core }}
+      desktop: ${{ steps.plan.outputs.desktop }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changed paths
+        id: filter
+        if: github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            core:
+              - 'bibavpn/**'
+              - '!bibavpn/**/*.md'
+              - 'biba/**'
+              - '!biba/**/*.md'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/test.yml'
+            desktop:
+              - 'apps/bibavpn-desktop/**'
+              - '!apps/bibavpn-desktop/**/*.md'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/test.yml'
+
+      - name: Plan which test jobs to run
+        id: plan
+        env:
+          FILTER_CORE: ${{ steps.filter.outputs.core }}
+          FILTER_DESKTOP: ${{ steps.filter.outputs.desktop }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
+            echo "core=true" >> "$GITHUB_OUTPUT"
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "core=${FILTER_CORE:-false}" >> "$GITHUB_OUTPUT"
+            echo "desktop=${FILTER_DESKTOP:-false}" >> "$GITHUB_OUTPUT"
+          fi
+
   core:
     name: cargo test (bibavpn, biba)
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -69,7 +118,8 @@ jobs:
 
   desktop:
     name: cargo test (bibavpn-desktop)
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     env:
