@@ -1074,6 +1074,9 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     let socks_bind = format!("127.0.0.1:{socks_port}");
 
     persist_cfg(app, &cfg)?;
+    // Same contract as Android: `start_config_json` / system-proxy ignore-hosts read the
+    // in-memory preset cache. Prefetch is racy; a cold cache silently disables split-tunnel.
+    let _ = bypass_domains::ensure_loaded(false);
 
     let json = cfg.start_config_json()?;
     let opts =
@@ -1137,6 +1140,11 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         .active_profile()
         .map(split_tunnel::bypass_domains_for_profile)
         .unwrap_or_default();
+    info!(
+        target: "bibavpn_desktop",
+        split_bypass = split_hosts.len(),
+        "split-tunnel domains for system proxy / local HTTP CONNECT"
+    );
     #[cfg(windows)]
     let prior_proxy_override = match backup.override_val.as_deref() {
         Some(s) if !s.is_empty() => Some(s),
