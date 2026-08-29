@@ -1008,4 +1008,25 @@ mod split_bypass_json_tests {
         let json = p.start_config_json().expect("build start json");
         assert!(!json.contains("split_bypass_domains"), "got: {json}");
     }
+
+    #[test]
+    fn emits_cached_preset_domains_when_split_enabled() {
+        crate::bypass_domains::replace_cache_for_test(vec![
+            crate::bypass_domains::BypassPresetInfo {
+                id: "banks".into(),
+                label: "Banks".into(),
+                source: None,
+                domains: vec!["sberbank.ru".into(), ".tinkoff.ru".into()],
+                android_packages: vec![],
+            },
+        ]);
+        let mut p = profile();
+        p.split_tunnel_enabled = true;
+        p.split_tunnel_preset_ids = vec!["banks".into()];
+        let json = p.start_config_json().expect("build start json");
+        assert!(
+            json.contains("split_bypass_domains") && json.contains("sberbank.ru"),
+            "got: {json}"
+        );
+    }
 }

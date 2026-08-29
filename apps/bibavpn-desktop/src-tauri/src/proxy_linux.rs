@@ -718,4 +718,19 @@ mod tests {
         assert_eq!(map.get("https_proxy").unwrap(), "http://127.0.0.1:8080");
         assert!(map.get("no_proxy").unwrap().contains("localhost"));
     }
+
+    #[test]
+    fn no_proxy_includes_split_tunnel_hosts() {
+        let v = proxy_env_assignments(
+            "127.0.0.1",
+            8080,
+            "127.0.0.1",
+            1080,
+            &["*.sberbank.ru".into(), "tinkoff.ru".into()],
+        );
+        let map: HashMap<_, _> = v.into_iter().collect();
+        let no = map.get("NO_PROXY").unwrap();
+        assert!(no.contains("sberbank.ru"), "{no}");
+        assert!(no.contains("tinkoff.ru"), "{no}");
+    }
 }
