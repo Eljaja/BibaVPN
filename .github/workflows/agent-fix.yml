@@ -1,3 +1,7 @@
+# Only issues opened by the repo owner can spawn the agent (see the `if:` on the
+# job). Someone else's issue does nothing even when labelled; use
+# `workflow_dispatch` if you really want to run the agent on it.
+#
 # Label an issue `agent-fix` (or run manually with the issue number) to spawn:
 #   1. Grok 4.6 (standard, not Fast) classifies SMALL bug vs LARGE feature
 #      - LARGE: posts a proposal, @-mentions the owner, stops (no code)
@@ -56,9 +60,16 @@ env:
 jobs:
   fix:
     name: spec → implement → review
+    # Only the repo owner's own issues may spawn the agent. Labelling already
+    # needs write access, but the issue *body* is the agent's prompt and is
+    # treated as untrusted input, so an outside contributor must not be able to
+    # get code written and a PR opened from text they authored.
+    # `workflow_dispatch` stays open as the manual escape hatch — it needs write
+    # access too, and that is the owner-approved path for LARGE features.
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event.issue.pull_request == null &&
+       github.event.issue.user.login == github.repository_owner &&
        (github.event.label.name == 'agent-fix' ||
         github.event.label.name == 'agent-implement'))
     runs-on: ubuntu-latest
