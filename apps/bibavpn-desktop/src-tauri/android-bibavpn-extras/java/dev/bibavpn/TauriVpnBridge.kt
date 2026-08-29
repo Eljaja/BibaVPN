@@ -8,7 +8,6 @@ import android.os.Handler
 import android.util.Log
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Вызовы из Rust (Tauri) через JNI. Рефлексия к [app.tauri.plugin.PluginManager], чтобы модуль
@@ -59,48 +58,64 @@ object TauriVpnBridge {
         splitDomains: Array<String>,
         screenOffBatterySaver: Boolean,
     ): String? {
+        // Rust вызывает нас через wry `jni_handle().exec`, то есть уже НА главном лупере.
+        // Ждать здесь нельзя ни в каком виде: результат диалога разрешения VPN приходит
+        // через Activity result на этот же лупер, поэтому любое ожидание — самоблокировка
+        // (ANR «Input dispatching timed out» через 5 с). [startConnectOnMain] не блокирует:
+        // он ставит диалог и возвращается, а исход прилетает асинхронно и подхватывается
+        // через [BibaVpnService.lastConnectError].
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            val holder = arrayOfNulls<String?>(1)
-            val latch = CountDownLatch(1)
-            Thread {
-                try {
-                    holder[0] =
-                        requestConnectWorker(
-                            activity,
-                            json,
-                            splitTunnelEnabled,
-                            splitPackages,
-                            splitDomains,
-                            screenOffBatterySaver,
-                        )
-                } catch (t: Throwable) {
-                    Log.e(TAG, "requestConnect", t)
-                    holder[0] = t.message ?: "requestConnect_exception"
-                } finally {
-                    latch.countDown()
-                }
-            }.start()
-            return try {
-                if (!latch.await(125, TimeUnit.SECONDS)) {
-                    "connect_ui_thread_timeout"
-                } else {
-                    holder[0]
-                }
-            } catch (e: InterruptedException) {
-                "connect_interrupted"
+            return startConnectOnMain(
+                activity,
+                json,
+                splitTunnelEnabled,
+                splitPackages,
+                splitDomains,
+                screenOffBatterySaver,
+            )
+        }
+        // Вызов с фонового потока: перепрыгиваем на UI и ждём только немедленный код
+        // возврата, который [startConnectOnMain] отдаёт не блокируясь.
+        val holder = arrayOfNulls<String?>(1)
+        val latch = CountDownLatch(1)
+        activity.runOnUiThread {
+            try {
+                holder[0] =
+                    startConnectOnMain(
+                        activity,
+                        json,
+                        splitTunnelEnabled,
+                        splitPackages,
+                        splitDomains,
+                        screenOffBatterySaver,
+                    )
+            } catch (t: Throwable) {
+                Log.e(TAG, "requestConnect", t)
+                holder[0] = t.message ?: "requestConnect_exception"
+            } finally {
+                latch.countDown()
             }
         }
-        return requestConnectWorker(
-            activity,
-            json,
-            splitTunnelEnabled,
-            splitPackages,
-            splitDomains,
-            screenOffBatterySaver,
-        )
+        return try {
+            if (!latch.await(30, TimeUnit.SECONDS)) {
+                "connect_ui_thread_timeout"
+            } else {
+                holder[0]
+            }
+        } catch (e: InterruptedException) {
+            "connect_interrupted"
+        }
     }
 
-    private fun requestConnectWorker(
+    /**
+     * Должна вызываться на главном лупере и НИКОГДА не блокировать его.
+     *
+     * Возвращает только немедленный исход: `null` — сервис стартовал или диалог
+     * разрешения VPN поставлен в очередь; строка — ошибка, которую видно сразу.
+     * Результат самого диалога приходит позже в [startVpnPermissionFlow] и попадает
+     * в [BibaVpnService.lastConnectError], откуда Rust забирает его в snapshot.
+     */
+    private fun startConnectOnMain(
         activity: Activity,
         json: String,
         splitTunnelEnabled: Boolean,
@@ -108,72 +123,48 @@ object TauriVpnBridge {
         splitDomains: Array<String>,
         screenOffBatterySaver: Boolean,
     ): String? {
-        val prepLatch = CountDownLatch(1)
-        val resultHolder = arrayOfNulls<String?>(1)
-        val released = AtomicBoolean(false)
-        fun finish(code: String?) {
-            if (released.compareAndSet(false, true)) {
-                resultHolder[0] = code
-                prepLatch.countDown()
-            }
-        }
-
-        activity.runOnUiThread {
-            try {
-                BibaVpnService.setSplitTunnelConfig(
-                    activity,
-                    splitTunnelEnabled,
-                    splitPackages.toSet(),
-                    splitDomains.toSet(),
-                )
-                BibaVpnService.setScreenOffBatterySaver(activity, screenOffBatterySaver)
-
-                val prep = VpnService.prepare(activity)
-                if (prep != null) {
-                    BibaVpnService.stashPendingConnectJson(activity, json)
-                    BibaVpnService.saveConfig(activity, json)
-                    val started =
-                        startVpnPermissionFlow(
-                            activity,
-                            prep,
-                            onOk = {
-                                val j =
-                                    BibaVpnService.takePendingConnectJson(activity)
-                                        ?: BibaVpnService.getLastConfigJson(activity)
-                                        ?: json
-                                BibaVpnService.clearPendingConnectJson(activity)
-                                BibaVpnService.startWithJson(activity, j)
-                                finish(null)
-                            },
-                            onDenied = {
-                                BibaVpnService.clearPendingConnectJson(activity)
-                                finish("vpn_permission_denied")
-                            },
-                        )
-                    if (!started) {
-                        BibaVpnService.clearPendingConnectJson(activity)
-                        finish("vpn_permission_ui_unavailable")
-                    }
-                    return@runOnUiThread
-                }
-
-                BibaVpnService.startWithJson(activity, json)
-                finish(null)
-            } catch (t: Throwable) {
-                Log.e(TAG, "requestConnectWorker", t)
-                finish(t.message ?: "requestConnect_exception")
-            }
-        }
-
         return try {
-            if (!prepLatch.await(120, TimeUnit.SECONDS)) {
-                BibaVpnService.clearPendingConnectJson(activity)
-                "vpn_permission_timeout"
-            } else {
-                resultHolder[0]
+            BibaVpnService.setSplitTunnelConfig(
+                activity,
+                splitTunnelEnabled,
+                splitPackages.toSet(),
+                splitDomains.toSet(),
+            )
+            BibaVpnService.setScreenOffBatterySaver(activity, screenOffBatterySaver)
+
+            val prep = VpnService.prepare(activity)
+            if (prep == null) {
+                BibaVpnService.startWithJson(activity, json)
+                return null
             }
-        } catch (e: InterruptedException) {
-            "connect_interrupted"
+
+            BibaVpnService.stashPendingConnectJson(activity, json)
+            BibaVpnService.saveConfig(activity, json)
+            val started =
+                startVpnPermissionFlow(
+                    activity,
+                    prep,
+                    onOk = {
+                        val j =
+                            BibaVpnService.takePendingConnectJson(activity)
+                                ?: BibaVpnService.getLastConfigJson(activity)
+                                ?: json
+                        BibaVpnService.clearPendingConnectJson(activity)
+                        BibaVpnService.startWithJson(activity, j)
+                    },
+                    onDenied = {
+                        BibaVpnService.clearPendingConnectJson(activity)
+                        BibaVpnService.recordConnectError("vpn_permission_denied")
+                    },
+                )
+            if (!started) {
+                BibaVpnService.clearPendingConnectJson(activity)
+                return "vpn_permission_ui_unavailable"
+            }
+            null
+        } catch (t: Throwable) {
+            Log.e(TAG, "startConnectOnMain", t)
+            t.message ?: "requestConnect_exception"
         }
     }
 

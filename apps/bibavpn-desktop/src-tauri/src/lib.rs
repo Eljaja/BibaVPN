@@ -1373,12 +1373,15 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(300));
     }
 
+    // Вне мьютекса: это JNI-раундтрип с ожиданием ответа от UI-потока (таймаут 5 с).
+    // Под локом он задерживал бы всех, кто держит опрос состояния раз в секунду.
+    let _ = android_vpn::clear_last_connect_error(app);
+
     let mut g = match state.inner.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     g.last_error = None;
-    let _ = android_vpn::clear_last_connect_error(app);
 
     if !g.cfg.can_connect() {
         warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");

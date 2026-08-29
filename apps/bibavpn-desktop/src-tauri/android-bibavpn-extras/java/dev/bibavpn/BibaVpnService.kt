@@ -1171,6 +1171,16 @@ class BibaVpnService : VpnService() {
             lastConnectError = msg
         }
 
+        /**
+         * Записать ошибку подключения, которая пришла асинхронно (результат диалога
+         * разрешения VPN). Rust забирает её из [lastConnectError] в snapshot — так
+         * [TauriVpnBridge.requestConnect] может вернуться сразу, не блокируя лупер.
+         */
+        @JvmStatic
+        fun recordConnectError(msg: String) {
+            setLastConnectError(msg)
+        }
+
         /** Якорь [SystemClock.elapsedRealtime] в момент [setTunnelActive](true); 0 если туннеля нет. */
         @Volatile
         private var tunnelConnectedSinceElapsed: Long = 0L
