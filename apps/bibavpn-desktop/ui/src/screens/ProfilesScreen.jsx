@@ -86,7 +86,8 @@ export function ProfilesScreen({ cfg, onSave }) {
                 >
                   <div style={{ fontFamily: "IBM Plex Sans", fontWeight: 600 }}>{p.name}</div>
                   <div style={{ fontFamily: "IBM Plex Mono", fontSize: 11, color: theme.textDim }}>
-                    {p.server.trim() || (p.from_invite.trim() ? t("display_invite") : "—")}
+                    {p.server.trim() ||
+                      (String(p.from_invite || "").trim() ? t("display_invite") : "—")}
                   </div>
                 </button>
                 {isActive && (

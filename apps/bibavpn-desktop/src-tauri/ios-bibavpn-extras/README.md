@@ -2,6 +2,11 @@
 
 This folder mirrors [`android-bibavpn-extras`](../android-bibavpn-extras): Network Extension + Rust FFI.
 
+**Current status:** tunnel start **fails** after SOCKS bind until Tun2socks (or
+equivalent) wires `packetFlow` / TUN fd forwarding in
+`PacketTunnelProvider.completeTunnelForwarding`. The gomobile Tun2socks script
+below remains a follow-up — the extension does not route traffic yet.
+
 ## Prerequisites
 
 - macOS with Xcode + Apple Developer Program (**Personal VPN** + **Network Extension** entitlements on the main app).

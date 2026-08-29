@@ -1,4 +1,6 @@
 # Сборка установочного .ipa для iPhone (macOS runner + подпись Apple).
+# Signing / packaging smoke artifact only — **not** a working VPN (no tun2socks forwarding yet).
+# Not published on GitHub Release as a product VPN; see release.yml (IPA omitted).
 # Запуск: Actions → «iOS IPA» → Run workflow.
 #
 # Подпись для успешного `tauri ios build` (Settings → Secrets → Actions):
