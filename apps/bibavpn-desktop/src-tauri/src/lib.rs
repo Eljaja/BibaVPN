@@ -54,8 +54,9 @@ use bibavpn::tls_util::install_ring_crypto;
 use config::load_config_from_path;
 use config::{
     apply_invite_fields, desktop_config_json_path, display_host_line, import_control_plane_payload,
-    load_config_disk, merge_saved_config, normalize_loaded, save_config_to_path,
-    server_card_subtitle, to_public_saved_config, PublicSavedConfig, SavedConfig,
+    load_config_disk, merge_saved_config, normalize_loaded, profile_control_plane_origins,
+    save_config_to_path, server_card_subtitle, to_public_saved_config, PublicSavedConfig,
+    SavedConfig,
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use locale::{resolved_tray_lang, tray_strings};
@@ -105,6 +106,23 @@ enum VpnPhase {
     Disconnecting,
 }
 
+#[derive(Debug, Clone)]
+struct PendingControlPlaneImport {
+    origin: String,
+    payload: control_plane_client::ImportPayload,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PendingImportView {
+    control_plane_host: String,
+    display_name: String,
+    server_name: String,
+    server_public_host: String,
+    host_port: i64,
+    vpn_host: String,
+}
+
 pub(crate) struct Inner {
     cfg: SavedConfig,
     proxy_backup: Option<ProxyBackup>,
@@ -117,6 +135,8 @@ pub(crate) struct Inner {
     /// so the watchdog must keep retrying instead of giving up after one attempt.
     /// Cleared by a successful connect or an explicit user disconnect.
     recovery_pending: bool,
+    /// Control-plane import awaiting user confirmation (not persisted).
+    pending_import: Option<PendingControlPlaneImport>,
 }
 
 #[derive(Clone)]
@@ -884,26 +904,70 @@ fn parse_import_deeplink(raw: &str) -> Option<(String, String)> {
     Some((token?, base_url?))
 }
 
+fn pending_import_view(origin: &str, payload: &control_plane_client::ImportPayload) -> PendingImportView {
+    let control_plane_host = url::Url::parse(origin)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| origin.to_string());
+    let vpn_host = format!("{}:{}", payload.server_public_host, payload.host_port);
+    PendingImportView {
+        control_plane_host,
+        display_name: payload.display_name.clone(),
+        server_name: payload.server_name.clone(),
+        server_public_host: payload.server_public_host.clone(),
+        host_port: payload.host_port,
+        vpn_host,
+    }
+}
+
+fn allowed_origins_for_import(cfg: &SavedConfig) -> Vec<String> {
+    control_plane_client::build_allowed_origins(&profile_control_plane_origins(cfg))
+}
+
 fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> Result<(), String> {
     let (token, base_url) = parse_import_deeplink(raw_url)
         .ok_or_else(|| "Неверная ссылка импорта (ожидается bibavpn://import?...).".to_string())?;
-    let payload = control_plane_client::redeem_import(&base_url, &token)?;
+    let allowed = {
+        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        allowed_origins_for_import(&g.cfg)
+    };
+    let (origin, payload) = control_plane_client::redeem_import(&base_url, &token, &allowed)?;
+    let pending = PendingControlPlaneImport { origin, payload };
+    let view = pending_import_view(&pending.origin, &pending.payload);
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     g.last_error = None;
-    import_control_plane_payload(&mut g.cfg, &payload, &base_url)?;
+    g.pending_import = Some(pending);
+    drop(g);
+    show_main_window(app);
+    let _ = app.emit("control-plane-import-pending", &view);
+    Ok(())
+}
+
+fn apply_pending_import(state: &AppState, app: &AppHandle) -> Result<(), String> {
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let pending = g
+        .pending_import
+        .take()
+        .ok_or_else(|| "Нет ожидающего импорта.".to_string())?;
+    g.last_error = None;
+    import_control_plane_payload(&mut g.cfg, &pending.payload, &pending.origin)?;
     persist_cfg(app, &g.cfg)?;
     info!(
         target: "bibavpn_desktop",
-        instance_id = payload.instance_id,
-        config_version = %payload.config_version,
+        instance_id = pending.payload.instance_id,
+        config_version = %pending.payload.config_version,
         "control plane import ok"
     );
     let snap = snapshot(app, &g);
     drop(g);
     let _ = app.emit("vpn-state", &snap);
     let _ = app.emit("control-plane-import", ());
-    show_main_window(app);
     Ok(())
+}
+
+fn cancel_pending_import_inner(state: &AppState) {
+    let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+    g.pending_import = None;
 }
 
 /// RAII-охрана фазы подключения: если [`connect_inner`] вышел с ошибкой (или паникой)
@@ -994,6 +1058,7 @@ mod connecting_phase_guard_tests {
             last_error: None,
             phase,
             recovery_pending: false,
+            pending_import: None,
         }))
     }
 
@@ -1563,6 +1628,31 @@ fn clear_error_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSn
     Ok(snap)
 }
 
+#[tauri::command]
+fn get_pending_import(state: State<'_, AppState>) -> Result<Option<PendingImportView>, String> {
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    Ok(g
+        .pending_import
+        .as_ref()
+        .map(|p| pending_import_view(&p.origin, &p.payload)))
+}
+
+#[tauri::command]
+fn confirm_pending_import_cmd(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StateSnapshot, String> {
+    apply_pending_import(&state, &app)?;
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    Ok(snapshot(&app, &g))
+}
+
+#[tauri::command]
+fn cancel_pending_import_cmd(state: State<'_, AppState>) -> Result<(), String> {
+    cancel_pending_import_inner(&state);
+    Ok(())
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BypassPresetsResponse {
@@ -1678,6 +1768,7 @@ pub fn run() -> anyhow::Result<()> {
             last_error: None,
             phase: VpnPhase::Idle,
             recovery_pending: false,
+            pending_import: None,
         })),
     };
 
@@ -1830,6 +1921,9 @@ pub fn run() -> anyhow::Result<()> {
             disconnect_cmd,
             apply_invite_cmd,
             clear_error_cmd,
+            get_pending_import,
+            confirm_pending_import_cmd,
+            cancel_pending_import_cmd,
             open_control_plane_refresh_cmd,
             get_bypass_presets_cmd,
         ])
@@ -1853,7 +1947,12 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod deeplink_tests {
-    use super::parse_import_deeplink;
+    use super::{
+        allowed_origins_for_import, cancel_pending_import_inner, parse_import_deeplink,
+        pending_import_view, AppState, Inner, PendingControlPlaneImport, SavedConfig, VpnPhase,
+    };
+    use crate::control_plane_client::{self, ImportPayload};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn parse_import_deeplink_ok() {
@@ -1861,5 +1960,67 @@ mod deeplink_tests {
         let (tok, base) = parse_import_deeplink(url).expect("parse");
         assert_eq!(tok, "abc123");
         assert_eq!(base, "https://cp.example.com");
+    }
+
+    #[test]
+    fn redeem_validates_before_http() {
+        let allowed = vec!["https://cp.example.com".to_string()];
+        let err = control_plane_client::redeem_import("http://cp.example.com", "tok", &allowed)
+            .unwrap_err();
+        assert!(err.contains("HTTPS"), "{err}");
+    }
+
+    #[test]
+    fn pending_import_not_persisted_until_confirm() {
+        let allowed = vec!["https://cp.example.com".to_string()];
+        let origin =
+            control_plane_client::validate_control_plane_base_url("https://cp.example.com", &allowed)
+                .unwrap();
+        let payload = ImportPayload {
+            invite_uri: "biba://x".into(),
+            invite_passphrase: "pw".into(),
+            instance_id: 1,
+            display_name: "alice".into(),
+            server_name: "node".into(),
+            server_public_host: "203.0.113.1".into(),
+            host_port: 8443,
+            expires_at: "2026-01-01".into(),
+            config_version: "1".into(),
+        };
+        let state = AppState {
+            rt: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            inner: Arc::new(Mutex::new(Inner {
+                cfg: SavedConfig::default(),
+                proxy_backup: None,
+                vpn: None,
+                tunnel_server: None,
+                last_error: None,
+                phase: VpnPhase::Idle,
+                recovery_pending: false,
+                pending_import: Some(PendingControlPlaneImport {
+                    origin: origin.clone(),
+                    payload: payload.clone(),
+                }),
+            })),
+        };
+        let cfg_before = state.inner.lock().unwrap().cfg.clone();
+        assert!(cfg_before.active_profile().is_none_or(|p| p.server.is_empty()));
+        cancel_pending_import_inner(&state);
+        assert!(state.inner.lock().unwrap().pending_import.is_none());
+        let view = pending_import_view(&origin, &payload);
+        assert_eq!(view.vpn_host, "203.0.113.1:8443");
+        assert_eq!(view.control_plane_host, "cp.example.com");
+    }
+
+    #[test]
+    fn allowed_origins_include_profile_base_url() {
+        let mut cfg = SavedConfig::default();
+        let id = cfg.profiles[0].id.clone();
+        cfg.active_profile_id = id;
+        if let Some(p) = cfg.active_profile_mut() {
+            p.control_plane_base_url = "https://saved.example.com".into();
+        }
+        let origins = allowed_origins_for_import(&cfg);
+        assert!(origins.iter().any(|o| o == "https://saved.example.com"));
     }
 }

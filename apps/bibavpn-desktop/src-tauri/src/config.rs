@@ -476,6 +476,23 @@ pub fn import_control_plane_payload(
     Ok(())
 }
 
+/// Canonical HTTPS origins from saved profile `control_plane_base_url` fields.
+pub fn profile_control_plane_origins(cfg: &SavedConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in &cfg.profiles {
+        let base = p.control_plane_base_url.trim();
+        if base.is_empty() {
+            continue;
+        }
+        if let Ok(origin) = crate::control_plane_client::origin_from_service_url(base) {
+            if !out.iter().any(|o| o == &origin) {
+                out.push(origin);
+            }
+        }
+    }
+    out
+}
+
 impl Default for TunnelProfile {
     fn default() -> Self {
         Self {
