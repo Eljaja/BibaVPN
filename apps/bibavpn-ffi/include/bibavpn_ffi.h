@@ -11,10 +11,16 @@ extern "C" {
  * Start embedded SOCKS5 → BibaVPN client (same JSON as Android JNI `nativeStart`).
  * @return 0 on success; non-zero on failure — then `*err_out` is a NUL-terminated
  *         UTF-8 message allocated by Rust; free with `bibavpn_ffi_string_free`.
+ *         Returns -99 when an internal panic was caught at the FFI boundary
+ *         (`*err_out` still holds a heap error string).
  */
 int32_t bibavpn_ffi_start(const char *config_json_utf8, char **err_out);
 
-/** Stop client if running; idempotent. */
+/**
+ * Stop client if running; idempotent.
+ * Returns within ~5s even if the client thread is stuck (shutdown is signalled,
+ * then the join is bounded — same as Android JNI `nativeStop`).
+ */
 void bibavpn_ffi_stop(void);
 
 /**

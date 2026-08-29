@@ -39,6 +39,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sys-locale = "0.3.2"
 ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+url = "2.5"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }

@@ -86,7 +86,7 @@ bibavpn_auth_failures_total {auth_failures_total}
 # HELP bibavpn_auth_bans_issued_total Temporary auth bans issued since process start.
 # TYPE bibavpn_auth_bans_issued_total counter
 bibavpn_auth_bans_issued_total {auth_bans_issued_total}
-# HELP bibavpn_handshake_timeouts_total Sessions that exceeded a pre-tunnel timeout (TLS, WS upgrade, REALITY, AUTH wait).
+# HELP bibavpn_handshake_timeouts_total Sessions that exceeded a pre-tunnel timeout (TLS, WS upgrade, REALITY, AUTH wait, post-AUTH first-channel wait).
 # TYPE bibavpn_handshake_timeouts_total counter
 bibavpn_handshake_timeouts_total {handshake_timeouts_total}
 # HELP bibavpn_auth_rejected_banned_total Connections rejected because the source IP is banned.
