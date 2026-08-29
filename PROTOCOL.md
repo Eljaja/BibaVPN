@@ -439,7 +439,7 @@ These options shape TLS/WebSocket timing and framing; they apply on top of the t
   background HTTPS decoys (merged with `--stealth-profile` defaults)
 - **Server:** `--server-ack-delay-min-ms` / `max`, `--rtt-mask-jitter-ms`, optional
   `--ack-profile balanced|aggressive` when the explicit millisecond args are all zero
-- `--camouflage-dir`, `--camouflage-url` (`http://` upstream only) — server camouflage
+- `--camouflage-dir`, `--camouflage-url` (`http://` upstream only), `--camouflage-allow-private` — server camouflage
 
 Wire-format changes require **both** client and server updates. Pure client-side
 or server-side **timing / TLS engine** options do not change the control opcodes
