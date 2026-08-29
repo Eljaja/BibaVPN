@@ -278,7 +278,11 @@ pub fn decode_udp_rep(data: &[u8]) -> anyhow::Result<(u64, String, u16, Vec<u8>)
     let xid = u64::from_be_bytes(data[1..9].try_into()?);
     let rest = &data[9..];
     let (h, p, addr_len) = decode_atyp_host_port(rest)?;
-    let payload = rest[addr_len..].to_vec();
+    let payload_slice = &rest[addr_len..];
+    if payload_slice.len() > MAX_UDP_PAYLOAD {
+        anyhow::bail!("udp rep payload too large");
+    }
+    let payload = payload_slice.to_vec();
     Ok((xid, h, p, payload))
 }
 
@@ -555,6 +559,21 @@ mod udp_tests {
         let big = vec![0u8; MAX_UDP_PAYLOAD + 1];
         assert!(encode_udp_req(1, "1.1.1.1", 53, &big).is_err());
         assert!(encode_udp_rep(1, "1.1.1.1", 53, &big).is_err());
+    }
+
+    #[test]
+    fn udp_rep_decode_payload_max_enforced() {
+        let max_payload = vec![0u8; MAX_UDP_PAYLOAD];
+        let q = encode_udp_rep(1, "1.1.1.1", 53, &max_payload).unwrap();
+        let (xid, h, port, pl) = decode_udp_rep(&q).unwrap();
+        assert_eq!(xid, 1);
+        assert_eq!(h, "1.1.1.1");
+        assert_eq!(port, 53);
+        assert_eq!(pl.len(), MAX_UDP_PAYLOAD);
+
+        let mut oversized = encode_udp_rep(1, "1.1.1.1", 53, b"").unwrap();
+        oversized.extend_from_slice(&vec![0u8; MAX_UDP_PAYLOAD + 1]);
+        assert!(decode_udp_rep(&oversized).is_err());
     }
 
     #[test]

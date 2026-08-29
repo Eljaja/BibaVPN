@@ -1,4 +1,5 @@
-# Manual: Actions → Android → Run workflow. Also runs on push/PR when core VPN (protocol/server/client lib), JNI, or Tauri Android paths change.
+# Manual: Actions → Android → Run workflow. Also runs on push to main when core
+# VPN, JNI, or Tauri Android paths change. Not on pull_request — tests live in test.yml.
 name: Android
 
 run-name: Android · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -12,22 +13,6 @@ on:
         required: false
 
   push:
-    branches: [main, master]
-    paths:
-      - "bibavpn/**"
-      - "!bibavpn/**/*.md"
-      - "biba/**"
-      - "!biba/**/*.md"
-      - "apps/bibavpn-jni/**"
-      - "!apps/bibavpn-jni/**/*.md"
-      - "apps/bibavpn-desktop/**"
-      - "!apps/bibavpn-desktop/**/*.md"
-      - "apps/scripts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".github/workflows/android.yml"
-  pull_request:
     branches: [main, master]
     paths:
       - "bibavpn/**"
