@@ -416,6 +416,36 @@ pub fn is_v3_mux_open(data: &[u8]) -> bool {
     data == [V3_CTRL_MUX]
 }
 
+/// Classify a decrypted, unpadded v3 control payload as a first-channel open opcode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V3FirstChannelKind {
+    TcpOpen {
+        host: String,
+        port: u16,
+        flags: u8,
+    },
+    UdpMux,
+    Mux,
+    NotChannelOpen,
+}
+
+pub fn classify_v3_first_channel(data: &[u8]) -> V3FirstChannelKind {
+    if let Ok((host, port, flags)) = decode_v3_open_with_flags(data) {
+        return V3FirstChannelKind::TcpOpen {
+            host,
+            port,
+            flags,
+        };
+    }
+    if is_v3_udp_mux_open(data) {
+        return V3FirstChannelKind::UdpMux;
+    }
+    if is_v3_mux_open(data) {
+        return V3FirstChannelKind::Mux;
+    }
+    V3FirstChannelKind::NotChannelOpen
+}
+
 pub fn encode_v3_open_ok() -> Vec<u8> {
     vec![V3_CTRL_OPEN_OK]
 }
@@ -571,6 +601,38 @@ mod v3_ctrl_tests {
         assert!(is_v3_mux_open(&encode_v3_mux_open()));
         assert!(is_v3_udp_mux_open(&encode_v3_udp_mux_open()));
         assert!(!is_v3_mux_open(&encode_v3_udp_mux_open()));
+    }
+
+    #[test]
+    fn classify_v3_first_channel_opcodes() {
+        use super::classify_v3_first_channel;
+        use super::V3FirstChannelKind;
+
+        let open = encode_v3_open_with_flags("example.org", 443, OPEN_FLAG_STATUS).unwrap();
+        match classify_v3_first_channel(&open) {
+            V3FirstChannelKind::TcpOpen { host, port, flags } => {
+                assert_eq!(host, "example.org");
+                assert_eq!(port, 443);
+                assert_ne!(flags & OPEN_FLAG_STATUS, 0);
+            }
+            other => panic!("expected TcpOpen, got {other:?}"),
+        }
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_mux_open()),
+            V3FirstChannelKind::Mux
+        );
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_udp_mux_open()),
+            V3FirstChannelKind::UdpMux
+        );
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_open_ok()),
+            V3FirstChannelKind::NotChannelOpen
+        );
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_auth("token").unwrap()),
+            V3FirstChannelKind::NotChannelOpen
+        );
     }
 
     #[test]
