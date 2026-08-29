@@ -59,8 +59,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             NSError(
                 domain: "BibaVPN",
                 code: 3,
-                userInfo: [NSLocalizedDescriptionKey: msg],
-            ),
+                userInfo: [NSLocalizedDescriptionKey: msg]
+            )
         )
     }
 
