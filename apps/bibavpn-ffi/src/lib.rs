@@ -413,7 +413,7 @@ pub unsafe extern "C" fn bibavpn_ffi_string_free(s: *mut c_char) {
 }
 
 #[cfg(test)]
-mod tests {
+mod panic_boundary_tests {
     use super::*;
     use std::sync::Arc;
 
