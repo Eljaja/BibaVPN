@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 fn reality_cfg_for(priv_key: [u8; 32], short_ids: Vec<[u8; 8]>) -> RealityServerConfig {
     RealityServerConfig {
         target: "front.example:443".into(),
-        server_names: vec!["front.example".into()],
+        server_names: vec!["127.0.0.1".into()],
         private_key: priv_key,
         short_ids,
         min_client_ver: None,
@@ -45,7 +45,8 @@ async fn spawn_reality_server(
     let handle = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.expect("accept");
         let tls = acceptor.accept(tcp).await.expect("tls accept");
-        let (mut ws, _) = accept_websocket_or_camouflage(
+        let tls_sni = tls.get_ref().1.server_name().map(str::to_string);
+        let (mut ws, _, http_host) = accept_websocket_or_camouflage(
             tls,
             &ws_path,
             false,
@@ -56,7 +57,14 @@ async fn spawn_reality_server(
         .await
         .expect("ws")
         .expect("ws some");
-        let res = server_handshake_reality(&mut ws, &cfg, &token).await;
+        let res = server_handshake_reality(
+            &mut ws,
+            &cfg,
+            &token,
+            tls_sni.as_deref(),
+            http_host.as_deref(),
+        )
+        .await;
         let _ = ws.close(None).await;
         res
     });
@@ -204,7 +212,7 @@ async fn reality_handshake_rejects_forged_server() {
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.expect("accept");
         let tls = acceptor.accept(tcp).await.expect("tls accept");
-        let (mut ws, _) = accept_websocket_or_camouflage(
+        let (mut ws, _, _http_host) = accept_websocket_or_camouflage(
             tls,
             &ws_path_s,
             false,
@@ -229,5 +237,31 @@ async fn reality_handshake_rejects_forged_server() {
 
     let res = reality_client_exchange_verify(&mut ws, &pub_key, &short_id, &token).await;
     assert!(res.is_err(), "client must reject a forged confirmation MAC");
+    let _ = ws.close(None).await;
+}
+
+/// TLS SNI / HTTP Host outside `--reality-server-names` must be rejected before
+/// REALITY HELLO is processed (and therefore before mux).
+#[tokio::test]
+async fn reality_handshake_rejects_non_listed_server_name() {
+    install_ring_crypto();
+
+    let (priv_key, pub_key) = RealityServerConfig::generate_keys();
+    let short_id = [0u8; 8];
+    let token = "test-token";
+
+    let mut cfg = reality_cfg_for(priv_key, vec![short_id]);
+    cfg.server_names = vec!["vk.com".into()];
+
+    let (addr, server) = spawn_reality_server(cfg, "/ws", token).await;
+    let mut ws = client_ws(addr, "/ws").await;
+
+    let _ = reality_client_exchange_verify(&mut ws, &pub_key, &short_id, token).await;
+
+    let server_res = server.await.expect("join");
+    assert!(
+        server_res.is_err(),
+        "server must reject TLS SNI / HTTP Host not in --reality-server-names"
+    );
     let _ = ws.close(None).await;
 }
