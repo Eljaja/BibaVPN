@@ -328,6 +328,15 @@ fn inject_mobile_tunnel_session_json(base_json: &str) -> Result<String, String> 
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn start_json_with_bypass_cache(cfg: &SavedConfig) -> Result<String, String> {
+    // Must run before `start_config_json()`: that builds `split_bypass_domains` for the
+    // tunnel client's DNS-snoop split routing out of the in-memory preset cache, so a cold
+    // cache here means an empty bypass list and silently no domain split at all.
+    let _ = bypass_domains::ensure_loaded(false);
+    cfg.start_config_json()
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn sync_tray_tooltip_i18n(app: &AppHandle, connected: bool, cfg: &SavedConfig) {
     let s = tray_strings(resolved_tray_lang(cfg));
@@ -1372,11 +1381,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     }
 
     persist_cfg(app, &g.cfg)?;
-    // Must run before `start_config_json()`: that builds `split_bypass_domains` for the
-    // tunnel client's DNS-snoop split routing out of the in-memory preset cache, so a cold
-    // cache here means an empty bypass list and silently no domain split at all.
-    let _ = bypass_domains::ensure_loaded(false);
-    let json = g.cfg.start_config_json()?;
+    let json = start_json_with_bypass_cache(&g.cfg)?;
     let (split_tunnel_enabled, packages, domains, battery) = match g.cfg.active_profile() {
         Some(p) => (
             p.split_tunnel_enabled,
@@ -1431,7 +1436,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     }
 
     persist_cfg(app, &g.cfg)?;
-    let json = g.cfg.start_config_json()?;
+    let json = start_json_with_bypass_cache(&g.cfg)?;
     let json = inject_mobile_tunnel_session_json(&json)?;
     let remote_label = display_host_line(&g.cfg);
     drop(g);
@@ -2129,5 +2134,30 @@ mod android_connect_error_tests {
             Some("vpn_permission_denied".into()),
         );
         assert_eq!(err, rust_err);
+    }
+}
+
+#[cfg(test)]
+mod ios_connect_tests {
+    /// iOS `connect_inner` is `cfg(ios)` and does not compile on Linux CI; assert source order instead.
+    #[test]
+    fn ios_connect_loads_bypass_cache_before_start_json() {
+        let src = include_str!("lib.rs").replace("\r\n", "\n");
+        let marker = "#[cfg(target_os = \"ios\")]\nfn connect_inner";
+        let ios_block = src
+            .split_once(marker)
+            .expect("ios connect_inner")
+            .1
+            .split("\n#[tauri::command]")
+            .next()
+            .expect("ios connect_inner block");
+        assert!(
+            ios_block.contains("start_json_with_bypass_cache"),
+            "iOS connect_inner must load bypass cache via shared helper"
+        );
+        assert!(
+            !ios_block.contains("g.cfg.start_config_json()"),
+            "iOS connect_inner must not call start_config_json without loading bypass cache first"
+        );
     }
 }
