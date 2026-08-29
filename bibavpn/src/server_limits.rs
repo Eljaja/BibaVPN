@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::crypto_layer;
+
 /// Sliding window: `max_failures` within `window`, then ban for `ban`.
 /// Counted per source bucket (IPv4 /32, IPv6 /64), see [`auth_limit_key`].
 #[derive(Debug, Clone)]
@@ -257,6 +259,38 @@ impl PreAuthBudgetTracker {
     }
 }
 
+/// Hard cap on junk binary frames before a well-formed v3 HELLO.
+pub const MAX_PRE_HELLO_FRAMES: u32 = 256;
+/// Hard cap on junk bytes before a well-formed v3 HELLO.
+pub const MAX_PRE_HELLO_BYTES: usize = 256 * 1024;
+/// Bail message when either pre-HELLO cap is exceeded.
+pub const PRE_HELLO_CAP_ERR: &str = "too much pre-handshake data before v3 HELLO";
+
+#[derive(Debug, Default)]
+pub struct PreHelloJunkTracker {
+    pub junk_frames: u32,
+    pub junk_bytes: usize,
+}
+
+/// Classify one pre-HELLO WebSocket binary: accept a well-formed HELLO, count
+/// everything else as junk, and bail when caps are exceeded.
+pub fn account_pre_hello_binary(
+    frame: &[u8],
+    tracker: &mut PreHelloJunkTracker,
+    max_frames: u32,
+    max_bytes: usize,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    if let Ok(client_random) = crypto_layer::parse_hello_v3(frame) {
+        return Ok(Some(client_random));
+    }
+    tracker.junk_frames = tracker.junk_frames.saturating_add(1);
+    tracker.junk_bytes = tracker.junk_bytes.saturating_add(frame.len());
+    if tracker.junk_frames > max_frames || tracker.junk_bytes > max_bytes {
+        anyhow::bail!(PRE_HELLO_CAP_ERR);
+    }
+    Ok(None)
+}
+
 /// Counts live TLS/WSS sessions (increment when `handle_one` starts after permit, decrement on return).
 pub struct ServerStats {
     pub active_sessions: AtomicU64,
@@ -487,5 +521,130 @@ mod tests {
         assert!(lim.check_allowed(mapped).await.is_err());
         assert!(lim.check_allowed(plain).await.is_err());
         assert_eq!(lim.bans_active.load(Ordering::Relaxed), 1);
+    }
+
+    fn malformed_hello_garbage() -> Vec<u8> {
+        vec![crypto_layer::V3_HELLO_TAG, 0xde, 0xad]
+    }
+
+    #[test]
+    fn pre_hello_malformed_hello_counts_as_junk() {
+        let mut tracker = PreHelloJunkTracker::default();
+        let frame = malformed_hello_garbage();
+        let got = account_pre_hello_binary(&frame, &mut tracker, 256, MAX_PRE_HELLO_BYTES).unwrap();
+        assert!(got.is_none());
+        assert_eq!(tracker.junk_frames, 1);
+        assert_eq!(tracker.junk_bytes, frame.len());
+    }
+
+    #[test]
+    fn pre_hello_frame_cap_exceeded_small() {
+        let mut tracker = PreHelloJunkTracker::default();
+        const CAP: u32 = 3;
+        for _ in 0..CAP {
+            account_pre_hello_binary(&malformed_hello_garbage(), &mut tracker, CAP, 1024)
+                .unwrap();
+        }
+        assert_eq!(tracker.junk_frames, CAP);
+        let err = account_pre_hello_binary(&malformed_hello_garbage(), &mut tracker, CAP, 1024)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(PRE_HELLO_CAP_ERR),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_hello_frame_cap_exceeded_production() {
+        let mut tracker = PreHelloJunkTracker::default();
+        for _ in 0..MAX_PRE_HELLO_FRAMES {
+            account_pre_hello_binary(
+                &malformed_hello_garbage(),
+                &mut tracker,
+                MAX_PRE_HELLO_FRAMES,
+                MAX_PRE_HELLO_BYTES,
+            )
+            .unwrap();
+        }
+        let err = account_pre_hello_binary(
+            &malformed_hello_garbage(),
+            &mut tracker,
+            MAX_PRE_HELLO_FRAMES,
+            MAX_PRE_HELLO_BYTES,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(PRE_HELLO_CAP_ERR),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_hello_byte_cap_exceeded() {
+        let mut tracker = PreHelloJunkTracker::default();
+        let mut frame = vec![crypto_layer::V3_HELLO_TAG];
+        frame.extend(std::iter::repeat_n(0u8, 8));
+        let err = account_pre_hello_binary(&frame, &mut tracker, 256, 4).unwrap_err();
+        assert!(
+            err.to_string().contains(PRE_HELLO_CAP_ERR),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_hello_well_formed_hello_accepted() {
+        let mut tracker = PreHelloJunkTracker::default();
+        let (client_random, hello) = crypto_layer::build_hello_v3();
+        let got = account_pre_hello_binary(
+            &hello,
+            &mut tracker,
+            MAX_PRE_HELLO_FRAMES,
+            MAX_PRE_HELLO_BYTES,
+        )
+        .unwrap()
+        .expect("well-formed HELLO");
+        assert_eq!(got, client_random);
+        assert_eq!(tracker.junk_frames, 0);
+        assert_eq!(tracker.junk_bytes, 0);
+    }
+
+    #[test]
+    fn pre_hello_junk_then_well_formed_hello() {
+        let mut tracker = PreHelloJunkTracker::default();
+        account_pre_hello_binary(&[0x04], &mut tracker, MAX_PRE_HELLO_FRAMES, MAX_PRE_HELLO_BYTES)
+            .unwrap();
+        let (_, hello) = crypto_layer::build_hello_v3();
+        let got = account_pre_hello_binary(
+            &hello,
+            &mut tracker,
+            MAX_PRE_HELLO_FRAMES,
+            MAX_PRE_HELLO_BYTES,
+        )
+        .unwrap()
+        .expect("HELLO after junk");
+        assert_eq!(got, crypto_layer::parse_hello_v3(&hello).unwrap());
+        assert_eq!(tracker.junk_frames, 1);
+    }
+
+    #[test]
+    fn pre_hello_non_tag_still_counts_as_junk() {
+        let mut tracker = PreHelloJunkTracker::default();
+        let got =
+            account_pre_hello_binary(&[], &mut tracker, MAX_PRE_HELLO_FRAMES, MAX_PRE_HELLO_BYTES)
+                .unwrap();
+        assert!(got.is_none());
+        assert_eq!(tracker.junk_frames, 1);
+        assert_eq!(tracker.junk_bytes, 0);
+
+        let got = account_pre_hello_binary(
+            &[0x02, 0x01],
+            &mut tracker,
+            MAX_PRE_HELLO_FRAMES,
+            MAX_PRE_HELLO_BYTES,
+        )
+        .unwrap();
+        assert!(got.is_none());
+        assert_eq!(tracker.junk_frames, 2);
+        assert_eq!(tracker.junk_bytes, 2);
     }
 }
