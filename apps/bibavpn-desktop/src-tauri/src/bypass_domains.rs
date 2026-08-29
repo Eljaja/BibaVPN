@@ -580,9 +580,9 @@ pub fn android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
-pub(crate) fn seed_test_cache(presets: Vec<BypassPresetInfo>) {
-    let mut state = cache_lock().lock().expect("bypass cache lock");
-    apply_presets(&mut state, presets, DEFAULT_TTL_SEC, "test://seed");
+pub fn replace_cache_for_test(presets: Vec<BypassPresetInfo>) {
+    let mut state = cache_lock().lock().expect("bypass cache");
+    apply_presets(&mut state, presets, DEFAULT_TTL_SEC, "test://bypass");
 }
 
 #[cfg(test)]

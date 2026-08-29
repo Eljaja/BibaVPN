@@ -131,9 +131,7 @@ export function ConnectScreen({
 
   const subtitle = snap.connected ? snap.displayHost : t("status_sub_disconnected");
 
-  const inviteMode =
-    String(profile?.from_invite || "").trim() !== "" &&
-    String(profile?.invite_passphrase || "").trim() !== "";
+  const inviteMode = Boolean(profile?.has_invite);
   const serverMismatch =
     snap.connected &&
     snap.tunnelServer &&

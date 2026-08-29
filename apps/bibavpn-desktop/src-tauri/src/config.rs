@@ -12,13 +12,226 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_VERSION: u32 = 2;
 
+/// Secret profile fields omitted from poll snapshots (`get_state` / `vpn-state`).
+const PROFILE_SECRET_KEYS: &[&str] = &[
+    "token",
+    "psk",
+    "from_invite",
+    "invite_passphrase",
+    "pin_cert_pem",
+];
+
+/// Публичный профиль для poll snapshot — без секретов, с флагами наличия.
+#[derive(Serialize, Clone)]
+pub struct PublicTunnelProfile {
+    pub id: String,
+    pub name: String,
+    pub server: String,
+    pub sni: String,
+    pub insecure: bool,
+    pub max_pad: u8,
+    pub decoy_max: u8,
+    pub max_ws_binary: usize,
+    pub tls_profile: String,
+    pub junk_frames: u32,
+    pub early_ws_frames: u8,
+    pub ws_ping_secs: u64,
+    pub ws_headers: String,
+    pub use_tcp_mux: bool,
+    pub ws_path: String,
+    pub pad_mode: String,
+    pub ws_ping_jitter_percent: u8,
+    pub ws_binary_send_jitter_ms: u8,
+    pub udp_max_pad: String,
+    pub udp_max_ws_binary: String,
+    pub udp_mux_reply_timeout_secs: String,
+    pub dummy_interval_secs: u64,
+    pub decoy_gets: bool,
+    pub decoy_gets_interval_secs: u64,
+    pub decoy_gets_paths: String,
+    pub split_tunnel_enabled: bool,
+    pub split_tunnel_preset_ids: Vec<String>,
+    pub proto: u8,
+    pub proto_domain: String,
+    pub stealth_profile: String,
+    pub decoy_mode: String,
+    pub desync_mode: String,
+    pub tcp_fooling: String,
+    pub tls_fragment: bool,
+    pub ws_parallel: u8,
+    pub idle_decoy_secs: u64,
+    pub tls_stack: String,
+    pub fingerprint: String,
+    pub reality_target: String,
+    pub reality_public_key: String,
+    pub reality_short_id: String,
+    pub ws_host: String,
+    pub ws_origin: String,
+    pub ws_user_agent: String,
+    pub ws_accept_language: String,
+    pub ws_jitter_min_ms: u8,
+    pub ws_jitter_max_ms: u8,
+    pub control_plane_instance_id: u64,
+    pub control_plane_config_version: String,
+    pub control_plane_base_url: String,
+    pub android_socks_bind: String,
+    pub android_split_tunnel_packages: Vec<String>,
+    pub android_manual_split_packages: Vec<String>,
+    pub android_vpn_routing_mode: String,
+    pub android_screen_off_battery_saver: bool,
+    pub has_token: bool,
+    pub has_psk: bool,
+    pub has_from_invite: bool,
+    pub has_invite_passphrase: bool,
+    pub has_invite: bool,
+    pub has_pin_cert: bool,
+}
+
+/// Публичный корневой конфиг для poll snapshot.
+#[derive(Serialize, Clone)]
+pub struct PublicSavedConfig {
+    pub version: u32,
+    pub ui_locale: String,
+    pub local_http_port: u16,
+    pub local_socks_port: u16,
+    pub active_profile_id: String,
+    pub profiles: Vec<PublicTunnelProfile>,
+}
+
+pub fn to_public_profile(p: &TunnelProfile) -> PublicTunnelProfile {
+    let has_token = !p.token.trim().is_empty();
+    let has_psk = !p.psk.trim().is_empty();
+    let has_from_invite = !p.from_invite.trim().is_empty();
+    let has_invite_passphrase = !p.invite_passphrase.trim().is_empty();
+    let has_invite = has_from_invite && has_invite_passphrase;
+    let has_pin_cert = !p.pin_cert_pem.trim().is_empty();
+    PublicTunnelProfile {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        server: p.server.clone(),
+        sni: p.sni.clone(),
+        insecure: p.insecure,
+        max_pad: p.max_pad,
+        decoy_max: p.decoy_max,
+        max_ws_binary: p.max_ws_binary,
+        tls_profile: p.tls_profile.clone(),
+        junk_frames: p.junk_frames,
+        early_ws_frames: p.early_ws_frames,
+        ws_ping_secs: p.ws_ping_secs,
+        ws_headers: p.ws_headers.clone(),
+        use_tcp_mux: p.use_tcp_mux,
+        ws_path: p.ws_path.clone(),
+        pad_mode: p.pad_mode.clone(),
+        ws_ping_jitter_percent: p.ws_ping_jitter_percent,
+        ws_binary_send_jitter_ms: p.ws_binary_send_jitter_ms,
+        udp_max_pad: p.udp_max_pad.clone(),
+        udp_max_ws_binary: p.udp_max_ws_binary.clone(),
+        udp_mux_reply_timeout_secs: p.udp_mux_reply_timeout_secs.clone(),
+        dummy_interval_secs: p.dummy_interval_secs,
+        decoy_gets: p.decoy_gets,
+        decoy_gets_interval_secs: p.decoy_gets_interval_secs,
+        decoy_gets_paths: p.decoy_gets_paths.clone(),
+        split_tunnel_enabled: p.split_tunnel_enabled,
+        split_tunnel_preset_ids: p.split_tunnel_preset_ids.clone(),
+        proto: p.proto,
+        proto_domain: p.proto_domain.clone(),
+        stealth_profile: p.stealth_profile.clone(),
+        decoy_mode: p.decoy_mode.clone(),
+        desync_mode: p.desync_mode.clone(),
+        tcp_fooling: p.tcp_fooling.clone(),
+        tls_fragment: p.tls_fragment,
+        ws_parallel: p.ws_parallel,
+        idle_decoy_secs: p.idle_decoy_secs,
+        tls_stack: p.tls_stack.clone(),
+        fingerprint: p.fingerprint.clone(),
+        reality_target: p.reality_target.clone(),
+        reality_public_key: p.reality_public_key.clone(),
+        reality_short_id: p.reality_short_id.clone(),
+        ws_host: p.ws_host.clone(),
+        ws_origin: p.ws_origin.clone(),
+        ws_user_agent: p.ws_user_agent.clone(),
+        ws_accept_language: p.ws_accept_language.clone(),
+        ws_jitter_min_ms: p.ws_jitter_min_ms,
+        ws_jitter_max_ms: p.ws_jitter_max_ms,
+        control_plane_instance_id: p.control_plane_instance_id,
+        control_plane_config_version: p.control_plane_config_version.clone(),
+        control_plane_base_url: p.control_plane_base_url.clone(),
+        android_socks_bind: p.android_socks_bind.clone(),
+        android_split_tunnel_packages: p.android_split_tunnel_packages.clone(),
+        android_manual_split_packages: p.android_manual_split_packages.clone(),
+        android_vpn_routing_mode: p.android_vpn_routing_mode.clone(),
+        android_screen_off_battery_saver: p.android_screen_off_battery_saver,
+        has_token,
+        has_psk,
+        has_from_invite,
+        has_invite_passphrase,
+        has_invite,
+        has_pin_cert,
+    }
+}
+
+pub fn to_public_saved_config(cfg: &SavedConfig) -> PublicSavedConfig {
+    PublicSavedConfig {
+        version: cfg.version,
+        ui_locale: cfg.ui_locale.clone(),
+        local_http_port: cfg.local_http_port,
+        local_socks_port: cfg.local_socks_port,
+        active_profile_id: cfg.active_profile_id.clone(),
+        profiles: cfg.profiles.iter().map(to_public_profile).collect(),
+    }
+}
+
+fn merge_profile_secrets(
+    stored: Option<&TunnelProfile>,
+    incoming: &mut TunnelProfile,
+    raw: &serde_json::Value,
+) {
+    let obj = raw.as_object();
+    for key in PROFILE_SECRET_KEYS {
+        let present = obj.map(|m| m.contains_key(*key)).unwrap_or(false);
+        if present {
+            continue;
+        }
+        if let Some(s) = stored {
+            match *key {
+                "token" => incoming.token = s.token.clone(),
+                "psk" => incoming.psk = s.psk.clone(),
+                "from_invite" => incoming.from_invite = s.from_invite.clone(),
+                "invite_passphrase" => incoming.invite_passphrase = s.invite_passphrase.clone(),
+                "pin_cert_pem" => incoming.pin_cert_pem = s.pin_cert_pem.clone(),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Merge UI `save_config_cmd` payload into stored config: omitted secret keys keep disk values.
+pub fn merge_saved_config(stored: &SavedConfig, incoming: &serde_json::Value) -> Result<SavedConfig, String> {
+    let incoming_cfg: SavedConfig =
+        serde_json::from_value(incoming.clone()).map_err(|e| e.to_string())?;
+    let profiles_raw = incoming
+        .get("profiles")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut merged = incoming_cfg;
+    for (i, profile) in merged.profiles.iter_mut().enumerate() {
+        let raw = profiles_raw.get(i).cloned().unwrap_or(serde_json::Value::Null);
+        let stored_profile = stored.profiles.iter().find(|p| p.id == profile.id);
+        merge_profile_secrets(stored_profile, profile, &raw);
+    }
+    Ok(merged)
+}
+
 /// Один профиль туннеля (как один «сервер» в Android).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TunnelProfile {
     pub id: String,
     pub name: String,
     pub server: String,
+    #[serde(default)]
     pub token: String,
+    #[serde(default)]
     pub psk: String,
     pub sni: String,
     pub insecure: bool,
@@ -261,6 +474,23 @@ pub fn import_control_plane_payload(
         .map_err(|e| format!("Ключ: {e:#}"))?;
     apply_invite_fields(p, &inv);
     Ok(())
+}
+
+/// Canonical HTTPS origins from saved profile `control_plane_base_url` fields.
+pub fn profile_control_plane_origins(cfg: &SavedConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in &cfg.profiles {
+        let base = p.control_plane_base_url.trim();
+        if base.is_empty() {
+            continue;
+        }
+        if let Ok(origin) = crate::control_plane_client::origin_from_service_url(base) {
+            if !out.iter().any(|o| o == &origin) {
+                out.push(origin);
+            }
+        }
+    }
+    out
 }
 
 impl Default for TunnelProfile {
@@ -947,12 +1177,7 @@ pub fn server_card_subtitle(cfg: &SavedConfig) -> String {
     if !server.is_empty() {
         server.to_string()
     } else if !invite.is_empty() {
-        let max = 36usize;
-        if invite.len() > max {
-            format!("{}…", &invite[..max])
-        } else {
-            invite.to_string()
-        }
+        "Ключ Biba".to_string()
     } else {
         "Не задан сервер".to_string()
     }
@@ -961,7 +1186,6 @@ pub fn server_card_subtitle(cfg: &SavedConfig) -> String {
 #[cfg(test)]
 mod split_bypass_json_tests {
     use super::TunnelProfile;
-    use crate::bypass_domains::{seed_test_cache, BypassPresetInfo};
 
     fn profile() -> TunnelProfile {
         TunnelProfile {
@@ -994,21 +1218,195 @@ mod split_bypass_json_tests {
     }
 
     #[test]
-    fn present_when_cache_seeded_and_presets_selected() {
-        seed_test_cache(vec![
-            BypassPresetInfo {
-                id: "banks".to_string(),
-                label: "Banks".to_string(),
+    fn emits_cached_preset_domains_when_split_enabled() {
+        crate::bypass_domains::replace_cache_for_test(vec![
+            crate::bypass_domains::BypassPresetInfo {
+                id: "banks".into(),
+                label: "Banks".into(),
                 source: None,
-                domains: vec!["sberbank.ru".to_string()],
+                domains: vec!["sberbank.ru".into(), ".tinkoff.ru".into()],
                 android_packages: vec![],
             },
         ]);
         let mut p = profile();
         p.split_tunnel_enabled = true;
-        p.split_tunnel_preset_ids = vec!["banks".to_string()];
+        p.split_tunnel_preset_ids = vec!["banks".into()];
         let json = p.start_config_json().expect("build start json");
-        assert!(json.contains("split_bypass_domains"), "got: {json}");
-        assert!(json.contains("sberbank.ru"), "got: {json}");
+        assert!(
+            json.contains("split_bypass_domains") && json.contains("sberbank.ru"),
+            "got: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod public_snapshot_tests {
+    use super::{
+        merge_saved_config, server_card_subtitle, to_public_saved_config, SavedConfig,
+        TunnelProfile,
+    };
+    use serde_json::{json, Value};
+
+    fn secret_profile() -> TunnelProfile {
+        TunnelProfile {
+            id: "p-test".to_string(),
+            name: "Secret".to_string(),
+            server: "vpn.example.com:8443".to_string(),
+            token: "super-secret-token".to_string(),
+            psk: "super-secret-psk".to_string(),
+            from_invite: "biba://invite-body-secret".to_string(),
+            invite_passphrase: "passphrase-secret".to_string(),
+            pin_cert_pem: "-----BEGIN CERTIFICATE-----SECRET-----END CERTIFICATE-----".to_string(),
+            ..TunnelProfile::default()
+        }
+    }
+
+    #[test]
+    fn public_snapshot_omits_secret_keys_and_substrings() {
+        let mut cfg = SavedConfig::default();
+        let p = secret_profile();
+        cfg.profiles = vec![p];
+        cfg.active_profile_id = "p-test".to_string();
+        let public = to_public_saved_config(&cfg);
+        let val = serde_json::to_value(&public).expect("serialize public cfg");
+        let text = serde_json::to_string(&val).expect("stringify");
+        for key in ["token", "psk", "from_invite", "invite_passphrase", "pin_cert_pem"] {
+            assert!(
+                !val.get("profiles")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|p| p.as_object())
+                    .map(|m| m.contains_key(key))
+                    .unwrap_or(false),
+                "key {key} must not appear in public profile JSON"
+            );
+        }
+        assert!(!text.contains("super-secret-token"));
+        assert!(!text.contains("super-secret-psk"));
+        assert!(!text.contains("biba://"));
+        assert!(!text.contains("invite-body-secret"));
+        assert!(!text.contains("passphrase-secret"));
+        assert!(!text.contains("SECRET"));
+    }
+
+    #[test]
+    fn public_has_flags_reflect_nonempty_secrets() {
+        let mut cfg = SavedConfig::default();
+        cfg.profiles = vec![secret_profile()];
+        cfg.active_profile_id = "p-test".to_string();
+        let public = to_public_saved_config(&cfg);
+        let p = &public.profiles[0];
+        assert!(p.has_token);
+        assert!(p.has_psk);
+        assert!(p.has_from_invite);
+        assert!(p.has_invite_passphrase);
+        assert!(p.has_invite);
+        assert!(p.has_pin_cert);
+    }
+
+    #[test]
+    fn public_has_flags_false_when_secrets_empty() {
+        let mut cfg = SavedConfig::default();
+        let p = TunnelProfile {
+            id: "p-empty".to_string(),
+            server: "host:443".to_string(),
+            ..TunnelProfile::default()
+        };
+        cfg.profiles = vec![p];
+        cfg.active_profile_id = "p-empty".to_string();
+        let public = to_public_saved_config(&cfg);
+        let pr = &public.profiles[0];
+        assert!(!pr.has_token);
+        assert!(!pr.has_psk);
+        assert!(!pr.has_from_invite);
+        assert!(!pr.has_invite_passphrase);
+        assert!(!pr.has_invite);
+        assert!(!pr.has_pin_cert);
+    }
+
+    #[test]
+    fn server_card_subtitle_invite_profile_no_uri() {
+        let mut cfg = SavedConfig::default();
+        let p = TunnelProfile {
+            id: "p-inv".to_string(),
+            from_invite: "biba://should-not-leak".to_string(),
+            invite_passphrase: "hidden".to_string(),
+            ..TunnelProfile::default()
+        };
+        cfg.profiles = vec![p];
+        cfg.active_profile_id = "p-inv".to_string();
+        let sub = server_card_subtitle(&cfg);
+        assert!(!sub.contains("biba://"));
+        assert!(!sub.contains("should-not-leak"));
+        assert_eq!(sub, "Ключ Biba");
+    }
+
+    #[test]
+    fn merge_preserves_secrets_when_keys_omitted() {
+        let mut stored = SavedConfig::default();
+        stored.profiles = vec![secret_profile()];
+        stored.active_profile_id = "p-test".to_string();
+        let public = to_public_saved_config(&stored);
+        let incoming: Value = serde_json::to_value(public).expect("public value");
+        let merged = merge_saved_config(&stored, &incoming).expect("merge");
+        let m = &merged.profiles[0];
+        assert_eq!(m.token, "super-secret-token");
+        assert_eq!(m.psk, "super-secret-psk");
+        assert_eq!(m.from_invite, "biba://invite-body-secret");
+        assert_eq!(m.invite_passphrase, "passphrase-secret");
+        assert!(m.pin_cert_pem.contains("SECRET"));
+    }
+
+    #[test]
+    fn merge_honors_present_empty_string_to_clear() {
+        let mut stored = SavedConfig::default();
+        stored.profiles = vec![secret_profile()];
+        stored.active_profile_id = "p-test".to_string();
+        let mut incoming = serde_json::to_value(stored.clone()).expect("full cfg");
+        incoming["profiles"][0]["token"] = json!("");
+        incoming["profiles"][0]["psk"] = json!("");
+        let merged = merge_saved_config(&stored, &incoming).expect("merge");
+        assert_eq!(merged.profiles[0].token, "");
+        assert_eq!(merged.profiles[0].psk, "");
+        assert_eq!(merged.profiles[0].from_invite, "biba://invite-body-secret");
+    }
+
+    #[test]
+    fn merge_new_profile_does_not_copy_other_secrets() {
+        let mut stored = SavedConfig::default();
+        stored.profiles = vec![secret_profile()];
+        stored.active_profile_id = "p-test".to_string();
+        let mut new_p = TunnelProfile::default();
+        new_p.id = "p-new".to_string();
+        new_p.name = "New".to_string();
+        new_p.server = "other.example.com:8443".to_string();
+        let mut new_val = serde_json::to_value(&new_p).expect("new profile value");
+        if let Some(obj) = new_val.as_object_mut() {
+            for key in super::PROFILE_SECRET_KEYS {
+                obj.remove(*key);
+            }
+        }
+        let incoming = json!({
+            "version": stored.version,
+            "ui_locale": stored.ui_locale,
+            "local_http_port": stored.local_http_port,
+            "local_socks_port": stored.local_socks_port,
+            "active_profile_id": "p-new",
+            "profiles": [
+                serde_json::to_value(secret_profile()).expect("p1"),
+                new_val,
+            ]
+        });
+        let merged = merge_saved_config(&stored, &incoming).expect("merge");
+        let new_p = merged
+            .profiles
+            .iter()
+            .find(|p| p.id == "p-new")
+            .expect("new profile");
+        assert_eq!(new_p.token, "");
+        assert_eq!(new_p.psk, "");
+        assert_eq!(new_p.from_invite, "");
+        assert_eq!(new_p.invite_passphrase, "");
+        assert_eq!(new_p.pin_cert_pem, "");
     }
 }

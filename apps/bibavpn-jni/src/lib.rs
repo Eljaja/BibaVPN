@@ -1,9 +1,8 @@
 //! Android JNI: start/stop the embedded SOCKS5 → BibaVPN client (same protocol as `bibavpn-client`).
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use anyhow::Context;
-use bibavpn::local_client::LocalClientOptions;
 use bibavpn::start_json_config::local_client_options_from_json_str;
 use bibavpn::tls_util::install_ring_crypto;
 use jni::objects::{JClass, JString};
@@ -24,6 +23,8 @@ struct NativeState {
 /// How long a stop waits for the client thread before detaching it.
 /// Mirrors the desktop bound in `ActiveVpn::stop` (`timeout(5s, handle)`).
 const STOP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+const PANIC_ERR: &str = "internal panic";
 
 /// Signal shutdown and wait for the client thread, but never longer than
 /// [`STOP_JOIN_TIMEOUT`].
@@ -74,6 +75,15 @@ static TRACING_ONCE: OnceLock<()> = OnceLock::new();
 #[cfg(target_os = "android")]
 static VPN_PROTECT_CLASS: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
 
+fn lock_state() -> MutexGuard<'static, Option<NativeState>> {
+    STATE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[cfg(target_os = "android")]
+fn lock_vpn_protect_class() -> MutexGuard<'static, Option<jni::objects::GlobalRef>> {
+    VPN_PROTECT_CLASS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn ensure_ring() {
     RING_ONCE.get_or_init(|| {
         install_ring_crypto();
@@ -114,7 +124,6 @@ fn ensure_tracing() {
         }
         #[cfg(not(target_os = "android"))]
         {
-            use tracing_subscriber::util::SubscriberInitExt;
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -125,9 +134,71 @@ fn ensure_tracing() {
     });
 }
 
+/// Build a non-null JSON error payload for [`nativeDecodeInvite`].
+fn decode_invite_error_json(error: &str) -> String {
+    json!({"ok": false, "error": error}).to_string()
+}
+
+/// Outcome of attempting to allocate a JNI error `jstring` (pure Rust; testable without a JVM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JniStringAlloc {
+    /// `new_string` succeeded; caller should return the raw `jstring`.
+    Ok,
+    /// `new_string` failed; caller must throw and return null.
+    ThrowAndNull,
+}
+
+/// Sanitize UTF-8 for JNI `NewString`: interior NUL bytes are replaced so allocation cannot fail
+/// for that reason.
+fn sanitize_jni_utf8(s: &str) -> String {
+    if s.as_bytes().contains(&0) {
+        s.replace('\0', "\u{FFFD}")
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Map a `new_string` result to a panic-free outcome (unit-tested with a mock allocator).
+fn map_jni_string_alloc<E>(result: Result<(), E>) -> JniStringAlloc {
+    match result {
+        Ok(()) => JniStringAlloc::Ok,
+        Err(_) => JniStringAlloc::ThrowAndNull,
+    }
+}
+
+fn jni_alloc_failed(env: &mut JNIEnv) -> jstring {
+    let _ = env.throw_new(
+        "java/lang/RuntimeException",
+        "failed to allocate JNI error string",
+    );
+    std::ptr::null_mut()
+}
+
+/// Allocate a JNI string or throw `RuntimeException` and return null on failure.
+fn jni_new_string_or_throw(env: &mut JNIEnv, s: &str) -> jstring {
+    let created = env.new_string(s);
+    match map_jni_string_alloc(created.as_ref().map(|_| ())) {
+        JniStringAlloc::Ok => match created {
+            Ok(js) => js.into_raw(),
+            Err(_) => jni_alloc_failed(env),
+        },
+        JniStringAlloc::ThrowAndNull => jni_alloc_failed(env),
+    }
+}
+
+/// Return a `jstring` for an error message, or throw `RuntimeException` if allocation fails.
+fn jni_err(env: &mut JNIEnv, msg: impl AsRef<str>) -> jstring {
+    jni_new_string_or_throw(env, &sanitize_jni_utf8(msg.as_ref()))
+}
+
+/// Return a non-null `jstring` with `{"ok":false,"error":…}` JSON.
+fn jni_json_err(env: &mut JNIEnv, error: impl AsRef<str>) -> jstring {
+    jni_err(env, decode_invite_error_json(error.as_ref()))
+}
+
 #[cfg(target_os = "android")]
 fn cache_vpn_protect_class(env: &mut JNIEnv) -> jni::errors::Result<()> {
-    let mut slot = VPN_PROTECT_CLASS.lock().unwrap();
+    let mut slot = lock_vpn_protect_class();
     if slot.is_none() {
         let cls = env.find_class("dev/bibavpn/core/VpnProtect")?;
         *slot = Some(env.new_global_ref(&cls)?);
@@ -142,7 +213,7 @@ fn jni_protect_socket(jvm: &jni::JavaVM, fd: std::os::unix::io::RawFd) -> std::i
         .attach_current_thread()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("jni attach: {e}")))?;
     let local = {
-        let guard = VPN_PROTECT_CLASS.lock().unwrap();
+        let guard = lock_vpn_protect_class();
         let gref = guard.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -177,38 +248,8 @@ fn jni_protect_socket(jvm: &jni::JavaVM, fd: std::os::unix::io::RawFd) -> std::i
     Ok(())
 }
 
-fn jni_err(env: &mut JNIEnv, msg: impl AsRef<str>) -> jstring {
-    env.new_string(msg.as_ref()).expect("jstring").into_raw()
-}
-
-#[no_mangle]
-pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeDecodeInvite(
-    mut env: JNIEnv,
-    _class: JClass,
-    uri: JString,
-    passphrase: JString,
-) -> jstring {
-    ensure_ring();
-    let uri_s: String = match env.get_string(&uri) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            return env
-                .new_string(json!({"ok": false, "error": format!("uri: {e}")}).to_string())
-                .expect("jstring")
-                .into_raw();
-        }
-    };
-    let pass_s: String = match env.get_string(&passphrase) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            return env
-                .new_string(json!({"ok": false, "error": format!("passphrase: {e}")}).to_string())
-                .expect("jstring")
-                .into_raw();
-        }
-    };
-
-    let payload = match bibavpn::decode_invite_v1(&uri_s, &pass_s) {
+fn decode_invite_payload(uri_s: &str, pass_s: &str) -> String {
+    match bibavpn::decode_invite_v1(uri_s, pass_s) {
         Ok(inv) => {
             let mut out = serde_json::Map::new();
             out.insert("ok".to_string(), json!(true));
@@ -220,38 +261,56 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeDecodeInvite(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return env
-                        .new_string(
-                            json!({ "ok": false, "error": format!("invite json: {e}") }).to_string(),
-                        )
-                        .expect("jstring")
-                        .into_raw();
+                    return decode_invite_error_json(&format!("invite json: {e}"));
                 }
             }
             serde_json::Value::Object(out).to_string()
         }
-        Err(e) => json!({
-            "ok": false,
-            "error": format!("{e:#}"),
-        })
-        .to_string(),
+        Err(e) => decode_invite_error_json(&format!("{e:#}")),
+    }
+}
+
+fn native_decode_invite_impl(
+    env: &mut JNIEnv,
+    _class: JClass,
+    uri: JString,
+    passphrase: JString,
+) -> jstring {
+    ensure_ring();
+    let uri_s: String = match env.get_string(&uri) {
+        Ok(s) => s.into(),
+        Err(e) => return jni_json_err(env, format!("uri: {e}")),
+    };
+    let pass_s: String = match env.get_string(&passphrase) {
+        Ok(s) => s.into(),
+        Err(e) => return jni_json_err(env, format!("passphrase: {e}")),
     };
 
-    env.new_string(payload).expect("jstring").into_raw()
+    jni_err(env, decode_invite_payload(&uri_s, &pass_s))
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
+pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeDecodeInvite(
     mut env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
+    class: JClass,
+    uri: JString,
+    passphrase: JString,
 ) -> jstring {
+    match catch_unwind(AssertUnwindSafe(|| {
+        native_decode_invite_impl(&mut env, class, uri, passphrase)
+    })) {
+        Ok(r) => r,
+        Err(_) => jni_json_err(&mut env, PANIC_ERR),
+    }
+}
+
+fn native_start_impl(env: &mut JNIEnv, _class: JClass, config_json: JString) -> jstring {
     ensure_ring();
     ensure_tracing();
 
     let json: String = match env.get_string(&config_json) {
         Ok(s) => s.into(),
-        Err(e) => return jni_err(&mut env, format!("config string: {e}")),
+        Err(e) => return jni_err(env, format!("config string: {e}")),
     };
     let json_fingerprint = {
         use std::collections::hash_map::DefaultHasher;
@@ -266,10 +325,7 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
         "nativeStart: enter"
     );
 
-    let mut guard = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return jni_err(&mut env, "state mutex poisoned"),
-    };
+    let mut guard = lock_state();
 
     if guard.is_some() {
         let thread_done = guard
@@ -286,7 +342,7 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
             }
         } else {
             tracing::warn!("nativeStart: already running");
-            return jni_err(&mut env, "already running");
+            return jni_err(env, "already running");
         }
     }
 
@@ -294,7 +350,7 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
         Ok(o) => o,
         Err(e) => {
             tracing::error!("nativeStart: parse config: {e:#}");
-            return jni_err(&mut env, format!("{e:#}"));
+            return jni_err(env, format!("{e:#}"));
         }
     };
     tracing::info!(
@@ -306,12 +362,12 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
     #[cfg(target_os = "android")]
     {
         use std::sync::Arc;
-        if let Err(e) = cache_vpn_protect_class(&mut env) {
-            return jni_err(&mut env, format!("cache VpnProtect: {e}"));
+        if let Err(e) = cache_vpn_protect_class(env) {
+            return jni_err(env, format!("cache VpnProtect: {e}"));
         }
         let jvm = match env.get_java_vm() {
             Ok(j) => Arc::new(j),
-            Err(e) => return jni_err(&mut env, format!("java_vm: {e}")),
+            Err(e) => return jni_err(env, format!("java_vm: {e}")),
         };
         let jvm_cb = jvm.clone();
         bibavpn::outbound_protect::set_hook(Some(std::sync::Arc::new(move |fd| {
@@ -366,10 +422,7 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
                 }
             };
             tracing::error!("nativeStart: SOCKS not ready: {msg}");
-            let mut guard = match STATE.lock() {
-                Ok(g) => g,
-                Err(_) => return jni_err(&mut env, msg),
-            };
+            let mut guard = lock_state();
             if let Some(mut s) = guard.take() {
                 stop_client_bounded(&mut s);
             }
@@ -377,22 +430,29 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
             {
                 bibavpn::outbound_protect::set_hook(None);
             }
-            jni_err(&mut env, msg)
+            jni_err(env, msg)
         }
     }
 }
 
 #[no_mangle]
-pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStop(
+pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStart(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
+    config_json: JString,
 ) -> jstring {
+    match catch_unwind(AssertUnwindSafe(|| {
+        native_start_impl(&mut env, class, config_json)
+    })) {
+        Ok(r) => r,
+        Err(_) => jni_err(&mut env, PANIC_ERR),
+    }
+}
+
+fn native_stop_impl(_env: &mut JNIEnv, _class: JClass) -> jstring {
     ensure_tracing();
     tracing::info!("nativeStop: enter");
-    let mut guard = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return jni_err(&mut env, "state mutex poisoned"),
-    };
+    let mut guard = lock_state();
 
     let mut s = match guard.take() {
         Some(s) => s,
@@ -411,4 +471,84 @@ pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStop(
 
     tracing::info!("nativeStop: done");
     std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_bibavpn_core_BibaNative_nativeStop(
+    mut env: JNIEnv,
+    class: JClass,
+) -> jstring {
+    match catch_unwind(AssertUnwindSafe(|| native_stop_impl(&mut env, class))) {
+        Ok(r) => r,
+        Err(_) => jni_err(&mut env, PANIC_ERR),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn catch_panic_sentinel() -> &'static str {
+        match catch_unwind(|| {
+            panic!("simulated extern body");
+        }) {
+            Ok(_) => "unexpected success",
+            Err(_) => PANIC_ERR,
+        }
+    }
+
+    #[test]
+    fn catch_unwind_returns_panic_sentinel() {
+        assert_eq!(catch_panic_sentinel(), PANIC_ERR);
+    }
+
+    #[test]
+    fn decode_invite_error_json_shape() {
+        let s = decode_invite_error_json("bad invite");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("json");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "bad invite");
+    }
+
+    #[test]
+    fn sanitize_jni_utf8_table() {
+        let cases: &[(&str, &str)] = &[
+            ("plain", "plain"),
+            ("bad\0invite", "bad\u{FFFD}invite"),
+            ("\0", "\u{FFFD}"),
+            ("no-nul-here", "no-nul-here"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(sanitize_jni_utf8(input), *want, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn map_jni_string_alloc_table() {
+        let cases: &[(Result<(), u8>, JniStringAlloc)] = &[
+            (Ok(()), JniStringAlloc::Ok),
+            (Err(1), JniStringAlloc::ThrowAndNull),
+        ];
+        for (result, want) in cases {
+            assert_eq!(map_jni_string_alloc(*result), *want);
+        }
+    }
+
+    #[test]
+    fn state_mutex_recovers_from_poison() {
+        let m = Arc::new(Mutex::new(0_i32));
+        let poisoner = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("lock");
+            panic!("poison mutex");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let mut guard = m.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = 42;
+        drop(guard);
+        let guard = m.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(*guard, 42);
+    }
 }
