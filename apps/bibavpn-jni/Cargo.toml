@@ -6,7 +6,7 @@ description = "JNI bridge: local SOCKS5 front for BibaVPN on Android"
 
 [lib]
 name = "bibavpn_jni"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1"

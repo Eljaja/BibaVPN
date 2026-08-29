@@ -405,17 +405,24 @@ class BibaVpnService : VpnService() {
                                 e.message ?: e.javaClass.simpleName
                             }
                         if (err != null) {
-                            Log.e(TAG, "$reason: nativeStart failed: $err")
-                            allowScreenOnStackRestart = true
-                            mainHandler.post {
-                                setTunnelActive(false)
-                                android.widget.Toast.makeText(
-                                    applicationContext,
-                                    err,
-                                    android.widget.Toast.LENGTH_LONG,
-                                ).show()
+                            if (err.contains(ERR_ALREADY_RUNNING, ignoreCase = true)) {
+                                Log.w(
+                                    TAG,
+                                    "$reason: nativeStart: $err — оставляем туннель как есть",
+                                )
+                            } else {
+                                Log.e(TAG, "$reason: nativeStart failed: $err")
+                                allowScreenOnStackRestart = true
+                                mainHandler.post {
+                                    setTunnelActive(false)
+                                    android.widget.Toast.makeText(
+                                        applicationContext,
+                                        err,
+                                        android.widget.Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                                return@Thread
                             }
-                            return@Thread
                         }
                     }
                     if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
