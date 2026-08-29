@@ -262,7 +262,8 @@ that record splitting is not implemented (`desync::note_tls_fragment_requested`)
 - **Server:** `--ack-profile balanced|aggressive` if explicit `--server-ack-`* /
 `--rtt-mask-jitter-ms` are all zero; else set delays in milliseconds directly
 - **Server:** `--handshake-timeout-secs` (per pre-tunnel phase: TLS accept, WS
-upgrade / camouflage HTTP head, REALITY exchange, HELLO…`AUTH`; default **15**),
+upgrade / camouflage HTTP head, REALITY exchange, HELLO…`AUTH`, and the post-AUTH
+wait for `OPEN` / `MUX_OPEN` / `UDP_MUX_OPEN`; default **15**),
 `--mux-connect-timeout-secs` (per mux stream outbound TCP connect, default **10**)
 - Server `--camouflage-dir`, `--camouflage-url` (`http://` upstream only)
 - **Logging (CLI):** server and client `--log-level`, `--log-format plain|json`;
@@ -343,7 +344,8 @@ accepted connection until it finishes).
 - **`--handshake-timeout-secs`** — drop inbound sessions that stall in any
   pre-tunnel phase (default **15**, applied per phase): TLS accept, WebSocket
   upgrade / camouflage HTTP head, REALITY exchange and its first application
-  frame, and the HELLO…`AUTH` wait. The concurrency permit is taken before any
+  frame, the HELLO…`AUTH` wait, and the post-AUTH wait for `OPEN` /
+  `MUX_OPEN` / `UDP_MUX_OPEN`. The concurrency permit is taken before any
   peer I/O, so without this a silent socket would hold a session slot; expiry
   counts in `bibavpn_handshake_timeouts_total` and releases the permit.
 - **`--mux-connect-timeout-secs`** — limit how long the server waits on each

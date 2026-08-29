@@ -380,6 +380,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "ureq",
+ "url",
  "urlencoding",
  "windows 0.58.0",
  "winreg 0.52.0",
