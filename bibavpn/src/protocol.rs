@@ -278,7 +278,11 @@ pub fn decode_udp_rep(data: &[u8]) -> anyhow::Result<(u64, String, u16, Vec<u8>)
     let xid = u64::from_be_bytes(data[1..9].try_into()?);
     let rest = &data[9..];
     let (h, p, addr_len) = decode_atyp_host_port(rest)?;
-    let payload = rest[addr_len..].to_vec();
+    let payload_slice = &rest[addr_len..];
+    if payload_slice.len() > MAX_UDP_PAYLOAD {
+        anyhow::bail!("udp rep payload too large");
+    }
+    let payload = payload_slice.to_vec();
     Ok((xid, h, p, payload))
 }
 
@@ -412,6 +416,36 @@ pub fn is_v3_mux_open(data: &[u8]) -> bool {
     data == [V3_CTRL_MUX]
 }
 
+/// Classify a decrypted, unpadded v3 control payload as a first-channel open opcode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum V3FirstChannelKind {
+    TcpOpen {
+        host: String,
+        port: u16,
+        flags: u8,
+    },
+    UdpMux,
+    Mux,
+    NotChannelOpen,
+}
+
+pub fn classify_v3_first_channel(data: &[u8]) -> V3FirstChannelKind {
+    if let Ok((host, port, flags)) = decode_v3_open_with_flags(data) {
+        return V3FirstChannelKind::TcpOpen {
+            host,
+            port,
+            flags,
+        };
+    }
+    if is_v3_udp_mux_open(data) {
+        return V3FirstChannelKind::UdpMux;
+    }
+    if is_v3_mux_open(data) {
+        return V3FirstChannelKind::Mux;
+    }
+    V3FirstChannelKind::NotChannelOpen
+}
+
 pub fn encode_v3_open_ok() -> Vec<u8> {
     vec![V3_CTRL_OPEN_OK]
 }
@@ -528,6 +562,21 @@ mod udp_tests {
     }
 
     #[test]
+    fn udp_rep_decode_payload_max_enforced() {
+        let max_payload = vec![0u8; MAX_UDP_PAYLOAD];
+        let q = encode_udp_rep(1, "1.1.1.1", 53, &max_payload).unwrap();
+        let (xid, h, port, pl) = decode_udp_rep(&q).unwrap();
+        assert_eq!(xid, 1);
+        assert_eq!(h, "1.1.1.1");
+        assert_eq!(port, 53);
+        assert_eq!(pl.len(), MAX_UDP_PAYLOAD);
+
+        let mut oversized = encode_udp_rep(1, "1.1.1.1", 53, b"").unwrap();
+        oversized.extend_from_slice(&vec![0u8; MAX_UDP_PAYLOAD + 1]);
+        assert!(decode_udp_rep(&oversized).is_err());
+    }
+
+    #[test]
     fn udp_rep_includes_trailing_in_payload() {
         let mut q = encode_udp_rep(9, "10.0.0.1", 1234, b"x").unwrap();
         q.push(b'y');
@@ -552,6 +601,38 @@ mod v3_ctrl_tests {
         assert!(is_v3_mux_open(&encode_v3_mux_open()));
         assert!(is_v3_udp_mux_open(&encode_v3_udp_mux_open()));
         assert!(!is_v3_mux_open(&encode_v3_udp_mux_open()));
+    }
+
+    #[test]
+    fn classify_v3_first_channel_opcodes() {
+        use super::classify_v3_first_channel;
+        use super::V3FirstChannelKind;
+
+        let open = encode_v3_open_with_flags("example.org", 443, OPEN_FLAG_STATUS).unwrap();
+        match classify_v3_first_channel(&open) {
+            V3FirstChannelKind::TcpOpen { host, port, flags } => {
+                assert_eq!(host, "example.org");
+                assert_eq!(port, 443);
+                assert_ne!(flags & OPEN_FLAG_STATUS, 0);
+            }
+            other => panic!("expected TcpOpen, got {other:?}"),
+        }
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_mux_open()),
+            V3FirstChannelKind::Mux
+        );
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_udp_mux_open()),
+            V3FirstChannelKind::UdpMux
+        );
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_open_ok()),
+            V3FirstChannelKind::NotChannelOpen
+        );
+        assert_eq!(
+            classify_v3_first_channel(&encode_v3_auth("token").unwrap()),
+            V3FirstChannelKind::NotChannelOpen
+        );
     }
 
     #[test]

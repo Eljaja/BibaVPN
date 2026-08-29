@@ -5,6 +5,7 @@ import { setLanguageFromCfg } from "./i18n.js";
 
 /**
  * @typedef {import('./vpnTypes').StateSnapshot} StateSnapshot
+ * @typedef {import('./vpnTypes').SavedConfig} SavedConfig
  */
 
 export function useVpn() {
@@ -43,7 +44,12 @@ export function useVpn() {
     };
   }, [refresh]);
 
-  /** @param {import('./vpnTypes').SavedConfig} cfg */
+  const getEditConfig = useCallback(async () => {
+    const c = await invoke("get_edit_config");
+    return /** @type {SavedConfig} */ (c);
+  }, []);
+
+  /** @param {SavedConfig} cfg */
   const saveCfg = useCallback(async (cfg) => {
     const s = await invoke("save_config_cmd", { cfg });
     setSnap(/** @type {StateSnapshot} */ (s));
@@ -93,6 +99,7 @@ export function useVpn() {
     snap,
     busy,
     refresh,
+    getEditConfig,
     saveCfg,
     connect,
     disconnect,

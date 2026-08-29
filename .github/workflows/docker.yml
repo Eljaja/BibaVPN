@@ -17,10 +17,11 @@
 #                         eljaja/bibavpn-client repositories.
 #
 # Forks: this workflow only pushes when the event runs on the original
-# repository (i.e. where the secrets exist). PRs from forks build only.
+# repository (i.e. where the secrets exist).
 #
 # Path gating: workflow skips docs-only / desktop-only / app-only commits.
 # Per-image matrix: server and client images build independently when only one side changed.
+# Images build on push to main / tags / manual run — not on pull_request.
 name: Docker images
 
 on:
@@ -29,23 +30,6 @@ on:
       - main
     tags:
       - "v*"
-    paths:
-      - "bibavpn/**"
-      - "!bibavpn/**/*.md"
-      - "biba/**"
-      - "!biba/**/*.md"
-      - "docker/Dockerfile.server"
-      - "docker/Dockerfile.client"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "docker-compose.yml"
-      - "docker-compose.hub.yml"
-      - "docker-compose.bibavpn-check.yml"
-      - ".github/workflows/docker.yml"
-  pull_request:
-    branches:
-      - main
     paths:
       - "bibavpn/**"
       - "!bibavpn/**/*.md"
@@ -145,7 +129,7 @@ jobs:
 
   build-push:
     needs: changes
-    if: needs.changes.outputs.matrix != '[]'
+    if: needs.changes.result == 'success' && needs.changes.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
