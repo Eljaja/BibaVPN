@@ -52,15 +52,29 @@ impl DomainRouteMap {
         Self::default()
     }
 
-    /// Record every A/AAAA answer in a DNS response, associating each returned IP
-    /// with the **queried** name (so `example.com` matches even when it CNAMEs to a
-    /// CDN host). `dns_msg` is the raw DNS message (UDP payload). Unparseable input
-    /// is ignored. Returns how many IPs were recorded.
-    pub fn record_dns_response(&self, dns_msg: &[u8], now_secs: u64) -> usize {
-        let Some((qname, answers)) = parse_dns_answers(dns_msg) else {
+    /// Record A/AAAA answers from a DNS response only when the message id and question
+    /// name match the client's pending query and the name is on `bypass`. Does not
+    /// replace a still-live mapping for an IP with a different normalized name.
+    pub fn record_dns_response(
+        &self,
+        dns_msg: &[u8],
+        expected_id: u16,
+        expected_qname: &str,
+        bypass: &[String],
+        now_secs: u64,
+    ) -> usize {
+        if bypass.is_empty() {
+            return 0;
+        }
+        let Some((resp_id, qname, answers)) = parse_dns_answers(dns_msg) else {
             return 0;
         };
-        if qname.is_empty() || answers.is_empty() {
+        if resp_id != expected_id
+            || normalize_domain(&qname) != normalize_domain(expected_qname)
+            || !matches_bypass(&qname, bypass)
+            || qname.is_empty()
+            || answers.is_empty()
+        {
             return 0;
         }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -68,8 +82,16 @@ impl DomainRouteMap {
         if g.len() >= MAX_ENTRIES {
             g.retain(|_, e| e.expires_at > now_secs);
         }
+        let domain = normalize_domain(&qname);
         let mut n = 0;
         for (ip, ttl) in answers {
+            if let Some(existing) = g.get(&ip) {
+                if existing.expires_at > now_secs
+                    && normalize_domain(&existing.domain) != domain
+                {
+                    continue;
+                }
+            }
             if g.len() >= MAX_ENTRIES && !g.contains_key(&ip) {
                 continue;
             }
@@ -77,7 +99,7 @@ impl DomainRouteMap {
             g.insert(
                 ip,
                 Entry {
-                    domain: qname.clone(),
+                    domain: domain.clone(),
                     expires_at: now_secs.saturating_add(ttl),
                 },
             );
@@ -210,6 +232,22 @@ pub fn should_bypass(host: &str) -> bool {
     decide(host, bypass.as_slice(), global_map(), now_secs()) == Route::Direct
 }
 
+/// UDP-relay convenience: learn IP→domain from a DNS response that matches a query
+/// this client sent. No-op when domain split routing isn't configured.
+pub fn record_dns(dns_msg: &[u8], expected_id: u16, expected_qname: &str) {
+    let bypass = GLOBAL_BYPASS.lock().unwrap_or_else(|p| p.into_inner());
+    if bypass.is_empty() {
+        return;
+    }
+    global_map().record_dns_response(
+        dns_msg,
+        expected_id,
+        expected_qname,
+        bypass.as_slice(),
+        now_secs(),
+    );
+}
+
 /// TLS extension type for server_name (RFC 6066).
 const TLS_EXT_SERVER_NAME: u16 = 0;
 /// SNI `host_name` name type.
@@ -324,27 +362,40 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
     None
 }
 
-/// UDP-relay convenience: learn IP→domain from a DNS response. No-op when domain
-/// split routing isn't configured.
-pub fn record_dns(dns_msg: &[u8]) {
-    if GLOBAL_BYPASS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .is_empty()
-    {
-        return;
-    }
-    global_map().record_dns_response(dns_msg, now_secs());
+fn normalize_domain(d: &str) -> String {
+    d.trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Minimal DNS response parser: returns the first question name (lowercased) and the
-/// list of `(ip, ttl)` from A / AAAA answer records. Returns `None` on malformed
-/// input. Bounds-checked; name-compression pointers are followed with a jump cap to
-/// prevent loops.
-pub fn parse_dns_answers(msg: &[u8]) -> Option<(String, Vec<(IpAddr, u32)>)> {
+/// Parse a DNS query: header id and the first question name (lowercased). Returns
+/// `None` on malformed input or unparseable names (including compression loops).
+pub fn parse_dns_query(msg: &[u8]) -> Option<(u16, String)> {
     if msg.len() < 12 {
         return None;
     }
+    let id = u16::from_be_bytes([msg[0], msg[1]]);
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]) as usize;
+    if qdcount == 0 {
+        return None;
+    }
+    let mut pos = 12;
+    let (qname, np) = read_name(msg, pos)?;
+    pos = np;
+    pos = pos.checked_add(4)?;
+    if pos > msg.len() {
+        return None;
+    }
+    Some((id, qname))
+}
+
+/// Minimal DNS response parser: returns the message id, first question name
+/// (lowercased), and the list of `(ip, ttl)` from A / AAAA answer records. Returns
+/// `None` on malformed input. Bounds-checked; name-compression pointers are followed
+/// with a jump cap to prevent loops.
+pub fn parse_dns_answers(msg: &[u8]) -> Option<(u16, String, Vec<(IpAddr, u32)>)> {
+    if msg.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([msg[0], msg[1]]);
     let qdcount = u16::from_be_bytes([msg[4], msg[5]]) as usize;
     let ancount = u16::from_be_bytes([msg[6], msg[7]]) as usize;
     if qdcount == 0 {
@@ -402,7 +453,7 @@ pub fn parse_dns_answers(msg: &[u8]) -> Option<(String, Vec<(IpAddr, u32)>)> {
         }
         pos = rdend;
     }
-    Some((qname, out))
+    Some((id, qname, out))
 }
 
 /// Read a DNS name starting at `start`; returns `(lowercased dotted name, position
@@ -461,8 +512,12 @@ mod tests {
     // Build a DNS response: 1 question (name, A/AAAA), then the given answers.
     // answers: (rtype, rdata)
     fn build(qname: &str, qtype: u16, answers: &[(u16, u32, Vec<u8>)]) -> Vec<u8> {
+        build_with_id(0x1234, qname, qtype, answers)
+    }
+
+    fn build_with_id(id: u16, qname: &str, qtype: u16, answers: &[(u16, u32, Vec<u8>)]) -> Vec<u8> {
         let mut m = Vec::new();
-        m.extend_from_slice(&[0x12, 0x34]); // id
+        m.extend_from_slice(&id.to_be_bytes());
         m.extend_from_slice(&[0x81, 0x80]); // flags: response, RD/RA
         m.extend_from_slice(&1u16.to_be_bytes()); // qd
         m.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // an
@@ -488,10 +543,34 @@ mod tests {
         m
     }
 
+    fn build_query(id: u16, qname: &str) -> Vec<u8> {
+        let qname = qname.trim_end_matches('.');
+        let mut m = Vec::new();
+        m.extend_from_slice(&id.to_be_bytes());
+        m.extend_from_slice(&[0x01, 0x00]); // flags: standard query
+        m.extend_from_slice(&1u16.to_be_bytes()); // qd
+        m.extend_from_slice(&0u16.to_be_bytes()); // an
+        m.extend_from_slice(&[0, 0, 0, 0]); // ns, ar
+        for label in qname.split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+        m.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        m.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        m
+    }
+
+    const BYPASS: &[&str] = &["example.com"];
+    fn bypass_list() -> Vec<String> {
+        BYPASS.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn parse_a_record_with_compression() {
         let msg = build("example.com", 1, &[(1, 300, vec![93, 184, 216, 34])]);
-        let (name, ans) = parse_dns_answers(&msg).expect("parse");
+        let (id, name, ans) = parse_dns_answers(&msg).expect("parse");
+        assert_eq!(id, 0x1234);
         assert_eq!(name, "example.com");
         assert_eq!(ans, vec![(ip("93.184.216.34"), 300)]);
     }
@@ -501,7 +580,8 @@ mod tests {
         let mut rd = vec![0u8; 16];
         rd[15] = 1; // ::1
         let msg = build("v6.example.com", 28, &[(28, 120, rd)]);
-        let (name, ans) = parse_dns_answers(&msg).expect("parse");
+        let (id, name, ans) = parse_dns_answers(&msg).expect("parse");
+        assert_eq!(id, 0x1234);
         assert_eq!(name, "v6.example.com");
         assert_eq!(ans, vec![(ip("::1"), 120)]);
     }
@@ -514,7 +594,8 @@ mod tests {
             1,
             &[(5, 300, vec![0xC0, 0x0C]), (1, 300, vec![1, 2, 3, 4])],
         );
-        let (name, ans) = parse_dns_answers(&msg).expect("parse");
+        let (id, name, ans) = parse_dns_answers(&msg).expect("parse");
+        assert_eq!(id, 0x1234);
         assert_eq!(name, "cdn.example.com");
         assert_eq!(ans, vec![(ip("1.2.3.4"), 300)]);
     }
@@ -527,8 +608,12 @@ mod tests {
     #[test]
     fn map_records_and_expires() {
         let map = DomainRouteMap::new();
+        let bypass = bypass_list();
         let msg = build("example.com", 1, &[(1, 300, vec![5, 6, 7, 8])]);
-        assert_eq!(map.record_dns_response(&msg, 1000), 1);
+        assert_eq!(
+            map.record_dns_response(&msg, 0x1234, "example.com", &bypass, 1000),
+            1
+        );
         assert_eq!(map.lookup(ip("5.6.7.8"), 1100).as_deref(), Some("example.com"));
         // 300s TTL from t=1000 → expires at 1300.
         assert_eq!(map.lookup(ip("5.6.7.8"), 1301), None);
@@ -537,8 +622,9 @@ mod tests {
     #[test]
     fn map_clamps_zero_ttl() {
         let map = DomainRouteMap::new();
-        let msg = build("z.example", 1, &[(1, 0, vec![9, 9, 9, 9])]);
-        map.record_dns_response(&msg, 0);
+        let bypass = bypass_list();
+        let msg = build("a.example.com", 1, &[(1, 0, vec![9, 9, 9, 9])]);
+        map.record_dns_response(&msg, 0x1234, "a.example.com", &bypass, 0);
         // clamped up to MIN_TTL_SECS (30) → still valid at t=29.
         assert!(map.lookup(ip("9.9.9.9"), 29).is_some());
         assert!(map.lookup(ip("9.9.9.9"), 31).is_none());
@@ -561,7 +647,7 @@ mod tests {
         let map = DomainRouteMap::new();
         let bypass = vec!["example.com".to_string()];
         let msg = build("example.com", 1, &[(1, 300, vec![10, 0, 0, 1])]);
-        map.record_dns_response(&msg, 100);
+        map.record_dns_response(&msg, 0x1234, "example.com", &bypass, 100);
         // IP known to be example.com → Direct.
         assert_eq!(decide("10.0.0.1", &bypass, &map, 150), Route::Direct);
         // Unknown IP → Tunnel (fail-safe).
@@ -583,6 +669,110 @@ mod tests {
         let map = DomainRouteMap::new();
         assert_eq!(decide("example.com", &[], &map, 0), Route::Tunnel);
         assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn record_rejects_forged_bypass_qname() {
+        let map = DomainRouteMap::new();
+        let bypass = bypass_list();
+        let msg = build("example.com", 1, &[(1, 300, vec![1, 2, 3, 4])]);
+        assert_eq!(
+            map.record_dns_response(&msg, 0x1234, "other.org", &bypass, 0),
+            0
+        );
+        assert_eq!(decide("1.2.3.4", &bypass, &map, 0), Route::Tunnel);
+    }
+
+    #[test]
+    fn record_rejects_id_mismatch() {
+        let map = DomainRouteMap::new();
+        let bypass = bypass_list();
+        let msg = build("example.com", 1, &[(1, 300, vec![1, 2, 3, 4])]);
+        assert_eq!(
+            map.record_dns_response(&msg, 0xAAAA, "example.com", &bypass, 0),
+            0
+        );
+        assert_eq!(map.lookup(ip("1.2.3.4"), 0), None);
+    }
+
+    #[test]
+    fn record_accepts_legitimate_match() {
+        let map = DomainRouteMap::new();
+        let bypass = bypass_list();
+        let msg = build("example.com", 1, &[(1, 300, vec![10, 0, 0, 1])]);
+        assert_eq!(
+            map.record_dns_response(&msg, 0x1234, "example.com", &bypass, 100),
+            1
+        );
+        assert_eq!(decide("10.0.0.1", &bypass, &map, 150), Route::Direct);
+    }
+
+    #[test]
+    fn record_skips_non_bypass_qname() {
+        let map = DomainRouteMap::new();
+        let bypass = bypass_list();
+        let msg = build("other.org", 1, &[(1, 300, vec![8, 8, 8, 8])]);
+        assert_eq!(
+            map.record_dns_response(&msg, 0x1234, "other.org", &bypass, 0),
+            0
+        );
+        assert_eq!(map.lookup(ip("8.8.8.8"), 0), None);
+    }
+
+    #[test]
+    fn record_does_not_overwrite_live_different_name() {
+        let map = DomainRouteMap::new();
+        let bypass = vec!["example.com".to_string(), "cdn.example.com".to_string()];
+        let first = build("example.com", 1, &[(1, 300, vec![1, 2, 3, 4])]);
+        map.record_dns_response(&first, 0x1234, "example.com", &bypass, 1000);
+        assert_eq!(
+            map.lookup(ip("1.2.3.4"), 1100).as_deref(),
+            Some("example.com")
+        );
+
+        let second = build("cdn.example.com", 1, &[(1, 300, vec![1, 2, 3, 4])]);
+        assert_eq!(
+            map.record_dns_response(&second, 0x1234, "cdn.example.com", &bypass, 1100),
+            0
+        );
+        assert_eq!(
+            map.lookup(ip("1.2.3.4"), 1100).as_deref(),
+            Some("example.com")
+        );
+
+        // After expiry the other name may bind.
+        assert_eq!(
+            map.record_dns_response(&second, 0x1234, "cdn.example.com", &bypass, 1400),
+            1
+        );
+        assert_eq!(
+            map.lookup(ip("1.2.3.4"), 1400).as_deref(),
+            Some("cdn.example.com")
+        );
+    }
+
+    #[test]
+    fn parse_dns_query_extracts_id_and_qname() {
+        let msg = build_query(0xBEEF, "Example.COM.");
+        let (id, qname) = parse_dns_query(&msg).expect("parse");
+        assert_eq!(id, 0xBEEF);
+        assert_eq!(qname, "example.com");
+    }
+
+    #[test]
+    fn parse_dns_query_rejects_truncated() {
+        assert!(parse_dns_query(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn parse_dns_query_rejects_compression_loop() {
+        // Pointer to self → read_name jump cap returns None.
+        let mut m = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        m.push(0xC0);
+        m.push(12);
+        m.extend_from_slice(&1u16.to_be_bytes());
+        m.extend_from_slice(&1u16.to_be_bytes());
+        assert!(parse_dns_query(&m).is_none());
     }
 
     /// Build a minimal TLS handshake record containing a ClientHello with one SNI.
