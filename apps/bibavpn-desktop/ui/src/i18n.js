@@ -32,6 +32,11 @@ const MESSAGES = {
     label_passphrase: "Passphrase",
     btn_apply_invite: "Применить к полям",
     btn_refresh_control_plane: "Обновить из кабинета",
+    import_confirm_title: "Импорт конфигурации",
+    import_confirm_body:
+      "Импортировать конфигурацию с «{cp_host}»? VPN-сервер будет {vpn_host}.",
+    btn_confirm_import: "Импортировать",
+    btn_cancel_import: "Отмена",
     group_connection: "Подключение",
     label_server: "Сервер",
     group_credentials: "Учётные данные",
@@ -109,7 +114,7 @@ const MESSAGES = {
     settings_group_platform: "Платформа",
     settings_group_ports: "Локальные порты (десктоп)",
     android_split_note:
-      "Пресеты: домены в обход VPN на Android 13+ (по IP при подключении); на старых версиях — обход по приложениям. Можно добавить приложение из списка установленных.",
+      "Пресеты: домены в обход VPN на всех версиях Android (через клиент туннеля); также можно выбрать приложения из списка установленных.",
     boring_unavailable: "Сборка без BoringTLS — значение будет проигнорировано.",
     pin_rustls_only: "pin_cert_pem только для rustls",
     tls_stack_label: "Стек TLS",
@@ -176,6 +181,11 @@ const MESSAGES = {
     label_passphrase: "Passphrase",
     btn_apply_invite: "Apply to fields",
     btn_refresh_control_plane: "Refresh from portal",
+    import_confirm_title: "Import configuration",
+    import_confirm_body:
+      "Import config from «{cp_host}»? VPN server will be {vpn_host}.",
+    btn_confirm_import: "Import",
+    btn_cancel_import: "Cancel",
     group_connection: "Connection",
     label_server: "Server",
     group_credentials: "Credentials",
@@ -253,7 +263,7 @@ const MESSAGES = {
     settings_group_platform: "Platform",
     settings_group_ports: "Local ports (desktop)",
     android_split_note:
-      "Presets: domain bypass on Android 13+ (IPs resolved at connect); older Android uses per-app bypass. You can also pick any installed app.",
+      "Presets: domain bypass on all Android versions (via the tunnel client); you can also pick installed apps to bypass.",
     boring_unavailable: "This build has no BoringTLS — value may be ignored.",
     pin_rustls_only: "pin_cert_pem is rustls-only",
     tls_stack_label: "TLS stack",

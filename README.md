@@ -125,8 +125,10 @@ Point your apps at the local SOCKS5 / HTTP CONNECT endpoint:
 
 Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. Essentials:
 
-- **Required:** `--server`, `--sni`, `--token`, `--psk`. The server
-  `--proto-domain` (default `default`) must match the client's.
+- **Required:** `--server`, `--sni`, `--token`, `--psk` (no default token; denylisted
+  placeholders such as `change-me` are rejected). Use **`--lab`** only for quick
+  local demos. **`--psk`** is required at startup unless REALITY is fully
+  configured (see below). Server `--proto-domain` (default `default`) must match the client's.
 - **Shape / anti-DPI:** `--decoy-max`, `--max-pad`, `--pad-mode`,
   `--dummy-interval-secs`, `--ws-ping-secs`, `--junk-frames`, `--stealth-profile`,
   `--fingerprint`, `--ws-jitter-min-ms`/`--ws-jitter-max-ms`, `--ws-parallel`,
@@ -182,6 +184,9 @@ the wire" — see [Security](#security).
 
 The desktop app and Android share `apps/bibavpn-desktop/` (Vite UI + Tauri
 shell); Android VPN glue lives under `src-tauri/android-bibavpn-extras/`.
+An iOS Packet Tunnel extension also exists under `src-tauri/ios-bibavpn-extras/`,
+but it **does not forward traffic** today (Tun2socks is not wired). Treat iOS as
+experimental — do not present it as a working VPN.
 Prebuilt binaries come from the GitHub Actions workflows in `.github/workflows/`,
 and releases are on the [Releases page](https://github.com/Eljaja/BibaVPN/releases).
 See [DESIGN.md](DESIGN.md) for the shared visual language.

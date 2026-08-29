@@ -1,7 +1,7 @@
 //! First request on a TLS stream: WebSocket upgrade vs plain HTTP (camouflage).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -44,7 +44,7 @@ pub async fn accept_websocket_or_camouflage<S>(
     token: &str,
     camo: CamouflageServeConfig,
     peer: Option<SocketAddr>,
-) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind)>>
+) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind, Option<String>)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -83,6 +83,7 @@ where
         };
 
         let key = header_line(&req, "Sec-WebSocket-Key").context("websocket: missing key")?;
+        let http_host = header_line(&req, "Host");
         let ver = header_line(&req, "Sec-WebSocket-Version").unwrap_or_else(|| "13".to_string());
         if ver != "13" {
             write_camouflage_status(&mut stream, 400).await?;
@@ -112,7 +113,7 @@ Sec-WebSocket-Accept: {accept}\r\n\
         let ws =
             WebSocketStream::from_partially_read(stream, remainder, Role::Server, Some(ws_cfg))
                 .await;
-        return Ok(Some((ws, kind)));
+        return Ok(Some((ws, kind, http_host)));
     }
 
     // Plain HTTP
@@ -349,6 +350,22 @@ async fn serve_camouflage_http<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// A single URL path segment must be one normal component with no separators or drive prefixes.
+fn static_url_segment_is_safe(seg: &str) -> bool {
+    if seg.is_empty() || seg.contains('\\') || seg.contains('\0') {
+        return false;
+    }
+    let b = seg.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return false;
+    }
+    let mut comps = Path::new(seg).components();
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(_)), None)
+    )
+}
+
 fn safe_static_path_under_base(base: &Path, url_path: &str) -> Option<std::path::PathBuf> {
     let base_canon = std::fs::canonicalize(base).ok()?;
     let p = url_path.split('?').next()?.trim_start_matches('/');
@@ -362,13 +379,17 @@ fn safe_static_path_under_base(base: &Path, url_path: &str) -> Option<std::path:
         if seg.is_empty() {
             continue;
         }
-        if seg == ".." {
+        if !static_url_segment_is_safe(seg) {
             return None;
         }
         out.push(seg);
     }
-    if out.starts_with(&base_canon) {
-        Some(out)
+    if !out.starts_with(&base_canon) {
+        return None;
+    }
+    let canon = std::fs::canonicalize(&out).ok()?;
+    if canon.starts_with(&base_canon) {
+        Some(canon)
     } else {
         None
     }
@@ -921,6 +942,11 @@ mod tests {
         assert!(safe_static_path_under_base(&base, "/").is_some());
         assert!(safe_static_path_under_base(&base, "/../etc/passwd").is_none());
         assert!(safe_static_path_under_base(&base, "/subdir/../../outside").is_none());
+        assert!(safe_static_path_under_base(&base, "/..\\..\\windows\\win.ini").is_none());
+        assert!(safe_static_path_under_base(&base, "/foo\\bar").is_none());
+        assert!(safe_static_path_under_base(&base, "/C:/Windows/win.ini").is_none());
+        assert!(safe_static_path_under_base(&base, "/C:\\Windows\\win.ini").is_none());
+        assert!(safe_static_path_under_base(&base, "/foo\0bar").is_none());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1217,6 +1243,25 @@ mod tests {
         assert!(!s.contains("Content-Length"), "{s}");
         assert!(!s.contains("Content-Type"), "{s}");
         assert!(s.ends_with("\r\n\r\n"), "{s}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_file_symlink_escape_is_rejected() {
+        let pid = std::process::id();
+        let outside = std::env::temp_dir().join(format!("bibavpn_outside_{pid}"));
+        let base = std::env::temp_dir().join(format!("bibavpn_symlink_{pid}"));
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&outside, b"outside secret").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
+        assert!(
+            serve_static_file(&base, "/escape").await.is_none(),
+            "symlink pointing outside camouflage dir must not be served"
+        );
+        let _ = fs::remove_file(&outside);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

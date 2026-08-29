@@ -19,7 +19,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::crypto_layer::SessionCrypto;
 use crate::frame::{AdaptivePadState, PadMode};
-use crate::protocol::{decode_open_err, is_open_ok};
+use crate::protocol::{decode_open_err, decode_v3_open_err, is_open_ok, is_v3_open_ok};
 use crate::retry::{
     maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration, ServerWsOutTiming,
     WsSendJitter,
@@ -29,6 +29,26 @@ use crate::{
 };
 
 pub type SharedCrypto = Arc<SessionCrypto>;
+
+/// Prefetched WS downlink items for `bridge_ws_tcp_padded` (legacy `--no-mux` open wait).
+#[derive(Debug)]
+pub enum WsBridgePrefetch {
+    /// Control / non-binary frames passed through unchanged.
+    Ws(Message),
+    /// Server→client payload already AEAD-opened and unpadded; write to TCP as-is.
+    OpenedPayload(Vec<u8>),
+}
+
+/// After client-side AEAD open + unpad: drop v3 `OPEN_OK`, fail on v3 `OPEN_ERR`.
+fn filter_client_downlink(inner: &[u8]) -> anyhow::Result<Option<&[u8]>> {
+    if is_v3_open_ok(inner) {
+        return Ok(None);
+    }
+    if let Ok(err) = decode_v3_open_err(inner) {
+        anyhow::bail!("remote OPEN failed: {err}");
+    }
+    Ok(Some(inner))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum TunnelEnd {
@@ -90,7 +110,7 @@ impl AsyncRead for BridgedTcpRead {
 /// `server_out_timing`: server-only; extra delay before each WS binary toward the client (ignored for `TunnelEnd::Client`).
 pub async fn bridge_ws_tcp_padded<S>(
     ws: WebSocketStream<S>,
-    prefetched_ws_messages: Vec<Message>,
+    prefetched_ws_messages: Vec<WsBridgePrefetch>,
     tcp: TcpStream,
     tcp_uplink_prefix: Vec<u8>,
     max_pad: u8,
@@ -121,7 +141,7 @@ where
             .max(256);
 
     let (mut ws_sink, mut ws_rx) = ws.split();
-    let mut prefetched_ws_messages: VecDeque<Message> = prefetched_ws_messages.into();
+    let mut prefetched_ws_messages: VecDeque<WsBridgePrefetch> = prefetched_ws_messages.into();
 
     // One writer owns the WebSocket sink; producers use an async channel (no Mutex on send path).
     const WS_OUT_CAP: usize = 512;
@@ -188,14 +208,22 @@ where
     let crypto_up = crypto.clone();
     let up = async move {
         loop {
-            let m = if let Some(m) = prefetched_ws_messages.pop_front() {
-                m
+            let m = if let Some(item) = prefetched_ws_messages.pop_front() {
+                match item {
+                    WsBridgePrefetch::OpenedPayload(payload) => {
+                        if !payload.is_empty() {
+                            tcp_write.write_all(&payload).await?;
+                        }
+                        continue;
+                    }
+                    WsBridgePrefetch::Ws(m) => m,
+                }
             } else {
-                let Some(m) = ws_rx.next().await else {
+                let Some(msg) = ws_rx.next().await else {
                     shutdown_up.store(true, Ordering::SeqCst);
                     break;
                 };
-                match m {
+                match msg {
                     Ok(m) => m,
                     Err(e) => {
                         shutdown_up.store(true, Ordering::SeqCst);
@@ -223,8 +251,10 @@ where
                                 .open_server_to_client(b.as_ref())
                                 .context("v2 open s2c")?;
                             let payload = read_padded_frame_into(raw).context("padded frame")?;
-                            if !payload.is_empty() {
-                                tcp_write.write_all(&payload).await?;
+                            if let Some(tcp_payload) = filter_client_downlink(&payload)? {
+                                if !tcp_payload.is_empty() {
+                                    tcp_write.write_all(tcp_payload).await?;
+                                }
                             }
                         }
                         (Some(c), TunnelEnd::Server) => {
@@ -384,4 +414,30 @@ where
 
     tokio::try_join!(writer, up, down, dummy)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::encode_v3_open_ok;
+
+    #[test]
+    fn late_v3_open_ok_filtered_from_client_downlink() {
+        let inner = encode_v3_open_ok();
+        assert!(filter_client_downlink(&inner).unwrap().is_none());
+    }
+
+    #[test]
+    fn v3_open_err_on_client_downlink_fails() {
+        use crate::protocol::encode_v3_open_err;
+        let inner = encode_v3_open_err("late fail").unwrap();
+        let err = filter_client_downlink(&inner).unwrap_err();
+        assert!(err.to_string().contains("late fail"));
+    }
+
+    #[test]
+    fn payload_passes_client_downlink_filter() {
+        let data = b"hello";
+        assert_eq!(filter_client_downlink(data).unwrap(), Some(data.as_slice()));
+    }
 }

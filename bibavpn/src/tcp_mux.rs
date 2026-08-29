@@ -156,8 +156,43 @@ async fn mux_remove_stream_if_epoch(
     epoch: u64,
 ) {
     let mut g = streams.lock().await;
-    if mux_cleanup_should_remove(g.get(&sid).map(|s| s.epoch()), epoch) {
+    let current = g.get(&sid).map(|s| s.epoch());
+    if mux_cleanup_should_remove(current, epoch) {
         g.remove(&sid);
+    } else if current.is_some() {
+        debug!(
+            target: "bibavpn_mux",
+            stream_id = sid,
+            expected_epoch = epoch,
+            current_epoch = current,
+            "mux: stale stream cleanup ignored"
+        );
+    }
+}
+
+/// Client downlink map entry: sid reuse is safe only when cleanup checks `epoch`.
+struct ClientDownEntry {
+    epoch: u64,
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+async fn mux_remove_client_down_if_epoch(
+    down: &Arc<Mutex<HashMap<u32, ClientDownEntry>>>,
+    sid: u32,
+    epoch: u64,
+) {
+    let mut g = down.lock().await;
+    let current = g.get(&sid).map(|e| e.epoch);
+    if mux_cleanup_should_remove(current, epoch) {
+        g.remove(&sid);
+    } else if current.is_some() {
+        debug!(
+            target: "bibavpn_mux",
+            stream_id = sid,
+            expected_epoch = epoch,
+            current_epoch = current,
+            "mux client: stale downlink cleanup ignored"
+        );
     }
 }
 
@@ -521,6 +556,7 @@ where
                             }
                         });
                     } else {
+                        let mut close_epoch: Option<u64> = None;
                         if act.data {
                             let mut maybe_tx: Option<(u64, mpsc::Sender<Vec<u8>>)> = None;
                             let mut payload_opt = Some(payload);
@@ -531,6 +567,7 @@ where
                                 let mut g = streams.lock().await;
                                 match g.get_mut(&sid) {
                                     Some(ServerStreamState::Open { epoch, tx }) => {
+                                        close_epoch = Some(*epoch);
                                         maybe_tx = Some((*epoch, tx.clone()));
                                     }
                                     Some(ServerStreamState::Opening {
@@ -612,11 +649,18 @@ where
                                 .await;
                             }
                         }
-                        // Applied after any DATA in the same record. Peer-driven, so whatever
-                        // entry is mapped now is the generation being closed.
+                        // Applied after any DATA in the same record. Use the epoch captured for
+                        // DATA lookup when present so a delayed close does not evict a reused sid.
                         // `MUX_FLAG_WIN` stays a no-op: no side sends window updates.
                         if act.close || act.reset {
-                            streams.lock().await.remove(&sid);
+                            if let Some(epoch) = close_epoch {
+                                mux_remove_stream_if_epoch(&streams, sid, epoch).await;
+                            } else {
+                                let epoch = streams.lock().await.get(&sid).map(|s| s.epoch());
+                                if let Some(e) = epoch {
+                                    mux_remove_stream_if_epoch(&streams, sid, e).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -832,7 +876,8 @@ pub struct MuxOpenStreamDropped {
 pub struct TcpMuxClientHandle {
     tx: mpsc::Sender<MuxWriteCmd>,
     next_stream_id: Arc<AtomicU32>,
-    down: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    next_down_epoch: Arc<AtomicU64>,
+    down: Arc<Mutex<HashMap<u32, ClientDownEntry>>>,
     cfg: MuxClientConfig,
 }
 
@@ -856,23 +901,37 @@ impl TcpMuxClientHandle {
         tcp_uplink_prefix: Vec<u8>,
     ) -> Result<(), MuxOpenStreamDropped> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        let stream_epoch = self.next_down_epoch.fetch_add(1, Ordering::Relaxed);
         let (down_tx, down_rx) = mpsc::channel::<Vec<u8>>(1024);
-        self.down.lock().await.insert(stream_id, down_tx);
+        self.down
+            .lock()
+            .await
+            .insert(stream_id, ClientDownEntry {
+                epoch: stream_epoch,
+                tx: down_tx,
+            });
         let open_pl = match encode_mux_open_target(&host, port) {
             Ok(p) => p,
             Err(e) => {
-                self.down.lock().await.remove(&stream_id);
+                mux_remove_client_down_if_epoch(&self.down, stream_id, stream_epoch).await;
                 return Err(MuxOpenStreamDropped { local, err: e });
             }
         };
         if let Err(e) = self.send_record(stream_id, MUX_FLAG_OPEN, open_pl).await {
-            self.down.lock().await.remove(&stream_id);
+            mux_remove_client_down_if_epoch(&self.down, stream_id, stream_epoch).await;
             return Err(MuxOpenStreamDropped { local, err: e });
         }
         let h = self.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                mux_client_stream_bridge(local, stream_id, tcp_uplink_prefix, h, down_rx).await
+            if let Err(e) = mux_client_stream_bridge(
+                local,
+                stream_id,
+                stream_epoch,
+                tcp_uplink_prefix,
+                h,
+                down_rx,
+            )
+            .await
             {
                 error!("mux client stream {stream_id}: {e:#}");
             }
@@ -967,7 +1026,7 @@ where
         }));
     }
     let tx_reader = tx.clone();
-    let down: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
+    let down: Arc<Mutex<HashMap<u32, ClientDownEntry>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let down_r = down.clone();
     let crypto_w = crypto.clone();
@@ -1126,6 +1185,7 @@ where
     let handle = TcpMuxClientHandle {
         tx,
         next_stream_id: Arc::new(AtomicU32::new(1)),
+        next_down_epoch: Arc::new(AtomicU64::new(1)),
         down,
         cfg,
     };
@@ -1136,7 +1196,7 @@ async fn mux_client_reader_loop<S>(
     mut ws_rx: futures_util::stream::SplitStream<WebSocketStream<S>>,
     crypto: Option<SharedCrypto>,
     cfg: MuxClientConfig,
-    down: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    down: Arc<Mutex<HashMap<u32, ClientDownEntry>>>,
     out_tx: mpsc::Sender<MuxWriteCmd>,
     session_id: u64,
     tcp_mux_slot: TcpMuxClientSlot,
@@ -1258,14 +1318,22 @@ async fn mux_client_reader_loop<S>(
                         a.touch();
                     }
                 }
+                let mut close_epoch: Option<u64> = None;
                 if act.data {
                     let tx = {
                         let g = down.lock().await;
-                        g.get(&sid).cloned()
+                        if let Some(entry) = g.get(&sid) {
+                            close_epoch = Some(entry.epoch);
+                            Some(entry.tx.clone())
+                        } else {
+                            None
+                        }
                     };
                     if let Some(tx) = tx {
                         if tx.send(payload).await.is_err() {
-                            down.lock().await.remove(&sid);
+                            if let Some(epoch) = close_epoch {
+                                mux_remove_client_down_if_epoch(&down, sid, epoch).await;
+                            }
                         }
                     } else if !payload.is_empty() {
                         tracing::debug!(
@@ -1276,9 +1344,17 @@ async fn mux_client_reader_loop<S>(
                         );
                     }
                 }
-                // After DATA from the same record; `MUX_FLAG_WIN` is a no-op (no flow control).
+                // After DATA from the same record; use captured epoch when present.
+                // `MUX_FLAG_WIN` is a no-op (no flow control).
                 if act.close || act.reset {
-                    down.lock().await.remove(&sid);
+                    if let Some(epoch) = close_epoch {
+                        mux_remove_client_down_if_epoch(&down, sid, epoch).await;
+                    } else {
+                        let epoch = down.lock().await.get(&sid).map(|e| e.epoch);
+                        if let Some(e) = epoch {
+                            mux_remove_client_down_if_epoch(&down, sid, e).await;
+                        }
+                    }
                 }
             }
             Message::Ping(p) => {
@@ -1295,6 +1371,7 @@ async fn mux_client_reader_loop<S>(
 async fn mux_client_stream_bridge(
     local: TcpStream,
     stream_id: u32,
+    stream_epoch: u64,
     tcp_uplink_prefix: Vec<u8>,
     mux: TcpMuxClientHandle,
     mut down_rx: mpsc::Receiver<Vec<u8>>,
@@ -1357,7 +1434,7 @@ async fn mux_client_stream_bridge(
             payload: Vec::new(),
         })
         .await;
-    mux.down.lock().await.remove(&stream_id);
+    mux_remove_client_down_if_epoch(&mux.down, stream_id, stream_epoch).await;
     Ok(())
 }
 
@@ -1745,6 +1822,96 @@ mod stream_epoch_tests {
             mux_open_decision(false, MUX_SERVER_MAX_STREAMS - 1),
             MuxOpenDecision::Accept
         );
+    }
+
+    #[tokio::test]
+    async fn stale_peer_close_rst_does_not_remove_reused_sid() {
+        let sid = 10u32;
+        let streams: Arc<Mutex<HashMap<u32, ServerStreamState>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        streams
+            .lock()
+            .await
+            .insert(sid, opening(2));
+
+        mux_remove_stream_if_epoch(&streams, sid, 1).await;
+        assert_eq!(streams.lock().await.get(&sid).map(|s| s.epoch()), Some(2));
+
+        mux_remove_stream_if_epoch(&streams, sid, 1).await;
+        assert_eq!(streams.lock().await.get(&sid).map(|s| s.epoch()), Some(2));
+
+        mux_remove_stream_if_epoch(&streams, sid, 2).await;
+        assert!(streams.lock().await.get(&sid).is_none());
+    }
+
+    #[test]
+    fn data_close_uses_captured_epoch_not_later_mapped() {
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        let mut map: HashMap<u32, ServerStreamState> = HashMap::new();
+        let captured_epoch = 1u64;
+        map.insert(
+            10,
+            ServerStreamState::Open {
+                epoch: 2,
+                tx,
+            },
+        );
+        if mux_cleanup_should_remove(map.get(&10).map(|s| s.epoch()), captured_epoch) {
+            map.remove(&10);
+        }
+        assert_eq!(map.get(&10).map(|s| s.epoch()), Some(2));
+        if mux_cleanup_should_remove(map.get(&10).map(|s| s.epoch()), 2) {
+            map.remove(&10);
+        }
+        assert!(map.get(&10).is_none());
+    }
+}
+
+#[cfg(test)]
+mod client_down_epoch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_close_rst_keeps_reused_down_entry() {
+        let sid = 7u32;
+        let down: Arc<Mutex<HashMap<u32, ClientDownEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(1);
+        down.lock().await.insert(
+            sid,
+            ClientDownEntry {
+                epoch: 2,
+                tx,
+            },
+        );
+
+        mux_remove_client_down_if_epoch(&down, sid, 1).await;
+        assert_eq!(down.lock().await.get(&sid).map(|e| e.epoch), Some(2));
+
+        mux_remove_client_down_if_epoch(&down, sid, 1).await;
+        assert_eq!(down.lock().await.get(&sid).map(|e| e.epoch), Some(2));
+
+        mux_remove_client_down_if_epoch(&down, sid, 2).await;
+        assert!(down.lock().await.get(&sid).is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_teardown_with_old_epoch_keeps_new_sender() {
+        let sid = 3u32;
+        let down: Arc<Mutex<HashMap<u32, ClientDownEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (tx_new, mut rx_new) = mpsc::channel::<Vec<u8>>(1);
+        down.lock().await.insert(
+            sid,
+            ClientDownEntry {
+                epoch: 5,
+                tx: tx_new,
+            },
+        );
+
+        mux_remove_client_down_if_epoch(&down, sid, 4).await;
+        assert_eq!(down.lock().await.get(&sid).map(|e| e.epoch), Some(5));
+        assert!(rx_new.try_recv().is_err());
     }
 }
 

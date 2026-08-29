@@ -42,7 +42,7 @@ use crate::tcp_mux::{
 };
 use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile, TlsStack};
 use crate::udp_mux::{spawn_udp_mux_driver, UdpMuxConfig, UdpMuxHandle};
-use crate::ws_bridge::{self, TunnelEnd};
+use crate::ws_bridge::{self, TunnelEnd, WsBridgePrefetch};
 use crate::{
     read_padded_frame_into, write_padded_frame_with_mode_state, socks5,
     socks5::SocksCommand,
@@ -556,10 +556,29 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
     }
 }
 
+/// Result of classifying the first decrypted server frame after client `OPEN`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpenWait {
+    Ok,
+    Err(String),
+    Payload(Vec<u8>),
+}
+
+/// Classify unpadded inner bytes from the first post-`OPEN` server binary.
+pub(crate) fn classify_open_wait_inner(inner: &[u8]) -> OpenWait {
+    if is_v3_open_ok(inner) {
+        OpenWait::Ok
+    } else if let Ok(err) = decode_v3_open_err(inner) {
+        OpenWait::Err(err)
+    } else {
+        OpenWait::Payload(inner.to_vec())
+    }
+}
+
 async fn wait_open_status_or_payload<S>(
     ws: &mut WebSocketStream<S>,
     crypto: &SharedCrypto,
-) -> anyhow::Result<Vec<Message>>
+) -> anyhow::Result<Vec<WsBridgePrefetch>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -571,13 +590,13 @@ where
                     .open_server_to_client(b.as_ref())
                     .context("decrypt OPEN status")?;
                 let inner = read_padded_frame_into(raw).context("padded OPEN status")?;
-                if is_v3_open_ok(&inner) {
-                    return Ok(Vec::new());
+                match classify_open_wait_inner(&inner) {
+                    OpenWait::Ok => return Ok(Vec::new()),
+                    OpenWait::Err(err) => anyhow::bail!("remote OPEN failed: {err}"),
+                    OpenWait::Payload(payload) => {
+                        return Ok(vec![WsBridgePrefetch::OpenedPayload(payload)]);
+                    }
                 }
-                if let Ok(err) = decode_v3_open_err(&inner) {
-                    anyhow::bail!("remote OPEN failed: {err}");
-                }
-                return Ok(vec![Message::Binary(Bytes::from(inner))]);
             }
             Message::Ping(p) => {
                 ws.send(Message::Pong(p))
@@ -586,7 +605,7 @@ where
             }
             Message::Pong(_) => {}
             Message::Close(_) => anyhow::bail!("closed before OPEN result"),
-            other => return Ok(vec![other]),
+            other => return Ok(vec![WsBridgePrefetch::Ws(other)]),
         }
     }
 }
@@ -595,7 +614,7 @@ async fn open_legacy_biba_channel(
     cfg: &Arc<ClientCfg>,
     host: &str,
     port: u16,
-) -> anyhow::Result<(ClientWs, SharedCrypto, Vec<Message>)> {
+) -> anyhow::Result<(ClientWs, SharedCrypto, Vec<WsBridgePrefetch>)> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..OUTBOUND_CONNECT_ATTEMPTS {
         match one_try_wss_session(cfg).await {
@@ -1187,13 +1206,151 @@ pub fn parse_ws_header(line: &str) -> anyhow::Result<(String, String)> {
 /// Split-tunnel bypass: relay a CONNECT straight to the target from the device,
 /// outside the tunnel. On Android the outbound socket is protected via the
 /// installed `outbound_protect` hook, so it does not loop back into the TUN.
-async fn direct_bypass_relay(mut local: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+async fn direct_bypass_relay(
+    mut local: TcpStream,
+    host: &str,
+    port: u16,
+    prefetch: &[u8],
+) -> anyhow::Result<()> {
     let mut remote = crate::outbound_protect::tcp_connect_host_protected(host, port)
         .await
         .map_err(|e| anyhow::anyhow!("direct bypass connect {host}:{port}: {e}"))?;
     let _ = remote.set_nodelay(true);
+    if !prefetch.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        remote
+            .write_all(prefetch)
+            .await
+            .map_err(|e| anyhow::anyhow!("direct bypass preface {host}:{port}: {e}"))?;
+    }
     tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
     Ok(())
+}
+
+/// Same relay with an owned preface — used by the plain-HTTP (`http://`) forward
+/// path, which has already consumed the request head it needs to replay.
+async fn direct_bypass_relay_preface(
+    local: TcpStream,
+    host: &str,
+    port: u16,
+    preface: Vec<u8>,
+) -> anyhow::Result<()> {
+    direct_bypass_relay(local, host, port, &preface).await
+}
+
+/// Outcome of domain split routing (DNS map, hostname, or TLS SNI peek).
+struct DomainSplitRoute {
+    direct: bool,
+    prefetch: Vec<u8>,
+}
+
+const TLS_SNI_PEEK_TIMEOUT: Duration = Duration::from_secs(2);
+const TLS_RECORD_PEEK_MAX: usize = 16_384;
+
+fn log_direct_bypass(label: &str) {
+    info!(
+        target: "bibavpn_client",
+        bypass_host = %label,
+        "split tunnel: routing connection direct (bypass)"
+    );
+}
+
+/// Decide tunnel vs direct for SOCKS/HTTP CONNECT.
+///
+/// When `sni_peek` is true, the SOCKS/HTTP success reply must already have been sent
+/// so the client can send TLS; then peek the first record for SNI on literal IP:443.
+async fn resolve_domain_split_route(
+    host: &str,
+    port: u16,
+    local: &mut TcpStream,
+    existing_prefetch: Vec<u8>,
+    sni_peek: bool,
+) -> DomainSplitRoute {
+    if crate::domain_route::should_bypass(host) {
+        log_direct_bypass(host);
+        return DomainSplitRoute {
+            direct: true,
+            prefetch: existing_prefetch,
+        };
+    }
+    if !sni_peek {
+        return DomainSplitRoute {
+            direct: false,
+            prefetch: existing_prefetch,
+        };
+    }
+    if !crate::domain_route::bypass_domains_active() || port != 443 {
+        return DomainSplitRoute {
+            direct: false,
+            prefetch: existing_prefetch,
+        };
+    }
+    if host.parse::<IpAddr>().is_err() {
+        return DomainSplitRoute {
+            direct: false,
+            prefetch: existing_prefetch,
+        };
+    }
+    let peeked = peek_tls_client_hello_record(local, existing_prefetch).await;
+    if let Some(sni) = crate::domain_route::extract_client_hello_sni(&peeked) {
+        if crate::domain_route::matches_active_bypass(&sni) {
+            log_direct_bypass(&sni);
+            return DomainSplitRoute {
+                direct: true,
+                prefetch: peeked,
+            };
+        }
+    }
+    DomainSplitRoute {
+        direct: false,
+        prefetch: peeked,
+    }
+}
+
+/// Read bytes until the first TLS handshake record is complete (or timeout / error).
+///
+/// Uses incremental `read` so a timeout never drops bytes already consumed from the
+/// socket; partial data is returned as prefetch for the tunnel or direct relay.
+async fn peek_tls_client_hello_record(
+    local: &mut TcpStream,
+    prefix: Vec<u8>,
+) -> Vec<u8> {
+    let mut buf = prefix;
+    let deadline = tokio::time::Instant::now() + TLS_SNI_PEEK_TIMEOUT;
+    let mut scratch = [0u8; 4096];
+
+    loop {
+        if buf.len() >= 5 {
+            if buf[0] != 0x16 {
+                break;
+            }
+            let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+            let total = 5usize
+                .saturating_add(rec_len)
+                .min(TLS_RECORD_PEEK_MAX);
+            if buf.len() >= total {
+                buf.truncate(total);
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline - tokio::time::Instant::now();
+        let n = match timeout(remaining, local.read(&mut scratch)).await {
+            Ok(Ok(n)) => n,
+            _ => break,
+        };
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&scratch[..n]);
+        if buf.len() >= TLS_RECORD_PEEK_MAX {
+            buf.truncate(TLS_RECORD_PEEK_MAX);
+            break;
+        }
+    }
+    buf
 }
 
 async fn handle_socks_peer(
@@ -1205,36 +1362,72 @@ async fn handle_socks_peer(
 ) -> anyhow::Result<()> {
     match socks5::socks5_read_command(&mut local, cfg.socks_auth.as_ref()).await? {
         SocksCommand::Connect { host, port } => {
-            // Domain-based split tunnel: if the target resolves (via the DNS
-            // snoop) or literally matches a bypass domain, connect directly
-            // (outside the tunnel). No-op unless bypass domains are configured.
-            if crate::domain_route::should_bypass(&host) {
+            let bypass = resolve_domain_split_route(&host, port, &mut local, Vec::new(), false)
+                .await;
+            if bypass.direct {
                 socks5::socks5_reply_ok(&mut local).await?;
-                return direct_bypass_relay(local, &host, port).await;
+                return direct_bypass_relay(local, &host, port, &bypass.prefetch).await;
+            }
+
+            let needs_sni_peek = crate::domain_route::bypass_domains_active()
+                && port == 443
+                && host.parse::<IpAddr>().is_ok();
+            let (split, connect_replied) = if needs_sni_peek {
+                socks5::socks5_reply_ok(&mut local).await?;
+                let split =
+                    resolve_domain_split_route(&host, port, &mut local, Vec::new(), true).await;
+                (split, true)
+            } else {
+                (
+                    DomainSplitRoute {
+                        direct: false,
+                        prefetch: Vec::new(),
+                    },
+                    false,
+                )
+            };
+            if split.direct {
+                return direct_bypass_relay(local, &host, port, &split.prefetch).await;
             }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
-                    let _ = socks5::socks5_reply_err(&mut local).await;
+                    if !connect_replied {
+                        let _ = socks5::socks5_reply_err(&mut local).await;
+                    }
                     return Err(e);
                 }
-                socks5::socks5_reply_ok(&mut local).await?;
-                tcp_mux_open_stream_with_retry(local, host, port, Vec::new(), cfg, tcp_mux_slot, &session)
-                    .await
+                if !connect_replied {
+                    socks5::socks5_reply_ok(&mut local).await?;
+                }
+                tcp_mux_open_stream_with_retry(
+                    local,
+                    host,
+                    port,
+                    split.prefetch,
+                    cfg,
+                    tcp_mux_slot,
+                    &session,
+                )
+                .await
             } else {
                 let (ws, crypto, prefetched_ws_messages) =
                     match open_legacy_biba_channel(&cfg, &host, port).await {
                         Ok(x) => x,
                         Err(e) => {
-                            let _ = socks5::socks5_reply_err(&mut local).await;
+                            if !connect_replied {
+                                let _ = socks5::socks5_reply_err(&mut local).await;
+                            }
                             return Err(e);
                         }
                     };
-                socks5::socks5_reply_ok(&mut local).await?;
+                if !connect_replied {
+                    socks5::socks5_reply_ok(&mut local).await?;
+                }
                 ws_bridge::bridge_ws_tcp_padded(
                     ws,
                     prefetched_ws_messages,
                     local,
-                    Vec::new(),
+                    split.prefetch,
                     cfg.max_pad,
                     cfg.decoy_max,
                     Some(crypto),
@@ -1454,18 +1647,60 @@ async fn handle_http_peer(
             port,
             client_prefetch,
         }) => {
+            // Same split-tunnel check as SOCKS CONNECT. Linux system proxy (GSettings /
+            // http_proxy) sends HTTPS here, so skipping this made domain bypass a no-op.
+            // `resolve_domain_split_route` starts with the plain `should_bypass(host)`
+            // test, then adds the SNI peek for bare-IP CONNECTs (Android full-TUN).
+            let bypass =
+                resolve_domain_split_route(&host, port, &mut local, client_prefetch, false).await;
+            if bypass.direct {
+                http_connect::reply_connect_ok(&mut local).await?;
+                return direct_bypass_relay(local, &host, port, &bypass.prefetch).await;
+            }
+
+            let needs_sni_peek = crate::domain_route::bypass_domains_active()
+                && port == 443
+                && host.parse::<IpAddr>().is_ok();
+            let (split, connect_replied) = if needs_sni_peek {
+                http_connect::reply_connect_ok(&mut local).await?;
+                let split = resolve_domain_split_route(
+                    &host,
+                    port,
+                    &mut local,
+                    bypass.prefetch,
+                    true,
+                )
+                .await;
+                (split, true)
+            } else {
+                (
+                    DomainSplitRoute {
+                        direct: false,
+                        prefetch: bypass.prefetch,
+                    },
+                    false,
+                )
+            };
+            if split.direct {
+                return direct_bypass_relay(local, &host, port, &split.prefetch).await;
+            }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
-                    let _ =
-                        http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
+                    if !connect_replied {
+                        let _ =
+                            http_connect::reply_connect_error(&mut local, 502, "Bad Gateway")
+                                .await;
+                    }
                     return Err(e);
                 }
-                http_connect::reply_connect_ok(&mut local).await?;
+                if !connect_replied {
+                    http_connect::reply_connect_ok(&mut local).await?;
+                }
                 tcp_mux_open_stream_with_retry(
                     local,
                     host,
                     port,
-                    client_prefetch,
+                    split.prefetch,
                     cfg,
                     tcp_mux_slot,
                     &session,
@@ -1476,18 +1711,26 @@ async fn handle_http_peer(
                     match open_legacy_biba_channel(&cfg, &host, port).await {
                         Ok(x) => x,
                         Err(e) => {
-                            let _ =
-                                http_connect::reply_connect_error(&mut local, 502, "Bad Gateway")
+                            if !connect_replied {
+                                let _ =
+                                    http_connect::reply_connect_error(
+                                        &mut local,
+                                        502,
+                                        "Bad Gateway",
+                                    )
                                     .await;
+                            }
                             return Err(e);
                         }
                     };
-                http_connect::reply_connect_ok(&mut local).await?;
+                if !connect_replied {
+                    http_connect::reply_connect_ok(&mut local).await?;
+                }
                 ws_bridge::bridge_ws_tcp_padded(
                     ws,
                     prefetched_ws_messages,
                     local,
-                    client_prefetch,
+                    split.prefetch,
                     cfg.max_pad,
                     cfg.decoy_max,
                     Some(crypto),
@@ -1510,6 +1753,9 @@ async fn handle_http_peer(
             port,
             to_origin,
         }) => {
+            if crate::domain_route::should_bypass(&host) {
+                return direct_bypass_relay_preface(local, &host, port, to_origin).await;
+            }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ =
@@ -1599,6 +1845,91 @@ pub const DEFAULT_CLIENT_MAX_WS_BINARY: usize = DEFAULT_MAX_WS_BINARY;
 
 /// Default SOCKS UDP-mux reply wait (seconds). Server embeds this in `biba://` invites for clients.
 pub const DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS: u64 = 130;
+
+#[cfg(test)]
+mod open_wait_tests {
+    use super::*;
+    use crate::crypto_layer::{build_ack, build_hello_v3, SessionCrypto};
+    use crate::frame::write_padded_frame;
+    use crate::protocol::{encode_v3_open_err, encode_v3_open_ok};
+    use std::sync::Arc;
+
+    fn session() -> Arc<SessionCrypto> {
+        let (c, _hello) = build_hello_v3();
+        let psk = "open-wait-psk";
+        let dom = "open.wait";
+        let (_ack, s) = build_ack(psk, dom, &c).unwrap();
+        Arc::new(SessionCrypto::new(psk, dom, &c, &s, 8))
+    }
+
+    fn seal_server_payload(crypto: &SessionCrypto, inner: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_padded_frame(&mut wire, inner, 8).unwrap();
+        crypto.seal_server_to_client(&wire).unwrap()
+    }
+
+    fn open_and_classify(crypto: &SessionCrypto, sealed: &[u8]) -> OpenWait {
+        let raw = crypto.open_server_to_client(sealed).unwrap();
+        let inner = read_padded_frame_into(raw).unwrap();
+        classify_open_wait_inner(&inner)
+    }
+
+    #[test]
+    fn open_ok_then_data_classify() {
+        let crypto = session();
+        let open_ok = encode_v3_open_ok();
+        let sealed_ok = seal_server_payload(&crypto, &open_ok);
+        assert_eq!(open_and_classify(&crypto, &sealed_ok), OpenWait::Ok);
+
+        let data = b"chunk";
+        let sealed_data = seal_server_payload(&crypto, data);
+        assert_eq!(
+            open_and_classify(&crypto, &sealed_data),
+            OpenWait::Payload(data.to_vec())
+        );
+        // Plaintext from classify must not decrypt again (documents the prefetch handoff).
+        assert!(crypto.open_server_to_client(data).is_err());
+    }
+
+    #[test]
+    fn early_payload_without_open_ok() {
+        let crypto = session();
+        let early = b"early";
+        let sealed = seal_server_payload(&crypto, early);
+        match open_and_classify(&crypto, &sealed) {
+            OpenWait::Payload(p) => assert_eq!(p, early),
+            other => panic!("expected payload, got {other:?}"),
+        }
+        assert!(crypto.open_server_to_client(early).is_err());
+    }
+
+    #[test]
+    fn open_err_classifies_as_error() {
+        let crypto = session();
+        let err_inner = encode_v3_open_err("host unreachable").unwrap();
+        let sealed = seal_server_payload(&crypto, &err_inner);
+        match open_and_classify(&crypto, &sealed) {
+            OpenWait::Err(msg) => assert_eq!(msg, "host unreachable"),
+            other => panic!("expected err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefetch_opened_payload_is_not_reopened() {
+        let crypto = session();
+        let data = b"handoff";
+        let sealed = seal_server_payload(&crypto, data);
+        let OpenWait::Payload(opened) = open_and_classify(&crypto, &sealed) else {
+            panic!("expected payload");
+        };
+        let prefetch = vec![WsBridgePrefetch::OpenedPayload(opened.clone())];
+        assert!(matches!(
+            &prefetch[0],
+            WsBridgePrefetch::OpenedPayload(p) if p == data
+        ));
+        assert!(crypto.open_server_to_client(&opened).is_err());
+    }
+}
 
 #[cfg(test)]
 mod parse_tests {
@@ -1772,5 +2103,180 @@ mod session_shutdown_tests {
         let after = hits.load(Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits.load(Ordering::Relaxed), after);
+    }
+}
+
+/// Linux (and any desktop) system proxy sends HTTPS through the local HTTP CONNECT
+/// port, not SOCKS. Split-tunnel must therefore fire on this path, not only SOCKS.
+#[cfg(test)]
+mod http_split_bypass_tests {
+    use super::*;
+    use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile, TlsStack};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
+
+    fn dummy_http_cfg() -> Arc<ClientCfg> {
+        let tls = client_tls_config(&ClientTlsParams {
+            insecure: true,
+            profile: TlsClientProfile::Default,
+            pinned_certs_pem: None,
+        })
+        .expect("tls");
+        Arc::new(ClientCfg {
+            server_host: "127.0.0.1".into(),
+            server_port: 1,
+            sni: "localhost".into(),
+            token: "t".into(),
+            insecure_tls: true,
+            tls,
+            max_pad: 0,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            psk: None,
+            decoy_max: 0,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_extra_headers: Arc::new(Vec::new()),
+            max_ws_binary: 65535,
+            ws_ping_secs: 0,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            udp_mux_max_pad: 0,
+            udp_mux_max_ws_binary: 65535,
+            udp_mux_reply_timeout_secs: 1,
+            tls_profile: TlsClientProfile::Default,
+            ws_path: "/ws".into(),
+            use_tcp_mux: true,
+            pad_mode: PadMode::Adaptive,
+            dummy_interval_secs: 0,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 0,
+            decoy_gets_paths: Vec::new(),
+            proto: 3,
+            proto_domain: String::new(),
+            reality_target: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            decoy_mode: DecoyMode::default(),
+            desync_mode: DesyncMode::default(),
+            tcp_fooling: TcpFooling::default(),
+            tls_fragment: false,
+            ws_parallel: 1,
+            idle_decoy_secs: 0,
+            activity: None,
+            socks_auth: None,
+            socks_bind: "127.0.0.1:0".into(),
+            tls_stack: TlsStack::Rustls,
+            pinned_certs_pem: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn http_connect_split_bypass_reaches_origin_directly() {
+        crate::domain_route::set_bypass_domains(&["localhost".into()]);
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+        let origin_addr = origin.local_addr().expect("origin addr");
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+
+        let origin_task = tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.expect("origin accept");
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).await.expect("origin read");
+            assert_eq!(&buf[..n], b"ping");
+            s.write_all(b"pong").await.expect("origin write");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let req = format!(
+                "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+                origin_addr.port(),
+                origin_addr.port()
+            );
+            s.write_all(req.as_bytes()).await.expect("client CONNECT");
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).await.expect("client read 200");
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                resp.contains("200"),
+                "HTTP CONNECT bypass should reply 200, got {resp:?}"
+            );
+            s.write_all(b"ping").await.expect("client ping");
+            let n = s.read(&mut buf).await.expect("client pong");
+            assert_eq!(&buf[..n], b"pong");
+        });
+
+        let (local, _) = proxy.accept().await.expect("proxy accept");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let session = SessionGuard::new(shutdown_rx);
+        let mux: TcpMuxSlot = Arc::new(Mutex::new(None));
+        let handled = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle_http_peer(local, dummy_http_cfg(), mux, session),
+        )
+        .await;
+        crate::domain_route::set_bypass_domains(&[]);
+        handled
+            .expect("timed out — HTTP CONNECT stayed on the tunnel instead of bypassing")
+            .expect("handle_http_peer");
+        client.await.expect("client");
+        origin_task.await.expect("origin");
+    }
+
+    #[tokio::test]
+    async fn http_forward_split_bypass_reaches_origin_directly() {
+        crate::domain_route::set_bypass_domains(&["localhost".into()]);
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+        let origin_addr = origin.local_addr().expect("origin addr");
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+
+        let origin_task = tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.expect("origin accept");
+            let mut buf = vec![0u8; 256];
+            let n = s.read(&mut buf).await.expect("origin read");
+            let got = String::from_utf8_lossy(&buf[..n]);
+            assert!(got.starts_with("GET /x HTTP/1.1"), "got {got:?}");
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .expect("origin write");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let req = format!(
+                "GET http://localhost:{}/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                origin_addr.port()
+            );
+            s.write_all(req.as_bytes()).await.expect("client GET");
+            let mut buf = vec![0u8; 256];
+            let n = s.read(&mut buf).await.expect("client read");
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(resp.contains("200") && resp.contains("ok"), "got {resp:?}");
+        });
+
+        let (local, _) = proxy.accept().await.expect("proxy accept");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let session = SessionGuard::new(shutdown_rx);
+        let mux: TcpMuxSlot = Arc::new(Mutex::new(None));
+        let handled = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle_http_peer(local, dummy_http_cfg(), mux, session),
+        )
+        .await;
+        crate::domain_route::set_bypass_domains(&[]);
+        handled
+            .expect("timed out — HTTP forward stayed on the tunnel instead of bypassing")
+            .expect("handle_http_peer");
+        client.await.expect("client");
+        origin_task.await.expect("origin");
     }
 }
