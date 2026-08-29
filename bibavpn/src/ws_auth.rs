@@ -5,17 +5,16 @@ use std::time::Duration;
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
 use crate::crypto_layer::secret_eq;
 use crate::protocol::{decode_auth, is_auth_frame};
 use crate::server_limits::{PreAuthBudget, PreAuthBudgetTracker};
+use crate::transport::{OuterMsg, WsConn};
 
 /// Read WebSocket messages until a valid AUTH frame matching `expected_token` or timeout.
 /// Ignores non-AUTH binary frames (noise). Handles Ping/Pong.
 pub async fn server_wait_token_auth<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     expected_token: &str,
     wait: Duration,
     mut pre_auth: Option<(&PreAuthBudget, &mut PreAuthBudgetTracker)>,
@@ -31,7 +30,7 @@ where
                 .context("eof during auth wait")?
                 .context("ws error during auth wait")?;
             match m {
-                Message::Binary(b) => {
+                OuterMsg::Data(b) => {
                     if let Some((budget, track)) = pre_auth.as_mut() {
                         track.note_binary_frame(b.len(), budget)?;
                     }
@@ -43,14 +42,13 @@ where
                         anyhow::bail!("auth token mismatch");
                     }
                 }
-                Message::Ping(p) => {
-                    ws.send(Message::Pong(p))
+                OuterMsg::Ping(p) => {
+                    ws.send(OuterMsg::Pong(p))
                         .await
                         .context("pong during auth")?;
                 }
-                Message::Pong(_) => {}
-                Message::Close(_) => anyhow::bail!("closed during auth"),
-                _ => {}
+                OuterMsg::Pong(_) => {}
+                OuterMsg::Close => anyhow::bail!("closed during auth"),
             }
         }
     };

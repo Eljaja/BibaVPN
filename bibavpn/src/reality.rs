@@ -26,8 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+use crate::transport::{OuterMsg, WsConn};
 use tracing::{info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
@@ -323,7 +322,7 @@ fn validate_short_id(short_id: &[u8; 8], cfg: &RealityServerConfig) -> anyhow::R
 /// in error messages; `control_frames` is the budget shared by all handshake
 /// phases so a pre-auth peer cannot reset it by advancing a phase.
 async fn next_handshake_binary<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     control_frames: &mut u32,
     what: &str,
 ) -> anyhow::Result<Bytes>
@@ -332,15 +331,15 @@ where
 {
     loop {
         match ws.next().await {
-            Some(Ok(Message::Binary(b))) => return Ok(b),
-            Some(Ok(Message::Ping(p))) => {
+            Some(Ok(OuterMsg::Data(b))) => return Ok(b),
+            Some(Ok(OuterMsg::Ping(p))) => {
                 *control_frames += 1;
                 if *control_frames > MAX_HANDSHAKE_CONTROL_FRAMES {
                     bail!("too many control frames during REALITY handshake");
                 }
-                ws.send(Message::Pong(p)).await.context("REALITY pong")?;
+                ws.send(OuterMsg::Pong(p)).await.context("REALITY pong")?;
             }
-            Some(Ok(Message::Pong(_))) => {
+            Some(Ok(OuterMsg::Pong(_))) => {
                 *control_frames += 1;
                 if *control_frames > MAX_HANDSHAKE_CONTROL_FRAMES {
                     bail!("too many control frames during REALITY handshake");
@@ -361,7 +360,7 @@ where
 /// it any peer that completes the WebSocket upgrade would get a working tunnel
 /// (the short-id allowlist is permissive by default, see `is_short_id_allowed`).
 pub async fn server_handshake_reality<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     cfg: &RealityServerConfig,
     token: &str,
 ) -> anyhow::Result<[u8; 32]>
@@ -388,7 +387,7 @@ where
     // key (binds the X25519 shared secret to the transcript).
     let (response, shared) =
         server_hello_with_confirm_and_shared(&cfg.private_key, &client_pubkey)?;
-    ws.send(Message::Binary(Bytes::from(response)))
+    ws.send(OuterMsg::Data(Bytes::from(response)))
         .await
         .context("send REALITY SERVER_HELLO")?;
 
@@ -407,7 +406,7 @@ pub async fn connect_reality_client(
     server_addr: &str,
     config: &RealityClientConfig,
     _target: &str,
-) -> anyhow::Result<WebSocketStream<TlsStream<TcpStream>>> {
+) -> anyhow::Result<WsConn<TlsStream<TcpStream>>> {
     use crate::stealth::{build_websocket_request, WsHandshakeParams};
     use crate::tls_util::TlsClientProfile;
 
@@ -450,7 +449,7 @@ pub async fn connect_reality_client(
         .await
         .map_err(|e| anyhow::anyhow!(e))
         .context("websocket upgrade")?;
-    Ok(ws)
+    Ok(WsConn::from_websocket(ws))
 }
 
 /// Encode REALITY client HELLO: `[version][ephemeral_pubkey:32][short_id:8]`.
@@ -465,7 +464,7 @@ pub fn encode_client_hello(short_id: &[u8; 8], client_pubkey: &[u8; 32]) -> Vec<
 /// Client REALITY HELLO + verify server pubkey (X25519 ephemeral), then send the
 /// mandatory AUTH frame proving knowledge of `token`. Returns the session key.
 pub async fn reality_client_exchange_verify<S>(
-    ws: &mut WebSocketStream<S>,
+    ws: &mut WsConn<S>,
     expected_server_pubkey: &[u8; 32],
     short_id: &[u8; 8],
     token: &str,
@@ -476,7 +475,7 @@ where
     let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
     let client_hello = encode_client_hello(short_id, ephemeral_public.as_bytes());
-    ws.send(Message::Binary(Bytes::from(client_hello)))
+    ws.send(OuterMsg::Data(Bytes::from(client_hello)))
         .await
         .context("send REALITY client hello")?;
 
@@ -513,7 +512,7 @@ where
         ephemeral_public.as_bytes(),
         &server_pubkey,
     );
-    ws.send(Message::Binary(Bytes::from(encode_client_auth(&auth_mac))))
+    ws.send(OuterMsg::Data(Bytes::from(encode_client_auth(&auth_mac))))
         .await
         .context("send REALITY client AUTH")?;
 

@@ -18,8 +18,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+use crate::transport::{OuterMsg, WsConn};
 use tracing::{debug, error, info, warn};
 
 use crate::crypto_layer::SessionCrypto;
@@ -205,7 +204,7 @@ fn classify_mux_flags(flags: u8) -> MuxFlags {
 
 /// Server: after `MUX_OPEN`, dispatch logical streams.
 pub async fn bridge_ws_tcp_mux_server<S>(
-    ws: WebSocketStream<S>,
+    ws: WsConn<S>,
     max_pad: u8,
     decoy_max: u8,
     crypto: Option<SharedCrypto>,
@@ -239,7 +238,7 @@ where
 
     let (mut ws_sink, mut ws_rx) = ws.split();
     const WS_OUT_CAP: usize = 512;
-    let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<Message>(WS_OUT_CAP);
+    let (ws_out_tx, mut ws_out_rx) = mpsc::channel::<OuterMsg>(WS_OUT_CAP);
     let ws_out_srv = ws_out_tx.clone();
     let ws_dummy_srv = ws_out_srv.clone();
     let crypto_dummy_srv = crypto.clone();
@@ -276,7 +275,7 @@ where
                         m = ws_out_rx.recv() => m,
                         _ = sleep_pin.as_mut() => {
                             ws_sink
-                                .send(Message::Ping(bytes::Bytes::new()))
+                                .send(OuterMsg::Ping(bytes::Bytes::new()))
                                 .await
                                 .context("ws ping")?;
                             *sleep_pin = Box::pin(sleep(ws_ping_period_duration(
@@ -314,7 +313,7 @@ where
         while let Some(m) = ws_rx.next().await {
             let m = m.context("websocket read")?;
             match m {
-                Message::Binary(b) => {
+                OuterMsg::Data(b) => {
                     if b.len() > max_ws_binary.saturating_mul(4) {
                         anyhow::bail!("oversized WS binary");
                     }
@@ -620,11 +619,11 @@ where
                         }
                     }
                 }
-                Message::Ping(p) => {
-                    ws_out_srv.send(Message::Pong(p)).await.context("ws pong")?;
+                OuterMsg::Ping(p) => {
+                    ws_out_srv.send(OuterMsg::Pong(p)).await.context("ws pong")?;
                 }
-                Message::Pong(_) => {}
-                Message::Close(_) => break,
+                OuterMsg::Pong(_) => {}
+                OuterMsg::Close => break,
                 _ => {}
             }
         }
@@ -654,7 +653,7 @@ where
 }
 
 async fn mux_server_send_record(
-    ws_out: &mpsc::Sender<Message>,
+    ws_out: &mpsc::Sender<OuterMsg>,
     sid: u32,
     flags: u8,
     payload: &[u8],
@@ -699,7 +698,7 @@ async fn mux_server_send_record(
         maybe_ws_send_jitter(ws_send_jitter).await;
     }
     ws_out
-        .send(Message::Binary(blob))
+        .send(OuterMsg::Data(blob))
         .await
         .context("mux ws queue")?;
     Ok(())
@@ -709,7 +708,7 @@ async fn mux_server_stream_read_loop(
     sid: u32,
     epoch: u64,
     mut tcp_read: OwnedReadHalf,
-    ws_out: mpsc::Sender<Message>,
+    ws_out: mpsc::Sender<OuterMsg>,
     streams: Arc<Mutex<HashMap<u32, ServerStreamState>>>,
     max_pad: u8,
     pad_mode: PadMode,
@@ -941,7 +940,7 @@ pub async fn remove_mux_session(slot: &TcpMuxClientSlot, session_id: u64) {
 
 /// After WebSocket is established and `MUX_OPEN` already sent: spawn reader/writer and return handle.
 pub fn spawn_tcp_mux_client<S>(
-    ws: WebSocketStream<S>,
+    ws: WsConn<S>,
     crypto: Option<SharedCrypto>,
     mut cfg: MuxClientConfig,
     tcp_mux_slot: TcpMuxClientSlot,
@@ -1005,7 +1004,7 @@ where
                             continue;
                         }
                         _ = sleep_pin.as_mut() => {
-                            if ws_sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                            if ws_sink.send(OuterMsg::Ping(Bytes::new())).await.is_err() {
                                 break;
                             }
                             *sleep_pin = Box::pin(sleep(ws_ping_period_duration(
@@ -1085,20 +1084,20 @@ where
                         if !bulk_c2s {
                             maybe_ws_send_jitter(send_j).await;
                         }
-                        if ws_sink.feed(Message::Binary(blob)).await.is_err() {
+                        if ws_sink.feed(OuterMsg::Data(blob)).await.is_err() {
                             stop = true;
                             break;
                         }
                     }
                     MuxWriteCmd::Pong(p) => {
-                        if ws_sink.feed(Message::Pong(Bytes::from(p))).await.is_err() {
+                        if ws_sink.feed(OuterMsg::Pong(Bytes::from(p))).await.is_err() {
                             stop = true;
                             break;
                         }
                     }
                     MuxWriteCmd::RawBinary(blob) => {
                         maybe_ws_send_jitter(send_j).await;
-                        if ws_sink.feed(Message::Binary(blob)).await.is_err() {
+                        if ws_sink.feed(OuterMsg::Data(blob)).await.is_err() {
                             stop = true;
                             break;
                         }
@@ -1133,7 +1132,7 @@ where
 }
 
 async fn mux_client_reader_loop<S>(
-    mut ws_rx: futures_util::stream::SplitStream<WebSocketStream<S>>,
+    mut ws_rx: futures_util::stream::SplitStream<WsConn<S>>,
     crypto: Option<SharedCrypto>,
     cfg: MuxClientConfig,
     down: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
@@ -1165,7 +1164,7 @@ async fn mux_client_reader_loop<S>(
         };
         let Ok(m) = m else { break };
         match m {
-            Message::Binary(b) => {
+            OuterMsg::Data(b) => {
                 if b.len() > cfg.max_ws_binary.saturating_mul(4) {
                     decode_failures = decode_failures.saturating_add(1);
                     if DECODE_WARN.should_emit() {
@@ -1281,11 +1280,11 @@ async fn mux_client_reader_loop<S>(
                     down.lock().await.remove(&sid);
                 }
             }
-            Message::Ping(p) => {
+            OuterMsg::Ping(p) => {
                 let _ = out_tx.send(MuxWriteCmd::Pong(p.to_vec())).await;
             }
-            Message::Pong(_) => {}
-            Message::Close(_) => break,
+            OuterMsg::Pong(_) => {}
+            OuterMsg::Close => break,
             _ => {}
         }
     }
@@ -1414,7 +1413,7 @@ async fn mux_client_dummy_task(
 }
 
 async fn mux_server_dummy_task(
-    out: mpsc::Sender<Message>,
+    out: mpsc::Sender<OuterMsg>,
     crypto: Option<SharedCrypto>,
     max_pad: u8,
     pad_mode: PadMode,
@@ -1451,7 +1450,7 @@ async fn mux_server_dummy_task(
         }
         maybe_server_ack_and_rtt_mask(server_out).await;
         maybe_ws_send_jitter(ws_send_jitter).await;
-        if out.send(Message::Binary(blob)).await.is_err() {
+        if out.send(OuterMsg::Data(blob)).await.is_err() {
             break;
         }
     }
@@ -1520,7 +1519,7 @@ mod fd_leak_tests {
             .insert(sid, ServerStreamState::Open { epoch, tx: wtx });
 
         // Outbound queue with a dropped receiver: every send fails ("mux ws queue").
-        let (ws_out, ws_out_rx) = mpsc::channel::<Message>(1);
+        let (ws_out, ws_out_rx) = mpsc::channel::<OuterMsg>(1);
         drop(ws_out_rx);
 
         // Give the pump something to forward so it reaches the failing send.
@@ -1576,7 +1575,7 @@ mod fd_leak_tests {
             .insert(sid, ServerStreamState::Open { epoch, tx: wtx });
 
         // Live queue: drain it so sends succeed.
-        let (ws_out, mut ws_out_rx) = mpsc::channel::<Message>(8);
+        let (ws_out, mut ws_out_rx) = mpsc::channel::<OuterMsg>(8);
         tokio::spawn(async move { while ws_out_rx.recv().await.is_some() {} });
 
         // Peer closes -> the pump sees EOF.

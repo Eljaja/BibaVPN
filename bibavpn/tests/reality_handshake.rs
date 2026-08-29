@@ -6,6 +6,7 @@ use bibavpn::reality::{
     reality_client_exchange_verify, server_handshake_reality, RealityServerConfig, REALITY_VERSION,
 };
 use bibavpn::stealth::{build_websocket_request, WsHandshakeParams};
+use bibavpn::transport::{OuterMsg, WsConn};
 use bibavpn::tls_util::{install_ring_crypto, server_self_signed, TlsClientProfile};
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
@@ -99,8 +100,9 @@ async fn reality_handshake_over_wss() {
     let (addr, server) =
         spawn_reality_server(reality_cfg_for(priv_key, vec![short_id]), "/ws", token).await;
     let mut ws = client_ws(addr, "/ws").await;
+    let mut outer = WsConn::from_websocket(ws);
 
-    let session_key = reality_client_exchange_verify(&mut ws, &pub_key, &short_id, token)
+    let session_key = reality_client_exchange_verify(&mut outer, &pub_key, &short_id, token)
         .await
         .expect("client REALITY");
     assert_eq!(session_key.len(), 32);
@@ -110,7 +112,7 @@ async fn reality_handshake_over_wss() {
         .expect("join")
         .expect("server REALITY (correct token must be accepted)");
     assert_eq!(server_shared, session_key);
-    let _ = ws.close(None).await;
+    let _ = outer.close(None).await;
 }
 
 /// A client that completes the X25519 exchange but does not know the session
@@ -130,17 +132,18 @@ async fn reality_handshake_rejects_wrong_token() {
     )
     .await;
     let mut ws = client_ws(addr, "/ws").await;
+    let mut outer = WsConn::from_websocket(ws);
 
     // The server is authentic, so the client side of the exchange succeeds; the
     // AUTH frame it sends is keyed by the wrong token.
-    let _ = reality_client_exchange_verify(&mut ws, &pub_key, &short_id, "wrong-token").await;
+    let _ = reality_client_exchange_verify(&mut outer, &pub_key, &short_id, "wrong-token").await;
 
     let res = server.await.expect("join");
     assert!(
         res.is_err(),
         "server must reject a client AUTH with a wrong token"
     );
-    let _ = ws.close(None).await;
+    let _ = outer.close(None).await;
 }
 
 /// A client that skips the AUTH frame and jumps straight to an application
@@ -221,13 +224,14 @@ async fn reality_handshake_rejects_forged_server() {
         let mut forged = vec![REALITY_VERSION];
         forged.extend_from_slice(&echoed_pub);
         forged.extend_from_slice(&[0u8; 32]);
-        let _ = ws.send(Message::Binary(forged.into())).await;
+        let _ = ws.send(OuterMsg::Data(forged.into())).await;
         let _ = ws.close(None).await;
     });
 
     let mut ws = client_ws(addr, &ws_path).await;
+    let mut outer = WsConn::from_websocket(ws);
 
-    let res = reality_client_exchange_verify(&mut ws, &pub_key, &short_id, &token).await;
+    let res = reality_client_exchange_verify(&mut outer, &pub_key, &short_id, &token).await;
     assert!(res.is_err(), "client must reject a forged confirmation MAC");
-    let _ = ws.close(None).await;
+    let _ = outer.close(None).await;
 }
