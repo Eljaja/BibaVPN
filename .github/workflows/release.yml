@@ -103,5 +103,6 @@ jobs:
           files: |
             dist/BibaVPN-macos-aarch64.dmg
             dist/BibaVPN-windows-x64.zip
-            dist/BibaVPN-linux-x64.tar.gz
+            dist/*.deb
+            dist/*.AppImage
             dist/BibaVPN-android-debug.apk

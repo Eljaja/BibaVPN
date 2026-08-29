@@ -61,48 +61,23 @@ jobs:
           BIBA_BYPASS_DOMAINS_REQUIRED: ${{ github.event_name == 'workflow_call' && '1' || '0' }}
         run: bash .github/scripts/ci-fetch-bypass-domains.sh
 
-      - name: Build bibavpn-desktop (release)
-        run: cargo build -p bibavpn-desktop --release
+      # `tauri build` (not a bare `cargo build`) is what consumes `bundle.icon`
+      # from tauri.conf.json: it writes Contents/Resources/icon.icns and the
+      # matching CFBundleIconFile into Info.plist. The previous hand-rolled
+      # BibaVPN.app created an empty Resources/ and a plist with no
+      # CFBundleIconFile, so the Dock and Finder fell back to the generic icon —
+      # only the tray icon worked, because that one is include_image!'d into the
+      # executable. The hand-written plist had also drifted to version 0.1.0
+      # while tauri.conf.json said 0.2.0; the bundler keeps them in sync.
+      - name: Build bundles (.app + DMG)
+        working-directory: apps/bibavpn-desktop
+        run: npx --yes @tauri-apps/cli@2 build --bundles app,dmg
 
-      - name: Pack BibaVPN.app + DMG
+      - name: Stage DMG
         run: |
           set -euo pipefail
-          APP_DIR="packaging/BibaVPN.app"
-          BIN="$APP_DIR/Contents/MacOS/BibaVPN"
-          mkdir -p "$(dirname "$BIN")" "$APP_DIR/Contents/Resources"
-          cp target/release/bibavpn-desktop "$BIN"
-          chmod +x "$BIN"
-          cat > "$APP_DIR/Contents/Info.plist" <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key>
-            <string>BibaVPN</string>
-            <key>CFBundleIdentifier</key>
-            <string>dev.bibavpn.desktop</string>
-            <key>CFBundleName</key>
-            <string>BibaVPN</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleShortVersionString</key>
-            <string>0.1.0</string>
-            <key>CFBundleVersion</key>
-            <string>1</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>11.0</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-          </dict>
-          </plist>
-          EOF
-          STAGE="packaging/dmg_root"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          cp -R "$APP_DIR" "$STAGE/"
-          ln -sf /Applications "$STAGE/Applications"
-          rm -f BibaVPN-macos-aarch64.dmg
-          hdiutil create -volname "BibaVPN" -srcfolder "$STAGE" -ov -format UDZO BibaVPN-macos-aarch64.dmg
+          cp target/release/bundle/dmg/*.dmg BibaVPN-macos-aarch64.dmg
+          ls -la BibaVPN-macos-aarch64.dmg
 
       - name: Upload DMG
         uses: actions/upload-artifact@v4
