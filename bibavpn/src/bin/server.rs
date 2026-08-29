@@ -15,6 +15,10 @@ use bibavpn::server_limits::{
 };
 use bibavpn::server_metrics::{spawn_metrics_listener, MetricsAuth};
 use bibavpn::transport_capabilities::log_server_listen_caps;
+use bibavpn::startup_secrets::{
+    log_lab_mode_enabled, log_reality_without_psk, require_psk, resolve_cli_token,
+    server_reality_configured,
+};
 use bibavpn::udp_mux::UdpSocketPool;
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
@@ -66,8 +70,12 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8443")]
     listen: String,
 
-    #[arg(long, default_value = "change-me")]
-    token: String,
+    #[arg(long, required_unless_present = "lab")]
+    token: Option<String>,
+
+    /// Local demos only: allow missing `--token` (uses `change-me`), skip token denylist, relax PSK when REALITY is configured.
+    #[arg(long, default_value_t = false)]
+    lab: bool,
 
     /// WebSocket HTTP path (token is sent in AUTH frame). Default `/ws`.
     #[arg(long, default_value = "/ws")]
@@ -354,6 +362,20 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     install_ring_crypto();
+
+    if args.lab {
+        log_lab_mode_enabled();
+    }
+    let token = resolve_cli_token(args.token.as_deref(), args.lab)?;
+    let reality_configured = server_reality_configured(
+        args.reality_target.as_deref(),
+        args.reality_private_key.as_deref(),
+    );
+    require_psk(args.psk.as_deref(), reality_configured, args.lab)?;
+    if reality_configured && args.psk.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        log_reality_without_psk();
+    }
+
     let ws_path = normalize_ws_path(&args.ws_path);
     let pad_mode = PadMode::from_str(args.pad_mode.trim()).context("pad-mode")?;
 
@@ -450,7 +472,7 @@ async fn main() -> anyhow::Result<()> {
             v: 1,
             server: public.clone(),
             sni,
-            token: args.token.clone(),
+            token: token.clone(),
             proto: 3,
             proto_domain,
             psk: args.psk.clone(),
@@ -512,7 +534,6 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("bibavpn-server: invite URI on stdout; keep --invite-passphrase secret (not in log aggregation).");
     }
 
-    let token = args.token.clone();
     let max_pad = args.max_pad;
     let psk = args.psk.clone();
     let decoy_max = args.decoy_max;

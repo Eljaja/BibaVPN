@@ -228,6 +228,15 @@ the mux record header when chunking TCP).
 - Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any + startup `WARN`; all-zero entry = wildcard + startup `WARN`), `--reality-server-names` (optional SNI allowlist; default = host from target). `--token` is **required** on the REALITY path too: it keys the client AUTH MAC.
 - `--ws-path` / server `--ws-path` — WebSocket path; token via `AUTH`
 (default `/ws`)
+- **`--token`** — no default on server or client. Required unless the client uses
+`--from-invite` or either binary passes **`--lab`** (local demos only; logs
+`bibavpn_security` WARN). Denylisted values (case-insensitive, after trim):
+`change-me`, `changeme`, `test`; empty/whitespace is rejected. JSON/Android
+start has no `lab` field — omitting `token` without a valid invite fails closed.
+- **`--psk`** — required at process start on server and client unless **REALITY**
+is fully configured (server: `--reality-target` + `--reality-private-key`;
+client: `reality_target` + `reality_public_key` after invite merge) or **`--lab`**.
+REALITY without PSK still starts but logs WARN that v3 HELLO / UDP mux need PSK.
 - Client `--proto` (only `**3`** is supported) and `--proto-domain` (KDF label;
 empty → SNI)
 - Server `--proto-domain` — KDF domain string for proto 3 (default `default`); must match
