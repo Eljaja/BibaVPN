@@ -17,17 +17,19 @@ function formatSessionUptime(elapsedMs) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-/** @param {{ snap: import('../vpnTypes').StateSnapshot, connectPending: boolean, refresh: () => Promise<void>, onSettings: () => void, onToggleConnect: () => void, onClearError: () => void }} props */
+/** @param {{ snap: import('../vpnTypes').StateSnapshot, connectPending: boolean, refresh: () => Promise<void>, getTunnelStatus: () => Promise<{ connected?: boolean, vpnSessionUptimeSecs?: number } | null>, onSettings: () => void, onToggleConnect: () => void, onClearError: () => void }} props */
 export function ConnectScreen({
   snap,
   connectPending,
   refresh,
+  getTunnelStatus,
   onSettings,
   onToggleConnect,
   onClearError,
 }) {
   const { theme, accent } = useT();
   const [sessionStartedAt, setSessionStartedAt] = useState(null);
+  const [backendUptimeSecs, setBackendUptimeSecs] = useState(null);
   /** Ререндер раз в секунду для uptime */
   const [, setTick] = useState(0);
   const [rttMs, setRttMs] = useState(null);
@@ -35,32 +37,61 @@ export function ConnectScreen({
   useEffect(() => {
     if (!snap || !snap.connected) {
       setSessionStartedAt(null);
+      setBackendUptimeSecs(null);
       setRttMs(null);
       return;
     }
     if (typeof snap.vpnSessionUptimeSecs === "number") {
       setSessionStartedAt(null);
+      setBackendUptimeSecs(snap.vpnSessionUptimeSecs);
       return;
     }
+    setBackendUptimeSecs(null);
     setSessionStartedAt((prev) => (prev == null ? Date.now() : prev));
   }, [snap?.connected, snap?.vpnSessionUptimeSecs]);
 
-  /** Android: uptime из JNI обновляем через get_state каждую секунду. Desktop: локальный таймер от первого connected в этом процессе. */
+  /** Android/iOS: обновляем только лёгкий статус туннеля, не весь snapshot с конфигом. */
   useEffect(() => {
     const backend =
       snap?.connected && typeof snap.vpnSessionUptimeSecs === "number";
     if (!snap?.connected) return;
     if (backend) {
+      let cancelled = false;
+      let inFlight = false;
+      async function refreshUptime() {
+        if (inFlight) return;
+        inFlight = true;
+        try {
+          const status = await getTunnelStatus();
+          if (cancelled) return;
+          if (status?.connected) {
+            setBackendUptimeSecs(
+              typeof status.vpnSessionUptimeSecs === "number"
+                ? status.vpnSessionUptimeSecs
+                : null
+            );
+          } else {
+            setBackendUptimeSecs(null);
+            await refresh();
+          }
+        } finally {
+          inFlight = false;
+        }
+      }
+      refreshUptime();
       const id = setInterval(() => {
-        refresh();
+        refreshUptime();
       }, 1000);
-      return () => clearInterval(id);
+      return () => {
+        cancelled = true;
+        clearInterval(id);
+      };
     }
     if (sessionStartedAt != null) {
       const id = setInterval(() => setTick((x) => x + 1), 1000);
       return () => clearInterval(id);
     }
-  }, [snap?.connected, snap?.vpnSessionUptimeSecs, sessionStartedAt, refresh]);
+  }, [snap?.connected, snap?.vpnSessionUptimeSecs, sessionStartedAt, refresh, getTunnelStatus]);
 
   useEffect(() => {
     if (!snap?.connected) return;
@@ -75,7 +106,7 @@ export function ConnectScreen({
       }
     }
     probe();
-    const id = setInterval(probe, 8000);
+    const id = setInterval(probe, 30000);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -84,9 +115,16 @@ export function ConnectScreen({
 
   if (!snap) return null;
 
+  const effectiveBackendUptimeSecs =
+    typeof backendUptimeSecs === "number"
+      ? backendUptimeSecs
+      : typeof snap.vpnSessionUptimeSecs === "number"
+        ? snap.vpnSessionUptimeSecs
+        : null;
+
   const uptimeStr =
-    snap.connected && typeof snap.vpnSessionUptimeSecs === "number"
-      ? formatSessionUptime(snap.vpnSessionUptimeSecs * 1000)
+    snap.connected && typeof effectiveBackendUptimeSecs === "number"
+      ? formatSessionUptime(effectiveBackendUptimeSecs * 1000)
       : snap.connected && sessionStartedAt != null
         ? formatSessionUptime(Date.now() - sessionStartedAt)
         : "—";
@@ -188,7 +226,7 @@ export function ConnectScreen({
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <StatusDot state={cs} size={8} />
+          <StatusDot state={cs} size={8} animate={false} />
           <span
             style={{
               fontFamily: MONO,
@@ -231,7 +269,7 @@ export function ConnectScreen({
             border: `1px solid ${cs === "connected" ? accent.hex : theme.line}`,
           }}
         >
-          <StatusDot state={cs} size={7} />
+          <StatusDot state={cs} size={7} animate={false} />
           <span
             style={{
               fontFamily: SANS,
@@ -260,9 +298,9 @@ export function ConnectScreen({
               cursor: !canTap || connectPending ? "not-allowed" : "pointer",
               padding: 0,
               position: "relative",
-              transition: "all 200ms ease",
+              transition: "border-color 200ms ease, opacity 160ms ease, transform 160ms ease",
               opacity: !canTap ? 0.45 : 1,
-              boxShadow: `0 0 0 10px rgba(255,255,255,0.015), 0 0 60px ${ringGlow}`,
+              boxShadow: `0 0 0 10px rgba(255,255,255,0.015), 0 0 36px ${ringGlow}`,
             }}
           >
             <div
@@ -315,38 +353,20 @@ export function ConnectScreen({
               </div>
             </div>
             {cs === "connecting" && (
-              <>
-                <div
-                  aria-hidden
-                  style={{
-                    position: "absolute",
-                    inset: -4,
-                    borderRadius: "50%",
-                    border: `1.5px solid ${SEMANTIC.warn}`,
-                    animation: "biba-ping 1.55s ease-out infinite",
-                    pointerEvents: "none",
-                    willChange: "transform, opacity",
-                    transform: "translateZ(0)",
-                    backfaceVisibility: "hidden",
-                  }}
-                />
-                <div
-                  aria-hidden
-                  style={{
-                    position: "absolute",
-                    inset: -4,
-                    borderRadius: "50%",
-                    border: `1px solid ${SEMANTIC.warn}`,
-                    animation: "biba-ping 1.55s ease-out infinite",
-                    animationDelay: "0.78s",
-                    pointerEvents: "none",
-                    willChange: "transform, opacity",
-                    transform: "translateZ(0)",
-                    backfaceVisibility: "hidden",
-                    opacity: 0.85,
-                  }}
-                />
-              </>
+              <div
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  inset: -4,
+                  borderRadius: "50%",
+                  border: `1.5px solid ${SEMANTIC.warn}`,
+                  animation: "biba-ping 1.55s ease-out infinite",
+                  pointerEvents: "none",
+                  willChange: "transform, opacity",
+                  transform: "translateZ(0)",
+                  backfaceVisibility: "hidden",
+                }}
+              />
             )}
           </button>
         </div>

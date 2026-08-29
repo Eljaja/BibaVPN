@@ -26,6 +26,15 @@ export function useVpn() {
     }
   }, []);
 
+  const getTunnelStatus = useCallback(async () => {
+    try {
+      return await invoke("get_tunnel_status_cmd");
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
     let alive = true;
     let unlisten = () => {};
@@ -99,6 +108,7 @@ export function useVpn() {
     snap,
     busy,
     refresh,
+    getTunnelStatus,
     getEditConfig,
     saveCfg,
     connect,

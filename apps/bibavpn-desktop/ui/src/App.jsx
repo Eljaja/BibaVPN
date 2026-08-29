@@ -26,6 +26,7 @@ function AppInner() {
     refreshFromControlPlane,
     clearError,
     refresh,
+    getTunnelStatus,
     getEditConfig,
   } = useVpn();
   const { theme } = useT();
@@ -115,15 +116,28 @@ function AppInner() {
     if (snap.error) setTunnelHandshake(false);
   }, [snap?.connected, snap?.error, tunnelHandshake]);
 
-  /** Туннель на Android поднимается после JNI; без опроса UI зависает в «рукопожатии». */
+  /** Туннель на Android поднимается после JNI; опрашиваем только лёгкий статус, а полный snapshot берём один раз. */
   useEffect(() => {
     if (!tunnelHandshake) return;
     if (snap?.connected) return;
-    const id = setInterval(() => {
-      refresh();
-    }, 650);
-    return () => clearInterval(id);
-  }, [tunnelHandshake, snap?.connected, refresh]);
+    let cancelled = false;
+    let timer = 0;
+    async function pollTunnelStatus() {
+      const status = await getTunnelStatus();
+      if (cancelled) return;
+      if (status?.connected) {
+        await refresh();
+        if (!cancelled) setTunnelHandshake(false);
+        return;
+      }
+      timer = window.setTimeout(pollTunnelStatus, 900);
+    }
+    timer = window.setTimeout(pollTunnelStatus, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [tunnelHandshake, snap?.connected, refresh, getTunnelStatus]);
 
   /** Снимаем зависший «handshake», если туннель так и не попал в snapshot (ошибка JNI и т.п.). */
   useEffect(() => {
@@ -244,6 +258,7 @@ function AppInner() {
         snap={snap}
         connectPending={connectPhasePending}
         refresh={refresh}
+        getTunnelStatus={getTunnelStatus}
         onSettings={() => goTab("settings")}
         onToggleConnect={handleToggleConnect}
         onClearError={clearError}
