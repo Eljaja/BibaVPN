@@ -16,7 +16,18 @@ function cloneCfg(c) {
 }
 
 function AppInner() {
-  const { snap, busy, connect, disconnect, saveCfg, applyInvite, refreshFromControlPlane, clearError, refresh } = useVpn();
+  const {
+    snap,
+    busy,
+    connect,
+    disconnect,
+    saveCfg,
+    applyInvite,
+    refreshFromControlPlane,
+    clearError,
+    refresh,
+    getEditConfig,
+  } = useVpn();
   const { theme } = useT();
   const [tab, setTab] = useState("connect");
   /** @type {[import('./vpnTypes').SavedConfig | null, (c: import('./vpnTypes').SavedConfig | null) => void]} */
@@ -43,21 +54,31 @@ function AppInner() {
     return () => unlisten();
   }, []);
 
+  const loadEditDraft = useCallback(async () => {
+    try {
+      const c = await getEditConfig();
+      setDraft(cloneCfg(c));
+    } catch (e) {
+      console.error(e);
+    }
+  }, [getEditConfig]);
+
   useEffect(() => {
     if (tab === "connect") setDraft(null);
-  }, [tab]);
+    else if (tab === "profiles" || tab === "settings") loadEditDraft();
+  }, [tab, loadEditDraft]);
 
   useEffect(() => {
     let unlisten = () => {};
     (async () => {
       unlisten = await listen("control-plane-import", () => {
-        setDraft(null);
         setPendingImport(null);
         setTab("profiles");
+        loadEditDraft();
       });
     })();
     return () => unlisten();
-  }, []);
+  }, [loadEditDraft]);
 
   const confirmPendingImport = useCallback(async () => {
     setImportBusy(true);
@@ -112,18 +133,17 @@ function AppInner() {
 
   const setCfg = useCallback((updater) => {
     setDraft((d) => {
-      const base = d ?? (snap?.cfg ? cloneCfg(snap.cfg) : null);
-      if (!base) return null;
-      return typeof updater === "function" ? updater(base) : updater;
+      if (!d) return null;
+      return typeof updater === "function" ? updater(d) : updater;
     });
-  }, [snap]);
+  }, []);
 
   const saveDraft = useCallback(async () => {
-    const toSave = draft ?? snap?.cfg;
-    if (!toSave) return;
-    const s = await saveCfg(toSave);
-    if (s?.cfg) setDraft(cloneCfg(s.cfg));
-  }, [draft, snap, saveCfg]);
+    if (!draft) return;
+    await saveCfg(draft);
+    const full = await getEditConfig();
+    setDraft(cloneCfg(full));
+  }, [draft, saveCfg, getEditConfig]);
 
   const goTab = useCallback(
     async (/** @type {"connect" | "profiles" | "settings"} */ next) => {
@@ -168,22 +188,24 @@ function AppInner() {
   }
 
   const boringAvailable = Boolean(snap.capabilities?.boring_tls_available);
-  const cfg = draft ?? snap.cfg;
+  const cfg = draft;
   const cpHost = pendingImport?.controlPlaneHost ?? "";
   const vpnHost = pendingImport?.vpnHost ?? "";
 
   let main = null;
-  if (tab === "profiles") {
+  if (tab === "profiles" && cfg) {
     main = (
       <ProfilesScreen
         cfg={cfg}
         onSave={async (c) => {
           setDraft(c);
           await saveCfg(c);
+          const full = await getEditConfig();
+          setDraft(cloneCfg(full));
         }}
       />
     );
-  } else if (tab === "settings") {
+  } else if (tab === "settings" && cfg) {
     main = (
       <SettingsScreen
         cfg={cfg}
@@ -197,17 +219,23 @@ function AppInner() {
           try {
             await applyInvite();
           } finally {
-            setDraft(null);
+            const full = await getEditConfig();
+            setDraft(cloneCfg(full));
           }
         }}
         onRefreshFromControlPlane={async () => {
           try {
             await refreshFromControlPlane();
           } finally {
-            setDraft(null);
+            const full = await getEditConfig();
+            setDraft(cloneCfg(full));
           }
         }}
       />
+    );
+  } else if (tab === "profiles" || tab === "settings") {
+    main = (
+      <div style={{ padding: 24, fontFamily: "IBM Plex Mono", color: "#6a7c78" }}>…</div>
     );
   } else {
     main = (

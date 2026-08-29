@@ -54,8 +54,9 @@ use bibavpn::tls_util::install_ring_crypto;
 use config::load_config_from_path;
 use config::{
     apply_invite_fields, desktop_config_json_path, display_host_line, import_control_plane_payload,
-    load_config_disk, normalize_loaded, profile_control_plane_origins, save_config_to_path,
-    server_card_subtitle, SavedConfig,
+    load_config_disk, merge_saved_config, normalize_loaded, profile_control_plane_origins,
+    save_config_to_path, server_card_subtitle, to_public_saved_config, PublicSavedConfig,
+    SavedConfig,
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use locale::{resolved_tray_lang, tray_strings};
@@ -153,7 +154,7 @@ struct ClientCapabilities {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StateSnapshot {
-    cfg: SavedConfig,
+    cfg: PublicSavedConfig,
     connected: bool,
     display_host: String,
     server_subtitle: String,
@@ -226,7 +227,7 @@ fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let vpn_session_uptime_secs = None;
     StateSnapshot {
-        cfg: inner.cfg.clone(),
+        cfg: to_public_saved_config(&inner.cfg),
         connected,
         display_host: display_host_line(&inner.cfg),
         server_subtitle: server_card_subtitle(&inner.cfg),
@@ -1446,14 +1447,20 @@ fn get_state(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot
 }
 
 #[tauri::command]
+fn get_edit_config(state: State<'_, AppState>) -> Result<SavedConfig, String> {
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    Ok(g.cfg.clone())
+}
+
+#[tauri::command]
 fn save_config_cmd(
-    cfg: SavedConfig,
+    cfg: serde_json::Value,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<StateSnapshot, String> {
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     let old_locale = g.cfg.ui_locale.clone();
-    g.cfg = cfg;
+    g.cfg = merge_saved_config(&g.cfg, &cfg)?;
     normalize_loaded(&mut g.cfg);
     let locale_changed = old_locale != g.cfg.ui_locale;
     persist_cfg(&app, &g.cfg)?;
@@ -1906,6 +1913,7 @@ pub fn run() -> anyhow::Result<()> {
     let app = builder
         .invoke_handler(tauri::generate_handler![
             get_state,
+            get_edit_config,
             measure_server_rtt_cmd,
             pick_installed_package_cmd,
             save_config_cmd,
