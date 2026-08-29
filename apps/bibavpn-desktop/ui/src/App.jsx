@@ -108,11 +108,12 @@ function AppInner() {
     if (tab !== "connect") setTunnelHandshake(false);
   }, [tab]);
 
-  /** Рукопожатие закончилось, когда туннель реально поднялся (ошибки обрабатываются через catch invoke и clear_error). */
+  /** Рукопожатие закончилось, когда туннель реально поднялся или появилась ошибка. */
   useEffect(() => {
     if (!tunnelHandshake || !snap) return;
     if (snap.connected) setTunnelHandshake(false);
-  }, [snap?.connected, tunnelHandshake]);
+    if (snap.error) setTunnelHandshake(false);
+  }, [snap?.connected, snap?.error, tunnelHandshake]);
 
   /** Туннель на Android поднимается после JNI; без опроса UI зависает в «рукопожатии». */
   useEffect(() => {

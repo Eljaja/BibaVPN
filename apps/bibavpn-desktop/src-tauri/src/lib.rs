@@ -202,6 +202,38 @@ fn measure_tcp_connect_rtt_ms(host: &str, port: u16) -> Option<u32> {
     Some(ms.min(u128::from(u32::MAX)) as u32)
 }
 
+/// Стабильные JNI-коды Android connect → короткий текст для UI (`last_error` / snapshot).
+fn map_android_jni_connect_error(code: &str) -> String {
+    match code.trim() {
+        "" => String::new(),
+        "vpn_permission_denied" => "Разрешение VPN отклонено".into(),
+        "vpn_permission_timeout" => "Истекло время ожидания разрешения VPN".into(),
+        "vpn_permission_ui_unavailable" => "Не удалось показать запрос разрешения VPN".into(),
+        "connect_ui_thread_timeout" => "Таймаут подключения VPN (UI)".into(),
+        "connect_interrupted" => "Подключение VPN прервано".into(),
+        "vpn_tunnel_start_failed" => "Не удалось поднять VPN-туннель".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Overlay bootstrap-ошибки из Kotlin, когда туннель ещё не активен и Rust `last_error` пуст.
+fn android_snapshot_error(
+    last_error: &Option<String>,
+    connected: bool,
+    jni_connect_error: Option<String>,
+) -> Option<String> {
+    if last_error.is_some() {
+        return last_error.clone();
+    }
+    if connected {
+        return None;
+    }
+    jni_connect_error
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| map_android_jni_connect_error(&s))
+        .filter(|s| !s.is_empty())
+}
+
 fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     #[cfg(target_os = "android")]
     let connected = android_vpn::tunnel_is_active(app).unwrap_or(false);
@@ -226,13 +258,18 @@ fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     };
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let vpn_session_uptime_secs = None;
+    #[cfg(target_os = "android")]
+    let jni_connect_error = android_vpn::last_connect_error(app).ok().flatten();
+    #[cfg(not(target_os = "android"))]
+    let jni_connect_error: Option<String> = None;
+    let error = android_snapshot_error(&inner.last_error, connected, jni_connect_error);
     StateSnapshot {
         cfg: to_public_saved_config(&inner.cfg),
         connected,
         display_host: display_host_line(&inner.cfg),
         server_subtitle: server_card_subtitle(&inner.cfg),
         tunnel_server: inner.tunnel_server.clone(),
-        error: inner.last_error.clone(),
+        error,
         can_connect: inner.cfg.can_connect(),
         capabilities: ClientCapabilities {
             boring_tls_available: cfg!(feature = "boring-tls"),
@@ -752,6 +789,8 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             g.last_error = None;
             g.tunnel_server = None;
         }
+
+        let _ = android_vpn::clear_last_connect_error(app);
 
         // JNI/webview без удержания Mutex — иначе ANR/краш при disconnect (глобальный lock + UI-поток).
         let jni_result = android_vpn::request_disconnect(app);
@@ -1322,6 +1361,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         Err(p) => p.into_inner(),
     };
     g.last_error = None;
+    let _ = android_vpn::clear_last_connect_error(app);
 
     if !g.cfg.can_connect() {
         warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
@@ -1356,7 +1396,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         &packages,
         &domains,
         battery,
-    )?;
+    )
+    .map_err(|code| map_android_jni_connect_error(&code))?;
 
     let mut g = match state.inner.lock() {
         Ok(g) => g,
@@ -1623,6 +1664,8 @@ fn open_portal_url(url: &str) -> Result<(), String> {
 fn clear_error_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     g.last_error = None;
+    #[cfg(target_os = "android")]
+    let _ = android_vpn::clear_last_connect_error(&app);
     let snap = snapshot(&app, &g);
     let _ = app.emit("vpn-state", &snap);
     Ok(snap)
@@ -2022,5 +2065,69 @@ mod deeplink_tests {
         }
         let origins = allowed_origins_for_import(&cfg);
         assert!(origins.iter().any(|o| o == "https://saved.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod android_connect_error_tests {
+    use super::{android_snapshot_error, map_android_jni_connect_error};
+
+    #[test]
+    fn map_android_jni_connect_error_known_codes() {
+        for (code, expect_substr) in [
+            ("vpn_permission_denied", "отклонено"),
+            ("vpn_permission_timeout", "ожидания"),
+            ("vpn_permission_ui_unavailable", "запрос"),
+        ] {
+            let msg = map_android_jni_connect_error(code);
+            assert!(!msg.is_empty(), "code {code}");
+            assert!(
+                msg.contains(expect_substr),
+                "code {code}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_android_jni_connect_error_unknown_passthrough() {
+        let raw = "custom_native_start_failure";
+        assert_eq!(map_android_jni_connect_error(raw), raw);
+    }
+
+    #[test]
+    fn map_android_jni_connect_error_empty_is_empty() {
+        assert!(map_android_jni_connect_error("").is_empty());
+        assert!(map_android_jni_connect_error("   ").is_empty());
+    }
+
+    #[test]
+    fn android_snapshot_error_overlay_inactive_tunnel() {
+        let err = android_snapshot_error(
+            &None,
+            false,
+            Some("vpn_permission_denied".into()),
+        );
+        assert_eq!(err.as_deref(), Some("Разрешение VPN отклонено"));
+    }
+
+    #[test]
+    fn android_snapshot_error_active_tunnel_ignores_jni() {
+        let err = android_snapshot_error(
+            &None,
+            true,
+            Some("vpn_tunnel_start_failed".into()),
+        );
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn android_snapshot_error_last_error_wins_over_jni() {
+        let rust_err = Some("Rust ошибка".into());
+        let err = android_snapshot_error(
+            &rust_err,
+            false,
+            Some("vpn_permission_denied".into()),
+        );
+        assert_eq!(err, rust_err);
     }
 }
