@@ -32,6 +32,11 @@ const MESSAGES = {
     label_passphrase: "Passphrase",
     btn_apply_invite: "Применить к полям",
     btn_refresh_control_plane: "Обновить из кабинета",
+    import_confirm_title: "Импорт конфигурации",
+    import_confirm_body:
+      "Импортировать конфигурацию с «{cp_host}»? VPN-сервер будет {vpn_host}.",
+    btn_confirm_import: "Импортировать",
+    btn_cancel_import: "Отмена",
     group_connection: "Подключение",
     label_server: "Сервер",
     group_credentials: "Учётные данные",
@@ -176,6 +181,11 @@ const MESSAGES = {
     label_passphrase: "Passphrase",
     btn_apply_invite: "Apply to fields",
     btn_refresh_control_plane: "Refresh from portal",
+    import_confirm_title: "Import configuration",
+    import_confirm_body:
+      "Import config from «{cp_host}»? VPN server will be {vpn_host}.",
+    btn_confirm_import: "Import",
+    btn_cancel_import: "Cancel",
     group_connection: "Connection",
     label_server: "Server",
     group_credentials: "Credentials",
