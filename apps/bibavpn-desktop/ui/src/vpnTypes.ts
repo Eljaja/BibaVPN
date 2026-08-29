@@ -1,5 +1,6 @@
 /** JSDoc typedefs for Tauri payloads (snake_case matches Rust serde). */
 
+/** Full profile for Settings / Profiles editing (`get_edit_config`, `save_config_cmd`). */
 export type TunnelProfile = {
   id: string;
   name: string;
@@ -53,6 +54,9 @@ export type TunnelProfile = {
   ws_accept_language: string;
   ws_jitter_min_ms: number;
   ws_jitter_max_ms: number;
+  control_plane_instance_id: number;
+  control_plane_config_version: string;
+  control_plane_base_url: string;
   android_socks_bind: string;
   /** Итог для JNI: пресеты + ручные пакеты */
   android_split_tunnel_packages: string[];
@@ -60,6 +64,19 @@ export type TunnelProfile = {
   android_manual_split_packages: string[];
   android_vpn_routing_mode: string;
   android_screen_off_battery_saver: boolean;
+};
+
+/** Poll snapshot profile — secrets omitted, presence flags only. */
+export type PublicTunnelProfile = Omit<
+  TunnelProfile,
+  "token" | "psk" | "from_invite" | "invite_passphrase" | "pin_cert_pem"
+> & {
+  has_token: boolean;
+  has_psk: boolean;
+  has_from_invite: boolean;
+  has_invite_passphrase: boolean;
+  has_invite: boolean;
+  has_pin_cert: boolean;
 };
 
 export type SavedConfig = {
@@ -71,12 +88,21 @@ export type SavedConfig = {
   profiles: TunnelProfile[];
 };
 
+export type PublicSavedConfig = {
+  version: number;
+  ui_locale: string;
+  local_http_port: number;
+  local_socks_port: number;
+  active_profile_id: string;
+  profiles: PublicTunnelProfile[];
+};
+
 export type ClientCapabilities = {
   boring_tls_available: boolean;
 };
 
 export type StateSnapshot = {
-  cfg: SavedConfig;
+  cfg: PublicSavedConfig;
   connected: boolean;
   displayHost: string;
   serverSubtitle: string;

@@ -2,13 +2,17 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
-use std::sync::{Mutex, OnceLock};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use bibavpn::start_json_config::local_client_options_from_json_str;
 use bibavpn::tls_util::install_ring_crypto;
 use serde_json::json;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
+
+const FFI_PANIC_CODE: c_int = -99;
+const PANIC_ERR: &str = "internal panic";
 
 struct NativeState {
     shutdown_tx: Option<watch::Sender<bool>>,
@@ -66,6 +70,10 @@ static STATE: Mutex<Option<NativeState>> = Mutex::new(None);
 static RING_ONCE: OnceLock<()> = OnceLock::new();
 static TRACING_ONCE: OnceLock<()> = OnceLock::new();
 
+fn lock_state() -> MutexGuard<'static, Option<NativeState>> {
+    STATE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn ensure_ring() {
     RING_ONCE.get_or_init(|| {
         install_ring_crypto();
@@ -76,8 +84,7 @@ fn ensure_tracing() {
     TRACING_ONCE.get_or_init(|| {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info")),
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
             )
             .with_ansi(false)
             .try_init();
@@ -98,18 +105,54 @@ unsafe fn set_err(err_out: *mut *mut c_char, msg: String) {
     if err_out.is_null() {
         return;
     }
-    match CString::new(msg) {
-        Ok(c) => unsafe {
-            *err_out = c.into_raw();
-        },
-        Err(_) => unsafe {
-            *err_out = std::ptr::null_mut();
-        },
+    unsafe {
+        *err_out = leak_cstring(msg);
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn bibavpn_ffi_start(
+fn decode_invite_error_json(error: &str) -> String {
+    json!({"ok": false, "error": error}).to_string()
+}
+
+fn decode_invite_payload(uri_s: &str, pass_s: &str) -> String {
+    match bibavpn::decode_invite_v1(uri_s, pass_s) {
+        Ok(inv) => {
+            let mut out = serde_json::Map::new();
+            out.insert("ok".to_string(), json!(true));
+            match serde_json::to_value(&inv) {
+                Ok(serde_json::Value::Object(m)) => {
+                    for (k, v) in m {
+                        out.insert(k, v);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return decode_invite_error_json(&format!("invite json: {e}"));
+                }
+            }
+            serde_json::Value::Object(out).to_string()
+        }
+        Err(e) => decode_invite_error_json(&format!("{e:#}")),
+    }
+}
+
+fn leak_cstring_fallback() -> *mut c_char {
+    const FALLBACK: &str = r#"{"ok":false,"error":"internal nul in json"}"#;
+    match CString::new(FALLBACK) {
+        Ok(c) => c.into_raw(),
+        // FALLBACK has no interior NUL; this arm is unreachable.
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+fn leak_cstring(s: String) -> *mut c_char {
+    match CString::new(s) {
+        Ok(c) => c.into_raw(),
+        Err(_) => leak_cstring_fallback(),
+    }
+}
+
+fn bibavpn_ffi_start_impl(
     config_json_utf8: *const c_char,
     err_out: *mut *mut c_char,
 ) -> c_int {
@@ -132,13 +175,7 @@ pub unsafe extern "C" fn bibavpn_ffi_start(
 
     tracing::info!(json_len = json.len(), "bibavpn_ffi_start");
 
-    let mut guard = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            unsafe { set_err(err_out, "state mutex poisoned".into()) };
-            return -2;
-        }
-    };
+    let mut guard = lock_state();
 
     if guard.is_some() {
         let thread_done = guard
@@ -219,13 +256,7 @@ pub unsafe extern "C" fn bibavpn_ffi_start(
                 }
             };
             tracing::error!("bibavpn_ffi_start: {msg}");
-            let mut guard = match STATE.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    unsafe { set_err(err_out, msg) };
-                    return -5;
-                }
-            };
+            let mut guard = lock_state();
             if let Some(mut s) = guard.take() {
                 stop_client_bounded(&mut s);
             }
@@ -236,13 +267,26 @@ pub unsafe extern "C" fn bibavpn_ffi_start(
 }
 
 #[no_mangle]
-pub extern "C" fn bibavpn_ffi_stop() {
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn bibavpn_ffi_start(
+    config_json_utf8: *const c_char,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    match catch_unwind(AssertUnwindSafe(|| {
+        bibavpn_ffi_start_impl(config_json_utf8, err_out)
+    })) {
+        Ok(code) => code,
+        Err(_) => {
+            set_err(err_out, PANIC_ERR.into());
+            FFI_PANIC_CODE
+        }
+    }
+}
+
+fn bibavpn_ffi_stop_impl() {
     ensure_tracing();
     tracing::info!("bibavpn_ffi_stop");
-    let mut guard = match STATE.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+    let mut guard = lock_state();
 
     let mut s = match guard.take() {
         Some(s) => s,
@@ -319,7 +363,11 @@ mod tests {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn bibavpn_ffi_decode_invite(
+pub extern "C" fn bibavpn_ffi_stop() {
+    let _ = catch_unwind(AssertUnwindSafe(bibavpn_ffi_stop_impl));
+}
+
+fn bibavpn_ffi_decode_invite_impl(
     uri_utf8: *const c_char,
     passphrase_utf8: *const c_char,
 ) -> *mut c_char {
@@ -327,57 +375,100 @@ pub unsafe extern "C" fn bibavpn_ffi_decode_invite(
 
     let uri_s = match unsafe { c_str_to_string(uri_utf8, "uri") } {
         Ok(s) => s,
-        Err(e) => return leak_cstring(json!({"ok": false, "error": e}).to_string()),
+        Err(e) => return leak_cstring(decode_invite_error_json(&e)),
     };
     let pass_s = match unsafe { c_str_to_string(passphrase_utf8, "passphrase") } {
         Ok(s) => s,
-        Err(e) => return leak_cstring(json!({"ok": false, "error": e}).to_string()),
+        Err(e) => return leak_cstring(decode_invite_error_json(&e)),
     };
 
-    let payload = match bibavpn::decode_invite_v1(&uri_s, &pass_s) {
-        Ok(inv) => {
-            let mut out = serde_json::Map::new();
-            out.insert("ok".to_string(), json!(true));
-            match serde_json::to_value(&inv) {
-                Ok(serde_json::Value::Object(m)) => {
-                    for (k, v) in m {
-                        out.insert(k, v);
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return leak_cstring(
-                        json!({ "ok": false, "error": format!("invite json: {e}") }).to_string(),
-                    );
-                }
-            }
-            serde_json::Value::Object(out).to_string()
-        }
-        Err(e) => json!({
-            "ok": false,
-            "error": format!("{e:#}"),
-        })
-        .to_string(),
-    };
-
-    leak_cstring(payload)
+    leak_cstring(decode_invite_payload(&uri_s, &pass_s))
 }
 
-fn leak_cstring(s: String) -> *mut c_char {
-    match CString::new(s) {
-        Ok(c) => c.into_raw(),
-        Err(_) => CString::new(r#"{"ok":false,"error":"internal nul in json"}"#)
-            .unwrap()
-            .into_raw(),
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn bibavpn_ffi_decode_invite(
+    uri_utf8: *const c_char,
+    passphrase_utf8: *const c_char,
+) -> *mut c_char {
+    match catch_unwind(AssertUnwindSafe(|| {
+        bibavpn_ffi_decode_invite_impl(uri_utf8, passphrase_utf8)
+    })) {
+        Ok(ptr) => ptr,
+        Err(_) => leak_cstring(decode_invite_error_json(PANIC_ERR)),
     }
 }
 
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn bibavpn_ffi_string_free(s: *mut c_char) {
-    if s.is_null() {
-        return;
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if s.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = CString::from_raw(s);
+        }
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn catch_start_panic_sentinel() -> c_int {
+        match catch_unwind(|| {
+            panic!("simulated extern body");
+        }) {
+            Ok(_) => 0,
+            Err(_) => FFI_PANIC_CODE,
+        }
     }
-    unsafe {
-        let _ = CString::from_raw(s);
+
+    #[test]
+    fn catch_unwind_returns_minus_99_sentinel() {
+        assert_eq!(catch_start_panic_sentinel(), -99);
+    }
+
+    #[test]
+    fn decode_invite_panic_sentinel_is_error_json() {
+        let ptr = leak_cstring(decode_invite_error_json(PANIC_ERR));
+        assert!(!ptr.is_null());
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().expect("utf-8");
+        let v: serde_json::Value = serde_json::from_str(s).expect("json");
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], PANIC_ERR);
+        unsafe {
+            bibavpn_ffi_string_free(ptr);
+        }
+    }
+
+    #[test]
+    fn leak_cstring_interior_nul_does_not_panic() {
+        let ptr = leak_cstring(String::from("a\0b"));
+        assert!(!ptr.is_null());
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().expect("utf-8");
+        assert_eq!(s, r#"{"ok":false,"error":"internal nul in json"}"#);
+        unsafe {
+            bibavpn_ffi_string_free(ptr);
+        }
+    }
+
+    #[test]
+    fn state_mutex_recovers_from_poison() {
+        let m = Arc::new(Mutex::new(0_i32));
+        let poisoner = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("lock");
+            panic!("poison mutex");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let mut guard = m.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = 42;
+        drop(guard);
+        let guard = m.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(*guard, 42);
     }
 }
