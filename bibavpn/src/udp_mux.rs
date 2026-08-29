@@ -537,9 +537,14 @@ async fn run_udp_mux_one_session(
     cfg: &UdpMuxConfig,
     cmd_rx: &mut mpsc::Receiver<ClientUdpCmd>,
 ) -> anyhow::Result<bool> {
+    struct PendingUdpEntry {
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+        /// Set when the forwarded datagram was a parseable DNS query to port 53.
+        dns_expect: Option<(u16, String)>,
+    }
+
     let mut udp_adaptive = AdaptivePadState::default();
-    let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>> =
-        HashMap::new();
+    let mut pending: HashMap<u64, PendingUdpEntry> = HashMap::new();
     let (ws_tx, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_tx));
     let mut bad_frames: u32 = 0;
@@ -584,14 +589,19 @@ async fn run_udp_mux_one_session(
                                 continue;
                             }
                             Entry::Vacant(e) => {
-                                e.insert(reply);
+                                let dns_expect = if dst_port == 53 {
+                                    crate::domain_route::parse_dns_query(&payload)
+                                } else {
+                                    None
+                                };
+                                e.insert(PendingUdpEntry { reply, dns_expect });
                             }
                         }
                         let req = match encode_udp_req(xid, &dst_host, dst_port, &payload) {
                             Ok(r) => r,
                             Err(e) => {
-                                if let Some(tx) = pending.remove(&xid) {
-                                    let _ = tx.send(Err(e));
+                                if let Some(entry) = pending.remove(&xid) {
+                                    let _ = entry.reply.send(Err(e));
                                 }
                                 continue;
                             }
@@ -606,8 +616,8 @@ async fn run_udp_mux_one_session(
                         ) {
                             Ok(b) => b,
                             Err(e) => {
-                                if let Some(tx) = pending.remove(&xid) {
-                                    let _ = tx.send(Err(e));
+                                if let Some(entry) = pending.remove(&xid) {
+                                    let _ = entry.reply.send(Err(e));
                                 }
                                 continue;
                             }
@@ -615,8 +625,8 @@ async fn run_udp_mux_one_session(
                         maybe_ws_send_jitter(cfg.send_jitter()).await;
                         let mut g = ws_tx.lock().await;
                         if let Err(e) = g.send(Message::Binary(Bytes::from(blob))).await {
-                            if let Some(tx) = pending.remove(&xid) {
-                                let _ = tx.send(Err(anyhow::anyhow!(e)));
+                            if let Some(entry) = pending.remove(&xid) {
+                                let _ = entry.reply.send(Err(anyhow::anyhow!(e)));
                             }
                             break;
                         }
@@ -651,19 +661,19 @@ async fn run_udp_mux_one_session(
                             }
                         };
                         let (xid, sh, sp, pl) = rep;
-                        // Snoop DNS answers to learn IP->domain for domain-based
-                        // split routing on full-TUN clients (mobile). No-op unless
-                        // bypass domains are configured. See `domain_route`.
-                        if sp == 53 {
-                            crate::domain_route::record_dns(&pl);
-                        }
-                        if let Some(tx) = pending.remove(&xid) {
-                            match crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl) {
-                                Ok(body) => { let _ = tx.send(Ok(body)); }
-                                Err(e) => { let _ = tx.send(Err(e)); }
-                            }
-                        } else {
+                        let Some(entry) = pending.remove(&xid) else {
                             trace!("udp mux: reply for unknown xid {xid} (likely timed out client-side)");
+                            continue;
+                        };
+                        // Snoop DNS answers only for replies to DNS queries this client sent.
+                        if sp == 53 {
+                            if let Some((expected_id, ref expected_qname)) = entry.dns_expect {
+                                crate::domain_route::record_dns(&pl, expected_id, expected_qname);
+                            }
+                        }
+                        match crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl) {
+                            Ok(body) => { let _ = entry.reply.send(Ok(body)); }
+                            Err(e) => { let _ = entry.reply.send(Err(e)); }
                         }
                     }
                     Message::Ping(p) => {
@@ -678,8 +688,8 @@ async fn run_udp_mux_one_session(
         }
     }
 
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(anyhow::anyhow!("udp mux session ended")));
+    for (_, entry) in pending.drain() {
+        let _ = entry.reply.send(Err(anyhow::anyhow!("udp mux session ended")));
     }
     Ok(shutdown)
 }

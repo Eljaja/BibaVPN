@@ -1,4 +1,5 @@
 # Cross-compile bibavpn-ffi for iOS (Rust ↔ Packet Tunnel static library).
+# Push to main when FFI/core paths change. Not on pull_request — tests live in test.yml.
 name: iOS FFI
 
 run-name: iOS FFI · ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.ref_name }}
@@ -7,19 +8,6 @@ on:
   workflow_dispatch:
 
   push:
-    branches: [main, master]
-    paths:
-      - "bibavpn/**"
-      - "!bibavpn/**/*.md"
-      - "biba/**"
-      - "!biba/**/*.md"
-      - "apps/bibavpn-ffi/**"
-      - "!apps/bibavpn-ffi/**/*.md"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".github/workflows/ios.yml"
-  pull_request:
     branches: [main, master]
     paths:
       - "bibavpn/**"
