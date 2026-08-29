@@ -197,24 +197,8 @@ object TauriVpnBridge {
     @JvmStatic
     fun pickInstalledLauncherPackage(activity: Activity): String {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            val holder = arrayOfNulls<String>(1)
-            val latch = CountDownLatch(1)
-            Thread {
-                try {
-                    holder[0] = pickInstalledLauncherPackageWorker(activity)
-                } finally {
-                    latch.countDown()
-                }
-            }.start()
-            return try {
-                if (!latch.await(120, TimeUnit.SECONDS)) {
-                    "ERROR:timeout"
-                } else {
-                    holder[0] ?: "ERROR:null_result"
-                }
-            } catch (e: InterruptedException) {
-                "ERROR:interrupted"
-            }
+            // startActivityForResult delivers on main; blocking here would deadlock (see requestConnect).
+            return "ERROR:main_thread"
         }
         return pickInstalledLauncherPackageWorker(activity)
     }
@@ -292,7 +276,7 @@ object TauriVpnBridge {
             }
         }
         return try {
-            if (!latch.await(120, TimeUnit.SECONDS)) {
+            if (!latch.await(60, TimeUnit.SECONDS)) {
                 "ERROR:timeout"
             } else {
                 holder[0] ?: "ERROR:null_result"
