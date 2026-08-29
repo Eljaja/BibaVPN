@@ -44,6 +44,14 @@ class BibaVpnService : VpnService() {
     @Volatile
     private var tunnelTeardownDoneBeforeDestroy: Boolean = false
 
+    /** Разбор стека идёт в воркере ([enqueueTeardownWorker]) — не запускать второй. */
+    @Volatile
+    private var teardownInProgress: Boolean = false
+
+    /** Поток текущего разбора: [onDestroy] ждёт его недолго, чтобы `nativeStop` успел. */
+    @Volatile
+    private var teardownThread: Thread? = null
+
     private val tunLock = Any()
     private var tun2socksThread: Thread? = null
     /** Java держит свой dup TUN fd; в Go отдаём отдельный dup, чтобы не спорить за ownership с fdsan. */
@@ -451,10 +459,10 @@ class BibaVpnService : VpnService() {
             ACTION_STOP -> {
                 networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
                 networkRestartRunnable = null
-                stopTunnelAndNative()
-                tunnelTeardownDoneBeforeDestroy = true
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                enqueueTeardownWorker("ACTION_STOP") {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
                 return START_NOT_STICKY
             }
             ACTION_SYNC_WAKE_LOCK -> {
@@ -548,6 +556,7 @@ class BibaVpnService : VpnService() {
 
     /** nativeStart ждёт bind SOCKS в Rust — не блокируем main thread (ANR). */
     private fun enqueueBootstrapWorker(sessionJson: String) {
+        clearLastConnectError()
         val worker =
             Thread(
                 {
@@ -567,6 +576,7 @@ class BibaVpnService : VpnService() {
                                 Log.w(TAG, "nativeStart: $err — оставляем сервис как есть")
                                 return@Thread
                             }
+                            setLastConnectError(err)
                             setTunnelActive(false)
                             mainHandler.post {
                                 android.widget.Toast.makeText(
@@ -583,6 +593,7 @@ class BibaVpnService : VpnService() {
                         Log.i(TAG, "worker: nativeStart OK — startVpnTunnel")
                         if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
                             Log.e(TAG, "startVpnTunnel returned false — nativeStop + stopSelf")
+                            setLastConnectError("vpn_tunnel_start_failed")
                             setTunnelActive(false)
                             synchronized(nativeLifecycleLock) {
                                 BibaNative.nativeStop()
@@ -594,6 +605,7 @@ class BibaVpnService : VpnService() {
                             return@Thread
                         }
                     } catch (e: Throwable) {
+                        setLastConnectError(e.message ?: e.javaClass.simpleName)
                         setTunnelActive(false)
                         Log.e(TAG, "vpn start thread", e)
                         mainHandler.post {
@@ -627,7 +639,19 @@ class BibaVpnService : VpnService() {
             VpnProtect.vpn = null
         }
         if (!tunnelTeardownDoneBeforeDestroy) {
+            // Страховка: разбор не начинали (сервис снят системой, а не через STOP).
+            // Уносить в воркер поздно — процесс может умереть сразу после onDestroy;
+            // сверху время здесь ограничивает STOP_JOIN_TIMEOUT в JNI.
             stopTunnelAndNative()
+        } else {
+            // Разбор уже идёт в воркере: ждём его недолго, иначе daemon-поток убьют
+            // вместе с процессом на середине nativeStop.
+            teardownThread?.let { t ->
+                try {
+                    t.join(3000)
+                } catch (_: InterruptedException) {
+                }
+            }
         }
         super.onDestroy()
     }
@@ -647,7 +671,7 @@ class BibaVpnService : VpnService() {
                 .addDnsServer("1.1.1.1")
             builder.addDisallowedApplication(packageName)
             builder.applySplitTunnelBypasses()
-            builder.applySplitTunnelDomainBypasses()
+            // Domain presets: enforced in the tunnel client (DNS map + TLS SNI peek), not excludeRoute.
             // Не добавляем ::/0: у многих сборок tun2socks UDP/IPv6 через TUN неполный — тогда AAAA/DNS v6 «висят».
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -831,10 +855,57 @@ class BibaVpnService : VpnService() {
                 )
             android.widget.Toast.makeText(applicationContext, msg, android.widget.Toast.LENGTH_LONG)
                 .show()
-            stopTunnelAndNative()
-            tunnelTeardownDoneBeforeDestroy = true
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            enqueueTeardownWorker("abort") {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
+    /**
+     * Разбор стека вне главного потока.
+     *
+     * [stopTunnelAndNative] блокирует надолго: `tunLock` может держать воркер перезапуска,
+     * ожидающий `Engine.start` до 25 с, затем идут `Engine.stop` + `join(8000)` у потока
+     * tun2socks и `nativeStop` (join клиентского потока, ограничен 5 с в JNI). На главном
+     * потоке это ANR — то же самое, из-за чего [enqueueBootstrapWorker] уже уносит
+     * `nativeStart` в отдельный поток.
+     *
+     * Флаг [tunnelTeardownDoneBeforeDestroy] и `setTunnelActive(false)` ставим сразу, до
+     * ухода в воркер: тогда [onDestroy] не начнёт второй разбор, а триггеры перезапуска
+     * (SCREEN_ON / USER_PRESENT / смена сети) сразу видят неактивный туннель.
+     *
+     * @param onDone выполняется на главном потоке после завершения разбора.
+     */
+    private fun enqueueTeardownWorker(reason: String, onDone: (() -> Unit)? = null) {
+        if (teardownInProgress) {
+            Log.i(TAG, "$reason: teardown already in progress")
+            return
+        }
+        teardownInProgress = true
+        tunnelTeardownDoneBeforeDestroy = true
+        setTunnelActive(false)
+        Thread(
+            {
+                try {
+                    Log.i(TAG, "$reason: teardown begin (worker)")
+                    stopTunnelAndNative()
+                    Log.i(TAG, "$reason: teardown done")
+                } catch (e: Throwable) {
+                    Log.e(TAG, "$reason: teardown", e)
+                } finally {
+                    teardownThread = null
+                    mainHandler.post {
+                        teardownInProgress = false
+                        onDone?.invoke()
+                    }
+                }
+            },
+            "biba-teardown",
+        ).also {
+            it.isDaemon = true
+            teardownThread = it
+            it.start()
         }
     }
 
@@ -1084,6 +1155,22 @@ class BibaVpnService : VpnService() {
         var isTunnelActive: Boolean = false
             private set
 
+        /** Последняя ошибка connect/bootstrap для overlay в Rust snapshot (не активный туннель). */
+        @Volatile
+        private var lastConnectError: String? = null
+
+        @JvmStatic
+        fun lastConnectError(): String? = lastConnectError
+
+        @JvmStatic
+        fun clearLastConnectError() {
+            lastConnectError = null
+        }
+
+        private fun setLastConnectError(msg: String) {
+            lastConnectError = msg
+        }
+
         /** Якорь [SystemClock.elapsedRealtime] в момент [setTunnelActive](true); 0 если туннеля нет. */
         @Volatile
         private var tunnelConnectedSinceElapsed: Long = 0L
@@ -1099,6 +1186,7 @@ class BibaVpnService : VpnService() {
             if (active) {
                 isTunnelActive = true
                 tunnelConnectedSinceElapsed = SystemClock.elapsedRealtime()
+                clearLastConnectError()
             } else {
                 isTunnelActive = false
                 tunnelConnectedSinceElapsed = 0L

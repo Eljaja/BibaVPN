@@ -33,12 +33,16 @@ jobs:
     uses: ./.github/workflows/desktop-windows.yml
     secrets: inherit
 
+  linux:
+    uses: ./.github/workflows/desktop-linux.yml
+    secrets: inherit
+
   android:
     uses: ./.github/workflows/android.yml
     secrets: inherit
 
   publish:
-    needs: [macos, windows, android]
+    needs: [macos, windows, linux, android]
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifacts
@@ -99,4 +103,5 @@ jobs:
           files: |
             dist/BibaVPN-macos-aarch64.dmg
             dist/BibaVPN-windows-x64.zip
+            dist/BibaVPN-linux-x64.tar.gz
             dist/BibaVPN-android-debug.apk

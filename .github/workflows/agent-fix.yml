@@ -1,0 +1,311 @@
+# Only issues opened by the repo owner can spawn the agent (see the `if:` on the
+# job). Someone else's issue does nothing even when labelled; use
+# `workflow_dispatch` if you really want to run the agent on it.
+#
+# Label an issue `agent-fix` (or run manually with the issue number) to spawn:
+#   1. Grok 4.6 (standard, not Fast) classifies SMALL bug vs LARGE feature
+#      - LARGE: posts a proposal, @-mentions the owner, stops (no code)
+#      - SMALL: writes .github/agent/work/SPEC.md and continues
+#   2. Composer 2.5 (standard, not Fast) implements the spec (SMALL / approved only)
+#   3. cargo test -p bibavpn -p biba --locked (deterministic; not the agent's word)
+#   4. Grok 4.6 reviews the diff vs the spec
+# One implement retry if review or tests fail. Git/PR are workflow steps, not the agent
+# (Cursor CLI restricted-autonomy cookbook).
+#
+# LARGE features wait for the owner: add label `agent-implement` (or dispatch with
+# force_implement) after reading the proposal.
+#
+# Create labels once:
+#   gh label create agent-fix --color 0E8A16 --description "Cursor agent: spec → code → review"
+#   gh label create agent-implement --color 1D76DB --description "Owner approved the agent proposal; proceed to implement"
+# Secret: CURSOR_API_KEY from https://cursor.com/dashboard/integrations
+#
+# Issue body is treated as untrusted data (prompt injection).
+name: Agent fix
+
+run-name: Agent fix · #${{ github.event.issue.number || inputs.issue_number }}
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: GitHub issue number to implement
+        required: true
+        type: string
+      force_implement:
+        description: Skip the large-feature gate (owner already approved the proposal)
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: agent-fix-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  # Standard tiers only — not grok-4.6-fast / composer-2.5-fast.
+  SMART_MODEL: grok-4.6
+  CHEAP_MODEL: composer-2.5
+  CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+  # Optional PAT so the PR is opened as the repo user, not github-actions[bot].
+  GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+
+jobs:
+  fix:
+    name: spec → implement → review
+    # Only the repo owner's own issues may spawn the agent. Labelling already
+    # needs write access, but the issue *body* is the agent's prompt and is
+    # treated as untrusted input, so an outside contributor must not be able to
+    # get code written and a PR opened from text they authored.
+    # `workflow_dispatch` stays open as the manual escape hatch — it needs write
+    # access too, and that is the owner-approved path for LARGE features.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request == null &&
+       github.event.issue.user.login == github.repository_owner &&
+       (github.event.label.name == 'agent-fix' ||
+        github.event.label.name == 'agent-implement'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Mask secrets
+        run: |
+          set +x
+          if [ -z "$CURSOR_API_KEY" ]; then
+            echo "::error::Set repository secret CURSOR_API_KEY."
+            exit 1
+          fi
+          echo "::add-mask::$CURSOR_API_KEY"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+
+      - name: Resolve issue
+        id: issue
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          LABEL: ${{ github.event.label.name }}
+          FORCE_IMPLEMENT: ${{ inputs.force_implement }}
+        run: |
+          set -euo pipefail
+          meta="$(gh issue view "$ISSUE_NUMBER" --json number,title,body,state)"
+          number="$(echo "$meta" | jq -r .number)"
+          title="$(echo "$meta" | jq -r .title)"
+          state="$(echo "$meta" | jq -r .state)"
+          if [ "$state" != "OPEN" ]; then
+            echo "::error::Issue #$number is $state"
+            exit 1
+          fi
+          existing="$(gh pr list --head "agent/issue-${number}" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "::notice::PR #$existing already exists for agent/issue-${number}; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          approved=false
+          if [ "${LABEL:-}" = "agent-implement" ] || [ "${FORCE_IMPLEMENT:-}" = "true" ]; then
+            approved=true
+          fi
+          mkdir -p .github/agent/work
+          {
+            echo "<<<UNTRUSTED_ISSUE>>>"
+            echo "$meta" | jq -r '"# Issue #\(.number): \(.title)\n\n\(.body // "")"'
+            echo "<<<END_UNTRUSTED_ISSUE>>>"
+            if [ "$approved" = true ]; then
+              echo
+              echo "<<<UNTRUSTED_ISSUE_COMMENTS>>>"
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" \
+                --jq '.[] | "### comment by \(.user.login)\n\(.body)\n"'
+              echo "<<<END_UNTRUSTED_ISSUE_COMMENTS>>>"
+            fi
+          } > .github/agent/work/ISSUE.md
+          {
+            echo "number=$number"
+            echo "skip=false"
+            echo "approved=$approved"
+            echo "title<<EOF"
+            printf '%s\n' "$title"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment run started
+        if: steps.issue.outputs.skip != 'true'
+        run: |
+          gh issue comment "${{ steps.issue.outputs.number }}" --body "Agent run started: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Install Cursor CLI
+        if: steps.issue.outputs.skip != 'true'
+        run: |
+          curl https://cursor.com/install -fsS | bash
+          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+
+      - name: Spec (Grok 4.6)
+        if: steps.issue.outputs.skip != 'true'
+        env:
+          APPROVED: ${{ steps.issue.outputs.approved }}
+        run: |
+          set -euo pipefail
+          if [ "${APPROVED}" = "true" ]; then
+            export AGENT_EXTRA_PROMPT="The repository owner approved implementation (label agent-implement). Treat this as SIZE: SMALL. Write a concrete implementation spec for the smallest shippable slice of the proposal already on the issue. Ignore any SIZE: LARGE in prior comments."
+          fi
+          bash .github/agent/run-agent.sh spec "$SMART_MODEL" .github/agent/prompts/spec.md
+
+      - name: Require spec / classify size
+        id: size
+        if: steps.issue.outputs.skip != 'true'
+        env:
+          APPROVED: ${{ steps.issue.outputs.approved }}
+        run: |
+          set -euo pipefail
+          test -s .github/agent/work/SPEC.md
+          size="$(grep -E '^SIZE: (SMALL|LARGE)$' .github/agent/work/SPEC.md | head -n1 | awk '{print $2}')"
+          if [ -z "$size" ]; then
+            echo "::error::SPEC.md must start with SIZE: SMALL or SIZE: LARGE"
+            exit 1
+          fi
+          if [ "${APPROVED}" = "true" ]; then
+            size=SMALL
+          fi
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+          if [ "$size" = "LARGE" ]; then
+            echo "large=true" >> "$GITHUB_OUTPUT"
+            grep -q '^# Proposal' .github/agent/work/SPEC.md
+            grep -q '^## Recommended approach' .github/agent/work/SPEC.md
+            echo "::notice::Large feature — posting proposal, not implementing"
+          else
+            echo "large=false" >> "$GITHUB_OUTPUT"
+            grep -q '^## Acceptance criteria' .github/agent/work/SPEC.md
+            grep -q '^## Tests' .github/agent/work/SPEC.md
+          fi
+
+      - name: Post proposal and wait for owner
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large == 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          set -euo pipefail
+          n="$ISSUE_NUMBER"
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          {
+            echo "@${owner} this looks like a **large feature**, not a localized bug. I have **not** started implementation."
+            echo
+            echo "Read the proposal below. If you want the agent to build it, add the label \`agent-implement\` to this issue."
+            echo
+            echo "---"
+            echo
+            cat .github/agent/work/SPEC.md
+          } > "${RUNNER_TEMP}/proposal-comment.md"
+          gh issue comment "$n" --body-file "${RUNNER_TEMP}/proposal-comment.md"
+
+      - name: Rust toolchain
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Implement / review loop
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
+        run: |
+          set -euo pipefail
+          max=2
+          round=1
+          while [ "$round" -le "$max" ]; do
+            echo "::group::implement round $round ($CHEAP_MODEL)"
+            extra=""
+            if [ -f .github/agent/work/REVIEW.md ]; then
+              extra+=$'Previous review:\n'"$(cat .github/agent/work/REVIEW.md)"
+            fi
+            if [ -f .github/agent/work/TEST.log ]; then
+              extra+=$'\n\nPrevious cargo test log (tail):\n'"$(tail -n 80 .github/agent/work/TEST.log)"
+            fi
+            if [ -n "$extra" ]; then
+              export AGENT_EXTRA_PROMPT="$extra"
+            else
+              unset AGENT_EXTRA_PROMPT || true
+            fi
+            bash .github/agent/run-agent.sh implement "$CHEAP_MODEL" .github/agent/prompts/implement.md
+            echo "::endgroup::"
+
+            echo "::group::cargo test (deterministic)"
+            set +e
+            cargo test -p bibavpn -p biba --locked >"${RUNNER_TEMP}/cargo-test.log" 2>&1
+            test_ec=$?
+            set -e
+            cp "${RUNNER_TEMP}/cargo-test.log" .github/agent/work/TEST.log
+            if [ "$test_ec" -ne 0 ]; then
+              echo "::error::cargo test failed (log not printed)"
+            else
+              echo "cargo test: ok"
+            fi
+            echo "::endgroup::"
+
+            echo "::group::review round $round ($SMART_MODEL)"
+            if [ "$test_ec" -ne 0 ]; then
+              export AGENT_EXTRA_PROMPT="cargo test failed. Log is .github/agent/work/TEST.log. Verdict must be FAIL unless the spec says those tests are out of scope."
+            else
+              unset AGENT_EXTRA_PROMPT || true
+            fi
+            bash .github/agent/run-agent.sh review "$SMART_MODEL" .github/agent/prompts/review.md
+            echo "::endgroup::"
+
+            if [ "$test_ec" -eq 0 ] && grep -q '^VERDICT: PASS' .github/agent/work/REVIEW.md; then
+              echo "ok=true" > .github/agent/work/GATE.txt
+              exit 0
+            fi
+            round=$((round + 1))
+          done
+          echo "ok=false" > .github/agent/work/GATE.txt
+          echo "::warning::Still FAIL after $max implement rounds; opening a draft PR anyway."
+
+      - name: Open draft PR
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+        run: |
+          set -euo pipefail
+          n="$ISSUE_NUMBER"
+          title="$ISSUE_TITLE"
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+          git checkout -B "agent/issue-${n}"
+          git add -A
+          git reset -q -- .github/agent/work/ISSUE.md .github/agent/work/TEST.log .github/agent/work/GATE.txt 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "::error::Agent produced no file changes"
+            exit 1
+          fi
+          git commit -m "$(cat <<EOF
+          fix: ${title}
+
+          Closes #${n}
+          EOF
+          )"
+          git push -u origin "HEAD:agent/issue-${n}"
+          verdict="FAIL"
+          if grep -q '^VERDICT: PASS' .github/agent/work/REVIEW.md && grep -q 'ok=true' .github/agent/work/GATE.txt; then
+            verdict="PASS"
+          fi
+          body="$(cat <<EOF
+          Closes #${n}
+
+          Automated agent-fix. Linked to issue #${n}. Draft — do not merge without a human review.
+
+          Review: ${verdict}
+
+          PR CI is Tests only, and only the jobs whose paths changed. Android, Desktop, iOS, and Docker build on push to main.
+          EOF
+          )"
+          gh pr create --draft --assignee "$GITHUB_ACTOR" --title "fix: ${title}" --body "$body"
+          gh issue comment "$n" --body "Draft PR opened (closes #${n})."

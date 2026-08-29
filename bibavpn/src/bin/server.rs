@@ -7,19 +7,26 @@ use anyhow::Context;
 use bibavpn::crypto_layer::{self, SessionCrypto};
 use bibavpn::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
 use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig, WsHandshakeKind};
+use bibavpn::log_ratelimit::LogEvery;
 use bibavpn::logging::{self, LogConfig, LogFormat};
 use bibavpn::server_limits::{
-    AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget, ServerStats,
+    account_pre_hello_binary, AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget,
+    PreHelloJunkTracker, ServerStats, MAX_PRE_HELLO_BYTES, MAX_PRE_HELLO_FRAMES,
 };
+use bibavpn::server_metrics::{spawn_metrics_listener, MetricsAuth};
 use bibavpn::transport_capabilities::log_server_listen_caps;
+use bibavpn::startup_secrets::{
+    log_lab_mode_enabled, log_reality_without_psk, require_psk, resolve_cli_token,
+    server_reality_configured,
+};
 use bibavpn::udp_mux::UdpSocketPool;
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use bibavpn::protocol::{
-    decode_v3_auth, decode_v3_open_with_flags, encode_v3_open_err, encode_v3_open_ok, is_v3_mux_open,
-    is_v3_udp_mux_open, OPEN_FLAG_STATUS,
+    classify_v3_first_channel, decode_v3_auth, encode_v3_open_err, encode_v3_open_ok,
+    is_v3_mux_open, V3FirstChannelKind, OPEN_FLAG_STATUS,
 };
 use bibavpn::ServerWsOutTiming;
 use bibavpn::{read_padded_frame_into, write_padded_frame_with_mode_state};
@@ -47,6 +54,7 @@ struct ServerConnParams {
     peer: SocketAddr,
     session_id: u64,
     auth: Arc<AuthRateLimiter>,
+    stats: Arc<ServerStats>,
     pre_auth: PreAuthBudget,
     handshake_timeout: Duration,
     mux_connect_timeout: Duration,
@@ -62,8 +70,12 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8443")]
     listen: String,
 
-    #[arg(long, default_value = "change-me")]
-    token: String,
+    #[arg(long, required_unless_present = "lab")]
+    token: Option<String>,
+
+    /// Local demos only: allow missing `--token` (uses `change-me`), skip token denylist, relax PSK when REALITY is configured.
+    #[arg(long, default_value_t = false)]
+    lab: bool,
 
     /// WebSocket HTTP path (token is sent in AUTH frame). Default `/ws`.
     #[arg(long, default_value = "/ws")]
@@ -206,7 +218,9 @@ struct Args {
     #[arg(long, default_value_t = 262144)]
     handshake_max_junk_bytes: usize,
 
-    /// Overall v3 handshake wait (HELLO..AUTH) timeout in seconds.
+    /// Per-phase pre-tunnel timeout in seconds: TLS accept, WS upgrade / camouflage HTTP head,
+    /// REALITY exchange, the v3 handshake wait (HELLO..AUTH), and the post-AUTH wait for
+    /// OPEN / MUX_OPEN / UDP_MUX_OPEN.
     #[arg(long, default_value_t = 15)]
     handshake_timeout_secs: u64,
 
@@ -231,6 +245,18 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     stats_interval_secs: u64,
 
+    /// Optional Prometheus listener (`host:port`). Serves `GET /metrics` and `GET /healthz`. Off by default; bind loopback in production.
+    #[arg(long)]
+    metrics_listen: Option<String>,
+
+    /// HTTP Basic Auth password for the metrics listener (user defaults to `metrics`). Requires `--metrics-listen`.
+    #[arg(long, requires = "metrics_listen")]
+    metrics_password: Option<String>,
+
+    /// HTTP Basic Auth username for the metrics listener (default `metrics`).
+    #[arg(long, default_value = "metrics", requires = "metrics_password")]
+    metrics_user: String,
+
     /// REALITY mode: target to steal TLS from (e.g., vk.com:443)
     #[arg(long)]
     reality_target: Option<String>,
@@ -243,12 +269,88 @@ struct Args {
     #[arg(long)]
     reality_short_ids: Option<String>,
 
-    /// REALITY mode: server names for SNI (comma-separated). Default: extracted from target.
+    /// REALITY mode: enforced TLS SNI / HTTP Host allowlist (comma-separated).
+    /// Default: host from `--reality-target`. An empty list accepts any name (startup WARN).
     #[arg(long)]
     reality_server_names: Option<String>,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
+
+/// Pause after an accept error that would otherwise repeat immediately.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// What the accept loop does after a failed `accept(2)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptRecovery {
+    /// Per-connection failure (peer vanished, signal): retry immediately.
+    RetryNow,
+    /// Sleep before retrying, otherwise the loop spins at 100% CPU for as long
+    /// as the condition lasts. `exhaustion` marks the out-of-descriptors /
+    /// out-of-buffers class so the log says so.
+    RetryAfterBackoff { exhaustion: bool },
+}
+
+impl AcceptRecovery {
+    fn backoff(self) -> Option<Duration> {
+        match self {
+            AcceptRecovery::RetryNow => None,
+            AcceptRecovery::RetryAfterBackoff { .. } => Some(ACCEPT_BACKOFF),
+        }
+    }
+
+    fn is_exhaustion(self) -> bool {
+        matches!(self, AcceptRecovery::RetryAfterBackoff { exhaustion: true })
+    }
+}
+
+/// True for raw OS errors meaning "out of descriptors or kernel buffers".
+/// These have no distinct `std::io::ErrorKind` on stable Rust, so they are
+/// matched numerically; the values are per-platform ABI constants.
+#[cfg(unix)]
+fn is_accept_resource_exhaustion(code: i32) -> bool {
+    // EMFILE, ENFILE and ENOMEM share values across Linux and the BSDs;
+    // ENOBUFS does not.
+    const EMFILE: i32 = 24;
+    const ENFILE: i32 = 23;
+    const ENOMEM: i32 = 12;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const ENOBUFS: i32 = 105;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const ENOBUFS: i32 = 55;
+    matches!(code, EMFILE | ENFILE | ENOMEM | ENOBUFS)
+}
+
+#[cfg(windows)]
+fn is_accept_resource_exhaustion(code: i32) -> bool {
+    // WSAEMFILE, WSAENOBUFS, WSAETOOMANYREFS.
+    matches!(code, 10024 | 10055 | 10059)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_accept_resource_exhaustion(_code: i32) -> bool {
+    false
+}
+
+/// Classify an `accept(2)` error. Never fatal: see the accept loop comment.
+fn classify_accept_error(e: &std::io::Error) -> AcceptRecovery {
+    use std::io::ErrorKind;
+    match e.kind() {
+        // Cheap and clearly per-connection: the next accept can succeed at once.
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::Interrupted
+        | ErrorKind::WouldBlock => AcceptRecovery::RetryNow,
+        // ENOMEM where the platform maps it to a kind.
+        ErrorKind::OutOfMemory => AcceptRecovery::RetryAfterBackoff { exhaustion: true },
+        // EMFILE/ENFILE/ENOBUFS have no stable `ErrorKind`, so check the raw
+        // code. Unrecognised errors back off as well: losing 100ms of accept
+        // throughput is cheaper than spinning on an error we do not know.
+        _ => AcceptRecovery::RetryAfterBackoff {
+            exhaustion: e.raw_os_error().is_some_and(is_accept_resource_exhaustion),
+        },
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -261,6 +363,20 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     install_ring_crypto();
+
+    if args.lab {
+        log_lab_mode_enabled();
+    }
+    let token = resolve_cli_token(args.token.as_deref(), args.lab)?;
+    let reality_configured = server_reality_configured(
+        args.reality_target.as_deref(),
+        args.reality_private_key.as_deref(),
+    );
+    require_psk(args.psk.as_deref(), reality_configured, args.lab)?;
+    if reality_configured && args.psk.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        log_reality_without_psk();
+    }
+
     let ws_path = normalize_ws_path(&args.ws_path);
     let pad_mode = PadMode::from_str(args.pad_mode.trim()).context("pad-mode")?;
 
@@ -357,7 +473,7 @@ async fn main() -> anyhow::Result<()> {
             v: 1,
             server: public.clone(),
             sni,
-            token: args.token.clone(),
+            token: token.clone(),
             proto: 3,
             proto_domain,
             psk: args.psk.clone(),
@@ -419,7 +535,6 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("bibavpn-server: invite URI on stdout; keep --invite-passphrase secret (not in log aggregation).");
     }
 
-    let token = args.token.clone();
     let max_pad = args.max_pad;
     let psk = args.psk.clone();
     let decoy_max = args.decoy_max;
@@ -486,8 +601,20 @@ async fn main() -> anyhow::Result<()> {
         let server_names = args
             .reality_server_names
             .as_ref()
-            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_else(|| vec![extract_sni(target)]);
+
+        if server_names.is_empty() {
+            warn!(
+                target: "bibavpn_security",
+                "REALITY server-name allowlist is empty; accepting ANY TLS SNI / HTTP Host"
+            );
+        }
 
         let short_ids: Vec<[u8; 8]> = args
             .reality_short_ids
@@ -517,6 +644,23 @@ async fn main() -> anyhow::Result<()> {
             server_names,
             short_ids.len()
         );
+
+        // `is_short_id_allowed` is permissive for an empty list or an all-zero
+        // entry: any short ID passes. Clients still have to pass the REALITY
+        // AUTH frame, but the operator should know the ID is not pinned.
+        let wildcard_short_id = short_ids.iter().any(|id| id.iter().all(|&b| b == 0));
+        if short_ids.is_empty() || wildcard_short_id {
+            let reason = if short_ids.is_empty() {
+                "empty allowlist"
+            } else {
+                "all-zeros wildcard entry"
+            };
+            warn!(
+                target: "bibavpn_security",
+                reason,
+                "REALITY short-ID allowlist accepts ANY short ID; pin clients with --reality-short-ids"
+            );
+        }
 
         Some(RealityServerConfig {
             private_key: privkey_arr,
@@ -571,6 +715,19 @@ async fn main() -> anyhow::Result<()> {
         args.udp_socket_pool_size,
     );
 
+    if let Some(ref metrics_listen) = args.metrics_listen {
+        let metrics_auth = match args.metrics_password.as_deref() {
+            Some(pw) if !pw.is_empty() => MetricsAuth::basic(args.metrics_user.trim(), pw),
+            _ => MetricsAuth::disabled(),
+        };
+        spawn_metrics_listener(
+            metrics_listen.clone(),
+            Arc::clone(&stats),
+            Arc::clone(&auth),
+            metrics_auth,
+        );
+    }
+
     if args.stats_interval_secs > 0 {
         let stats_c = Arc::clone(&stats);
         let auth_c = Arc::clone(&auth);
@@ -599,8 +756,38 @@ async fn main() -> anyhow::Result<()> {
         info!("SpiderX background crawler started for {}", cfg.target);
     }
 
+    // A failed accept(2) must never take the listener down: EMFILE/ENFILE/ENOBUFS
+    // (fd or kernel-buffer exhaustion, i.e. exactly what a connection flood
+    // produces) and ECONNABORTED (peer gone between SYN and accept) are all
+    // transient, and a proxy that exits on them is trivially DoS-able. Neither
+    // tokio nor the OS reports a permanently dead listener distinguishably here,
+    // so no error is treated as fatal; a listener that never recovers shows up as
+    // a climbing bibavpn_accepts_failed_total plus these rate-limited warnings.
+    static ACCEPT_ERR_LOG: LogEvery = LogEvery::new(8, 256);
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                stats.inc_accept_failed();
+                let recovery = classify_accept_error(&e);
+                let backoff = recovery.backoff();
+                if ACCEPT_ERR_LOG.should_emit() {
+                    warn!(
+                        target: "bibavpn_server",
+                        error_kind = ?e.kind(),
+                        errno = e.raw_os_error().unwrap_or(0),
+                        resource_exhaustion = recovery.is_exhaustion(),
+                        backoff_ms = backoff.map(|d| d.as_millis() as u64).unwrap_or(0),
+                        accepts_failed_total = stats.accepts_failed_total.load(Ordering::Relaxed),
+                        "accept failed, still serving: {e:#}"
+                    );
+                }
+                if let Some(d) = backoff {
+                    tokio::time::sleep(d).await;
+                }
+                continue;
+            }
+        };
         let acceptor = acceptor.clone();
         let token = token.clone();
         let ws_path = ws_path.clone();
@@ -628,6 +815,7 @@ async fn main() -> anyhow::Result<()> {
                         Ok(Ok(p)) => Some(p),
                         Ok(Err(_)) => return,
                         Err(_) => {
+                            stats.inc_sessions_rejected_busy();
                             debug!(
                                 target: "bibavpn_server",
                                 %peer,
@@ -641,6 +829,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             if let Err(e) = auth.check_allowed(peer.ip()).await {
+                stats.inc_auth_rejected_banned();
                 debug!(
                     target: "bibavpn_security",
                     %peer,
@@ -657,6 +846,7 @@ async fn main() -> anyhow::Result<()> {
                 peer,
                 session_id,
                 auth,
+                stats: Arc::clone(&stats),
                 pre_auth,
                 handshake_timeout,
                 mux_connect_timeout,
@@ -691,6 +881,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             {
+                stats.inc_session_error();
                 error!(
                     target: "bibavpn_server",
                     %peer,
@@ -733,6 +924,7 @@ async fn server_handshake_v3_after_first_hello<S>(
     decoy_max: u8,
     proto_domain: &str,
     auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
     handshake_timeout: Duration,
@@ -754,12 +946,13 @@ where
     ));
     let auth_c = Arc::clone(auth);
     let wait = async {
-        server_wait_v3_auth(ws, &crypto, token, &auth_c, peer_ip, pre_auth).await
+        server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer_ip, pre_auth).await
     };
     match timeout(handshake_timeout, wait).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => {
+            stats.inc_handshake_timeout();
             auth.record_failure(peer_ip).await;
             anyhow::bail!("handshake timeout waiting for v3 AUTH (REALITY path)");
         }
@@ -768,7 +961,7 @@ where
 }
 
 async fn run_session_after_v3_handshake<S>(
-    mut ws: WebSocketStream<S>,
+    ws: WebSocketStream<S>,
     crypto: SharedCrypto,
     udp_mux_max_pad: u8,
     udp_mux_max_ws_binary: usize,
@@ -786,11 +979,28 @@ async fn run_session_after_v3_handshake<S>(
     server_out: ServerWsOutTiming,
     mux_connect_timeout: Duration,
     udp_socket_pool: Option<Arc<UdpSocketPool>>,
+    handshake_timeout: Duration,
+    pre_auth: &PreAuthBudget,
+    auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
+    peer_ip: std::net::IpAddr,
+    session_id: u64,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match wait_first_channel(ws, &crypto).await? {
+    match wait_first_channel_with_timeout(
+        ws,
+        &crypto,
+        pre_auth,
+        auth,
+        stats,
+        peer_ip,
+        session_id,
+        handshake_timeout,
+    )
+    .await?
+    {
         FirstChannel::Tcp {
             host,
             port,
@@ -799,7 +1009,17 @@ where
         } => {
             info!("OPEN {host}:{port}");
             let mut pad_st = AdaptivePadState::default();
-            let remote = match TcpStream::connect((host.as_str(), port)).await {
+            // Bound the dial so a blackholed target cannot tie up the session
+            // (and its concurrency permit) until the OS TCP timeout (~minutes).
+            let connect = timeout(mux_connect_timeout, TcpStream::connect((host.as_str(), port)))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connect timed out",
+                    ))
+                });
+            let remote = match connect {
                 Ok(remote) => remote,
                 Err(e) => {
                     if supports_open_status {
@@ -847,7 +1067,7 @@ where
             }
             bibavpn::ws_bridge::bridge_ws_tcp_padded(
                 ws,
-                Vec::new(),
+                Vec::<bibavpn::ws_bridge::WsBridgePrefetch>::new(),
                 remote,
                 Vec::new(),
                 max_pad,
@@ -910,6 +1130,41 @@ where
     Ok(())
 }
 
+/// Bound one pre-tunnel setup phase (TLS accept, WS upgrade / camouflage HTTP head,
+/// REALITY exchange) with `dur`.
+///
+/// The concurrency permit and the session guard are taken before any peer I/O, so a
+/// peer that opens a socket and then stalls would otherwise hold a slot until it gives
+/// up: a handful of silent sockets can exhaust `--max-concurrent-sessions`. Expiry is
+/// counted as a handshake timeout and returns an error, which releases both.
+/// No `auth.record_failure`: a peer that never spoke has not failed authentication.
+async fn with_setup_timeout<T, F>(
+    phase: &'static str,
+    dur: Duration,
+    stats: &Arc<ServerStats>,
+    peer: SocketAddr,
+    session_id: u64,
+    fut: F,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match timeout(dur, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            let secs = dur.as_secs();
+            stats.inc_handshake_timeout();
+            debug!(
+                target: "bibavpn_server",
+                %peer,
+                session_id,
+                "pre-tunnel timeout in {phase} after {secs}s; releasing concurrency permit"
+            );
+            anyhow::bail!("{phase} timeout after {secs}s");
+        }
+    }
+}
+
 async fn handle_one(
     tcp: TcpStream,
     acceptor: TlsAcceptor,
@@ -944,11 +1199,36 @@ async fn handle_one(
     );
     let _span_enter = span.enter();
 
-    let tls = acceptor.accept(tcp).await.context("tls accept")?;
+    let tls = with_setup_timeout(
+        "tls accept",
+        params.handshake_timeout,
+        &params.stats,
+        params.peer,
+        params.session_id,
+        async move { acceptor.accept(tcp).await.context("tls accept") },
+    )
+    .await?;
 
-    let Some((mut ws, ws_kind)) =
-        accept_websocket_or_camouflage(tls, &ws_path, legacy_path_auth, &token, camo, Some(params.peer))
-            .await?
+    let tls_sni = tls.get_ref().1.server_name().map(str::to_string);
+
+    // Covers the HTTP head read (`incoming::read_http_head` has no deadline of its own)
+    // plus writing the camouflage answer; a real probe is served long before it expires.
+    let Some((mut ws, ws_kind, http_host)) = with_setup_timeout(
+        "websocket upgrade / camouflage http",
+        params.handshake_timeout,
+        &params.stats,
+        params.peer,
+        params.session_id,
+        accept_websocket_or_camouflage(
+            tls,
+            &ws_path,
+            legacy_path_auth,
+            &token,
+            camo,
+            Some(params.peer),
+        ),
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -975,21 +1255,65 @@ async fn handle_one(
 
     if let Some(ref reality_cfg) = reality_config {
         info!("REALITY mode: app tunnel after X25519");
-        server_handshake_reality(&mut ws, reality_cfg)
-            .await
-            .context("REALITY handshake")?;
+        // REALITY authenticates only the server, so the client must prove it
+        // knows the session token (MAC bound to this handshake) *before* any
+        // application frame is honoured — otherwise this is an open proxy.
+        // Bounded like the other pre-tunnel phases, but with its own arms: this
+        // one is an auth step, so it also feeds the per-IP rate limiter.
+        match timeout(
+            handshake_timeout,
+            server_handshake_reality(
+                &mut ws,
+                reality_cfg,
+                &token,
+                tls_sni.as_deref(),
+                http_host.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_session_key)) => {
+                auth.record_success(peer_ip).await;
+            }
+            Ok(Err(e)) => {
+                auth.record_failure(peer_ip).await;
+                warn!(
+                    target: "bibavpn_security",
+                    %peer_ip,
+                    session_id = params.session_id,
+                    "REALITY handshake/AUTH rejected: {e:#}"
+                );
+                return Err(e).context("REALITY handshake");
+            }
+            Err(_) => {
+                params.stats.inc_handshake_timeout();
+                auth.record_failure(peer_ip).await;
+                anyhow::bail!("handshake timeout waiting for REALITY AUTH");
+            }
+        }
 
         let domain_trim = proto_domain.trim();
         if domain_trim.is_empty() {
             anyhow::bail!("--proto-domain must not be empty");
         }
 
-        let next = read_next_binary_after_reality(&mut ws)
-            .await
-            .context("after REALITY: first application frame")?;
+        let next = with_setup_timeout(
+            "first frame after REALITY",
+            handshake_timeout,
+            &params.stats,
+            params.peer,
+            params.session_id,
+            async {
+                read_next_binary_after_reality(&mut ws)
+                    .await
+                    .context("after REALITY: first application frame")
+            },
+        )
+        .await?;
 
         if is_v3_mux_open(next.as_ref()) {
             info!("REALITY: TCP mux (plaintext mux records)");
+            params.stats.inc_handshake_success();
             return bibavpn::tcp_mux::bridge_ws_tcp_mux_server(
                 ws,
                 max_pad,
@@ -1022,6 +1346,7 @@ async fn handle_one(
                 decoy_max,
                 domain_trim,
                 auth,
+                &params.stats,
                 peer_ip,
                 pre_auth,
                 handshake_timeout,
@@ -1047,6 +1372,12 @@ async fn handle_one(
                 server_out,
                 mux_connect_timeout,
                 udp_pool,
+                handshake_timeout,
+                pre_auth,
+                auth,
+                &params.stats,
+                peer_ip,
+                params.session_id,
             )
             .await;
         }
@@ -1070,6 +1401,7 @@ async fn handle_one(
         decoy_max,
         domain_trim,
         auth,
+        &params.stats,
         peer_ip,
         pre_auth,
         handshake_timeout,
@@ -1096,10 +1428,17 @@ async fn handle_one(
         server_out,
         mux_connect_timeout,
         udp_pool,
+        handshake_timeout,
+        pre_auth,
+        auth,
+        &params.stats,
+        peer_ip,
+        params.session_id,
     )
     .await
 }
 
+#[derive(Debug)]
 enum FirstChannel<S>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1118,13 +1457,58 @@ where
     },
 }
 
-async fn wait_first_channel<S>(
-    mut ws: WebSocketStream<S>,
+async fn wait_first_channel_with_timeout<S>(
+    ws: WebSocketStream<S>,
     crypto: &SharedCrypto,
+    pre_auth: &PreAuthBudget,
+    auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
+    peer_ip: std::net::IpAddr,
+    session_id: u64,
+    handshake_timeout: Duration,
 ) -> anyhow::Result<FirstChannel<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    match timeout(
+        handshake_timeout,
+        wait_first_channel(ws, crypto, pre_auth, auth, peer_ip),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            stats.inc_handshake_timeout();
+            auth.record_failure(peer_ip).await;
+            debug!(
+                target: "bibavpn_server",
+                %peer_ip,
+                session_id,
+                "handshake timeout waiting for OPEN / MUX_OPEN / UDP_MUX_OPEN; releasing concurrency permit"
+            );
+            warn!(
+                target: "bibavpn_security",
+                %peer_ip,
+                session_id,
+                "handshake timeout waiting for OPEN / MUX_OPEN / UDP_MUX_OPEN"
+            );
+            anyhow::bail!("handshake timeout waiting for OPEN / MUX_OPEN / UDP_MUX_OPEN");
+        }
+    }
+}
+
+async fn wait_first_channel<S>(
+    mut ws: WebSocketStream<S>,
+    crypto: &SharedCrypto,
+    pre_auth: &PreAuthBudget,
+    auth: &Arc<AuthRateLimiter>,
+    peer_ip: std::net::IpAddr,
+) -> anyhow::Result<FirstChannel<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use bibavpn::server_limits::PreAuthBudgetTracker;
+    let mut tracker = PreAuthBudgetTracker::default();
     while let Some(m) = ws.next().await {
         let m = m.context("ws read")?;
         match m {
@@ -1133,19 +1517,27 @@ where
                     .open_client_to_server(b.as_ref())
                     .context("decrypt v3 control")?;
                 let inner = read_padded_frame_into(raw).context("padded v3 control")?;
-                if let Ok((h, p, flags)) = decode_v3_open_with_flags(&inner) {
-                    return Ok(FirstChannel::Tcp {
-                        host: h,
-                        port: p,
-                        supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
-                        ws,
-                    });
-                }
-                if is_v3_udp_mux_open(&inner) {
-                    return Ok(FirstChannel::UdpMux { ws });
-                }
-                if is_v3_mux_open(&inner) {
-                    return Ok(FirstChannel::Mux { ws });
+                match classify_v3_first_channel(&inner) {
+                    V3FirstChannelKind::TcpOpen { host, port, flags } => {
+                        return Ok(FirstChannel::Tcp {
+                            host,
+                            port,
+                            supports_open_status: (flags & OPEN_FLAG_STATUS) != 0,
+                            ws,
+                        });
+                    }
+                    V3FirstChannelKind::UdpMux => {
+                        return Ok(FirstChannel::UdpMux { ws });
+                    }
+                    V3FirstChannelKind::Mux => {
+                        return Ok(FirstChannel::Mux { ws });
+                    }
+                    V3FirstChannelKind::NotChannelOpen => {
+                        if let Err(e) = tracker.note_binary_frame(b.len(), pre_auth) {
+                            auth.record_failure(peer_ip).await;
+                            return Err(e);
+                        }
+                    }
                 }
             }
             Message::Ping(p) => {
@@ -1167,6 +1559,7 @@ async fn server_handshake_v3<S>(
     decoy_max: u8,
     proto_domain: &str,
     auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
     handshake_timeout: Duration,
@@ -1178,10 +1571,7 @@ where
     let auth_f = Arc::clone(auth);
     let peer = peer_ip;
     let fut = async {
-        let mut junk_frames = 0u32;
-        let mut junk_bytes = 0usize;
-        const MAX_PRE_HELLO_FRAMES: u32 = 256;
-        const MAX_PRE_HELLO_BYTES: usize = 256 * 1024;
+        let mut pre_hello = PreHelloJunkTracker::default();
         loop {
             let m = ws
                 .next()
@@ -1190,17 +1580,14 @@ where
                 .context("ws error")?;
             match m {
                 Message::Binary(b) => {
-                    if b.is_empty() || b.as_ref()[0] != crypto_layer::V3_HELLO_TAG {
-                        junk_frames = junk_frames.saturating_add(1);
-                        junk_bytes = junk_bytes.saturating_add(b.len());
-                        if junk_frames > MAX_PRE_HELLO_FRAMES || junk_bytes > MAX_PRE_HELLO_BYTES {
-                            anyhow::bail!("too much pre-handshake data before v3 HELLO");
-                        }
-                        continue;
-                    }
-                    let c = match crypto_layer::parse_hello_v3(b.as_ref()) {
-                        Ok(x) => x,
-                        Err(_) => continue,
+                    let c = match account_pre_hello_binary(
+                        b.as_ref(),
+                        &mut pre_hello,
+                        MAX_PRE_HELLO_FRAMES,
+                        MAX_PRE_HELLO_BYTES,
+                    )? {
+                        Some(c) => c,
+                        None => continue,
                     };
                     let secret = psk.context("Biba v3 requires server --psk")?;
                     info!("Biba v3 PSK mode, decoy_max={decoy_max}");
@@ -1216,7 +1603,8 @@ where
                         decoy_max,
                     ));
                     let auth_c = Arc::clone(&auth_f);
-                    server_wait_v3_auth(ws, &crypto, token, &auth_c, peer, pre_auth).await?;
+                    server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer, pre_auth)
+                        .await?;
                     return Ok(crypto);
                 }
                 Message::Ping(p) => {
@@ -1232,6 +1620,7 @@ where
         Ok(Ok(crypto)) => Ok(crypto),
         Ok(Err(e)) => Err(e),
         Err(_) => {
+            stats.inc_handshake_timeout();
             auth_f.record_failure(peer).await;
             anyhow::bail!("handshake timeout");
         }
@@ -1243,6 +1632,7 @@ async fn server_wait_v3_auth<S>(
     crypto: &SharedCrypto,
     expected_token: &str,
     auth: &Arc<AuthRateLimiter>,
+    stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
 ) -> anyhow::Result<()>
@@ -1275,7 +1665,7 @@ where
                 };
                 let inner = read_padded_frame_into(raw).context("v3 auth frame")?;
                 let tok = decode_v3_auth(&inner).context("decode v3 auth")?;
-                if tok != expected_token {
+                if !crypto_layer::secret_eq(tok.as_str(), expected_token) {
                     auth.record_failure(peer_ip).await;
                     warn!(
                         target: "bibavpn_security",
@@ -1285,6 +1675,7 @@ where
                     anyhow::bail!("v3 auth token mismatch");
                 }
                 auth.record_success(peer_ip).await;
+                stats.inc_handshake_success();
                 return Ok(());
             }
             Message::Ping(p) => {
@@ -1294,6 +1685,334 @@ where
             Message::Close(_) => anyhow::bail!("closed before v3 AUTH"),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn transient_per_connection_accept_errors_retry_immediately() {
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+        ] {
+            let r = classify_accept_error(&Error::from(kind));
+            assert_eq!(r, AcceptRecovery::RetryNow, "kind {kind:?}");
+            assert_eq!(r.backoff(), None, "kind {kind:?}");
+            assert!(!r.is_exhaustion(), "kind {kind:?}");
+        }
+    }
+
+    #[test]
+    fn out_of_memory_accept_error_backs_off() {
+        let r = classify_accept_error(&Error::from(ErrorKind::OutOfMemory));
+        assert_eq!(r, AcceptRecovery::RetryAfterBackoff { exhaustion: true });
+        assert_eq!(r.backoff(), Some(ACCEPT_BACKOFF));
+    }
+
+    #[test]
+    fn unknown_accept_error_backs_off_without_exhaustion_flag() {
+        let r = classify_accept_error(&Error::from(ErrorKind::PermissionDenied));
+        assert_eq!(r, AcceptRecovery::RetryAfterBackoff { exhaustion: false });
+        assert_eq!(r.backoff(), Some(ACCEPT_BACKOFF));
+    }
+
+    // Raw codes for the current platform: EMFILE, ENFILE, ENOMEM, ENOBUFS
+    // (WSAEMFILE, WSAENOBUFS, WSAETOOMANYREFS on Windows). Most have no stable
+    // `ErrorKind`, which is the case the raw-code rule exists for.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const EXHAUSTION_CODES: &[i32] = &[24, 23, 12, 105];
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    const EXHAUSTION_CODES: &[i32] = &[24, 23, 12, 55];
+    #[cfg(windows)]
+    const EXHAUSTION_CODES: &[i32] = &[10024, 10055, 10059];
+    #[cfg(not(any(unix, windows)))]
+    const EXHAUSTION_CODES: &[i32] = &[];
+
+    #[test]
+    fn descriptor_exhaustion_accept_errors_back_off() {
+        for &code in EXHAUSTION_CODES {
+            let r = classify_accept_error(&Error::from_raw_os_error(code));
+            assert!(
+                r.is_exhaustion(),
+                "errno {code} should be exhaustion: {r:?}"
+            );
+            assert_eq!(r.backoff(), Some(ACCEPT_BACKOFF), "errno {code}");
+        }
+    }
+
+    #[test]
+    fn accept_backoff_is_short() {
+        assert!(ACCEPT_BACKOFF >= Duration::from_millis(50));
+        assert!(ACCEPT_BACKOFF <= Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod first_channel_wait_tests {
+    use super::*;
+    use bibavpn::crypto_layer::{build_ack, build_hello_v3, SessionCrypto};
+    use bibavpn::frame::PadMode;
+    use bibavpn::protocol::{
+        encode_v3_mux_open, encode_v3_open_ok, encode_v3_open_with_flags, encode_v3_udp_mux_open,
+    };
+    use bibavpn::server_limits::AuthRateLimiterConfig;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::Ordering;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    fn test_crypto() -> SharedCrypto {
+        let (c, _hello) = build_hello_v3();
+        let psk = "test-psk";
+        let dom = "test.domain";
+        let (_ack, s) = build_ack(psk, dom, &c).unwrap();
+        Arc::new(SessionCrypto::new(psk, dom, &c, &s, 8))
+    }
+
+    fn seal_client_frame(crypto: &SessionCrypto, inner: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_padded_frame_with_mode_state(&mut wire, inner, 8, PadMode::Random, None).unwrap();
+        crypto.seal_client_to_server(&wire).unwrap()
+    }
+
+    async fn ws_pair() -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        (client, server)
+    }
+
+    fn wait_ctx() -> (
+        Arc<ServerStats>,
+        Arc<AuthRateLimiter>,
+        PreAuthBudget,
+        IpAddr,
+    ) {
+        (
+            ServerStats::new(),
+            AuthRateLimiter::new(AuthRateLimiterConfig::default()),
+            PreAuthBudget::default(),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        )
+    }
+
+    #[tokio::test]
+    async fn wait_first_channel_times_out_on_silent_peer() {
+        let (_client, server) = ws_pair().await;
+        let crypto = test_crypto();
+        let (stats, auth, pre_auth, peer) = wait_ctx();
+        let before = stats
+            .handshake_timeouts_total
+            .load(Ordering::Relaxed);
+
+        let err = wait_first_channel_with_timeout(
+            server,
+            &crypto,
+            &pre_auth,
+            &auth,
+            &stats,
+            peer,
+            1,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("handshake timeout waiting for OPEN / MUX_OPEN / UDP_MUX_OPEN"),
+            "{err:#}"
+        );
+        assert_eq!(
+            stats.handshake_timeouts_total.load(Ordering::Relaxed),
+            before + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_first_channel_times_out_on_ping_only_peer() {
+        let (mut client, server) = ws_pair().await;
+        let crypto = test_crypto();
+        let (stats, auth, pre_auth, peer) = wait_ctx();
+        let before = stats
+            .handshake_timeouts_total
+            .load(Ordering::Relaxed);
+
+        let client_task = tokio::spawn(async move {
+            loop {
+                client
+                    .send(Message::Ping(Bytes::from_static(b"ping")))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let err = wait_first_channel_with_timeout(
+            server,
+            &crypto,
+            &pre_auth,
+            &auth,
+            &stats,
+            peer,
+            2,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        client_task.abort();
+
+        assert!(
+            err.to_string()
+                .contains("handshake timeout waiting for OPEN / MUX_OPEN / UDP_MUX_OPEN"),
+            "{err:#}"
+        );
+        assert_eq!(
+            stats.handshake_timeouts_total.load(Ordering::Relaxed),
+            before + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_first_channel_accepts_mux_open() {
+        let (mut client, server) = ws_pair().await;
+        let crypto = test_crypto();
+        let (stats, auth, pre_auth, peer) = wait_ctx();
+
+        let sealed = seal_client_frame(&crypto, &encode_v3_mux_open());
+        client
+            .send(Message::Binary(Bytes::from(sealed)))
+            .await
+            .unwrap();
+
+        let ch = wait_first_channel_with_timeout(
+            server,
+            &crypto,
+            &pre_auth,
+            &auth,
+            &stats,
+            peer,
+            3,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(ch, FirstChannel::Mux { .. }));
+        assert_eq!(
+            stats.handshake_timeouts_total.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_first_channel_accepts_open_and_udp_mux_open() {
+        let crypto = test_crypto();
+        let (stats, auth, pre_auth, peer) = wait_ctx();
+
+        let (mut client, server) = ws_pair().await;
+        let open = encode_v3_open_with_flags("example.org", 443, OPEN_FLAG_STATUS).unwrap();
+        client
+            .send(Message::Binary(Bytes::from(
+                seal_client_frame(&crypto, &open),
+            )))
+            .await
+            .unwrap();
+        let ch = wait_first_channel_with_timeout(
+            server,
+            &crypto,
+            &pre_auth,
+            &auth,
+            &stats,
+            peer,
+            4,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            ch,
+            FirstChannel::Tcp {
+                ref host,
+                port: 443,
+                supports_open_status: true,
+                ..
+            } if host == "example.org"
+        ));
+
+        let (mut client, server) = ws_pair().await;
+        client
+            .send(Message::Binary(Bytes::from(seal_client_frame(
+                &crypto,
+                &encode_v3_udp_mux_open(),
+            ))))
+            .await
+            .unwrap();
+        let ch = wait_first_channel_with_timeout(
+            server,
+            &crypto,
+            &pre_auth,
+            &auth,
+            &stats,
+            peer,
+            5,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ch, FirstChannel::UdpMux { .. }));
+    }
+
+    #[tokio::test]
+    async fn wait_first_channel_junk_budget_exceeded_before_timeout() {
+        let (mut client, server) = ws_pair().await;
+        let crypto = test_crypto();
+        let stats = ServerStats::new();
+        let auth = AuthRateLimiter::new(AuthRateLimiterConfig::default());
+        let pre_auth = PreAuthBudget {
+            max_junk_frames: 2,
+            max_junk_bytes: 1024 * 1024,
+            max_decrypt_failures: 64,
+        };
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let junk = seal_client_frame(&crypto, &encode_v3_open_ok());
+
+        for _ in 0..3 {
+            client
+                .send(Message::Binary(Bytes::from(junk.clone())))
+                .await
+                .unwrap();
+        }
+
+        let err = wait_first_channel_with_timeout(
+            server,
+            &crypto,
+            &pre_auth,
+            &auth,
+            &stats,
+            peer,
+            6,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("too much pre-auth data before v3 AUTH"),
+            "{err:#}"
+        );
+        assert_eq!(
+            stats.handshake_timeouts_total.load(Ordering::Relaxed),
+            0
+        );
     }
 }
 

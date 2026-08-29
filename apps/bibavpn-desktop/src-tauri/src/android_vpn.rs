@@ -129,8 +129,52 @@ pub fn request_connect(
         })();
         let _ = tx.send(res);
     })?;
-    rx.recv_timeout(Duration::from_secs(60))
+    rx.recv_timeout(Duration::from_secs(125))
         .map_err(|_| "таймаут JNI (VPN)".to_string())?
+}
+
+pub fn last_connect_error(app: &AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    with_main_webview_jni(app, move |env, activity| {
+        let res = (|| {
+            let cls = load_app_class(env, activity, "dev.bibavpn.TauriVpnBridge")?;
+            let out = env
+                .call_static_method(&cls, "lastConnectError", "()Ljava/lang/String;", &[])
+                .map_err(|e| jni_string_err(env, e))?;
+            let j_obj = out.l().map_err(|e| jni_string_err(env, e))?;
+            if j_obj.is_null() {
+                return Ok::<Option<String>, String>(None);
+            }
+            let j_str = jni::objects::JString::from(j_obj);
+            let s: String = env
+                .get_string(&j_str)
+                .map_err(|e| jni_string_err(env, e))?
+                .into();
+            if s.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s))
+            }
+        })();
+        let _ = tx.send(res);
+    })?;
+    rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "таймаут JNI (lastConnectError)".to_string())?
+}
+
+pub fn clear_last_connect_error(app: &AppHandle) -> Result<(), String> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    with_main_webview_jni(app, move |env, activity| {
+        let res = (|| {
+            let cls = load_app_class(env, activity, "dev.bibavpn.TauriVpnBridge")?;
+            env.call_static_method(&cls, "clearLastConnectError", "()V", &[])
+                .map_err(|e| jni_string_err(env, e))?;
+            Ok::<(), String>(())
+        })();
+        let _ = tx.send(res);
+    })?;
+    rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "таймаут JNI (clearLastConnectError)".to_string())?
 }
 
 pub fn request_disconnect(app: &AppHandle) -> Result<(), String> {

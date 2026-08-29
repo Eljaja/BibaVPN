@@ -57,6 +57,10 @@ apps/bibavpn-desktop/src-tauri/ios-bibavpn-extras/BibaVpnTunnel/rust-static/**/*
 /apps/bibavpn-desktop/node_modules
 apps/bibavpn-desktop/.merge-no-vite.json
 
+# CI-fetched split-tunnel list (baked at build time; secret URL)
+/apps/bibavpn-desktop/src-tauri/embedded/bypass_domains.json
+/apps/bibavpn-desktop/src-tauri/embedded/bypass_domains.json.tmp
+
 # Tauri `android init` output + merged VPN glue (regenerate: `npm run android:bootstrap` in apps/bibavpn-desktop)
 /apps/bibavpn-desktop/src-tauri/gen/
 

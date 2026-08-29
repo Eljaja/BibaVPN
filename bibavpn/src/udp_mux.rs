@@ -13,7 +13,8 @@ use rand::Rng;
 use rand::RngCore;
 use rustls::pki_types::ServerName;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -259,24 +260,35 @@ impl UdpMuxHandle {
 }
 
 /// Start background driver; returns handle for submitting UDP requests.
-pub fn spawn_udp_mux_driver(cfg: UdpMuxConfig) -> UdpMuxHandle {
+pub fn spawn_udp_mux_driver(
+    cfg: UdpMuxConfig,
+    mut shutdown: watch::Receiver<bool>,
+    tasks: &mut Vec<JoinHandle<()>>,
+) -> UdpMuxHandle {
     let (tx, rx) = mpsc::channel(UDP_MUX_CMD_QUEUE_CAP);
-    tokio::spawn(async move {
-        if let Err(e) = run_udp_mux_driver_forever(cfg, rx).await {
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = run_udp_mux_driver_forever(cfg, rx, shutdown).await {
             error!("udp mux client: {e:#}");
         }
-    });
+    }));
     UdpMuxHandle { tx }
 }
 
 async fn run_udp_mux_driver_forever(
     cfg: UdpMuxConfig,
     mut cmd_rx: mpsc::Receiver<ClientUdpCmd>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     loop {
-        let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg).await?;
-        let shutdown = run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await?;
-        if shutdown {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg, &mut shutdown).await?;
+        let stop = run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await?;
+        if stop {
+            return Ok(());
+        }
+        if *shutdown.borrow() {
             return Ok(());
         }
     }
@@ -284,17 +296,28 @@ async fn run_udp_mux_driver_forever(
 
 async fn connect_udp_mux_ws_resilient(
     cfg: &UdpMuxConfig,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<(
     WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     SharedCrypto,
 )> {
     let mut streak = 0u32;
     loop {
+        if *shutdown.borrow() {
+            anyhow::bail!("udp mux: shutdown");
+        }
         match connect_udp_mux_ws(cfg).await {
             Ok(x) => return Ok(x),
             Err(e) => {
                 warn!("udp mux connect failed (streak {streak}): {e:#}");
-                sleep_outbound_backoff(streak.min(10)).await;
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            anyhow::bail!("udp mux: shutdown");
+                        }
+                    }
+                    _ = sleep_outbound_backoff(streak.min(10)) => {}
+                }
                 streak = streak.saturating_add(1);
             }
         }
@@ -385,7 +408,7 @@ async fn connect_udp_mux_ws(
         let short_id = cfg
             .reality_short_id
             .unwrap_or_else(|| rand::random::<[u8; 8]>());
-        crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id)
+        crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id, &cfg.token)
             .await
             .context("REALITY handshake (udp mux)")?;
     }
@@ -514,9 +537,14 @@ async fn run_udp_mux_one_session(
     cfg: &UdpMuxConfig,
     cmd_rx: &mut mpsc::Receiver<ClientUdpCmd>,
 ) -> anyhow::Result<bool> {
+    struct PendingUdpEntry {
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+        /// Set when the forwarded datagram was a parseable DNS query to port 53.
+        dns_expect: Option<(u16, String)>,
+    }
+
     let mut udp_adaptive = AdaptivePadState::default();
-    let mut pending: HashMap<u64, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>> =
-        HashMap::new();
+    let mut pending: HashMap<u64, PendingUdpEntry> = HashMap::new();
     let (ws_tx, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_tx));
     let mut bad_frames: u32 = 0;
@@ -561,14 +589,19 @@ async fn run_udp_mux_one_session(
                                 continue;
                             }
                             Entry::Vacant(e) => {
-                                e.insert(reply);
+                                let dns_expect = if dst_port == 53 {
+                                    crate::domain_route::parse_dns_query(&payload)
+                                } else {
+                                    None
+                                };
+                                e.insert(PendingUdpEntry { reply, dns_expect });
                             }
                         }
                         let req = match encode_udp_req(xid, &dst_host, dst_port, &payload) {
                             Ok(r) => r,
                             Err(e) => {
-                                if let Some(tx) = pending.remove(&xid) {
-                                    let _ = tx.send(Err(e));
+                                if let Some(entry) = pending.remove(&xid) {
+                                    let _ = entry.reply.send(Err(e));
                                 }
                                 continue;
                             }
@@ -583,8 +616,8 @@ async fn run_udp_mux_one_session(
                         ) {
                             Ok(b) => b,
                             Err(e) => {
-                                if let Some(tx) = pending.remove(&xid) {
-                                    let _ = tx.send(Err(e));
+                                if let Some(entry) = pending.remove(&xid) {
+                                    let _ = entry.reply.send(Err(e));
                                 }
                                 continue;
                             }
@@ -592,8 +625,8 @@ async fn run_udp_mux_one_session(
                         maybe_ws_send_jitter(cfg.send_jitter()).await;
                         let mut g = ws_tx.lock().await;
                         if let Err(e) = g.send(Message::Binary(Bytes::from(blob))).await {
-                            if let Some(tx) = pending.remove(&xid) {
-                                let _ = tx.send(Err(anyhow::anyhow!(e)));
+                            if let Some(entry) = pending.remove(&xid) {
+                                let _ = entry.reply.send(Err(anyhow::anyhow!(e)));
                             }
                             break;
                         }
@@ -628,13 +661,19 @@ async fn run_udp_mux_one_session(
                             }
                         };
                         let (xid, sh, sp, pl) = rep;
-                        if let Some(tx) = pending.remove(&xid) {
-                            match crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl) {
-                                Ok(body) => { let _ = tx.send(Ok(body)); }
-                                Err(e) => { let _ = tx.send(Err(e)); }
-                            }
-                        } else {
+                        let Some(entry) = pending.remove(&xid) else {
                             trace!("udp mux: reply for unknown xid {xid} (likely timed out client-side)");
+                            continue;
+                        };
+                        // Snoop DNS answers only for replies to DNS queries this client sent.
+                        if sp == 53 {
+                            if let Some((expected_id, ref expected_qname)) = entry.dns_expect {
+                                crate::domain_route::record_dns(&pl, expected_id, expected_qname);
+                            }
+                        }
+                        match crate::protocol::build_socks5_udp_datagram(&sh, sp, &pl) {
+                            Ok(body) => { let _ = entry.reply.send(Ok(body)); }
+                            Err(e) => { let _ = entry.reply.send(Err(e)); }
                         }
                     }
                     Message::Ping(p) => {
@@ -649,8 +688,8 @@ async fn run_udp_mux_one_session(
         }
     }
 
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Err(anyhow::anyhow!("udp mux session ended")));
+    for (_, entry) in pending.drain() {
+        let _ = entry.reply.send(Err(anyhow::anyhow!("udp mux session ended")));
     }
     Ok(shutdown)
 }
@@ -775,7 +814,8 @@ where
                                 UdpSockHolder::Ephemeral(bind_udp_for_family(want_v6).await?)
                             };
                             let sock = holder.sock_mut();
-                            sock.set_broadcast(true).ok();
+                            // Do not enable SO_BROADCAST: it let a client steer
+                            // relayed UDP at broadcast addresses (amplification).
                             if let Err(e) = sock.send_to(&payload, dest).await {
                                 last_err = Some(anyhow::Error::from(e).context("udp send"));
                                 continue;

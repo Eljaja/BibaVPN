@@ -9,6 +9,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use rand::rngs::OsRng;
 use rand::Rng;
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 /// First byte of Biba v3 opaque client hello (after WS noise/junk).
 pub const V3_HELLO_TAG: u8 = 0x03;
@@ -22,6 +23,17 @@ pub const V3_ACK_PAD_MAX: u8 = 64;
 pub const V3_HELLO_MIN_WIRE_LEN: usize = 1 + 32 + 1;
 
 const MAC_LEN: usize = 16;
+
+/// Compare a received secret (token, password, MAC) against the expected one without
+/// leaking how many leading bytes matched.
+///
+/// Only the content comparison is constant time. The length check short-circuits, so the
+/// length of `got` relative to `expected` is still observable; secret lengths are not hidden.
+pub fn secret_eq(got: impl AsRef<[u8]>, expected: impl AsRef<[u8]>) -> bool {
+    let got = got.as_ref();
+    let expected = expected.as_ref();
+    got.len() == expected.len() && got.ct_eq(expected).into()
+}
 
 fn mac_psk_key_v3(psk: &[u8], domain: &str) -> [u8; 32] {
     let d = domain.as_bytes();
@@ -253,7 +265,8 @@ pub fn parse_ack(
         bail!("bad v3 ACK length");
     }
     let expected = compute_mac(psk.as_bytes(), domain, client_random, &s);
-    if tag != expected.as_slice() {
+    // Constant-time compare: avoid leaking how many leading bytes matched.
+    if tag.ct_ne(expected.as_slice()).into() {
         bail!("ACK mac mismatch");
     }
     Ok(s)
@@ -272,6 +285,26 @@ mod tests {
         let (ack, s) = build_ack(psk, dom, &c).unwrap();
         let s2 = parse_ack(psk, dom, &ack, &c).unwrap();
         assert_eq!(s2, s);
+    }
+
+    #[test]
+    fn secret_eq_accepts_equal_and_rejects_everything_else() {
+        assert!(secret_eq("token-abc", "token-abc"));
+        assert!(secret_eq(&b"token-abc"[..], "token-abc"));
+        // Same length, different content.
+        assert!(!secret_eq("token-abc", "token-abd"));
+        assert!(!secret_eq("Token-abc", "token-abc"));
+        // Different lengths (prefix and suffix cases).
+        assert!(!secret_eq("token-ab", "token-abc"));
+        assert!(!secret_eq("token-abcd", "token-abc"));
+    }
+
+    #[test]
+    fn secret_eq_empty_inputs() {
+        assert!(secret_eq("", ""));
+        assert!(secret_eq(&b""[..], ""));
+        assert!(!secret_eq("", "token"));
+        assert!(!secret_eq("token", ""));
     }
 
     #[test]

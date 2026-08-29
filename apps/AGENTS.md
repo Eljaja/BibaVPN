@@ -61,6 +61,9 @@ cd apps/bibavpn-desktop && npm run tauri:android:build
 
 **Tauri iOS (macOS)**
 
+Packet Tunnel start currently **fails** until Tun2socks (or equivalent) forwards
+`packetFlow` into SOCKS — do not treat iOS as a working VPN yet.
+
 Requirements: Xcode, Apple Developer (VPN entitlements), `pip install pyyaml`, optional Go/gomobile for Tun2socks.
 
 ```bash

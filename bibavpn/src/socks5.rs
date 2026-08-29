@@ -6,6 +6,8 @@ use anyhow::{bail, Context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::crypto_layer::secret_eq;
+
 const SOCKS5_AUTH_NONE: u8 = 0;
 const SOCKS5_AUTH_USERPASS: u8 = 2;
 
@@ -42,6 +44,19 @@ async fn socks5_negotiate_method(local: &mut TcpStream, require_userpass: bool) 
     Ok(())
 }
 
+/// Both comparisons always run and are constant time, so a wrong username is not
+/// distinguishable from a wrong password by timing.
+fn socks5_userpass_ok(
+    uname: &[u8],
+    passwd: &[u8],
+    expected_user: &str,
+    expected_pass: &str,
+) -> bool {
+    let user_ok = secret_eq(uname, expected_user);
+    let pass_ok = secret_eq(passwd, expected_pass);
+    user_ok & pass_ok
+}
+
 async fn socks5_userpass_verify(
     local: &mut TcpStream,
     expected_user: &str,
@@ -63,7 +78,7 @@ async fn socks5_userpass_verify(
     let mut passwd = vec![0u8; plen];
     local.read_exact(&mut passwd).await.context("passwd")?;
 
-    let ok = uname == expected_user.as_bytes() && passwd == expected_pass.as_bytes();
+    let ok = socks5_userpass_ok(&uname, &passwd, expected_user, expected_pass);
     if ok {
         local.write_all(&[1u8, 0u8]).await.context("rfc1929 ok")?;
         Ok(())
@@ -216,4 +231,52 @@ pub async fn socks5_reply_err(local: &mut TcpStream) -> anyhow::Result<()> {
 #[allow(dead_code)]
 pub fn socket_addr_for_test(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
     Ok(format!("{host}:{port}").parse()?)
+}
+
+/// True when the peer opened TCP then closed before completing the SOCKS5 handshake
+/// (port probes, reachability checks, or clients that never send a version byte).
+pub fn is_benign_handshake_abort(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    if !msg.contains("early eof") {
+        return false;
+    }
+    msg.contains("socks version")
+        || msg.contains("methods")
+        || msg.contains("request hdr")
+        || msg.contains("rfc1929 ver")
+        || msg.contains("ulen")
+        || msg.contains("uname")
+        || msg.contains("plen")
+        || msg.contains("passwd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_benign_handshake_abort, socks5_userpass_ok};
+    use anyhow::Context;
+
+    #[test]
+    fn userpass_ok_only_for_both_correct() {
+        assert!(socks5_userpass_ok(b"user", b"pass", "user", "pass"));
+        assert!(!socks5_userpass_ok(b"user", b"wrong", "user", "pass"));
+        assert!(!socks5_userpass_ok(b"wrong", b"pass", "user", "pass"));
+        assert!(!socks5_userpass_ok(b"wrong", b"wrong", "user", "pass"));
+        // Length mismatches (prefix of the expected value must not pass).
+        assert!(!socks5_userpass_ok(b"use", b"pass", "user", "pass"));
+        assert!(!socks5_userpass_ok(b"user", b"pas", "user", "pass"));
+        assert!(!socks5_userpass_ok(b"", b"", "user", "pass"));
+    }
+
+    #[test]
+    fn benign_abort_detects_version_eof() {
+        let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof");
+        let err = Err::<(), _>(err).context("socks version").unwrap_err();
+        assert!(is_benign_handshake_abort(&err));
+    }
+
+    #[test]
+    fn benign_abort_rejects_real_failures() {
+        let err = anyhow::anyhow!("unsupported socks version 4");
+        assert!(!is_benign_handshake_abort(&err));
+    }
 }

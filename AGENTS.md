@@ -41,7 +41,7 @@ control opcodes, and inner UDP records in the same framing.
 That **proto-3** layout is carried over **TLS + WebSocket**; optional **stealth**
 layers sit on the outside (TLS client profile labels, padding modes, timing,
 decoys, optional multi-WSS, optional BoringSSL). **Future inner opcodes / framing**
-may evolve — see the roadmap section in **[PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification)**
+may evolve — see the roadmap section in **[PROTOCOL.md](PROTOCOL.md#target-specification-roadmap)**
 for targets that are not fully implemented here yet.
 
 **WebSocket transport** knobs (ping, frame-size cap, custom headers, early noise)
@@ -59,7 +59,7 @@ the client sends `MUX_OPEN`; per-target opens use mux records (stream id, flags,
 payload) inside padded frames, with window-based flow control. Use `--no-mux` for
 legacy **one WSS per SOCKS CONNECT** (`OPEN` + binary loop). **REALITY** mode uses
 the same `**--ws-parallel` 1..=4** pattern: each outer link runs TLS + WSS +
-REALITY (X25519) handshake, then `MUX_OPEN`; the pool **round-robins** new streams
+REALITY (X25519 + client AUTH) handshake, then `MUX_OPEN`; the pool **round-robins** new streams
 (`connect_reality_tcp_mux_handle` in `local_client.rs`).
 
 **UDP** (e.g. DNS via SOCKS5 UDP) uses a **separate** shared WSS:
@@ -96,12 +96,23 @@ for the operator story.
 
 **REALITY (WSS path):** optional front-domain mode — outer **TLS SNI** follows
 `reality_target` (e.g. `vk.com`), then **WSS upgrade**, then **X25519** binary frames on the
-WebSocket (`reality.rs`), then **plaintext** `MUX_OPEN` (no v3 PSK on that TCP path). This is
+WebSocket (`reality.rs`), then a **mandatory client AUTH frame**, then **plaintext** `MUX_OPEN`
+(no v3 PSK on that TCP path). This is
 **not** Xray-style TLS ClientHello stealing; see **[PROTOCOL.md — REALITY](PROTOCOL.md#reality-wss-path)**.
 Server: `--reality-target`, `--reality-private-key`, optional `--reality-short-ids` (SpiderX
-background fetch runs when REALITY is enabled). Client / invite: `reality_target`,
+background fetch runs when REALITY is enabled; a missing/all-zeros allowlist accepts any short ID and
+logs a `WARN` at startup). Client / invite: `reality_target`,
 `reality_public_key`, `reality_short_id`. Outer TLS may use **rustls** or **boring** (same as
 non-REALITY). Test: `cargo test -p bibavpn --test reality_handshake`.
+
+**REALITY client AUTH is required** in every REALITY session, on both the `MUX_OPEN` and the
+REALITY + v3 (UDP mux) sub-paths: `[version:1][0xa1][mac:32]` right after `SERVER_HELLO`, where the
+MAC is keyed BLAKE3 over `client_ephemeral_pub || server_pub` keyed by `shared_secret || token`
+(`reality_client_auth_mac`). The X25519 exchange only authenticates the **server**, so before this
+frame existed the REALITY TCP path was an **open proxy**. The token is never sent on the wire; the
+server compares in constant time and records failures with the auth rate limiter, like a v3 AUTH
+mismatch. Adding a frame does not change the HELLO / SERVER_HELLO layout, so `REALITY_VERSION`
+stays `2` — but old and new peers no longer interoperate on the REALITY path.
 
 Typical traffic path (TCP, mux):
 
@@ -155,7 +166,7 @@ Full layout for `**apps/`** (desktop, Android, JNI crate, scripts): **[apps/AGEN
 | `bibavpn/src/ws_auth.rs`                            | Server waits for sealed `AUTH` (timeout, pre-`AUTH` junk/decrypt budgets via `PreAuthBudget` in `server_limits.rs`)   |
 | `bibavpn/src/tcp_mux.rs`                            | Mux wire format, client handle, server bridge, optional idle dummy, multi-WSS pool + RR                            |
 | `bibavpn/src/tcp_mux_roadmap.rs`                    | **Historical** one-WSS mux sketch; **current** implementation is `tcp_mux.rs` (doc-only module)                    |
-| `bibavpn/src/reality.rs`                              | WSS REALITY: X25519 exchange, SpiderX, `effective_tls_sni`, invite fields                     |
+| `bibavpn/src/reality.rs`                              | WSS REALITY: X25519 exchange, mandatory client AUTH MAC (`reality_client_auth_mac`), SpiderX, `effective_tls_sni`, invite fields                     |
 | `bibavpn/src/client_tls_stream.rs`, `tls_boring.rs` | `TlsStack` paths: `rustls` (default) vs `boring` (`--features boring-tls`); REALITY + Boring; **`--pin-cert`** on both; Boring **`--tls-fragment`** via `SSL_CTX_set_max_send_fragment` |
 | `bibavpn/src/client_policy.rs`                      | TLS client label resolution: `fingerprint` → `tls_profile` → invite → `stealth` → default **Chrome 132+**          |
 | `bibavpn/src/stealth_v12.rs`                        | `StealthProfile` / presets (pad, jitter, decoys, idle threshold, server RTT defaults)                              |
@@ -167,6 +178,7 @@ Full layout for `**apps/`** (desktop, Android, JNI crate, scripts): **[apps/AGEN
 | `bibavpn/src/protocol.rs`                           | Proto-3 sealed opcodes, `UDP_MUX_OPEN`, `UDP_REQ`/`UDP_REP` (`0x05`/`0x06`), ATYP helpers                            |
 | `bibavpn/src/tls_util.rs`, `frame.rs`, `stealth.rs` | Cipher/ALPN + `TlsStack` + record-fragment notes (`tls_util.rs`); `PadMode`; WS upgrade (UA / Sec-CH / `Accept-Language`) |
 | `bibavpn/src/server_limits.rs`                      | `AuthRateLimiter`, `PreAuthBudget`, `ServerStats` / `SessionGuard`                                                 |
+| `bibavpn/src/server_metrics.rs`                     | Prometheus text render + optional HTTP `/metrics` and `/healthz` on `--metrics-listen`; optional `--metrics-password` Basic Auth |
 | `bibavpn/src/transport_capabilities.rs`             | `log_server_listen_caps` / `log_client_transport_caps`; effective desync helpers                                    |
 | `bibavpn/src/logging.rs`                           | Tracing init (`LogConfig`, idempotent second init); `bibavpn/src/log_ratelimit.rs` — hot-path log cadence          |
 | `bibavpn/src/desync.rs`                            | TCP post-connect hints, TLS fragment notes, decoy RTT jitter; **re-export** `effective_desync_mode`, `DesyncApplied` |
@@ -213,9 +225,18 @@ the mux record header when chunking TCP).
 - `--early-ws-frames`, `--junk-frames`
 - `--pin-cert` (client) — incompatible with `--insecure`; supported on **rustls** and **boring** (`boring-tls` build)
 - `--reality-target`, `--reality-public-key`, `--reality-short-id` (client) — WSS REALITY front mode; invite JSON mirrors these fields
-- Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any; all-zero entry = wildcard), `--reality-server-names` (optional SNI allowlist; default = host from target)
+- Server **REALITY:** `--reality-target vk.com:443`, `--reality-private-key` (base64 X25519 seed, 32 bytes), `--reality-short-ids` (hex, comma-separated; empty = any + startup `WARN`; all-zero entry = wildcard + startup `WARN`), `--reality-server-names` (optional enforced TLS SNI / HTTP Host allowlist; default = host from target; empty list = any + startup `WARN`). `--token` is **required** on the REALITY path too: it keys the client AUTH MAC.
 - `--ws-path` / server `--ws-path` — WebSocket path; token via `AUTH`
 (default `/ws`)
+- **`--token`** — no default on server or client. Required unless the client uses
+`--from-invite` or either binary passes **`--lab`** (local demos only; logs
+`bibavpn_security` WARN). Denylisted values (case-insensitive, after trim):
+`change-me`, `changeme`, `test`; empty/whitespace is rejected. JSON/Android
+start has no `lab` field — omitting `token` without a valid invite fails closed.
+- **`--psk`** — required at process start on server and client unless **REALITY**
+is fully configured (server: `--reality-target` + `--reality-private-key`;
+client: `reality_target` + `reality_public_key` after invite merge) or **`--lab`**.
+REALITY without PSK still starts but logs WARN that v3 HELLO / UDP mux need PSK.
 - Client `--proto` (only `**3`** is supported) and `--proto-domain` (KDF label;
 empty → SNI)
 - Server `--proto-domain` — KDF domain string for proto 3 (default `default`); must match
@@ -240,7 +261,9 @@ balanced/aggressive default **10 s** unless overridden)
 that record splitting is not implemented (`desync::note_tls_fragment_requested`)
 - **Server:** `--ack-profile balanced|aggressive` if explicit `--server-ack-`* /
 `--rtt-mask-jitter-ms` are all zero; else set delays in milliseconds directly
-- **Server:** `--handshake-timeout-secs` (HELLO…`AUTH`, default **15**),
+- **Server:** `--handshake-timeout-secs` (per pre-tunnel phase: TLS accept, WS
+upgrade / camouflage HTTP head, REALITY exchange, HELLO…`AUTH`, and the post-AUTH
+wait for `OPEN` / `MUX_OPEN` / `UDP_MUX_OPEN`; default **15**),
 `--mux-connect-timeout-secs` (per mux stream outbound TCP connect, default **10**)
 - Server `--camouflage-dir`, `--camouflage-url` (`http://` upstream only)
 - **Logging (CLI):** server and client `--log-level`, `--log-format plain|json`;
@@ -303,8 +326,10 @@ logs a one-line summary via `transport_capabilities::log_server_listen_caps`):
   accept waits **up to 5 seconds** for a permit; if none is available, the TCP
   is dropped and a `bibavpn_security` line records the timeout (server busy).
 - **`--no-auth-rate-limit`** / **`--auth-max-failures`** /
-  **`--auth-failure-window-secs`** / **`--auth-ban-secs`** — per-IP limits on
-  failed tunnel `AUTH` (see `server_limits::AuthRateLimiter`).
+  **`--auth-failure-window-secs`** / **`--auth-ban-secs`** — per-source limits
+  on failed tunnel `AUTH` (see `server_limits::AuthRateLimiter`). Counted per
+  bucket, **IPv4 /32** and **IPv6 /64** (`server_limits::auth_limit_key`), so a
+  routed IPv6 prefix cannot rotate source addresses to dodge the ban.
 - **`--handshake-max-junk-bytes`** (+ internal frame/decrypt budgets) — bounds
   pre-`AUTH` noise before `AUTH` completes (`server_limits::PreAuthBudget`).
 - **`--udp-socket-pool-size`** — reuse up to N UDP sockets on the UDP mux path
@@ -316,8 +341,13 @@ accepted connection until it finishes).
 
 **Other server timeouts / telemetry:**
 
-- **`--handshake-timeout-secs`** — drop inbound sessions that never complete
-  HELLO…`AUTH` in time (default **15**).
+- **`--handshake-timeout-secs`** — drop inbound sessions that stall in any
+  pre-tunnel phase (default **15**, applied per phase): TLS accept, WebSocket
+  upgrade / camouflage HTTP head, REALITY exchange and its first application
+  frame, the HELLO…`AUTH` wait, and the post-AUTH wait for `OPEN` /
+  `MUX_OPEN` / `UDP_MUX_OPEN`. The concurrency permit is taken before any
+  peer I/O, so without this a silent socket would hold a session slot; expiry
+  counts in `bibavpn_handshake_timeouts_total` and releases the permit.
 - **`--mux-connect-timeout-secs`** — limit how long the server waits on each
   outbound **TCP connect** for a mux stream (default **10**).
 - **`--stats-interval-secs`** — periodic aggregate stats on the `bibavpn_server`
@@ -450,7 +480,7 @@ See **[SECURITY.md](SECURITY.md)** for the disclosure policy.
 
 ## Stealth, DPI, and roadmap
 
-**Long-term targets:** [roadmap section in PROTOCOL.md](PROTOCOL.md#bibav4-v120-target-specification).
+**Long-term targets:** [roadmap section in PROTOCOL.md](PROTOCOL.md#target-specification-roadmap).
 **Release history:** [CHANGELOG.md](CHANGELOG.md).
 
 This table tracks **PROTOCOL.md roadmap** items against what the **current tree**
@@ -465,7 +495,7 @@ This table tracks **PROTOCOL.md roadmap** items against what the **current tree*
 | **Padding**              | `PadMode::Adaptive` + `stealth` / presets                                                                                                                                | Future spec may redefine burst heuristics / budgets                                                                                      |
 | **Jitter**               | Min/max MS on WS sends; preset merge                                                                                                                                     | Spec band (e.g. 5–25 ms) as product default                                          |
 | **Decoys**               | Parallel `--decoy-gets` + idle decoys (`--idle-decoy-secs`): same **TLS/WS fingerprint class** as tunnel (UA / `Accept-Language` / upgrade shape); decoy fields in presets (`stealth_v12.rs`) | Full `--decoy-mode browser` catalog (Referer parity, etc.) per spec                     |
-| **REALITY (WSS)**        | X25519 after WSS upgrade; pinned server pubkey in invite; auto **SNI** from `reality_target`; plaintext mux; SpiderX; **rustls** or **boring** outer TLS; test `reality_handshake.rs` | Xray TLS ClientHello relay / uTLS parity on REALITY path |
+| **REALITY (WSS)**        | X25519 after WSS upgrade; pinned server pubkey in invite; **mandatory client AUTH MAC (token)** before any application frame; auto **SNI** from `reality_target`; plaintext mux; SpiderX; **rustls** or **boring** outer TLS; test `reality_handshake.rs` | Xray TLS ClientHello relay / uTLS parity on REALITY path |
 | **Desync**               | `DesyncConfig` on wire + `desync` module (`effective_desync_mode` / `DesyncApplied`; operator notes in PROTOCOL/README) | Raw-socket / OS hook paths; privilege guards                                         |
 | **UI / JNI**             | `start_json_config` fields for new options where wired                                                                                                                   | Expose all toggles in Tauri + Android as they stabilize                              |
 

@@ -1,7 +1,9 @@
 //! Bypass (split-tunnel) domain lists from the control-plane API.
 //!
 //! URL is **not** hardcoded: set `BIBA_BYPASS_DOMAINS_URL` at build time (CI secret / local `.env`)
-//! or at runtime. Responses are cached on disk under `%LOCALAPPDATA%/BibaVPN/`.
+//! or at runtime. CI also fetches the JSON before `cargo build` and embeds it via `build.rs`
+//! (`include_str!` from `OUT_DIR`) so split-tunnel works offline / before the first refresh.
+//! Responses are cached on disk under the platform data dir (`…/BibaVPN/`).
 
 use std::collections::HashMap;
 use std::fs;
@@ -149,6 +151,25 @@ pub fn bypass_domains_url() -> Option<String> {
             Some(t.to_string())
         }
     })
+}
+
+/// JSON baked in at compile time (CI `ci-fetch-bypass-domains.sh` → `build.rs` → OUT_DIR).
+const EMBEDDED_BYPASS_JSON: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/bypass_domains_embedded.json"));
+
+fn load_embedded_presets() -> Option<(Vec<BypassPresetInfo>, u64)> {
+    match parse_api_payload(EMBEDDED_BYPASS_JSON) {
+        Ok((presets, ttl)) if !presets.is_empty() => Some((presets, ttl)),
+        _ => None,
+    }
+}
+
+/// True when a URL is configured and/or a non-empty list was embedded at build time.
+pub fn bypass_source_configured() -> bool {
+    if bypass_domains_url().is_some() {
+        return true;
+    }
+    option_env!("BIBA_BYPASS_DOMAINS_EMBEDDED").is_some() || load_embedded_presets().is_some()
 }
 
 fn cache_file_path() -> Option<PathBuf> {
@@ -395,10 +416,33 @@ pub fn background_refresh_full() {
     }
 }
 
-/// Load presets from memory, disk, or network (in that order when stale).
+fn apply_embedded_into_cache() -> Result<Vec<BypassPresetInfo>, String> {
+    let Some((presets, ttl)) = load_embedded_presets() else {
+        return Ok(Vec::new());
+    };
+    let url = bypass_domains_url().unwrap_or_else(|| "embedded://bypass_domains".to_string());
+    let mut state = cache_lock().lock().map_err(|e| e.to_string())?;
+    apply_presets(&mut state, presets.clone(), ttl, &url);
+    info!(
+        target: "bibavpn_desktop",
+        count = presets.len(),
+        "bypass-domains: using compile-time embedded list"
+    );
+    Ok(presets)
+}
+
+/// Load presets from memory, disk, network, or compile-time embed (in that order when stale).
 pub fn ensure_loaded(force_refresh: bool) -> Result<Vec<BypassPresetInfo>, String> {
-    let url = bypass_domains_url()
-        .ok_or_else(|| "BIBA_BYPASS_DOMAINS_URL не задан (CI secret или local .env)".to_string())?;
+    let url_opt = bypass_domains_url();
+    if url_opt.is_none() && load_embedded_presets().is_none() {
+        return Err(
+            "BIBA_BYPASS_DOMAINS_URL не задан и embedded-список пуст (CI secret / local .env)"
+                .to_string(),
+        );
+    }
+    let url = url_opt
+        .clone()
+        .unwrap_or_else(|| "embedded://bypass_domains".to_string());
 
     {
         let state = cache_lock().lock().map_err(|e| e.to_string())?;
@@ -414,17 +458,27 @@ pub fn ensure_loaded(force_refresh: bool) -> Result<Vec<BypassPresetInfo>, Strin
             info!(target: "bibavpn_desktop", count = state.presets.len(), "bypass-domains: disk cache");
             return Ok(state.presets.clone());
         }
+        // Prefer baked-in list over a cold network hop on first launch.
+        if let Ok(presets) = apply_embedded_into_cache() {
+            if !presets.is_empty() {
+                return Ok(presets);
+            }
+        }
     }
 
-    match fetch_remote(&url) {
+    let Some(remote_url) = url_opt else {
+        return apply_embedded_into_cache();
+    };
+
+    match fetch_remote(&remote_url) {
         Ok((presets, ttl)) => {
-            save_disk_cache(&url, ttl, &presets);
+            save_disk_cache(&remote_url, ttl, &presets);
             let mut state = cache_lock().lock().map_err(|e| e.to_string())?;
-            apply_presets(&mut state, presets.clone(), ttl, &url);
+            apply_presets(&mut state, presets.clone(), ttl, &remote_url);
             info!(
                 target: "bibavpn_desktop",
                 count = presets.len(),
-                url = %url,
+                url = %remote_url,
                 "bypass-domains: fetched from API"
             );
             Ok(presets)
@@ -435,13 +489,14 @@ pub fn ensure_loaded(force_refresh: bool) -> Result<Vec<BypassPresetInfo>, Strin
             if state.loaded && !state.presets.is_empty() {
                 return Ok(state.presets.clone());
             }
-            if let Some(file) = load_disk_cache(&url) {
+            if let Some(file) = load_disk_cache(&remote_url) {
                 drop(state);
                 let mut state = cache_lock().lock().map_err(|e2| e2.to_string())?;
-                apply_presets(&mut state, file.presets.clone(), file.ttl_sec, &url);
+                apply_presets(&mut state, file.presets.clone(), file.ttl_sec, &remote_url);
                 return Ok(state.presets.clone());
             }
-            Ok(Vec::new())
+            drop(state);
+            apply_embedded_into_cache()
         }
     }
 }
@@ -522,6 +577,12 @@ pub fn cached_android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
 
 pub fn android_packages_for_preset_ids(ids: &[String]) -> Vec<String> {
     cached_android_packages_for_preset_ids(ids)
+}
+
+#[cfg(test)]
+pub fn replace_cache_for_test(presets: Vec<BypassPresetInfo>) {
+    let mut state = cache_lock().lock().expect("bypass cache");
+    apply_presets(&mut state, presets, DEFAULT_TTL_SEC, "test://bypass");
 }
 
 #[cfg(test)]

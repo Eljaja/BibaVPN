@@ -6,6 +6,9 @@ use anyhow::{bail, Context};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+/// Local-only liveness path for desktop recovery probes (not forwarded to the tunnel).
+pub const LOCAL_HEALTH_PATH: &str = "/bibavpn-health";
+
 /// Parsed first client request on the local HTTP proxy port.
 #[derive(Debug)]
 pub enum HttpProxyHandshake {
@@ -22,6 +25,39 @@ pub enum HttpProxyHandshake {
         port: u16,
         to_origin: Vec<u8>,
     },
+}
+
+/// Respond to `GET /bibavpn-health` without opening a tunnel (desktop liveness probe).
+pub async fn try_serve_health_check(stream: &mut TcpStream) -> anyhow::Result<bool> {
+    let mut buf = [0u8; 128];
+    let n = stream.peek(&mut buf).await.context("health peek")?;
+    if n == 0 {
+        return Ok(false);
+    }
+    let prefix = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    if !prefix.starts_with("GET /bibavpn-health ") && !prefix.starts_with("GET /bibavpn-health\r") {
+        return Ok(false);
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.context("health read line")?;
+    read_header_block(&mut reader).await?;
+    let stream = reader.into_inner();
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        )
+        .await
+        .context("health write")?;
+    stream.flush().await.context("health flush")?;
+    Ok(true)
+}
+
+/// True when the peer opened TCP then closed before sending an HTTP request line.
+pub fn is_benign_handshake_abort(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("empty request line") || (msg.contains("early eof") && msg.contains("read request line"))
 }
 
 /// Read the first HTTP request: either `CONNECT` or proxy-style `METHOD http://authority/path …`.
@@ -230,5 +266,11 @@ mod tests {
         let uri: Uri = "http://10.0.0.1/".parse().unwrap();
         assert_eq!(uri.host(), Some("10.0.0.1"));
         assert_eq!(uri.port_u16(), None);
+    }
+
+    #[test]
+    fn benign_abort_detects_empty_request_line() {
+        let err = anyhow::anyhow!("empty request line");
+        assert!(super::is_benign_handshake_abort(&err));
     }
 }
