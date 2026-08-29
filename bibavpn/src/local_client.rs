@@ -1187,11 +1187,27 @@ pub fn parse_ws_header(line: &str) -> anyhow::Result<(String, String)> {
 /// Split-tunnel bypass: relay a CONNECT straight to the target from the device,
 /// outside the tunnel. On Android the outbound socket is protected via the
 /// installed `outbound_protect` hook, so it does not loop back into the TUN.
-async fn direct_bypass_relay(mut local: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+async fn direct_bypass_relay(local: TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+    direct_bypass_relay_preface(local, host, port, Vec::new()).await
+}
+
+async fn direct_bypass_relay_preface(
+    mut local: TcpStream,
+    host: &str,
+    port: u16,
+    preface: Vec<u8>,
+) -> anyhow::Result<()> {
     let mut remote = crate::outbound_protect::tcp_connect_host_protected(host, port)
         .await
         .map_err(|e| anyhow::anyhow!("direct bypass connect {host}:{port}: {e}"))?;
     let _ = remote.set_nodelay(true);
+    if !preface.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        remote
+            .write_all(&preface)
+            .await
+            .map_err(|e| anyhow::anyhow!("direct bypass preface {host}:{port}: {e}"))?;
+    }
     tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
     Ok(())
 }
@@ -1454,6 +1470,12 @@ async fn handle_http_peer(
             port,
             client_prefetch,
         }) => {
+            // Same split-tunnel check as SOCKS CONNECT. Linux system proxy (GSettings /
+            // http_proxy) sends HTTPS here, so skipping this made domain bypass a no-op.
+            if crate::domain_route::should_bypass(&host) {
+                http_connect::reply_connect_ok(&mut local).await?;
+                return direct_bypass_relay_preface(local, &host, port, client_prefetch).await;
+            }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ =
@@ -1510,6 +1532,9 @@ async fn handle_http_peer(
             port,
             to_origin,
         }) => {
+            if crate::domain_route::should_bypass(&host) {
+                return direct_bypass_relay_preface(local, &host, port, to_origin).await;
+            }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     let _ =
@@ -1772,5 +1797,180 @@ mod session_shutdown_tests {
         let after = hits.load(Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits.load(Ordering::Relaxed), after);
+    }
+}
+
+/// Linux (and any desktop) system proxy sends HTTPS through the local HTTP CONNECT
+/// port, not SOCKS. Split-tunnel must therefore fire on this path, not only SOCKS.
+#[cfg(test)]
+mod http_split_bypass_tests {
+    use super::*;
+    use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile, TlsStack};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
+
+    fn dummy_http_cfg() -> Arc<ClientCfg> {
+        let tls = client_tls_config(&ClientTlsParams {
+            insecure: true,
+            profile: TlsClientProfile::Default,
+            pinned_certs_pem: None,
+        })
+        .expect("tls");
+        Arc::new(ClientCfg {
+            server_host: "127.0.0.1".into(),
+            server_port: 1,
+            sni: "localhost".into(),
+            token: "t".into(),
+            insecure_tls: true,
+            tls,
+            max_pad: 0,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            psk: None,
+            decoy_max: 0,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_extra_headers: Arc::new(Vec::new()),
+            max_ws_binary: 65535,
+            ws_ping_secs: 0,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            udp_mux_max_pad: 0,
+            udp_mux_max_ws_binary: 65535,
+            udp_mux_reply_timeout_secs: 1,
+            tls_profile: TlsClientProfile::Default,
+            ws_path: "/ws".into(),
+            use_tcp_mux: true,
+            pad_mode: PadMode::Adaptive,
+            dummy_interval_secs: 0,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 0,
+            decoy_gets_paths: Vec::new(),
+            proto: 3,
+            proto_domain: String::new(),
+            reality_target: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            decoy_mode: DecoyMode::default(),
+            desync_mode: DesyncMode::default(),
+            tcp_fooling: TcpFooling::default(),
+            tls_fragment: false,
+            ws_parallel: 1,
+            idle_decoy_secs: 0,
+            activity: None,
+            socks_auth: None,
+            socks_bind: "127.0.0.1:0".into(),
+            tls_stack: TlsStack::Rustls,
+            pinned_certs_pem: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn http_connect_split_bypass_reaches_origin_directly() {
+        crate::domain_route::set_bypass_domains(&["localhost".into()]);
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+        let origin_addr = origin.local_addr().expect("origin addr");
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+
+        let origin_task = tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.expect("origin accept");
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).await.expect("origin read");
+            assert_eq!(&buf[..n], b"ping");
+            s.write_all(b"pong").await.expect("origin write");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let req = format!(
+                "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+                origin_addr.port(),
+                origin_addr.port()
+            );
+            s.write_all(req.as_bytes()).await.expect("client CONNECT");
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).await.expect("client read 200");
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                resp.contains("200"),
+                "HTTP CONNECT bypass should reply 200, got {resp:?}"
+            );
+            s.write_all(b"ping").await.expect("client ping");
+            let n = s.read(&mut buf).await.expect("client pong");
+            assert_eq!(&buf[..n], b"pong");
+        });
+
+        let (local, _) = proxy.accept().await.expect("proxy accept");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let session = SessionGuard::new(shutdown_rx);
+        let mux: TcpMuxSlot = Arc::new(Mutex::new(None));
+        let handled = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle_http_peer(local, dummy_http_cfg(), mux, session),
+        )
+        .await;
+        crate::domain_route::set_bypass_domains(&[]);
+        handled
+            .expect("timed out — HTTP CONNECT stayed on the tunnel instead of bypassing")
+            .expect("handle_http_peer");
+        client.await.expect("client");
+        origin_task.await.expect("origin");
+    }
+
+    #[tokio::test]
+    async fn http_forward_split_bypass_reaches_origin_directly() {
+        crate::domain_route::set_bypass_domains(&["localhost".into()]);
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+        let origin_addr = origin.local_addr().expect("origin addr");
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+
+        let origin_task = tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.expect("origin accept");
+            let mut buf = vec![0u8; 256];
+            let n = s.read(&mut buf).await.expect("origin read");
+            let got = String::from_utf8_lossy(&buf[..n]);
+            assert!(got.starts_with("GET /x HTTP/1.1"), "got {got:?}");
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .expect("origin write");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let req = format!(
+                "GET http://localhost:{}/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                origin_addr.port()
+            );
+            s.write_all(req.as_bytes()).await.expect("client GET");
+            let mut buf = vec![0u8; 256];
+            let n = s.read(&mut buf).await.expect("client read");
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(resp.contains("200") && resp.contains("ok"), "got {resp:?}");
+        });
+
+        let (local, _) = proxy.accept().await.expect("proxy accept");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let session = SessionGuard::new(shutdown_rx);
+        let mux: TcpMuxSlot = Arc::new(Mutex::new(None));
+        let handled = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle_http_peer(local, dummy_http_cfg(), mux, session),
+        )
+        .await;
+        crate::domain_route::set_bypass_domains(&[]);
+        handled
+            .expect("timed out — HTTP forward stayed on the tunnel instead of bypassing")
+            .expect("handle_http_peer");
+        client.await.expect("client");
+        origin_task.await.expect("origin");
     }
 }
