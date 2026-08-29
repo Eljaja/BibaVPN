@@ -64,11 +64,11 @@ fn split_bypass_domains_from_start_json_reaches_domain_route() {
     // Once the UDP relay snoops a DNS answer for a bypassed domain, that IP goes direct.
     // This is what `excludeRoute` cannot do: the association is learned live, so a CDN
     // rotating addresses keeps working without reconnecting.
-    domain_route::record_dns(&dns_a_response("example.com", [93, 184, 216, 34], 3600));
+    domain_route::record_dns(&dns_a_response("example.com", [93, 184, 216, 34], 3600), 0x1234, "example.com");
     assert!(domain_route::should_bypass("93.184.216.34"));
 
     // An IP belonging to a domain that is not on the list stays tunneled.
-    domain_route::record_dns(&dns_a_response("other.org", [198, 51, 100, 7], 3600));
+    domain_route::record_dns(&dns_a_response("other.org", [198, 51, 100, 7], 3600), 0x1234, "other.org");
     assert!(!domain_route::should_bypass("198.51.100.7"));
 }
 

@@ -54,7 +54,9 @@ use bibavpn::tls_util::install_ring_crypto;
 use config::load_config_from_path;
 use config::{
     apply_invite_fields, desktop_config_json_path, display_host_line, import_control_plane_payload,
-    load_config_disk, normalize_loaded, save_config_to_path, server_card_subtitle, SavedConfig,
+    load_config_disk, merge_saved_config, normalize_loaded, profile_control_plane_origins,
+    save_config_to_path, server_card_subtitle, to_public_saved_config, PublicSavedConfig,
+    SavedConfig,
 };
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use locale::{resolved_tray_lang, tray_strings};
@@ -104,6 +106,23 @@ enum VpnPhase {
     Disconnecting,
 }
 
+#[derive(Debug, Clone)]
+struct PendingControlPlaneImport {
+    origin: String,
+    payload: control_plane_client::ImportPayload,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PendingImportView {
+    control_plane_host: String,
+    display_name: String,
+    server_name: String,
+    server_public_host: String,
+    host_port: i64,
+    vpn_host: String,
+}
+
 pub(crate) struct Inner {
     cfg: SavedConfig,
     proxy_backup: Option<ProxyBackup>,
@@ -116,6 +135,8 @@ pub(crate) struct Inner {
     /// so the watchdog must keep retrying instead of giving up after one attempt.
     /// Cleared by a successful connect or an explicit user disconnect.
     recovery_pending: bool,
+    /// Control-plane import awaiting user confirmation (not persisted).
+    pending_import: Option<PendingControlPlaneImport>,
 }
 
 #[derive(Clone)]
@@ -133,7 +154,7 @@ struct ClientCapabilities {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StateSnapshot {
-    cfg: SavedConfig,
+    cfg: PublicSavedConfig,
     connected: bool,
     display_host: String,
     server_subtitle: String,
@@ -181,6 +202,38 @@ fn measure_tcp_connect_rtt_ms(host: &str, port: u16) -> Option<u32> {
     Some(ms.min(u128::from(u32::MAX)) as u32)
 }
 
+/// Стабильные JNI-коды Android connect → короткий текст для UI (`last_error` / snapshot).
+fn map_android_jni_connect_error(code: &str) -> String {
+    match code.trim() {
+        "" => String::new(),
+        "vpn_permission_denied" => "Разрешение VPN отклонено".into(),
+        "vpn_permission_timeout" => "Истекло время ожидания разрешения VPN".into(),
+        "vpn_permission_ui_unavailable" => "Не удалось показать запрос разрешения VPN".into(),
+        "connect_ui_thread_timeout" => "Таймаут подключения VPN (UI)".into(),
+        "connect_interrupted" => "Подключение VPN прервано".into(),
+        "vpn_tunnel_start_failed" => "Не удалось поднять VPN-туннель".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Overlay bootstrap-ошибки из Kotlin, когда туннель ещё не активен и Rust `last_error` пуст.
+fn android_snapshot_error(
+    last_error: &Option<String>,
+    connected: bool,
+    jni_connect_error: Option<String>,
+) -> Option<String> {
+    if last_error.is_some() {
+        return last_error.clone();
+    }
+    if connected {
+        return None;
+    }
+    jni_connect_error
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| map_android_jni_connect_error(&s))
+        .filter(|s| !s.is_empty())
+}
+
 fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     #[cfg(target_os = "android")]
     let connected = android_vpn::tunnel_is_active(app).unwrap_or(false);
@@ -205,13 +258,18 @@ fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
     };
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let vpn_session_uptime_secs = None;
+    #[cfg(target_os = "android")]
+    let jni_connect_error = android_vpn::last_connect_error(app).ok().flatten();
+    #[cfg(not(target_os = "android"))]
+    let jni_connect_error: Option<String> = None;
+    let error = android_snapshot_error(&inner.last_error, connected, jni_connect_error);
     StateSnapshot {
-        cfg: inner.cfg.clone(),
+        cfg: to_public_saved_config(&inner.cfg),
         connected,
         display_host: display_host_line(&inner.cfg),
         server_subtitle: server_card_subtitle(&inner.cfg),
         tunnel_server: inner.tunnel_server.clone(),
-        error: inner.last_error.clone(),
+        error,
         can_connect: inner.cfg.can_connect(),
         capabilities: ClientCapabilities {
             boring_tls_available: cfg!(feature = "boring-tls"),
@@ -270,6 +328,15 @@ fn inject_mobile_tunnel_session_json(base_json: &str) -> Result<String, String> 
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn start_json_with_bypass_cache(cfg: &SavedConfig) -> Result<String, String> {
+    // Must run before `start_config_json()`: that builds `split_bypass_domains` for the
+    // tunnel client's DNS-snoop split routing out of the in-memory preset cache, so a cold
+    // cache here means an empty bypass list and silently no domain split at all.
+    let _ = bypass_domains::ensure_loaded(false);
+    cfg.start_config_json()
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn sync_tray_tooltip_i18n(app: &AppHandle, connected: bool, cfg: &SavedConfig) {
     let s = tray_strings(resolved_tray_lang(cfg));
@@ -323,19 +390,33 @@ fn apply_tray_menu_locale(
     Ok(())
 }
 
+/// Импорт по ссылке всегда уходит с главного потока.
+///
+/// [`handle_import_deeplink`] делает блокирующий HTTP-запрос к control plane
+/// (`ureq`, по 20 с на connect и на read), а попасть сюда можно только с
+/// главного потока: из `setup()` при запуске по ссылке и из `RunEvent::Opened`
+/// на macOS (Rust-слушатели `emit` вызываются инлайн на потоке-эмитенте).
+/// Синхронный вызов замораживал окно на всё время запроса, а на старте —
+/// задерживал его появление.
+fn spawn_import_deeplink(state: AppState, app: AppHandle, raw_url: String) {
+    std::thread::spawn(move || {
+        if let Err(e) = handle_import_deeplink(&state, &app, &raw_url) {
+            warn!(target: "bibavpn_desktop", "deep link: {e}");
+            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.last_error = Some(e);
+            let snap = snapshot(&app, &g);
+            drop(g);
+            let _ = app.emit("vpn-state", &snap);
+        }
+    });
+}
+
 fn install_deep_link_handler(app: &AppHandle, state: AppState) {
     let handle = app.clone();
     let st = state.clone();
     app.deep_link().on_open_url(move |event| {
         for url in event.urls() {
-            let raw = url.to_string();
-            if let Err(e) = handle_import_deeplink(&st, &handle, &raw) {
-                warn!(target: "bibavpn_desktop", "deep link: {e}");
-                let mut g = st.inner.lock().unwrap_or_else(|p| p.into_inner());
-                g.last_error = Some(e);
-                let snap = snapshot(&handle, &g);
-                let _ = handle.emit("vpn-state", &snap);
-            }
+            spawn_import_deeplink(st.clone(), handle.clone(), url.to_string());
         }
     });
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -344,10 +425,7 @@ fn install_deep_link_handler(app: &AppHandle, state: AppState) {
     }
     if let Ok(Some(urls)) = app.deep_link().get_current() {
         for url in urls {
-            let raw = url.to_string();
-            if let Err(e) = handle_import_deeplink(&state, app, &raw) {
-                warn!(target: "bibavpn_desktop", "deep link startup: {e}");
-            }
+            spawn_import_deeplink(state.clone(), app.clone(), url.to_string());
         }
     }
 }
@@ -585,6 +663,50 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
     });
 }
 
+/// Подключение из трея — тоже вне главного потока.
+///
+/// Обработчики меню трея Tauri вызываются инлайн из event loop
+/// (`muda::MenuEvent` → `RunEvent::MenuEvent` → слушатели), то есть на главном
+/// потоке. [`connect_inner`] ждёт готовности локального прокси и туннеля до 45 с,
+/// плюс HTTP за списками обхода, запись конфига и подпроцессы системного прокси;
+/// прямой вызов из трея подвешивал окно, IPC и сам трей на всё это время.
+/// IPC-команды [`connect_cmd`] / [`disconnect_cmd`] уже уходят с главного потока
+/// через `spawn_blocking` — трей обязан вести себя так же.
+///
+/// Отдельный поток, а не blocking-пул `tauri::async_runtime`: пул делят
+/// `connect_cmd`, `disconnect_cmd`, `get_bypass_presets_cmd` и RTT-пробы раз в
+/// 8 с, а здесь работа редкая и долгая — как у watchdog и prefetch рядом.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn spawn_tray_connect(state: AppState, app: AppHandle) {
+    std::thread::spawn(move || {
+        let failed = match connect_inner(&state, &app) {
+            Ok(()) => false,
+            Err(e) => {
+                warn!(target: "bibavpn_desktop", "подключение из трея: {e}");
+                let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+                g.last_error = Some(e);
+                true
+            }
+        };
+        let g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let snap = snapshot(&app, &g);
+        drop(g);
+        let _ = app.emit("vpn-state", &snap);
+        if failed {
+            show_main_window(&app);
+        }
+    });
+}
+
+/// Отключение из трея: [`disconnect_inner`] блокируется на восстановлении
+/// системного прокси (ретраи со sleep + подпроцессы) и до 5 с на остановке
+/// клиента, поэтому с главного потока его тоже вызывать нельзя.
+/// Актуальный `vpn-state` он отправляет сам в конце.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn spawn_tray_disconnect(state: AppState, app: AppHandle) {
+    std::thread::spawn(move || disconnect_inner(&state, &app, true));
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn restore_with_retry(backup: &ProxyBackup) -> Result<(), String> {
     let mut last = None;
@@ -676,6 +798,8 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             g.last_error = None;
             g.tunnel_server = None;
         }
+
+        let _ = android_vpn::clear_last_connect_error(app);
 
         // JNI/webview без удержания Mutex — иначе ANR/краш при disconnect (глобальный lock + UI-поток).
         let jni_result = android_vpn::request_disconnect(app);
@@ -828,26 +952,70 @@ fn parse_import_deeplink(raw: &str) -> Option<(String, String)> {
     Some((token?, base_url?))
 }
 
+fn pending_import_view(origin: &str, payload: &control_plane_client::ImportPayload) -> PendingImportView {
+    let control_plane_host = url::Url::parse(origin)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| origin.to_string());
+    let vpn_host = format!("{}:{}", payload.server_public_host, payload.host_port);
+    PendingImportView {
+        control_plane_host,
+        display_name: payload.display_name.clone(),
+        server_name: payload.server_name.clone(),
+        server_public_host: payload.server_public_host.clone(),
+        host_port: payload.host_port,
+        vpn_host,
+    }
+}
+
+fn allowed_origins_for_import(cfg: &SavedConfig) -> Vec<String> {
+    control_plane_client::build_allowed_origins(&profile_control_plane_origins(cfg))
+}
+
 fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> Result<(), String> {
     let (token, base_url) = parse_import_deeplink(raw_url)
         .ok_or_else(|| "Неверная ссылка импорта (ожидается bibavpn://import?...).".to_string())?;
-    let payload = control_plane_client::redeem_import(&base_url, &token)?;
+    let allowed = {
+        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        allowed_origins_for_import(&g.cfg)
+    };
+    let (origin, payload) = control_plane_client::redeem_import(&base_url, &token, &allowed)?;
+    let pending = PendingControlPlaneImport { origin, payload };
+    let view = pending_import_view(&pending.origin, &pending.payload);
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     g.last_error = None;
-    import_control_plane_payload(&mut g.cfg, &payload, &base_url)?;
+    g.pending_import = Some(pending);
+    drop(g);
+    show_main_window(app);
+    let _ = app.emit("control-plane-import-pending", &view);
+    Ok(())
+}
+
+fn apply_pending_import(state: &AppState, app: &AppHandle) -> Result<(), String> {
+    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let pending = g
+        .pending_import
+        .take()
+        .ok_or_else(|| "Нет ожидающего импорта.".to_string())?;
+    g.last_error = None;
+    import_control_plane_payload(&mut g.cfg, &pending.payload, &pending.origin)?;
     persist_cfg(app, &g.cfg)?;
     info!(
         target: "bibavpn_desktop",
-        instance_id = payload.instance_id,
-        config_version = %payload.config_version,
+        instance_id = pending.payload.instance_id,
+        config_version = %pending.payload.config_version,
         "control plane import ok"
     );
     let snap = snapshot(app, &g);
     drop(g);
     let _ = app.emit("vpn-state", &snap);
     let _ = app.emit("control-plane-import", ());
-    show_main_window(app);
     Ok(())
+}
+
+fn cancel_pending_import_inner(state: &AppState) {
+    let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+    g.pending_import = None;
 }
 
 /// RAII-охрана фазы подключения: если [`connect_inner`] вышел с ошибкой (или паникой)
@@ -938,6 +1106,7 @@ mod connecting_phase_guard_tests {
             last_error: None,
             phase,
             recovery_pending: false,
+            pending_import: None,
         }))
     }
 
@@ -1074,6 +1243,9 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     let socks_bind = format!("127.0.0.1:{socks_port}");
 
     persist_cfg(app, &cfg)?;
+    // Same contract as Android: `start_config_json` / system-proxy ignore-hosts read the
+    // in-memory preset cache. Prefetch is racy; a cold cache silently disables split-tunnel.
+    let _ = bypass_domains::ensure_loaded(false);
 
     let json = cfg.start_config_json()?;
     let opts =
@@ -1137,6 +1309,11 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         .active_profile()
         .map(split_tunnel::bypass_domains_for_profile)
         .unwrap_or_default();
+    info!(
+        target: "bibavpn_desktop",
+        split_bypass = split_hosts.len(),
+        "split-tunnel domains for system proxy / local HTTP CONNECT"
+    );
     #[cfg(windows)]
     let prior_proxy_override = match backup.override_val.as_deref() {
         Some(s) if !s.is_empty() => Some(s),
@@ -1193,6 +1370,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         Err(p) => p.into_inner(),
     };
     g.last_error = None;
+    let _ = android_vpn::clear_last_connect_error(app);
 
     if !g.cfg.can_connect() {
         warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
@@ -1203,11 +1381,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     }
 
     persist_cfg(app, &g.cfg)?;
-    // Must run before `start_config_json()`: that builds `split_bypass_domains` for the
-    // tunnel client's DNS-snoop split routing out of the in-memory preset cache, so a cold
-    // cache here means an empty bypass list and silently no domain split at all.
-    let _ = bypass_domains::ensure_loaded(false);
-    let json = g.cfg.start_config_json()?;
+    let json = start_json_with_bypass_cache(&g.cfg)?;
     let (split_tunnel_enabled, packages, domains, battery) = match g.cfg.active_profile() {
         Some(p) => (
             p.split_tunnel_enabled,
@@ -1227,7 +1401,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         &packages,
         &domains,
         battery,
-    )?;
+    )
+    .map_err(|code| map_android_jni_connect_error(&code))?;
 
     let mut g = match state.inner.lock() {
         Ok(g) => g,
@@ -1261,7 +1436,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     }
 
     persist_cfg(app, &g.cfg)?;
-    let json = g.cfg.start_config_json()?;
+    let json = start_json_with_bypass_cache(&g.cfg)?;
     let json = inject_mobile_tunnel_session_json(&json)?;
     let remote_label = display_host_line(&g.cfg);
     drop(g);
@@ -1318,14 +1493,20 @@ fn get_state(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot
 }
 
 #[tauri::command]
+fn get_edit_config(state: State<'_, AppState>) -> Result<SavedConfig, String> {
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    Ok(g.cfg.clone())
+}
+
+#[tauri::command]
 fn save_config_cmd(
-    cfg: SavedConfig,
+    cfg: serde_json::Value,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<StateSnapshot, String> {
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     let old_locale = g.cfg.ui_locale.clone();
-    g.cfg = cfg;
+    g.cfg = merge_saved_config(&g.cfg, &cfg)?;
     normalize_loaded(&mut g.cfg);
     let locale_changed = old_locale != g.cfg.ui_locale;
     persist_cfg(&app, &g.cfg)?;
@@ -1488,9 +1669,36 @@ fn open_portal_url(url: &str) -> Result<(), String> {
 fn clear_error_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
     let mut g = state.inner.lock().map_err(|e| e.to_string())?;
     g.last_error = None;
+    #[cfg(target_os = "android")]
+    let _ = android_vpn::clear_last_connect_error(&app);
     let snap = snapshot(&app, &g);
     let _ = app.emit("vpn-state", &snap);
     Ok(snap)
+}
+
+#[tauri::command]
+fn get_pending_import(state: State<'_, AppState>) -> Result<Option<PendingImportView>, String> {
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    Ok(g
+        .pending_import
+        .as_ref()
+        .map(|p| pending_import_view(&p.origin, &p.payload)))
+}
+
+#[tauri::command]
+fn confirm_pending_import_cmd(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StateSnapshot, String> {
+    apply_pending_import(&state, &app)?;
+    let g = state.inner.lock().map_err(|e| e.to_string())?;
+    Ok(snapshot(&app, &g))
+}
+
+#[tauri::command]
+fn cancel_pending_import_cmd(state: State<'_, AppState>) -> Result<(), String> {
+    cancel_pending_import_inner(&state);
+    Ok(())
 }
 
 #[derive(Serialize, Clone)]
@@ -1608,6 +1816,7 @@ pub fn run() -> anyhow::Result<()> {
             last_error: None,
             phase: VpnPhase::Idle,
             recovery_pending: false,
+            pending_import: None,
         })),
     };
 
@@ -1668,34 +1877,23 @@ pub fn run() -> anyhow::Result<()> {
                     .on_menu_event(move |app, event| match event.id.as_ref() {
                         "show" => show_main_window(app),
                         "quit" => {
-                            let st = app.state::<AppState>();
-                            disconnect_inner(&*st, app, true);
+                            // Teardown делает единственный обработчик `RunEvent::Exit`:
+                            // `AppHandle::exit` гарантированно доставляет
+                            // `ExitRequested` + `Exit`. Раньше `disconnect_inner`
+                            // вызывался и здесь, и там — прокси восстанавливался
+                            // дважды, причём второй проход шёл уже без снимка
+                            // настроек (`proxy_backup` забран первым) и вслепую
+                            // дёргал `gsettings` / `networksetup` ещё раз.
                             app.exit(0);
                         }
-                        "on" => {
-                            let st = app.state::<AppState>();
-                            let h = app.clone();
-                            if let Err(e) = connect_inner(&*st, &h) {
-                                warn!(target: "bibavpn_desktop", "подключение из трея: {e}");
-                                let mut g = st.inner.lock().unwrap_or_else(|e| e.into_inner());
-                                g.last_error = Some(e);
-                                let snap = snapshot(&h, &g);
-                                let _ = h.emit("vpn-state", &snap);
-                                show_main_window(&h);
-                            } else {
-                                let g = st.inner.lock().unwrap_or_else(|e| e.into_inner());
-                                let snap = snapshot(&h, &g);
-                                let _ = h.emit("vpn-state", &snap);
-                            }
-                        }
-                        "off" => {
-                            let st = app.state::<AppState>();
-                            let h = app.clone();
-                            disconnect_inner(&*st, &h, true);
-                            let g = st.inner.lock().unwrap_or_else(|e| e.into_inner());
-                            let snap = snapshot(&h, &g);
-                            let _ = h.emit("vpn-state", &snap);
-                        }
+                        "on" => spawn_tray_connect(
+                            Clone::clone(&*app.state::<AppState>()),
+                            app.clone(),
+                        ),
+                        "off" => spawn_tray_disconnect(
+                            Clone::clone(&*app.state::<AppState>()),
+                            app.clone(),
+                        ),
                         "logs" => {
                             if let Some(dir) = logging::logs_directory() {
                                 logging::open_in_file_manager(dir);
@@ -1763,6 +1961,7 @@ pub fn run() -> anyhow::Result<()> {
     let app = builder
         .invoke_handler(tauri::generate_handler![
             get_state,
+            get_edit_config,
             measure_server_rtt_cmd,
             pick_installed_package_cmd,
             save_config_cmd,
@@ -1770,6 +1969,9 @@ pub fn run() -> anyhow::Result<()> {
             disconnect_cmd,
             apply_invite_cmd,
             clear_error_cmd,
+            get_pending_import,
+            confirm_pending_import_cmd,
+            cancel_pending_import_cmd,
             open_control_plane_refresh_cmd,
             get_bypass_presets_cmd,
         ])
@@ -1777,6 +1979,12 @@ pub fn run() -> anyhow::Result<()> {
 
     app.run(|app_handle, event| {
         if let RunEvent::Exit = event {
+            // Единственная точка teardown на выходе, и она обязана быть
+            // синхронной: процесс умирает сразу после возврата, а системный
+            // прокси надо успеть вернуть — иначе пользователь останется без
+            // интернета. Отсюда же и цена выхода (восстановление прокси плюс
+            // до 5 с на остановку клиента), поэтому дублировать её из трея
+            // нельзя.
             let st = app_handle.state::<AppState>();
             disconnect_inner(&*st, app_handle, true);
         }
@@ -1787,7 +1995,12 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod deeplink_tests {
-    use super::parse_import_deeplink;
+    use super::{
+        allowed_origins_for_import, cancel_pending_import_inner, parse_import_deeplink,
+        pending_import_view, AppState, Inner, PendingControlPlaneImport, SavedConfig, VpnPhase,
+    };
+    use crate::control_plane_client::{self, ImportPayload};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn parse_import_deeplink_ok() {
@@ -1795,5 +2008,156 @@ mod deeplink_tests {
         let (tok, base) = parse_import_deeplink(url).expect("parse");
         assert_eq!(tok, "abc123");
         assert_eq!(base, "https://cp.example.com");
+    }
+
+    #[test]
+    fn redeem_validates_before_http() {
+        let allowed = vec!["https://cp.example.com".to_string()];
+        let err = control_plane_client::redeem_import("http://cp.example.com", "tok", &allowed)
+            .unwrap_err();
+        assert!(err.contains("HTTPS"), "{err}");
+    }
+
+    #[test]
+    fn pending_import_not_persisted_until_confirm() {
+        let allowed = vec!["https://cp.example.com".to_string()];
+        let origin =
+            control_plane_client::validate_control_plane_base_url("https://cp.example.com", &allowed)
+                .unwrap();
+        let payload = ImportPayload {
+            invite_uri: "biba://x".into(),
+            invite_passphrase: "pw".into(),
+            instance_id: 1,
+            display_name: "alice".into(),
+            server_name: "node".into(),
+            server_public_host: "203.0.113.1".into(),
+            host_port: 8443,
+            expires_at: "2026-01-01".into(),
+            config_version: "1".into(),
+        };
+        let state = AppState {
+            rt: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            inner: Arc::new(Mutex::new(Inner {
+                cfg: SavedConfig::default(),
+                proxy_backup: None,
+                vpn: None,
+                tunnel_server: None,
+                last_error: None,
+                phase: VpnPhase::Idle,
+                recovery_pending: false,
+                pending_import: Some(PendingControlPlaneImport {
+                    origin: origin.clone(),
+                    payload: payload.clone(),
+                }),
+            })),
+        };
+        let cfg_before = state.inner.lock().unwrap().cfg.clone();
+        assert!(cfg_before.active_profile().is_none_or(|p| p.server.is_empty()));
+        cancel_pending_import_inner(&state);
+        assert!(state.inner.lock().unwrap().pending_import.is_none());
+        let view = pending_import_view(&origin, &payload);
+        assert_eq!(view.vpn_host, "203.0.113.1:8443");
+        assert_eq!(view.control_plane_host, "cp.example.com");
+    }
+
+    #[test]
+    fn allowed_origins_include_profile_base_url() {
+        let mut cfg = SavedConfig::default();
+        let id = cfg.profiles[0].id.clone();
+        cfg.active_profile_id = id;
+        if let Some(p) = cfg.active_profile_mut() {
+            p.control_plane_base_url = "https://saved.example.com".into();
+        }
+        let origins = allowed_origins_for_import(&cfg);
+        assert!(origins.iter().any(|o| o == "https://saved.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod android_connect_error_tests {
+    use super::{android_snapshot_error, map_android_jni_connect_error};
+
+    #[test]
+    fn map_android_jni_connect_error_known_codes() {
+        for (code, expect_substr) in [
+            ("vpn_permission_denied", "отклонено"),
+            ("vpn_permission_timeout", "ожидания"),
+            ("vpn_permission_ui_unavailable", "запрос"),
+        ] {
+            let msg = map_android_jni_connect_error(code);
+            assert!(!msg.is_empty(), "code {code}");
+            assert!(
+                msg.contains(expect_substr),
+                "code {code}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_android_jni_connect_error_unknown_passthrough() {
+        let raw = "custom_native_start_failure";
+        assert_eq!(map_android_jni_connect_error(raw), raw);
+    }
+
+    #[test]
+    fn map_android_jni_connect_error_empty_is_empty() {
+        assert!(map_android_jni_connect_error("").is_empty());
+        assert!(map_android_jni_connect_error("   ").is_empty());
+    }
+
+    #[test]
+    fn android_snapshot_error_overlay_inactive_tunnel() {
+        let err = android_snapshot_error(
+            &None,
+            false,
+            Some("vpn_permission_denied".into()),
+        );
+        assert_eq!(err.as_deref(), Some("Разрешение VPN отклонено"));
+    }
+
+    #[test]
+    fn android_snapshot_error_active_tunnel_ignores_jni() {
+        let err = android_snapshot_error(
+            &None,
+            true,
+            Some("vpn_tunnel_start_failed".into()),
+        );
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn android_snapshot_error_last_error_wins_over_jni() {
+        let rust_err = Some("Rust ошибка".into());
+        let err = android_snapshot_error(
+            &rust_err,
+            false,
+            Some("vpn_permission_denied".into()),
+        );
+        assert_eq!(err, rust_err);
+    }
+}
+
+#[cfg(test)]
+mod ios_connect_tests {
+    /// iOS `connect_inner` is `cfg(ios)` and does not compile on Linux CI; assert source order instead.
+    #[test]
+    fn ios_connect_loads_bypass_cache_before_start_json() {
+        let src = include_str!("lib.rs").replace("\r\n", "\n");
+        let marker = "#[cfg(target_os = \"ios\")]\nfn connect_inner";
+        let ios_block = src
+            .split_once(marker)
+            .expect("ios connect_inner")
+            .1
+            .split("\n#[tauri::command]")
+            .next()
+            .expect("ios connect_inner block");
+        assert!(
+            ios_block.contains("start_json_with_bypass_cache"),
+            "iOS connect_inner must load bypass cache via shared helper"
+        );
+        assert!(
+            !ios_block.contains("g.cfg.start_config_json()"),
+            "iOS connect_inner must not call start_config_json without loading bypass cache first"
+        );
     }
 }
