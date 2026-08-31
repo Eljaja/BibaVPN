@@ -112,7 +112,9 @@ MAC is keyed BLAKE3 over `client_ephemeral_pub || server_pub` keyed by `shared_s
 frame existed the REALITY TCP path was an **open proxy**. The token is never sent on the wire; the
 server compares in constant time and records failures with the auth rate limiter, like a v3 AUTH
 mismatch. Adding a frame does not change the HELLO / SERVER_HELLO layout, so `REALITY_VERSION`
-stays `2` — but old and new peers no longer interoperate on the REALITY path.
+stays `2` — but old and new peers no longer interoperate on the REALITY path. On **REALITY + v3 PSK**,
+ChaCha20-Poly1305 transport keys also mix the REALITY X25519 shared secret (not the HELLO ACK MAC);
+client and server must ship together on that path.
 
 Typical traffic path (TCP, mux):
 

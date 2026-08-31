@@ -369,6 +369,14 @@ short-ID allowlist is permissive by default — see `--reality-short-ids`). Addi
 change the HELLO / SERVER_HELLO layout, so `REALITY_VERSION` stays **2**; older clients/servers fail
 the handshake immediately (breaking change on the REALITY path only).
 
+**REALITY + v3 PSK key schedule:** after the REALITY X25519 exchange, v3 `HELLO` / `ACK` and the
+HELLO ACK MAC are unchanged (PSK-only). ChaCha20-Poly1305 transport keys (`bibavpn.v3.c2s` /
+`bibavpn.v3.s2c`) additionally bind the 32-byte REALITY shared secret:
+`u32be(psk.len) || psk || u32be(domain.len) || domain || client_random || server_random ||
+u32be(32) || reality_dh`. Client and server **must upgrade together** on this path; a peer that omits
+the DH mix cannot decrypt sealed frames and fails at the first v3 `AUTH`. Non-REALITY v3 transport
+keys are unchanged.
+
 **Server CLI**
 
 ```bash

@@ -66,15 +66,20 @@ fn transport_keys(
     domain: &str,
     client_random: &[u8; 32],
     server_random: &[u8; 32],
+    reality_dh: Option<&[u8; 32]>,
 ) -> ([u8; 32], [u8; 32]) {
     let d = domain.as_bytes();
-    let mut ctx = Vec::with_capacity(4 + psk.len() + 4 + d.len() + 64);
+    let mut ctx = Vec::with_capacity(4 + psk.len() + 4 + d.len() + 64 + 4 + 32);
     ctx.extend_from_slice(&(psk.len() as u32).to_be_bytes());
     ctx.extend_from_slice(psk);
     ctx.extend_from_slice(&(d.len() as u32).to_be_bytes());
     ctx.extend_from_slice(d);
     ctx.extend_from_slice(client_random);
     ctx.extend_from_slice(server_random);
+    if let Some(dh) = reality_dh {
+        ctx.extend_from_slice(&(32u32).to_be_bytes());
+        ctx.extend_from_slice(dh);
+    }
     let k_up = derive_key("bibavpn.v3.c2s", &ctx);
     let k_dn = derive_key("bibavpn.v3.s2c", &ctx);
     (k_up, k_dn)
@@ -172,7 +177,31 @@ impl SessionCrypto {
         server_random: &[u8; 32],
         decoy_max: u8,
     ) -> Self {
-        let (k_up, k_dn) = transport_keys(psk.as_bytes(), domain, client_random, server_random);
+        let (k_up, k_dn) =
+            transport_keys(psk.as_bytes(), domain, client_random, server_random, None);
+        Self {
+            c2s: ChaHalf::new(&k_up),
+            s2c: ChaHalf::new(&k_dn),
+            decoy_max,
+        }
+    }
+
+    /// REALITY + v3 PSK: transport keys also bind the X25519 shared secret from the REALITY handshake.
+    pub fn new_with_reality_dh(
+        psk: &str,
+        domain: &str,
+        client_random: &[u8; 32],
+        server_random: &[u8; 32],
+        reality_dh: &[u8; 32],
+        decoy_max: u8,
+    ) -> Self {
+        let (k_up, k_dn) = transport_keys(
+            psk.as_bytes(),
+            domain,
+            client_random,
+            server_random,
+            Some(reality_dh),
+        );
         Self {
             c2s: ChaHalf::new(&k_up),
             s2c: ChaHalf::new(&k_dn),
@@ -371,6 +400,59 @@ mod tests {
         let wire = enc.seal_client_to_server(b"plain").unwrap();
         let plain = enc.open_client_to_server(&wire).unwrap();
         assert_eq!(plain, b"plain");
+    }
+
+    #[test]
+    fn reality_dh_changes_keys() {
+        let psk = "same-psk";
+        let c = [3u8; 32];
+        let s = [4u8; 32];
+        let dom = "reality.example";
+        let dh_a = [0x11u8; 32];
+        let dh_b = [0x22u8; 32];
+        let a = SessionCrypto::new_with_reality_dh(psk, dom, &c, &s, &dh_a, 0);
+        let b = SessionCrypto::new_with_reality_dh(psk, dom, &c, &s, &dh_b, 0);
+        let inner = b"payload".to_vec();
+        let w = a.seal_client_to_server(&inner).unwrap();
+        assert!(b.open_client_to_server(&w).is_err());
+        let w2 = a.seal_server_to_client(&inner).unwrap();
+        assert!(b.open_server_to_client(&w2).is_err());
+    }
+
+    #[test]
+    fn reality_dh_same_roundtrip() {
+        let psk = "unit-test-psk";
+        let c = [1u8; 32];
+        let s = [2u8; 32];
+        let dom = "test.domain";
+        let dh = [0xabu8; 32];
+        let enc = SessionCrypto::new_with_reality_dh(psk, dom, &c, &s, &dh, 8);
+        let dec = SessionCrypto::new_with_reality_dh(psk, dom, &c, &s, &dh, 8);
+        let inner = b"padded-frame-blob".to_vec();
+        let wire = enc.seal_client_to_server(&inner).unwrap();
+        let out = dec.open_client_to_server(&wire).unwrap();
+        assert_eq!(out, inner);
+
+        let back = b"server-payload".to_vec();
+        let w2 = dec.seal_server_to_client(&back).unwrap();
+        let out2 = enc.open_server_to_client(&w2).unwrap();
+        assert_eq!(out2, back);
+    }
+
+    #[test]
+    fn reality_dh_vs_psk_only_mismatch() {
+        let psk = "psk";
+        let c = [5u8; 32];
+        let s = [6u8; 32];
+        let dom = "dom";
+        let dh = [0xccu8; 32];
+        let with_dh = SessionCrypto::new_with_reality_dh(psk, dom, &c, &s, &dh, 0);
+        let psk_only = SessionCrypto::new(psk, dom, &c, &s, 0);
+        let inner = b"x".to_vec();
+        let w = with_dh.seal_client_to_server(&inner).unwrap();
+        assert!(psk_only.open_client_to_server(&w).is_err());
+        let w2 = psk_only.seal_client_to_server(&inner).unwrap();
+        assert!(with_dh.open_client_to_server(&w2).is_err());
     }
 
     #[test]
