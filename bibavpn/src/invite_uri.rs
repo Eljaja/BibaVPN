@@ -1,6 +1,16 @@
-//! `biba://` invite links: ChaCha20-Poly1305 encrypted JSON (key from BLAKE3 KDF on a passphrase).
+//! `biba://` invite links: ChaCha20-Poly1305 encrypted JSON.
+//!
+//! **Outer blob v1:** `version(1) || nonce(12) || ciphertext` with key from BLAKE3
+//! `derive_key("bibavpn.invite.uri.v1", passphrase)` (decode-only; legacy URIs).
+//!
+//! **Outer blob v2:** `version(2) || salt(16) || m_kib(u32 LE) || t_cost(u32 LE) ||
+//! p_cost(u32 LE) || nonce(12) || ciphertext` with key from Argon2id(passphrase, salt,
+//! recorded params). New invites always use v2.
+//!
+//! After decrypt, inner JSON `InviteV1.v` must be `1` (schema version; independent of outer blob).
 
 use anyhow::Context;
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use blake3::derive_key;
@@ -9,10 +19,26 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-const BLOB_VERSION: u8 = 1;
-const KDF_CONTEXT: &str = "bibavpn.invite.uri.v1";
+const BLOB_VERSION_V1: u8 = 1;
+const BLOB_VERSION_V2: u8 = 2;
+const INNER_JSON_VERSION: u8 = 1;
+const KDF_CONTEXT_V1: &str = "bibavpn.invite.uri.v1";
 const NONCE_LEN: usize = 12;
+const SALT_LEN: usize = 16;
 const PREFIX: &str = "biba://";
+
+/// Default Argon2id encode params (OWASP interactive; one-shot decode on desktop/mobile).
+const DEFAULT_M_KIB: u32 = 19456;
+const DEFAULT_T_COST: u32 = 2;
+const DEFAULT_P_COST: u32 = 1;
+
+/// Hard caps on v2 params before running Argon2 (crafted URI memory DoS guard).
+const MAX_M_KIB: u32 = 65536;
+const MAX_T_COST: u32 = 8;
+const MAX_P_COST: u32 = 4;
+
+const V1_MIN_WIRE_LEN: usize = 1 + NONCE_LEN + 16;
+const V2_HEADER_LEN: usize = 1 + SALT_LEN + 12 + NONCE_LEN;
 
 // --- serde default helpers (backward compatible: old JSON omits these) ---
 
@@ -234,30 +260,113 @@ fn default_udp_mux_reply_timeout_secs() -> u64 {
     130
 }
 
-fn cipher_from_passphrase(passphrase: &[u8]) -> ChaCha20Poly1305 {
-    ChaCha20Poly1305::new_from_slice(&derive_key(KDF_CONTEXT, passphrase))
+fn cipher_from_passphrase_v1(passphrase: &[u8]) -> ChaCha20Poly1305 {
+    ChaCha20Poly1305::new_from_slice(&derive_key(KDF_CONTEXT_V1, passphrase))
         .expect("ChaCha20Poly1305 key length")
 }
 
-/// `biba://` + URL-safe base64 of `version || nonce(12) || ciphertext`.
+fn validate_v2_argon_params(m_kib: u32, t_cost: u32, p_cost: u32) -> anyhow::Result<()> {
+    if m_kib == 0 || t_cost == 0 || p_cost == 0 {
+        anyhow::bail!("invite: unsupported argon2 params");
+    }
+    if m_kib > MAX_M_KIB || t_cost > MAX_T_COST || p_cost > MAX_P_COST {
+        anyhow::bail!("invite: unsupported argon2 params");
+    }
+    Ok(())
+}
+
+fn derive_argon2_key(
+    passphrase: &[u8],
+    salt: &[u8],
+    m_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> anyhow::Result<[u8; 32]> {
+    validate_v2_argon_params(m_kib, t_cost, p_cost)?;
+    let params = Params::new(m_kib, t_cost, p_cost, Some(32))
+        .map_err(|_| anyhow::anyhow!("invite: unsupported argon2 params"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase, salt, &mut key)
+        .map_err(|_| anyhow::anyhow!("invite: unsupported argon2 params"))?;
+    Ok(key)
+}
+
+fn decrypt_invite_json(
+    cipher: &ChaCha20Poly1305,
+    nonce: &[u8],
+    ct: &[u8],
+) -> anyhow::Result<InviteV1> {
+    let plain = cipher
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|_| anyhow::anyhow!("invite: bad passphrase or corrupted blob"))?;
+    let invite: InviteV1 = serde_json::from_slice(&plain).context("invite: bad json")?;
+    if invite.v != INNER_JSON_VERSION {
+        anyhow::bail!("invite: inner v mismatch");
+    }
+    Ok(invite)
+}
+
+fn decode_wire_v1(wire: &[u8], passphrase: &str) -> anyhow::Result<InviteV1> {
+    if wire.len() < V1_MIN_WIRE_LEN {
+        anyhow::bail!("invite: blob too short");
+    }
+    let nonce = &wire[1..1 + NONCE_LEN];
+    let ct = &wire[1 + NONCE_LEN..];
+    let cipher = cipher_from_passphrase_v1(passphrase.as_bytes());
+    decrypt_invite_json(&cipher, nonce, ct)
+}
+
+fn decode_wire_v2(wire: &[u8], passphrase: &str) -> anyhow::Result<InviteV1> {
+    if wire.len() < V2_HEADER_LEN + 16 {
+        anyhow::bail!("invite: blob too short");
+    }
+    let salt = &wire[1..1 + SALT_LEN];
+    let m_kib = u32::from_le_bytes(wire[1 + SALT_LEN..1 + SALT_LEN + 4].try_into().unwrap());
+    let t_cost =
+        u32::from_le_bytes(wire[1 + SALT_LEN + 4..1 + SALT_LEN + 8].try_into().unwrap());
+    let p_cost =
+        u32::from_le_bytes(wire[1 + SALT_LEN + 8..1 + SALT_LEN + 12].try_into().unwrap());
+    validate_v2_argon_params(m_kib, t_cost, p_cost)?;
+    let nonce = &wire[1 + SALT_LEN + 12..V2_HEADER_LEN];
+    let ct = &wire[V2_HEADER_LEN..];
+    let key = derive_argon2_key(passphrase.as_bytes(), salt, m_kib, t_cost, p_cost)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20Poly1305 key length");
+    decrypt_invite_json(&cipher, nonce, ct)
+}
+
+/// `biba://` + URL-safe base64 of outer blob v2 (`version || salt || params || nonce || ct`).
 pub fn encode_invite_v1(invite: &InviteV1, passphrase: &str) -> anyhow::Result<String> {
     let plain = serde_json::to_vec(invite).context("invite json")?;
-    let cipher = cipher_from_passphrase(passphrase.as_bytes());
+    let m_kib = DEFAULT_M_KIB;
+    let t_cost = DEFAULT_T_COST;
+    let p_cost = DEFAULT_P_COST;
+
+    let mut salt = [0u8; SALT_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let key = derive_argon2_key(passphrase.as_bytes(), &salt, m_kib, t_cost, p_cost)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20Poly1305 key length");
+
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
         .map_err(|e| anyhow::anyhow!("encrypt invite: {e}"))?;
 
-    let mut wire = Vec::with_capacity(1 + NONCE_LEN + ct.len());
-    wire.push(BLOB_VERSION);
+    let mut wire = Vec::with_capacity(V2_HEADER_LEN + ct.len());
+    wire.push(BLOB_VERSION_V2);
+    wire.extend_from_slice(&salt);
+    wire.extend_from_slice(&m_kib.to_le_bytes());
+    wire.extend_from_slice(&t_cost.to_le_bytes());
+    wire.extend_from_slice(&p_cost.to_le_bytes());
     wire.extend_from_slice(&nonce);
     wire.extend_from_slice(&ct);
 
     Ok(format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire)))
 }
 
-/// Decode `biba://...` or raw base64 payload.
+/// Decode `biba://...` or raw base64 payload (outer blob v1 BLAKE3 or v2 Argon2id).
 pub fn decode_invite_v1(uri: &str, passphrase: &str) -> anyhow::Result<InviteV1> {
     let s = uri.trim();
     let b64 = s
@@ -267,32 +376,22 @@ pub fn decode_invite_v1(uri: &str, passphrase: &str) -> anyhow::Result<InviteV1>
     let wire = URL_SAFE_NO_PAD
         .decode(b64.trim())
         .context("invite: invalid base64url")?;
-    if wire.is_empty() || wire[0] != BLOB_VERSION {
+    if wire.is_empty() {
         anyhow::bail!("invite: unsupported blob version");
     }
-    if wire.len() < 1 + NONCE_LEN + 16 {
-        anyhow::bail!("invite: blob too short");
+    match wire[0] {
+        BLOB_VERSION_V1 => decode_wire_v1(&wire, passphrase),
+        BLOB_VERSION_V2 => decode_wire_v2(&wire, passphrase),
+        _ => anyhow::bail!("invite: unsupported blob version"),
     }
-    let nonce = &wire[1..1 + NONCE_LEN];
-    let ct = &wire[1 + NONCE_LEN..];
-    let cipher = cipher_from_passphrase(passphrase.as_bytes());
-    let plain = cipher
-        .decrypt(Nonce::from_slice(nonce), ct)
-        .map_err(|_| anyhow::anyhow!("invite: bad passphrase or corrupted blob"))?;
-    let invite: InviteV1 = serde_json::from_slice(&plain).context("invite: bad json")?;
-    if invite.v != BLOB_VERSION {
-        anyhow::bail!("invite: inner v mismatch");
-    }
-    Ok(invite)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trip() {
-        let i = InviteV1 {
+    fn sample_invite() -> InviteV1 {
+        InviteV1 {
             v: 1,
             server: "203.0.113.7:8443".into(),
             sni: "vpn.example.com".into(),
@@ -348,11 +447,94 @@ mod tests {
             server_ack_delay_max_ms: None,
             rtt_mask_jitter_ms: None,
             ack_profile: None,
-        };
+        }
+    }
+
+    fn encode_invite_v1_blob_v1(invite: &InviteV1, passphrase: &str) -> Vec<u8> {
+        let plain = serde_json::to_vec(invite).expect("invite json");
+        let cipher = cipher_from_passphrase_v1(passphrase.as_bytes());
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(b"012345678901");
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
+            .expect("encrypt");
+        let mut wire = Vec::with_capacity(1 + NONCE_LEN + ct.len());
+        wire.push(BLOB_VERSION_V1);
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&ct);
+        wire
+    }
+
+    #[test]
+    fn round_trip() {
+        let i = sample_invite();
         let u = encode_invite_v1(&i, "pass").unwrap();
         assert!(u.starts_with(PREFIX));
+        let b64 = u.strip_prefix(PREFIX).unwrap();
+        let wire = URL_SAFE_NO_PAD.decode(b64).unwrap();
+        assert_eq!(wire[0], BLOB_VERSION_V2);
         let j = decode_invite_v1(&u, "pass").unwrap();
         assert_eq!(i, j);
+    }
+
+    #[test]
+    fn v2_wrong_passphrase() {
+        let i = sample_invite();
+        let u = encode_invite_v1(&i, "pass").unwrap();
+        let err = decode_invite_v1(&u, "wrong").unwrap_err();
+        assert!(
+            err.to_string().contains("invite: bad passphrase or corrupted blob"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_still_decodes() {
+        let i = sample_invite();
+        let wire = encode_invite_v1_blob_v1(&i, "legacy");
+        let uri = format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire));
+        let j = decode_invite_v1(&uri, "legacy").unwrap();
+        assert_eq!(i, j);
+    }
+
+    #[test]
+    fn unknown_blob_version() {
+        let mut wire = encode_invite_v1_blob_v1(&sample_invite(), "pass");
+        wire[0] = 3;
+        let uri = format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire));
+        let err = decode_invite_v1(&uri, "pass").unwrap_err();
+        assert!(
+            err.to_string().contains("invite: unsupported blob version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_param_cap_rejects_before_argon2() {
+        let i = sample_invite();
+        let plain = serde_json::to_vec(&i).unwrap();
+        let cipher = cipher_from_passphrase_v1("pass".as_bytes());
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(b"012345678901");
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
+            .unwrap();
+
+        let mut wire = Vec::with_capacity(V2_HEADER_LEN + ct.len());
+        wire.push(BLOB_VERSION_V2);
+        wire.extend_from_slice(&[0u8; SALT_LEN]);
+        wire.extend_from_slice(&(MAX_M_KIB + 1).to_le_bytes());
+        wire.extend_from_slice(&DEFAULT_T_COST.to_le_bytes());
+        wire.extend_from_slice(&DEFAULT_P_COST.to_le_bytes());
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&ct);
+
+        let uri = format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire));
+        let err = decode_invite_v1(&uri, "pass").unwrap_err();
+        assert!(
+            err.to_string().contains("invite: unsupported argon2 params"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
