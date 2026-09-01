@@ -236,6 +236,13 @@ fn merge_bypass_for_apply(saved: &[String], split_tunnel: &[String]) -> Vec<Stri
         "127.0.0.1",
         "localhost",
         "*.local",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "fc00::/7",
+        "fe80::/10",
         "tauri.localhost",
         "steamloopback.host",
         "*.steamloopback.host",
@@ -424,4 +431,16 @@ fn restore_slot(
         run_netsetup(&[state_cmd, service, "off"])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_bypass_includes_private_cidrs() {
+        let merged = merge_bypass_for_apply(&[], &[]);
+        assert!(merged.iter().any(|x| x.eq_ignore_ascii_case("10.0.0.0/8")));
+        assert!(merged.iter().any(|x| x.eq_ignore_ascii_case("192.168.0.0/16")));
+    }
 }

@@ -128,6 +128,66 @@ impl DomainRouteMap {
     }
 }
 
+/// True when `host` is a literal loopback, RFC1918, CGNAT, ULA, or link-local address,
+/// or the hostname `localhost` (case-insensitive; trailing `.` trimmed).
+pub fn host_is_local_or_private(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .ok()
+        .is_some_and(ip_is_local_or_private)
+}
+
+fn ip_is_local_or_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => ipv4_is_local_or_private(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ipv4_is_local_or_private(v4);
+            }
+            let o = v6.octets();
+            // ULA fc00::/7
+            if o[0] & 0xfe == 0xfc {
+                return true;
+            }
+            // link-local fe80::/10
+            if o[0] == 0xfe && (o[1] & 0xc0) == 0x80 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+fn ipv4_is_local_or_private(addr: Ipv4Addr) -> bool {
+    let [a, b, _, _] = addr.octets();
+    if a == 127 {
+        return true;
+    }
+    if a == 10 {
+        return true;
+    }
+    if a == 172 && (16..=31).contains(&b) {
+        return true;
+    }
+    if a == 192 && b == 168 {
+        return true;
+    }
+    if a == 169 && b == 254 {
+        return true;
+    }
+    // CGNAT 100.64.0.0/10 — explicit octets; do not use Ipv4Addr::is_shared.
+    if a == 100 && (64..=127).contains(&b) {
+        return true;
+    }
+    false
+}
+
 /// True if `domain` equals a bypass entry or is a subdomain of one (case-insensitive).
 /// `example.com` in the list matches `example.com` and `a.b.example.com`, but not
 /// `notexample.com`.
@@ -152,6 +212,9 @@ pub fn matches_bypass(domain: &str, bypass: &[String]) -> bool {
 /// can positively attribute the target to a bypass domain; otherwise `Tunnel`
 /// (fail-safe: unknown → tunnel).
 pub fn decide(host: &str, bypass: &[String], map: &DomainRouteMap, now_secs: u64) -> Route {
+    if host_is_local_or_private(host) {
+        return Route::Direct;
+    }
     if bypass.is_empty() {
         return Route::Tunnel;
     }
@@ -225,6 +288,9 @@ pub fn matches_active_bypass(domain: &str) -> bool {
 /// SOCKS/CONNECT convenience: should this target bypass the tunnel (go direct)?
 /// Cheap no-op when no bypass domains are configured.
 pub fn should_bypass(host: &str) -> bool {
+    if host_is_local_or_private(host) {
+        return true;
+    }
     let bypass = GLOBAL_BYPASS.lock().unwrap_or_else(|p| p.into_inner());
     if bypass.is_empty() {
         return false;
@@ -646,14 +712,14 @@ mod tests {
     fn decide_ip_via_map() {
         let map = DomainRouteMap::new();
         let bypass = vec!["example.com".to_string()];
-        let msg = build("example.com", 1, &[(1, 300, vec![10, 0, 0, 1])]);
+        let msg = build("example.com", 1, &[(1, 300, vec![203, 0, 113, 1])]);
         map.record_dns_response(&msg, 0x1234, "example.com", &bypass, 100);
         // IP known to be example.com → Direct.
-        assert_eq!(decide("10.0.0.1", &bypass, &map, 150), Route::Direct);
+        assert_eq!(decide("203.0.113.1", &bypass, &map, 150), Route::Direct);
         // Unknown IP → Tunnel (fail-safe).
-        assert_eq!(decide("10.0.0.2", &bypass, &map, 150), Route::Tunnel);
+        assert_eq!(decide("203.0.113.2", &bypass, &map, 150), Route::Tunnel);
         // Expired mapping → Tunnel.
-        assert_eq!(decide("10.0.0.1", &bypass, &map, 100_000), Route::Tunnel);
+        assert_eq!(decide("203.0.113.1", &bypass, &map, 100_000), Route::Tunnel);
     }
 
     #[test]
@@ -699,12 +765,46 @@ mod tests {
     fn record_accepts_legitimate_match() {
         let map = DomainRouteMap::new();
         let bypass = bypass_list();
-        let msg = build("example.com", 1, &[(1, 300, vec![10, 0, 0, 1])]);
+        let msg = build("example.com", 1, &[(1, 300, vec![203, 0, 113, 1])]);
         assert_eq!(
             map.record_dns_response(&msg, 0x1234, "example.com", &bypass, 100),
             1
         );
-        assert_eq!(decide("10.0.0.1", &bypass, &map, 150), Route::Direct);
+        assert_eq!(decide("203.0.113.1", &bypass, &map, 150), Route::Direct);
+    }
+
+    #[test]
+    fn decide_private_hosts_direct_even_with_empty_bypass() {
+        let map = DomainRouteMap::new();
+        let empty: Vec<String> = vec![];
+        for host in [
+            "192.168.88.1",
+            "10.0.0.1",
+            "172.16.1.1",
+            "127.0.0.1",
+            "localhost",
+            "::1",
+            "fc00::1",
+            "::ffff:192.168.1.1",
+            "100.64.1.1",
+            "169.254.1.1",
+            "fe80::1",
+        ] {
+            assert_eq!(
+                decide(host, &empty, &map, 0),
+                Route::Direct,
+                "expected Direct for {host}"
+            );
+        }
+        assert_eq!(decide("1.1.1.1", &empty, &map, 0), Route::Tunnel);
+        assert_eq!(decide("example.com", &empty, &map, 0), Route::Tunnel);
+    }
+
+    #[test]
+    fn should_bypass_private_with_empty_global_list() {
+        set_bypass_domains(&[]);
+        assert!(should_bypass("192.168.88.1"));
+        set_bypass_domains(&[]);
     }
 
     #[test]

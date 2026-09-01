@@ -89,8 +89,29 @@ fn merge_proxy_override(
     // web UI websocket handshakes fail.
     for req in [
         "<-loopback>",
+        "<local>",
         "localhost",
         "127.0.0.1",
+        "10.*",
+        "192.168.*",
+        "169.254.*",
+        "100.*",
+        "172.16.*",
+        "172.17.*",
+        "172.18.*",
+        "172.19.*",
+        "172.20.*",
+        "172.21.*",
+        "172.22.*",
+        "172.23.*",
+        "172.24.*",
+        "172.25.*",
+        "172.26.*",
+        "172.27.*",
+        "172.28.*",
+        "172.29.*",
+        "172.30.*",
+        "172.31.*",
         "tauri.localhost",
         "steamloopback.host",
         "*.steamloopback.host",
@@ -252,4 +273,19 @@ pub fn restore(backup: &ProxyBackup) -> Result<(), String> {
         }
     }
     notify_changed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_proxy_override_includes_private_wildcards() {
+        let merged = merge_proxy_override(None, &[]);
+        assert!(merged.to_ascii_lowercase().contains("<local>"));
+        assert!(merged.contains("10.*"));
+        assert!(merged.contains("192.168.*"));
+        assert!(merged.contains("172.16.*"));
+        assert!(merged.contains("172.31.*"));
+    }
 }
