@@ -7,29 +7,6 @@ const NETSETUP: &str = "/usr/sbin/networksetup";
 /// Столько сетевых сервисов максимум трогаем (остальные — мосты, VPN, Thunderbolt и т.д.).
 const MAX_PROXY_SERVICES: usize = 8;
 
-/// Поднять мягкий лимит дескрипторов (частая причина `Too many open files` при долгой работе + spawn).
-pub fn init_process_limits() {
-    use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE, RLIM_INFINITY};
-
-    const WANT: rlim_t = 50_000;
-    unsafe {
-        let mut lim: rlimit = std::mem::zeroed();
-        if getrlimit(RLIMIT_NOFILE, &mut lim) != 0 {
-            return;
-        }
-        let hard = if lim.rlim_max == RLIM_INFINITY {
-            WANT
-        } else {
-            lim.rlim_max
-        };
-        let target = WANT.min(hard).max(lim.rlim_cur);
-        if target > lim.rlim_cur {
-            lim.rlim_cur = target;
-            let _ = setrlimit(RLIMIT_NOFILE, &lim);
-        }
-    }
-}
-
 /// `networksetup` can wedge indefinitely (right after wake, while the network
 /// service is in flux). It is called dozens of times per connect/disconnect, so a
 /// single stuck invocation would block the caller forever — bound it.

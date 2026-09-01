@@ -16,7 +16,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+use crate::accept::classify_accept_error;
 
 use crate::client_tls_stream::ClientTlsStream;
 use crate::crypto_layer::{self, SessionCrypto};
@@ -91,6 +93,33 @@ struct SessionGuard {
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
 }
 
+fn abort_session_tasks_sync(session: &SessionGuard) {
+    let mut handles = session.tasks.lock().unwrap_or_else(|e| e.into_inner());
+    for h in handles.drain(..) {
+        h.abort();
+    }
+}
+
+/// Non-cloned owner: aborts tracked tasks on drop so HTTP accept and mux loops stop
+/// when `run_local_client` exits for any reason (not only clean shutdown).
+struct SessionGuardOwner {
+    inner: SessionGuard,
+}
+
+impl SessionGuardOwner {
+    fn new(shutdown: watch::Receiver<bool>) -> (Self, SessionGuard) {
+        let inner = SessionGuard::new(shutdown);
+        let guard = inner.clone();
+        (Self { inner }, guard)
+    }
+}
+
+impl Drop for SessionGuardOwner {
+    fn drop(&mut self) {
+        abort_session_tasks_sync(&self.inner);
+    }
+}
+
 impl SessionGuard {
     fn new(shutdown: watch::Receiver<bool>) -> Self {
         Self {
@@ -115,10 +144,33 @@ impl SessionGuard {
     }
 
     async fn abort_all(&self) {
-        let mut handles = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        for h in handles.drain(..) {
-            h.abort();
-        }
+        abort_session_tasks_sync(self);
+    }
+}
+
+/// Per-connection accept errors must never take down `run_local_client`.
+#[cfg(test)]
+fn local_accept_error_is_transient(e: &std::io::Error) -> bool {
+    let _ = classify_accept_error(e);
+    true
+}
+
+async fn log_local_accept_error(e: std::io::Error, label: &str, log: &crate::log_ratelimit::LogEvery) {
+    let recovery = classify_accept_error(&e);
+    let backoff = recovery.backoff();
+    if log.should_emit() {
+        warn!(
+            target: "bibavpn_client",
+            listener = label,
+            error_kind = ?e.kind(),
+            errno = e.raw_os_error().unwrap_or(0),
+            resource_exhaustion = recovery.is_exhaustion(),
+            backoff_ms = backoff.map(|d| d.as_millis() as u64).unwrap_or(0),
+            "accept failed, still serving: {e:#}"
+        );
+    }
+    if let Some(d) = backoff {
+        tokio::time::sleep(d).await;
     }
 }
 
@@ -1003,7 +1055,8 @@ pub async fn run_local_client(
         pinned_certs_pem: opts.pinned_certs_pem.clone(),
     });
 
-    let session = SessionGuard::new(shutdown.clone());
+    let (session_owner, session) = SessionGuardOwner::new(shutdown.clone());
+    let _session_owner = session_owner;
 
     if cfg.decoy_gets {
         let ua = cfg
@@ -1125,6 +1178,8 @@ pub async fn run_local_client(
         let tcp_mux_http = tcp_mux_slot.clone();
         let mut shutdown_http = shutdown.clone();
         let sess_http = session.clone();
+        static HTTP_ACCEPT_ERR_LOG: crate::log_ratelimit::LogEvery =
+            crate::log_ratelimit::LogEvery::new(8, 256);
         session.push_task(tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1146,7 +1201,7 @@ pub async fn run_local_client(
                                 });
                             }
                             Err(e) => {
-                                error!("http accept: {e:#}");
+                                log_local_accept_error(e, "http", &HTTP_ACCEPT_ERR_LOG).await;
                             }
                         }
                     }
@@ -1155,6 +1210,8 @@ pub async fn run_local_client(
         }));
     }
 
+    static SOCKS_ACCEPT_ERR_LOG: crate::log_ratelimit::LogEvery =
+        crate::log_ratelimit::LogEvery::new(8, 256);
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -1167,20 +1224,26 @@ pub async fn run_local_client(
                 }
             }
             res = socks_listener.accept() => {
-                let (sock, peer) = res.context("socks accept")?;
-                let c = cfg.clone();
-                let ums = udp_mux_slot.clone();
-                let tms = tcp_mux_slot.clone();
-                let sess = session.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_socks_peer(sock, c, ums, tms, sess).await {
-                        if socks5::is_benign_handshake_abort(&e) {
-                            debug!("socks {peer}: client closed before SOCKS5 handshake");
-                        } else {
-                            error!("socks {peer}: {e:#}");
-                        }
+                match res {
+                    Ok((sock, peer)) => {
+                        let c = cfg.clone();
+                        let ums = udp_mux_slot.clone();
+                        let tms = tcp_mux_slot.clone();
+                        let sess = session.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_socks_peer(sock, c, ums, tms, sess).await {
+                                if socks5::is_benign_handshake_abort(&e) {
+                                    debug!("socks {peer}: client closed before SOCKS5 handshake");
+                                } else {
+                                    error!("socks {peer}: {e:#}");
+                                }
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        log_local_accept_error(e, "socks", &SOCKS_ACCEPT_ERR_LOG).await;
+                    }
+                }
             }
         }
     }
@@ -2103,6 +2166,56 @@ mod session_shutdown_tests {
         let after = hits.load(Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits.load(Ordering::Relaxed), after);
+    }
+
+    #[tokio::test]
+    async fn session_guard_owner_aborts_on_drop_without_shutdown() {
+        let (_tx, rx) = watch::channel(false);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = hits.clone();
+        {
+            let (owner, session) = SessionGuardOwner::new(rx);
+            session.push_task(tokio::spawn(async move {
+                loop {
+                    hits_task.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(hits.load(Ordering::Relaxed) > 0);
+            drop(owner);
+        }
+        let after = hits.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hits.load(Ordering::Relaxed), after);
+    }
+
+    #[tokio::test]
+    async fn session_guard_clone_drop_does_not_abort_tasks() {
+        let (_tx, rx) = watch::channel(false);
+        let session = SessionGuard::new(rx);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = hits.clone();
+        session.push_task(tokio::spawn(async move {
+            loop {
+                hits_task.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }));
+        let clone = session.clone();
+        drop(clone);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(hits.load(Ordering::Relaxed) > 0);
+        session.abort_all().await;
+    }
+
+    #[test]
+    fn socks_accept_emfile_is_transient_not_fatal() {
+        let e = std::io::Error::from_raw_os_error(24);
+        let recovery = crate::accept::classify_accept_error(&e);
+        assert!(recovery.is_exhaustion());
+        assert_eq!(recovery.backoff(), Some(crate::accept::ACCEPT_BACKOFF));
+        assert!(local_accept_error_is_transient(&e));
     }
 }
 
