@@ -8,6 +8,9 @@ mod locale;
 mod logging;
 mod split_tunnel;
 
+#[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+mod process_limits;
+
 #[cfg(target_os = "android")]
 mod proxy_android;
 #[cfg(target_os = "linux")]
@@ -526,6 +529,42 @@ fn next_recovery_backoff(current: Duration) -> Duration {
     Duration::from_secs(next)
 }
 
+#[cfg(all(not(any(target_os = "android", target_os = "ios")), unix))]
+fn is_fd_exhaustion_message(msg: &str) -> bool {
+    if msg.contains("Too many open files") {
+        return true;
+    }
+    if msg.contains("os error 24") || msg.contains("os error 23") {
+        return true;
+    }
+    false
+}
+
+#[cfg(all(not(any(target_os = "android", target_os = "ios")), not(unix)))]
+fn is_fd_exhaustion_message(msg: &str) -> bool {
+    msg.contains("Too many open files")
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn fail_fd_exhaustion_recovery(state: &AppState, app: &AppHandle, detail: &str) {
+    warn!(
+        target: "bibavpn_desktop",
+        "исчерпаны файловые дескрипторы — перезапустите приложение: {detail}"
+    );
+    disconnect_inner(state, app, true);
+    let mut g = match state.inner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.recovery_pending = false;
+    g.last_error = Some(format!(
+        "Слишком много открытых соединений — перезапустите BibaVPN. ({detail})"
+    ));
+    let snap = snapshot(app, &g);
+    drop(g);
+    let _ = app.emit("vpn-state", &snap);
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
     std::thread::spawn(move || {
@@ -579,6 +618,11 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
                     );
                 }
                 Err(e) => {
+                    if is_fd_exhaustion_message(&e) {
+                        fail_fd_exhaustion_recovery(&state, &app, &e);
+                        retry_backoff = Duration::from_secs(0);
+                        continue;
+                    }
                     retry_backoff = next_recovery_backoff(retry_backoff);
                     warn!(
                         target: "bibavpn_desktop",
@@ -643,6 +687,11 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
         }
         disconnect_inner(&state, &app, false);
         if let Err(e) = connect_inner(&state, &app) {
+            if is_fd_exhaustion_message(&e) {
+                fail_fd_exhaustion_recovery(&state, &app, &e);
+                retry_backoff = Duration::from_secs(0);
+                continue;
+            }
             retry_backoff = next_recovery_backoff(retry_backoff);
             warn!(
                 target: "bibavpn_desktop",
@@ -1071,6 +1120,23 @@ impl Drop for ConnectingPhaseGuard {
         if g.phase == VpnPhase::Connecting {
             g.phase = VpnPhase::Idle;
         }
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod fd_exhaustion_tests {
+    use super::is_fd_exhaustion_message;
+
+    #[test]
+    fn bind_emfile_message_is_fd_exhaustion() {
+        let msg = "bind socks 127.0.0.1:17891: Too many open files (os error 24)";
+        assert!(is_fd_exhaustion_message(msg));
+    }
+
+    #[test]
+    fn tls_timeout_is_not_fd_exhaustion() {
+        let msg = "remote tunnel connect failed: TLS handshake timed out after 15s";
+        assert!(!is_fd_exhaustion_message(msg));
     }
 }
 
@@ -1861,8 +1927,8 @@ pub fn run() -> anyhow::Result<()> {
     install_ring_crypto();
     #[cfg(unix)]
     unix_ignore_shell_signals();
-    #[cfg(target_os = "macos")]
-    proxy_mac::init_process_limits();
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    process_limits::init_process_limits();
 
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()

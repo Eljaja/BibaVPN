@@ -2,6 +2,7 @@
 //! and browser-looking HTTP upgrade headers. Intended to run alongside zapret on Linux routers
 //! (see `scripts/zapret-sidecar.sh`); zapret is not linked into these binaries.
 
+pub mod accept;
 pub mod activity;
 pub mod camouflage;
 pub mod client_policy;
