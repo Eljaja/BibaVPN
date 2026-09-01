@@ -215,6 +215,14 @@ fn merge_ignore_hosts(existing_raw: &str, split_tunnel_hosts: &[String]) -> Stri
         "localhost",
         "127.0.0.0/8",
         "::1",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "fc00::/7",
+        "fe80::/10",
+        "*.local",
         "tauri.localhost",
         "steamloopback.host",
         ".steamloopback.host",
@@ -270,6 +278,14 @@ fn no_proxy_list(split_tunnel_hosts: &[String]) -> String {
         "localhost".into(),
         "127.0.0.1".into(),
         "::1".into(),
+        "10.0.0.0/8".into(),
+        "172.16.0.0/12".into(),
+        "192.168.0.0/16".into(),
+        "169.254.0.0/16".into(),
+        "100.64.0.0/10".into(),
+        "fc00::/7".into(),
+        "fe80::/10".into(),
+        "*.local".into(),
         "tauri.localhost".into(),
     ];
     for h in split_tunnel_hosts {
@@ -708,6 +724,17 @@ mod tests {
         assert!(merged.contains("localhost"));
         assert!(merged.contains(".bank.ru"));
         assert!(merged.contains("127.0.0.0/8"));
+        assert!(merged.contains("10.0.0.0/8"));
+        assert!(merged.contains("192.168.0.0/16"));
+    }
+
+    #[test]
+    fn proxy_env_contains_private_cidrs_in_no_proxy() {
+        let v = proxy_env_assignments("127.0.0.1", 8080, "127.0.0.1", 1080, &[]);
+        let map: HashMap<_, _> = v.into_iter().collect();
+        let no = map.get("NO_PROXY").unwrap();
+        assert!(no.contains("192.168.0.0/16"), "{no}");
+        assert!(no.contains("10.0.0.0/8"), "{no}");
     }
 
     #[test]

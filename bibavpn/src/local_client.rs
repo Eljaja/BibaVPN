@@ -2290,6 +2290,60 @@ mod http_split_bypass_tests {
     }
 
     #[tokio::test]
+    async fn http_connect_empty_bypass_list_localhost_direct() {
+        crate::domain_route::set_bypass_domains(&[]);
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+        let origin_addr = origin.local_addr().expect("origin addr");
+        let proxy = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+
+        let origin_task = tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.expect("origin accept");
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).await.expect("origin read");
+            assert_eq!(&buf[..n], b"ping");
+            s.write_all(b"pong").await.expect("origin write");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let req = format!(
+                "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                origin_addr.port(),
+                origin_addr.port()
+            );
+            s.write_all(req.as_bytes()).await.expect("client CONNECT");
+            let mut buf = [0u8; 256];
+            let n = s.read(&mut buf).await.expect("client read 200");
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                resp.contains("200"),
+                "HTTP CONNECT to 127.0.0.1 should reply 200, got {resp:?}"
+            );
+            s.write_all(b"ping").await.expect("client ping");
+            let n = s.read(&mut buf).await.expect("client pong");
+            assert_eq!(&buf[..n], b"pong");
+        });
+
+        let (local, _) = proxy.accept().await.expect("proxy accept");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let session = SessionGuard::new(shutdown_rx);
+        let mux: TcpMuxSlot = Arc::new(Mutex::new(None));
+        let handled = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle_http_peer(local, dummy_http_cfg(), mux, session),
+        )
+        .await;
+        crate::domain_route::set_bypass_domains(&[]);
+        handled
+            .expect("timed out — HTTP CONNECT to 127.0.0.1 waited on mux with empty bypass list")
+            .expect("handle_http_peer");
+        client.await.expect("client");
+        origin_task.await.expect("origin");
+    }
+
+    #[tokio::test]
     async fn http_connect_split_bypass_reaches_origin_directly() {
         crate::domain_route::set_bypass_domains(&["localhost".into()]);
 

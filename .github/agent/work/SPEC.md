@@ -2,38 +2,46 @@ SIZE: SMALL
 # Spec
 ## Summary
 
-Linux desktop dies overnight on `Too many open files` (EMFILE): the HTTP accept loop busy-spins and floods the log, SOCKS `accept` `?`-exits `run_local_client` without aborting the HTTP task, leftover fds block rebind, and the recovery watchdog keeps the system proxy pointed at a dead local port.
+Literal LAN / loopback / RFC1918 / CGNAT / IPv6 ULA / link-local targets are sent through the tunnel. The VPS cannot reach them, so `curl -x http://127.0.0.1:17890 http://192.168.x.x/` hangs while a direct request succeeds.
 
-Fix it in one client/desktop PR: raise `RLIMIT_NOFILE` on Linux the same way macOS already does, share the server’s accept-error backoff with both local listeners, abort session tasks on every `run_local_client` exit, and stop EMFILE recovery from retrying bind while leaving the OS proxy applied.
+Root cause is two missing always-direct paths: `domain_route::decide` / `should_bypass` only treat an IP as `Direct` after a DNS-snoop map hit (and both short-circuit to Tunnel when the split-tunnel list is empty), and desktop OS proxy ignore lists only force loopback. Fix both in one PR: always classify private/local hosts as `Route::Direct` in the core matcher, and add the matching RFC1918 / ULA / link-local / `*.local` entries to Linux, macOS, and Windows system-proxy bypass lists.
 
 ## In scope
 
-1. **Raise soft `NOFILE` on Linux desktop** to the same target as macOS (`50_000`, capped by the hard limit, never lowering the current soft limit). Call it at process start in `bibavpn_desktop::run()`. Do not call it on Android/iOS.
+1. **Core matcher.** Add `host_is_local_or_private(host: &str) -> bool` in `bibavpn/src/domain_route.rs`. Call it at the **top** of both `decide` and `should_bypass` (before the empty-bypass early returns). Those early returns stay for public hosts: empty split-tunnel list still means `Tunnel` for `example.com` and `1.1.1.1`.
 
-2. **Share accept recovery.** Move `AcceptRecovery`, `ACCEPT_BACKOFF` (100 ms), `is_accept_resource_exhaustion`, and `classify_accept_error` out of `bibavpn/src/bin/server.rs` into a small public `bibavpn` module. Use that helper on **both** HTTP and SOCKS accept loops in `run_local_client`. On any accept error: classify, rate-limit the log (`LogEvery`, target `bibavpn_client`), sleep when `backoff()` is `Some`, continue. Never `?` out of `run_local_client` for a per-connection accept error (including EMFILE/ENFILE).
+   Treat as local/private:
+   - IPv4: loopback `127.0.0.0/8`, RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local `169.254.0.0/16`, CGNAT `100.64.0.0/10`.
+   - IPv6: loopback `::1`, ULA `fc00::/7`, link-local `fe80::/10`, and IPv4-mapped `::ffff:x.x.x.x` after mapping to the inner v4.
+   - Hostname `localhost` (ASCII case-insensitive; trim a single trailing `.`).
 
-3. **Abort session tasks on every exit from `run_local_client`.** `SessionGuard` is `Clone` (shared `Arc` of `JoinHandle`s); do **not** `impl Drop` on the cloneable guard (a per-connection drop would abort the whole session). Hold a **non-cloned owner** only inside `run_local_client` that calls a synchronous abort of tracked tasks on drop (and/or wrap the body so every `?` / return runs abort). The existing clean `shutdown.changed()` path may still call `abort_all`; abort must be idempotent. After a SOCKS/mux/`?` failure the HTTP accept task must die so the listen port can bind again in the same process.
+   CGNAT: match octets (`first == 100 && second >= 64 && second <= 127`). Do **not** use unstable `Ipv4Addr::is_shared`.
 
-4. **Watchdog failsafe for fd exhaustion.** If `connect_inner` / `run_local_client` fails with a bind/accept EMFILE-class error (`Too many open files`, `os error 24`, raw 24/23 on Unix), do **not** keep `recovery_pending` and retry bind. Surface a distinct `last_error` (user must restart the app), clear `recovery_pending`, and restore the system proxy (`disconnect_inner(..., true)` / `restore_proxy_blocking`) so the machine is not black-holed until kill. Sleep/network recovery policy is unchanged for all other errors.
+2. **Existing unit tests that used `10.0.0.1` as a stand-in public IP** in `domain_route.rs` (`decide_ip_via_map`, `record_accepts_legitimate_match`, and any expiry/unknown-IP assertion on that address) must switch the mapped address to TEST-NET `203.0.113.0/24`. After this change `10.0.0.1` is always `Direct`, so those cases would otherwise become tautologies. Do not rewrite unrelated `10.0.0.1` fixtures in `protocol.rs` / `http_connect.rs` / `incoming.rs`.
+
+3. **HTTP CONNECT regression** in `local_client.rs` (next to `http_connect_split_bypass_reaches_origin_directly`): `set_bypass_domains(&[])`, `CONNECT 127.0.0.1:<origin-port>` to a local origin, 3s timeout. Must reach the origin (200 + ping/pong) and must not wait on mux. Reset the global list in a `finally`-style cleanup as the existing test does.
+
+4. **Desktop OS bypass lists** (always merged, not only when split-tunnel domains are set):
+   - Linux `merge_ignore_hosts` and `no_proxy_list`: add `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `fc00::/7`, `fe80::/10`, `*.local` (Linux ignore-hosts already has loopback).
+   - macOS `merge_bypass_for_apply`: the same CIDRs (it already has `*.local`).
+   - Windows `merge_proxy_override`: `<local>`, `10.*`, `192.168.*`, `169.254.*`, `100.*`, and `172.16.*` … `172.31.*` (WinInet has no CIDR). Keep existing `<-loopback>` and Steam/WebView entries.
 
 ## Out of scope
 
-- Mux epoch / stream-id wrap (#103), server mux `CLOSE-WAIT` leak (#67), wire format, proto 3, REALITY, PSK.
-- `parse_ignore_hosts_list` comma-in-comment bug in `proxy_linux.rs`.
-- Telegram SOCKS4 vs SOCKS5-only (`unsupported socks version 4`).
-- IPv6 AAAA with no default route.
-- Raising `NOFILE` on Android, iOS, or `bibavpn-server` / CLI `bibavpn-client`.
-- Changing default fail-closed recovery for sleep/network-change (non-EMFILE) cases.
-- New product UI, new CLI flags, new transports.
+- Hostname `.local` / mDNS matching in the **core** matcher (OS `*.local` lists are enough).
+- Sending any LAN/private range through the VPS under any profile or flag.
+- Mux epoch / stream-id wrap, EMFILE accept-loop recovery, camouflage, proto 3 / REALITY / PSK, wire format.
+- New CLI flags, UI toggles, invite fields, or a user-facing “bypass LAN” setting.
+- Android TUN `excludeRoute` / iOS Packet Tunnel routing tables (desktop HTTP/SOCKS + OS proxy lists only).
+- UDP mux datagrams to LAN resolvers (SOCKS/HTTP CONNECT TCP is the reported bug).
 
 ## Files to change
 
-- `bibavpn/src/accept.rs` (new) — move `AcceptRecovery`, `ACCEPT_BACKOFF`, `classify_accept_error`, `is_accept_resource_exhaustion`, and the existing server unit tests from `bin/server.rs`. Export from `bibavpn/src/lib.rs`.
-- `bibavpn/src/bin/server.rs` — delete the local copies; import the shared helper. Accept-loop behavior stays the same.
-- `bibavpn/src/local_client.rs` — HTTP loop (`http_listener.accept`, today logs and spins) and SOCKS loop (`res.context("socks accept")?`) both use classify + backoff + continue; `SessionGuard` owner abort on all exits; extend `session_shutdown_tests`.
-- `apps/bibavpn-desktop/src-tauri/src/process_limits.rs` (new, `cfg(unix)` desktop only) — portable `getrlimit`/`setrlimit` extracted from `proxy_mac::init_process_limits` (WANT = 50_000). Keep a tiny pure helper (e.g. `desired_nofile_soft(cur, hard, want)`) for unit tests.
-- `apps/bibavpn-desktop/src-tauri/src/proxy_mac.rs` — remove `init_process_limits` (or re-export the shared fn so macOS behavior is unchanged).
-- `apps/bibavpn-desktop/src-tauri/src/lib.rs` — call process limits for Linux **and** macOS desktop in `run()` (replace `#[cfg(target_os = "macos")]` only). In `spawn_tunnel_recovery_watch`, classify fd-exhaustion errors and stop retry + restore proxy. Add a small `is_fd_exhaustion_message` helper + tests next to existing `lib.rs` unit tests.
+- `bibavpn/src/domain_route.rs` — `host_is_local_or_private`; call it first in `decide` and `should_bypass`; retarget `10.0.0.1` DNS-map tests to `203.0.113.x`; add private/empty-list unit cases.
+- `bibavpn/src/local_client.rs` — HTTP CONNECT empty-list + `127.0.0.1` regression (HTTP CONNECT already uses `should_bypass` / `resolve_domain_split_route`; no production path change beyond the matcher).
+- `apps/bibavpn-desktop/src-tauri/src/proxy_linux.rs` — required CIDRs / `*.local` in `merge_ignore_hosts` and `no_proxy_list`; extend existing merge / `NO_PROXY` unit tests.
+- `apps/bibavpn-desktop/src-tauri/src/proxy_mac.rs` — same CIDRs in `merge_bypass_for_apply`; add a small merge unit test (none exists today).
+- `apps/bibavpn-desktop/src-tauri/src/proxy_win.rs` — WinInet wildcards in `merge_proxy_override`; add a small merge unit test.
 
 ## Tests
 
@@ -44,25 +52,29 @@ cargo test -p bibavpn
 cargo test -p bibavpn-desktop
 ```
 
-Required cases (add or move; do not invent a live `prlimit` e2e job):
+Required cases:
 
-- Existing server cases, now in `bibavpn` `accept` module: transient `ErrorKind`s → `RetryNow`; `OutOfMemory` / raw EMFILE(24), ENFILE(23), ENOMEM, ENOBUFS → exhaustion + `Some(ACCEPT_BACKOFF)`; unknown kind → backoff without exhaustion flag; `ACCEPT_BACKOFF` in 50–250 ms.
-- `local_client`: `io::Error::from_raw_os_error(24)` is classified as exhaustion+backoff and is **not** a fatal `run_local_client` accept error (helper or loop policy function; do not require a mocked `TcpListener` unless cheap).
-- `session_shutdown_tests`: tracked task is aborted when the **owner** is dropped / error-path cleanup runs, **without** going through `shutdown.changed()`. Dropping a **clone** of `SessionGuard` must not abort tasks.
-- Desktop: `desired_nofile_soft` (or equivalent) never lowers `cur`; result is `min(want, hard)` when `hard` is finite and `want > cur`.
-- Desktop: `is_fd_exhaustion_message` is true for `bind socks 127.0.0.1:17891: Too many open files (os error 24)` and false for a normal TLS/timeout string.
+- `decide("192.168.88.1", &[], …) == Direct`; same for `10.0.0.1`, `172.16.1.1`, `127.0.0.1`, `localhost`, `::1`, `fc00::1`, `::ffff:192.168.1.1`. Also `100.64.1.1` (CGNAT) and `169.254.1.1` / `fe80::1`.
+- `decide("1.1.1.1", &[], …) == Tunnel`; `decide("example.com", &[], …) == Tunnel`.
+- DNS-map tests that previously used `10.0.0.1` as a mapped public IP now use `203.0.113.x`: known+live → Direct, unknown / expired → Tunnel.
+- `should_bypass("192.168.88.1")` is true after `set_bypass_domains(&[])` (or equivalent: empty global list must not hide the always-direct check). Reset globals after the test.
+- HTTP CONNECT: empty bypass list + `CONNECT 127.0.0.1` reaches the origin within 3s (does not block on mux).
+- `bibavpn/tests/split_bypass_wiring.rs` still passes (`example.com` / public `93.184.216.34` behavior unchanged).
+- Linux: merged `ignore-hosts` and `NO_PROXY` contain `192.168.0.0/16` and `10.0.0.0/8` (extend `merge_adds_loopback_and_split` / `proxy_env_assignments`).
+- macOS merge includes `192.168.0.0/16` and `10.0.0.0/8`; Windows merge includes `<local>`, `10.*`, `192.168.*`, and `172.16.*`.
 
 ## Acceptance criteria
 
-- After Linux desktop `run()`, soft `RLIMIT_NOFILE` is `min(50_000, hard)` and `≫ 1024` when the hard limit allows it (same as current macOS).
-- HTTP and SOCKS accept on EMFILE/ENFILE: rate-limited log, ~100 ms sleep, loop continues; `run_local_client` does not return `Err` for that accept.
-- Any `run_local_client` error or return aborts the HTTP accept task; the listen port can bind again in the same process.
-- Recovery watchdog: EMFILE on bind/reconnect restores the system proxy, sets a distinct `last_error`, and does not keep `recovery_pending` retries. Other reconnect failures still fail-closed with 2s→30s backoff.
-- `cargo test -p bibavpn` and `cargo test -p bibavpn-desktop` pass. No protocol / mux-epoch / wire-format changes.
+- Private / loopback / CGNAT / ULA / link-local literals and `localhost` are `Route::Direct` even when the split-tunnel domain list is empty.
+- Public IPs and ordinary hostnames with an empty bypass list remain `Tunnel`.
+- HTTP CONNECT to `127.0.0.1` with `set_bypass_domains(&[])` reaches the origin; it does not wait on mux.
+- Linux merged `ignore-hosts` / `NO_PROXY` contain `192.168.0.0/16` and `10.0.0.0/8`. macOS and Windows merge helpers include the lists in **In scope**.
+- `cargo test -p bibavpn` and `cargo test -p bibavpn-desktop` pass. No protocol / mux / wire-format changes.
 
 ## Non-goals
 
-- Full fd-leak audit of mux writers, decoy GETs, or Chromium/Electron client sockets.
-- Automatically raising the **hard** `NOFILE` (requires privileges; GUI scopes already have a large hard limit).
-- Changing camouflage, server listen semaphore, or `bibavpn-server` accept policy beyond the extract/import.
-- Documenting a user-facing “restart required” dialog beyond `last_error` / existing vpn-state emit.
+- Do not send LAN through the VPS under any profile.
+- Do not change mux/epoch or the EMFILE accept loop.
+- Do not match `.local` hostnames in `host_is_local_or_private` (OS `*.local` only).
+- Do not add a user-facing toggle to force private ranges into the tunnel.
+- Do not invent a new test harness or live `curl` / GNOME e2e job.
