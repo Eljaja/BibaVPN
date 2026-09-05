@@ -313,7 +313,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let stats_c = Arc::clone(&stats);
         let auth_c = Arc::clone(&auth);
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             serve_one_http(stream, &stats_c, &auth_c, &metrics_auth)
                 .await
@@ -325,9 +325,13 @@ mod tests {
             .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
             .unwrap();
-        let mut resp = vec![0u8; 256];
-        let n = stream.read(&mut resp).await.unwrap();
-        let text = std::str::from_utf8(&resp[..n]).unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut resp))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.contains("200 OK"));
         assert!(text.contains("ok"));
     }
@@ -344,7 +348,7 @@ mod tests {
         let stats_c = Arc::clone(&stats);
         let auth_c = Arc::clone(&auth);
         let metrics_auth_c = metrics_auth.clone();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             serve_one_http(stream, &stats_c, &auth_c, &metrics_auth_c)
                 .await
@@ -355,9 +359,13 @@ mod tests {
             .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
             .unwrap();
-        let mut resp = vec![0u8; 256];
-        let n = stream.read(&mut resp).await.unwrap();
-        let text = std::str::from_utf8(&resp[..n]).unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut resp))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.contains("401 Unauthorized"));
         assert!(text.contains(r#"WWW-Authenticate: Basic realm="bibavpn-metrics""#));
 
@@ -379,10 +387,13 @@ mod tests {
         );
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(req.as_bytes()).await.unwrap();
-        let mut resp = vec![0u8; 4096];
-        let n = stream.read(&mut resp).await.unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut resp))
+            .await
+            .unwrap()
+            .unwrap();
         server.await.unwrap();
-        let text = std::str::from_utf8(&resp[..n]).unwrap();
+        let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.contains("200 OK"), "response: {text}");
         assert!(text.contains("bibavpn_active_sessions"), "response: {text}");
     }
