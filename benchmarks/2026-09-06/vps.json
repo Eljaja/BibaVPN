@@ -344,5 +344,30 @@
         "ttfb": 0.260514
       }
     ]
+  },
+  {
+    "label": "final-config-build",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 86.86,
+    "seconds": 6.181,
+    "server_CPU_pct": 7.3,
+    "client_CPU_pct": 7.1,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 80.4,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.169925,
+        "ttfb": 0.261087
+      }
+    ]
   }
 ]

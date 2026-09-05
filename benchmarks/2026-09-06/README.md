@@ -28,6 +28,10 @@ Old-client/new-server and new-client/old-server each transferred the full
 using the production image (revision `5c3af36`); the production container
 was not modified.
 
+After the configuration fixes (`cb0b57d`, transport unchanged), the final
+release pair transferred 64 MiB on the VPS at 86.86 Mbit/s (`final-config-build`
+in `vps.json`). This is a verification sample, not another three-run comparison.
+
 ## Method
 
 - Release binaries were frozen separately for before/after runs. No production
@@ -57,6 +61,10 @@ was not modified.
 The maintained `scripts/wsl-local-bench.sh` reproduces the local topology and
 negative control; use its help for binary overrides and sample sizes. The raw
 local files here came from its precursor harness with the same topology.
+The maintained harness completed a separate 64 MiB direct/mux/negative-control
+run with `--origin-mss 1200`. A later direct 64 MiB run timed out even with
+that fixture option; it was reported as a failure, not a throughput sample.
+The optional MSS setting therefore does not eliminate local filter variability.
 
 ## AEAD-only microbenchmark
 
@@ -86,3 +94,22 @@ cleanly. `--ws-parallel 4` offers up to 256 streams distributed across four
 sessions; it does not split one stream across sessions. A 1 MiB window may
 limit a single stream on a high-bandwidth, high-RTT route. See `PROTOCOL.md`
 for exact negotiation, fallback and half-close semantics.
+
+## Verification
+
+- `cargo test -p bibavpn -p biba --locked`: passed, including 265 library,
+  3 client, 20 integration and 6 `biba` tests; no filtered-out tests.
+- Release client/server/example build: passed.
+- `scripts/wsl-proto-v3-smoke.sh`: passed with proxy bypass disabled.
+  Its historical second label says v2, but both invocations use current proto 3;
+  mixed-version interoperability is covered by the separate VPS runs above.
+- `scripts/docker-smoke.sh`: passed with a unique Compose project, matching
+  lab credentials and 1,400-byte caps. The first attempt returned curl 52;
+  subsequent explicit SOCKS/HTTP CONNECT probes and the full retry passed.
+- Maintained benchmark: final binaries passed exact 1,048,583-byte direct and
+  mux transfers plus server-stop negative control. The 64 MiB local failure
+  described above remains an environmental limitation.
+- `cargo clippy -p bibavpn -- -D warnings`: fails on the same baseline issues
+  in `biba/src/parrot.rs` (unused import) and `biba/src/parse.rs`
+  (`manual_is_multiple_of`). Normal clippy completes with existing warnings;
+  this change does not claim a warning-free repository.
