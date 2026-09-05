@@ -22,7 +22,7 @@ use bibavpn::startup_secrets::{
     resolve_cli_token, validate_resolved_token,
 };
 use bibavpn::client_policy::tls_profile_from_invite;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use base64::Engine;
 use tokio::signal;
 use tokio::sync::watch;
@@ -244,7 +244,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)?;
     bibavpn::logging::init(bibavpn::logging::LogConfig {
         level: bibavpn::logging::level_directive(&args.log_level)?,
         format: args
@@ -255,6 +256,25 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     install_ring_crypto();
+    let opts = options_from_args(args, &matches)?;
+
+    bibavpn::transport_capabilities::log_client_transport_caps(&opts);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(async move {
+        bibavpn::local_client::run_local_client(opts, shutdown_rx, None).await
+    });
+
+    signal::ctrl_c().await?;
+    info!("ctrl-c");
+    let _ = shutdown_tx.send(true);
+    server.await??;
+    Ok(())
+}
+
+fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<LocalClientOptions> {
+    let explicit =
+        |name| matches.value_source(name) == Some(clap::parser::ValueSource::CommandLine);
     if args.from_invite.is_some() != args.invite_passphrase.is_some() {
         anyhow::bail!("use --from-invite and --invite-passphrase together");
     }
@@ -302,20 +322,72 @@ async fn main() -> anyhow::Result<()> {
             p,
             sni,
             inv.token.clone(),
-            inv.max_pad,
-            inv.junk_frames,
-            inv.early_ws_frames,
+            if explicit("max_pad") {
+                args.max_pad
+            } else {
+                inv.max_pad
+            },
+            if explicit("junk_frames") {
+                args.junk_frames
+            } else {
+                inv.junk_frames
+            },
+            if explicit("early_ws_frames") {
+                args.early_ws_frames
+            } else {
+                inv.early_ws_frames
+            },
             inv.psk.clone(),
-            inv.decoy_max,
-            inv.max_ws_binary,
-            inv.ws_ping_secs,
-            inv.ws_ping_jitter_percent,
-            inv.ws_binary_send_jitter_ms,
-            inv.ws_jitter_min_ms,
-            inv.ws_jitter_max_ms,
-            inv.udp_max_pad,
-            inv.udp_max_ws_binary,
-            inv.udp_mux_reply_timeout_secs,
+            if explicit("decoy_max") {
+                args.decoy_max
+            } else {
+                inv.decoy_max
+            },
+            if explicit("max_ws_binary") {
+                args.max_ws_binary
+            } else {
+                inv.max_ws_binary
+            },
+            if explicit("ws_ping_secs") {
+                args.ws_ping_secs
+            } else {
+                inv.ws_ping_secs
+            },
+            if explicit("ws_ping_jitter_percent") {
+                args.ws_ping_jitter_percent
+            } else {
+                inv.ws_ping_jitter_percent
+            },
+            if explicit("ws_binary_send_jitter_ms") {
+                args.ws_binary_send_jitter_ms
+            } else {
+                inv.ws_binary_send_jitter_ms
+            },
+            if explicit("ws_jitter_min_ms") {
+                args.ws_jitter_min_ms
+            } else {
+                inv.ws_jitter_min_ms
+            },
+            if explicit("ws_jitter_max_ms") {
+                args.ws_jitter_max_ms
+            } else {
+                inv.ws_jitter_max_ms
+            },
+            if explicit("udp_max_pad") {
+                args.udp_max_pad
+            } else {
+                inv.udp_max_pad
+            },
+            if explicit("udp_max_ws_binary") {
+                args.udp_max_ws_binary
+            } else {
+                inv.udp_max_ws_binary
+            },
+            if explicit("udp_mux_reply_timeout_secs") {
+                args.udp_mux_reply_timeout_secs
+            } else {
+                inv.udp_mux_reply_timeout_secs
+            },
             args.insecure || inv.insecure,
             inv.proto,
             inv
@@ -390,8 +462,15 @@ async fn main() -> anyhow::Result<()> {
     })()
     .context("stealth profile")?;
     let pr_opt = stealth_for_merge.map(preset);
+    let explicit_jitter = explicit("ws_jitter_min_ms")
+        || explicit("ws_jitter_max_ms")
+        || explicit("ws_binary_send_jitter_ms");
     let (ws_jitter_min_ms, ws_jitter_max_ms) = apply_preset_ws_jitter(
-        pr_opt.as_ref(),
+        if explicit_jitter {
+            None
+        } else {
+            pr_opt.as_ref()
+        },
         ws_jitter_min_ms,
         ws_jitter_max_ms,
     );
@@ -443,10 +522,7 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_default()
                 }
             } else {
-                pr_opt
-                    .as_ref()
-                    .map(|p| p.pad_mode)
-                    .unwrap_or_default()
+                pr_opt.as_ref().map(|p| p.pad_mode).unwrap_or_default()
             }
         }
     };
@@ -555,14 +631,18 @@ async fn main() -> anyhow::Result<()> {
         log_reality_without_psk();
     }
 
-    let decoy_gets = if let Some(ref pr) = pr_opt {
+    let decoy_gets = if explicit("decoy_gets") {
+        args.decoy_gets
+    } else if let Some(ref pr) = pr_opt {
         pr.decoy_gets
     } else if let Some(ref inv) = inv_opt {
         inv.decoy_gets
     } else {
         args.decoy_gets
     };
-    let decoy_gets_interval_secs = if let Some(ref inv) = inv_opt {
+    let decoy_gets_interval_secs = if explicit("decoy_gets_interval_secs") {
+        args.decoy_gets_interval_secs
+    } else if let Some(ref inv) = inv_opt {
         inv.decoy_gets_interval_secs
     } else {
         args.decoy_gets_interval_secs
@@ -641,10 +721,14 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|i| i.tls_fragment)
         .unwrap_or(args.tls_fragment);
-    let ws_parallel = inv_opt
-        .as_ref()
-        .map(|i| i.ws_parallel)
-        .unwrap_or(args.ws_parallel);
+    let ws_parallel = if explicit("ws_parallel") {
+        args.ws_parallel
+    } else {
+        inv_opt
+            .as_ref()
+            .map(|i| i.ws_parallel)
+            .unwrap_or(args.ws_parallel)
+    };
 
     let socks_auth: Option<(String, String)> = if let Some(ref inv) = inv_opt {
         let u = inv
@@ -717,7 +801,7 @@ async fn main() -> anyhow::Result<()> {
     let sni_owned =
         bibavpn::reality::effective_tls_sni(&sni_owned, reality_target.as_deref());
 
-    let opts = LocalClientOptions {
+    Ok(LocalClientOptions {
         server_host,
         server_port,
         sni: sni_owned,
@@ -767,18 +851,148 @@ async fn main() -> anyhow::Result<()> {
         idle_decoy_secs,
         stealth_profile: stealth_for_merge,
         tls_stack,
-    };
+    })
+}
 
-    bibavpn::transport_capabilities::log_client_transport_caps(&opts);
+#[cfg(test)]
+mod performance_precedence_tests {
+    use super::*;
+    #[test]
+    fn explicit_performance_defaults_override_invite() {
+        let inv: bibavpn::InviteV1 = serde_json::from_value(serde_json::json!({
+            "v": 1, "server": "vpn.example:443", "sni": "vpn.example", "token": "strong-token",
+            "psk": "0123456789abcdef0123456789abcdef", "insecure": false,
+            "max_pad": 99, "max_ws_binary": 1400, "decoy_max": 22,
+            "ws_ping_secs": 77, "ws_ping_jitter_percent": 33,
+            "ws_binary_send_jitter_ms": 9, "ws_jitter_min_ms": 4, "ws_jitter_max_ms": 8,
+            "udp_max_pad": 88, "udp_max_ws_binary": 2000, "udp_mux_reply_timeout_secs": 99,
+            "decoy_gets": true, "decoy_gets_interval_secs": 99, "use_tcp_mux": true, "ws_parallel": 4, "stealth_profile": "balanced"
+        }))
+        .unwrap();
+        let uri = bibavpn::invite_uri::encode_invite_v1(&inv, "benchmark-test").unwrap();
+        let matches = Args::command()
+            .try_get_matches_from([
+                "client",
+                "--from-invite",
+                &uri,
+                "--invite-passphrase",
+                "benchmark-test",
+                "--max-pad",
+                "64",
+                "--max-ws-binary",
+                "262144",
+                "--decoy-max",
+                "0",
+                "--ws-ping-secs",
+                "25",
+                "--ws-ping-jitter-percent",
+                "0",
+                "--ws-binary-send-jitter-ms",
+                "0",
+                "--ws-jitter-min-ms",
+                "0",
+                "--ws-jitter-max-ms",
+                "0",
+                "--udp-max-pad",
+                "0",
+                "--udp-max-ws-binary",
+                "262144",
+                "--udp-mux-reply-timeout-secs",
+                "0",
+                "--ws-parallel",
+                "1",
+                "--decoy-gets-interval-secs", "30", "--no-mux",
+            ])
+            .unwrap();
+        let o = options_from_args(Args::from_arg_matches(&matches).unwrap(), &matches).unwrap();
+        assert_eq!(o.max_pad, 64, "max_pad");
+        assert_eq!(o.max_ws_binary, 262144, "max_ws_binary");
+        assert_eq!(o.decoy_max, 0, "decoy_max");
+        assert_eq!(o.ws_ping_secs, 25, "ws_ping_secs");
+        assert_eq!(o.ws_ping_jitter_percent, 0, "ws_ping_jitter_percent");
+        assert_eq!(o.ws_binary_send_jitter_ms, 0, "ws_binary_send_jitter_ms");
+        assert_eq!(o.ws_jitter_min_ms, 0, "ws_jitter_min_ms");
+        assert_eq!(o.ws_jitter_max_ms, 0, "ws_jitter_max_ms");
+        assert_eq!(o.udp_max_pad, Some(0), "udp_max_pad");
+        assert_eq!(o.udp_max_ws_binary, Some(262144), "udp_max_ws_binary");
+        assert_eq!(
+            o.udp_mux_reply_timeout_secs, 0,
+            "udp_mux_reply_timeout_secs"
+        );
+        assert_eq!(o.ws_parallel, 1, "ws_parallel");
+        assert_eq!(o.use_tcp_mux, false);
+        assert!(!o.insecure_tls);
+        assert_eq!(o.decoy_gets_interval_secs, 30);
+    }
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = tokio::spawn(async move {
-        bibavpn::local_client::run_local_client(opts, shutdown_rx, None).await
-    });
+    #[test]
+    fn omitted_performance_settings_preserve_invite() {
+        let inv: bibavpn::InviteV1 = serde_json::from_value(serde_json::json!({
+            "v": 1, "server": "vpn.example:443", "sni": "vpn.example", "token": "strong-token",
+            "psk": "0123456789abcdef0123456789abcdef", "insecure": false,
+            "max_pad": 99, "max_ws_binary": 1400, "decoy_max": 22,
+            "ws_ping_secs": 77, "ws_ping_jitter_percent": 33,
+            "ws_binary_send_jitter_ms": 9, "ws_jitter_min_ms": 4, "ws_jitter_max_ms": 8,
+            "udp_max_pad": 88, "udp_max_ws_binary": 2000, "udp_mux_reply_timeout_secs": 99,
+            "decoy_gets": true, "decoy_gets_interval_secs": 99, "use_tcp_mux": false, "ws_parallel": 4, "stealth_profile": "balanced"
+        }))
+        .unwrap();
+        let uri = bibavpn::invite_uri::encode_invite_v1(&inv, "benchmark-test").unwrap();
+        let matches = Args::command()
+            .try_get_matches_from([
+                "client",
+                "--from-invite",
+                &uri,
+                "--invite-passphrase",
+                "benchmark-test",
+            ])
+            .unwrap();
+        let o = options_from_args(Args::from_arg_matches(&matches).unwrap(), &matches).unwrap();
+        assert_eq!(o.max_pad, 99);
+        assert_eq!(o.max_ws_binary, 1400);
+        assert_eq!(o.decoy_max, 22);
+        assert_eq!(o.ws_ping_secs, 77);
+        assert_eq!(o.ws_ping_jitter_percent, 33);
+        assert_eq!(o.ws_binary_send_jitter_ms, 9);
+        assert_eq!(o.ws_jitter_min_ms, 4);
+        assert_eq!(o.ws_jitter_max_ms, 8);
+        assert_eq!(o.udp_max_pad, Some(88));
+        assert_eq!(o.udp_max_ws_binary, Some(2000));
+        assert_eq!(o.udp_mux_reply_timeout_secs, 99);
+        assert_eq!(o.ws_parallel, 4);
+        assert_eq!(o.use_tcp_mux, false);
+    }
 
-    signal::ctrl_c().await?;
-    info!("ctrl-c");
-    let _ = shutdown_tx.send(true);
-    server.await??;
-    Ok(())
+    #[test]
+    fn explicit_zero_jitter_disables_preset_without_invite() {
+        let matches = Args::command()
+            .try_get_matches_from([
+                "client",
+                "--server",
+                "vpn.example:443",
+                "--token",
+                "strong-token",
+                "--psk",
+                "0123456789abcdef0123456789abcdef",
+                "--stealth-profile",
+                "balanced",
+                "--ws-binary-send-jitter-ms",
+                "0",
+            ])
+            .unwrap();
+        let o = options_from_args(Args::from_arg_matches(&matches).unwrap(), &matches).unwrap();
+        assert_eq!(
+            (
+                o.ws_jitter_min_ms,
+                o.ws_jitter_max_ms,
+                o.ws_binary_send_jitter_ms
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(o.max_ws_binary, DEFAULT_CLIENT_MAX_WS_BINARY);
+        assert_eq!(o.max_pad, 64);
+        assert_eq!(o.ws_ping_secs, 25);
+        assert_eq!(o.ws_parallel, 1);
+        assert!(o.use_tcp_mux);
+    }
 }
