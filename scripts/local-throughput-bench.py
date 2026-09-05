@@ -87,10 +87,10 @@ def curl_result(args, timeout):
     return result, data
 
 
-def validate_transfer(result, data, expected):
+def validate_transfer(result, data, expected, context="transfer"):
     if (result.returncode or data.get('http_code') != 200
             or data.get('size_download') != expected or data.get('time_total', 0) <= 0):
-        raise RuntimeError(f'incomplete transfer: rc={result.returncode}, '
+        raise RuntimeError(f'{context}: incomplete transfer: rc={result.returncode}, '
                            f'HTTP={data.get("http_code")}, bytes={data.get("size_download")}, '
                            f'expected={expected}; {result.stderr.strip()}')
 
@@ -145,8 +145,9 @@ def main():
                  '-keyout', str(lab / 'key.pem'), '-out', str(lab / 'cert.pem'),
                  '-subj', '/CN=biba-bench.invalid', '-addext', 'subjectAltName=DNS:biba-bench.invalid'])
             (lab / 'origin.py').write_text(ORIGIN)
-            docker('network', 'create', tag)
+            # Docker may create the network before its CLI response times out.
             owned_network = True
+            docker('network', 'create', tag)
             # Register names before creation so a timed-out docker invocation is cleaned up too.
             owned_containers.append(origin)
             docker('run', '--rm', '-d', '--name', origin, '--network', tag,
@@ -188,15 +189,15 @@ def main():
             routes = [('direct', direct, f'https://biba-bench.invalid:{origin_port}'),
                       ('mux', mux, 'https://biba-bench.invalid:8080')]
             # Actual HTTPS requests prove both origin and tunnel readiness before timing.
-            for _, options, url in routes:
+            for mode, options, url in routes:
                 result, data = curl_result(options + [url + '/ready'], 15)
-                validate_transfer(result, data, 1)
+                validate_transfer(result, data, 1, context=f'{mode} readiness')
             emit(event='setup', label=args.label, client=str(args.client), server=str(args.server),
                  bytes=args.bytes, repeats=args.repeats, client_args=args.client_arg, origin_mss=args.origin_mss)
             for sample in range(1, args.repeats + 1):
                 for mode, options, url in routes:
                     result, data = curl_result(options + [url + '/payload'], args.timeout)
-                    validate_transfer(result, data, args.bytes)
+                    validate_transfer(result, data, args.bytes, context=f'{mode} sample {sample}')
                     emit(event='sample', label=args.label, mode=mode, sample=sample,
                          bytes=data['size_download'], seconds=data['time_total'],
                          Mbps=round(data['size_download'] * 8 / data['time_total'] / 1e6, 2))
@@ -220,8 +221,11 @@ def main():
             for command in cleanup:
                 try:
                     result = run(command, check=False)
-                    # --rm containers already disappear after docker stop.
-                    if result.returncode and 'No such container' not in result.stderr:
+                    # Resources may already be gone, or creation may never have completed.
+                    missing = 'No such container' in result.stderr or (
+                        command[1:3] == ['network', 'rm'] and
+                        ('not found' in result.stderr or 'No such network' in result.stderr))
+                    if result.returncode and not missing:
                         cleanup_errors.append(result.stderr.strip())
                 except RuntimeError as error:
                     cleanup_errors.append(str(error))
