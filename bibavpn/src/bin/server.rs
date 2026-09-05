@@ -719,6 +719,8 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+        // Small mux credit updates must not wait for Nagle/delayed ACK on the outer link.
+        let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         let token = token.clone();
         let ws_path = ws_path.clone();
