@@ -14,10 +14,17 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::frame::read_padded_frame_bytes;
 use crate::frame::AdaptivePadState;
+use crate::frame::PreparedFrame;
 #[cfg(test)]
 use crate::read_padded_frame_into;
 use crate::retry::{maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration};
-use crate::write_padded_frame_with_mode_state;
+
+// Bytes -> Vec returns the complete allocation capacity, normalizing a sliced
+// prefix with a memmove when uniquely owned. Shared/static inputs copy instead.
+// Unlike try_into_mut().capacity(), Vec capacity includes any hidden prefix.
+fn own_received_frame(blob: Bytes) -> Vec<u8> {
+    blob.into()
+}
 
 const OPEN_CREDIT: u8 = 0x20;
 const MAX_STREAMS: usize = 256;
@@ -716,8 +723,6 @@ impl Endpoint {
         }
         let writer = async {
             let mut adaptive = AdaptivePadState::default();
-            let mut wire = Vec::new();
-            let mut record = Vec::new();
             let mut ping_at = Instant::now() + self.ping_period();
             let mut dummy_at = Instant::now() + self.dummy_period();
             loop {
@@ -737,9 +742,7 @@ impl Endpoint {
                             maybe_server_ack_and_rtt_mask(self.timing).await;
                         }
                         maybe_ws_send_jitter(self.cfg.send_jitter()).await;
-                        wire.clear();
-                        write_padded_frame_with_mode_state(&mut wire, &[], self.cfg.max_pad, self.cfg.pad_mode, Some(&mut adaptive))?;
-                        let blob = self.seal(&wire, &crypto)?;
+                        let blob = self.serialize(&[], &crypto, &mut adaptive)?;
                         if blob.len() <= self.cfg.max_ws_binary { sink.send(Message::Binary(blob)).await?; }
                         dummy_at = Instant::now() + self.dummy_period();
                         continue;
@@ -787,22 +790,16 @@ impl Endpoint {
                                 }
                             }
                             // Normal FIN completion retains its queued DATA and CLOSE.
-                            record.clear();
-                            write_mux_record_to(
-                                &mut record,
-                                command.sid,
-                                command.flags,
-                                &command.payload,
-                            );
-                            wire.clear();
-                            write_padded_frame_with_mode_state(
-                                &mut wire,
-                                &record,
-                                self.cfg.max_pad,
-                                self.cfg.pad_mode,
-                                Some(&mut adaptive),
+                            let mut header = [0u8; 9];
+                            header[..4].copy_from_slice(&command.sid.to_be_bytes());
+                            header[4] = command.flags;
+                            header[5..]
+                                .copy_from_slice(&(command.payload.len() as u32).to_be_bytes());
+                            let blob = self.serialize(
+                                &[&header, &command.payload],
+                                &crypto,
+                                &mut adaptive,
                             )?;
-                            let blob = self.seal(&wire, &crypto)?;
                             if blob.len() > self.cfg.max_ws_binary {
                                 bail!("mux ws binary cap");
                             }
@@ -824,10 +821,9 @@ impl Endpoint {
                         if blob.len() > self.cfg.max_ws_binary.saturating_mul(4) {
                             bail!("oversized mux binary");
                         }
-                        // Own one exact wire allocation for in-place decryption. Bytes
-                        // from tungstenite may be shared/sliced; copying once gives a
-                        // known capacity that survives all subsequent zero-copy slices.
-                        let owned = blob.to_vec();
+                        // Recover the full backing allocation when unique; otherwise copy.
+                        // Account its actual capacity before decrypting/slicing/compacting.
+                        let owned = own_received_frame(blob);
                         let backing_capacity = owned.capacity();
                         let raw = match &crypto {
                             Some(crypto) if self.client => {
@@ -874,12 +870,22 @@ impl Endpoint {
         result
     }
 
-    fn seal(&self, wire: &[u8], crypto: &Option<SharedCrypto>) -> anyhow::Result<Bytes> {
-        Ok(Bytes::from(match crypto {
-            Some(crypto) if self.client => crypto.seal_client_to_server(wire)?,
-            Some(crypto) => crypto.seal_server_to_client(wire)?,
-            None => wire.to_vec(),
-        }))
+    fn serialize(
+        &self,
+        parts: &[&[u8]],
+        crypto: &Option<SharedCrypto>,
+        adaptive: &mut AdaptivePadState,
+    ) -> anyhow::Result<Bytes> {
+        let frame = PreparedFrame::new(parts, self.cfg.max_pad, self.cfg.pad_mode, Some(adaptive))?;
+        let wire = match crypto {
+            Some(crypto) => crypto.seal_frame(self.client, &frame)?,
+            None => {
+                let mut wire = Vec::with_capacity(frame.wire_len());
+                frame.append_to(&mut wire);
+                wire
+            }
+        };
+        Ok(Bytes::from(wire))
     }
 
     fn ping_period(&self) -> Duration {
@@ -1002,6 +1008,47 @@ mod tests {
         flow.consumed(1);
         drop(flow);
         assert_eq!(endpoint.receive_budget.available_permits(), RECEIVE_BUDGET);
+    }
+
+    #[test]
+    fn incoming_ownership_reuses_unique_and_accounts_hidden_prefix() {
+        let mut allocation = Vec::with_capacity(1024 * 1024);
+        allocation.extend_from_slice(b"paddingpayload");
+        let pointer = allocation.as_ptr();
+        let capacity = allocation.capacity();
+        let owned = own_received_frame(Bytes::from(allocation));
+        assert_eq!(owned.as_ptr(), pointer);
+        assert_eq!(owned.capacity(), capacity);
+        let sliced = Bytes::from(owned).slice(7..);
+        let owned = own_received_frame(sliced);
+        assert_eq!(owned.as_slice(), b"payload");
+        assert_eq!(owned.as_ptr(), pointer);
+        assert_eq!(
+            owned.capacity(),
+            capacity,
+            "must include hidden sliced prefix"
+        );
+        let blob = Bytes::from(owned);
+        let shared = blob.clone();
+        let copied = own_received_frame(blob);
+        assert_ne!(copied.as_ptr(), shared.as_ptr());
+        assert_eq!(copied.as_slice(), shared.as_ref());
+        assert_eq!(copied.capacity(), copied.len());
+        assert_eq!(own_received_frame(Bytes::from_static(b"static")), b"static");
+        let mut mutable = bytes::BytesMut::with_capacity(1024 * 1024);
+        mutable.extend_from_slice(b"prefixdata");
+        let pointer = mutable.as_ptr();
+        let capacity = mutable.capacity();
+        let frozen = mutable.freeze();
+        let slice = frozen.slice(6..);
+        drop(frozen);
+        let owned = own_received_frame(slice);
+        assert_eq!(owned.as_slice(), b"data");
+        assert_eq!(owned.as_ptr(), pointer);
+        assert_eq!(owned.capacity(), capacity);
+        let compacted = compact_received_payload(Bytes::from(owned), capacity);
+        assert_ne!(compacted.as_ptr(), pointer);
+        assert_eq!(compacted.as_ref(), b"data");
     }
 
     #[test]

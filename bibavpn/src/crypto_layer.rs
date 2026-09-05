@@ -104,6 +104,15 @@ impl ChaHalf {
     }
 
     fn seal(&self, decoy_max: u8, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.seal_with(decoy_max, inner.len(), |out| out.extend_from_slice(inner))
+    }
+
+    fn seal_with(
+        &self,
+        decoy_max: u8,
+        inner_len: usize,
+        append: impl FnOnce(&mut Vec<u8>),
+    ) -> anyhow::Result<Vec<u8>> {
         let dlen = if decoy_max == 0 {
             0
         } else {
@@ -112,14 +121,14 @@ impl ChaHalf {
         let nonce = self.next_nonce();
         // One allocation, including space for the detached tag. Fill decoy directly
         // in its final location rather than allocating temporary random scratch.
-        let mut out = Vec::with_capacity(12 + 1 + usize::from(dlen) + inner.len() + 16);
+        let mut out = Vec::with_capacity(12 + 1 + usize::from(dlen) + inner_len + 16);
         out.extend_from_slice(&nonce);
         out.push(dlen);
         out.resize(13 + usize::from(dlen), 0);
         if dlen != 0 {
-            OsRng.fill_bytes(&mut out[13..]);
+            rand::thread_rng().fill_bytes(&mut out[13..]);
         }
-        out.extend_from_slice(inner);
+        append(&mut out);
         let tag = self
             .cipher
             .encrypt_in_place_detached(&nonce.into(), b"", &mut out[12..])
@@ -186,6 +195,15 @@ impl SessionCrypto {
         }
     }
 
+    pub(crate) fn seal_frame(
+        &self,
+        client: bool,
+        frame: &crate::frame::PreparedFrame<'_>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let half = if client { &self.c2s } else { &self.s2c };
+        half.seal_with(self.decoy_max, frame.wire_len(), |out| frame.append_to(out))
+    }
+
     pub fn seal_client_to_server(&self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.c2s.seal(self.decoy_max, inner)
     }
@@ -246,7 +264,11 @@ pub fn parse_hello_v3(buf: &[u8]) -> anyhow::Result<[u8; 32]> {
 }
 
 /// Wire: `[server_random:32][mac:16][pad_len:u8][random padding]`.
-pub fn build_ack(psk: &str, domain: &str, client_random: &[u8; 32]) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
+pub fn build_ack(
+    psk: &str,
+    domain: &str,
+    client_random: &[u8; 32],
+) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
     let mut s = [0u8; 32];
     OsRng.fill_bytes(&mut s);
     let mac = compute_mac(psk.as_bytes(), domain, client_random, &s);
@@ -346,6 +368,41 @@ mod tests {
                 assert_eq!(opened.as_ref(), payload);
                 if !payload.is_empty() {
                     assert_eq!(opened.as_ptr(), start, "prefix removal must only slice");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_seal_keeps_final_allocation_and_legacy_wire() {
+        use crate::frame::{PadMode, PreparedFrame};
+        let half = ChaHalf::new(&[17; 32]);
+        let payload = vec![0x47; 65536];
+        let header = [0, 0, 0, 19, 2, 0, 1, 0, 0];
+        for mode in [PadMode::Random, PadMode::Adaptive, PadMode::HttpBuckets] {
+            for max_pad in [0, 255] {
+                let parts: &[&[u8]] = &[&header, &payload];
+                let frame = PreparedFrame::new(parts, max_pad, mode, None).unwrap();
+                let mut pointer = std::ptr::null();
+                let wire = half
+                    .seal_with(255, frame.wire_len(), |out| {
+                        pointer = out.as_ptr();
+                        frame.append_to(out);
+                        assert_eq!(out.as_ptr(), pointer);
+                    })
+                    .unwrap();
+                assert_eq!(wire.as_ptr(), pointer, "AEAD/tag must not reallocate");
+                let nonce: [u8; 12] = wire[..12].try_into().unwrap();
+                let plain = half.cipher.decrypt(&nonce.into(), &wire[12..]).unwrap();
+                let raw = &plain[1 + plain[0] as usize..];
+                assert_eq!(&raw[..4], &[1, 1, 0, 9]);
+                assert!(raw[4] <= max_pad);
+                assert_eq!(&raw[5 + raw[4] as usize..][..9], &header);
+                assert_eq!(&raw[14 + raw[4] as usize..], payload.as_slice());
+                for at in [0, 12, wire.len() / 2, wire.len() - 1] {
+                    let mut bad = wire.clone();
+                    bad[at] ^= 1;
+                    assert!(half.open_owned(bad).is_err());
                 }
             }
         }
