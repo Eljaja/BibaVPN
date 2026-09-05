@@ -1,0 +1,72 @@
+[
+  {
+    "event": "setup",
+    "label": "baseline-smallframes-decoy32",
+    "bytes": 67108864,
+    "repeats": 3,
+    "window_mib": "default",
+    "max_ws_binary": 1400,
+    "decoy_max": 32,
+    "topology": "all containers, no published ports"
+  },
+  {
+    "event": "sample",
+    "label": "baseline-smallframes-decoy32",
+    "mode": "direct",
+    "sample": 1,
+    "bytes": 67108864,
+    "seconds": 0.034492,
+    "Mbps": 15565.085005218602
+  },
+  {
+    "event": "sample",
+    "label": "baseline-smallframes-decoy32",
+    "mode": "mux",
+    "sample": 1,
+    "bytes": 67108864,
+    "seconds": 0.27931,
+    "Mbps": 1922.1327986824674
+  },
+  {
+    "event": "sample",
+    "label": "baseline-smallframes-decoy32",
+    "mode": "direct",
+    "sample": 2,
+    "bytes": 67108864,
+    "seconds": 0.03763,
+    "Mbps": 14267.098378952966
+  },
+  {
+    "event": "sample",
+    "label": "baseline-smallframes-decoy32",
+    "mode": "mux",
+    "sample": 2,
+    "bytes": 67108864,
+    "seconds": 0.269234,
+    "Mbps": 1994.0680300407826
+  },
+  {
+    "event": "sample",
+    "label": "baseline-smallframes-decoy32",
+    "mode": "direct",
+    "sample": 3,
+    "bytes": 67108864,
+    "seconds": 0.044095,
+    "Mbps": 12175.324004989227
+  },
+  {
+    "event": "sample",
+    "label": "baseline-smallframes-decoy32",
+    "mode": "mux",
+    "sample": 3,
+    "bytes": 67108864,
+    "seconds": 0.270408,
+    "Mbps": 1985.4106091535755
+  },
+  {
+    "event": "negative_control",
+    "passed": true,
+    "rc": 28,
+    "bytes": 0
+  }
+]

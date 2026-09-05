@@ -1,0 +1,49 @@
+[
+  {
+    "event": "setup",
+    "label": "window-2",
+    "bytes": 33554432,
+    "repeats": 3,
+    "client_args": [
+      "--mux-window-mib",
+      "2"
+    ],
+    "origin_mss": 1200,
+    "client_ready_seconds": 0.6044,
+    "full_readiness_seconds": 0.8337,
+    "delay_per_direction_ms": 50.0
+  },
+  {
+    "event": "sample",
+    "label": "window-2",
+    "mode": "mux",
+    "sample": 1,
+    "bytes": 33554432,
+    "seconds": 1.864011,
+    "Mbps": 144.01
+  },
+  {
+    "event": "sample",
+    "label": "window-2",
+    "mode": "mux",
+    "sample": 2,
+    "bytes": 33554432,
+    "seconds": 1.864622,
+    "Mbps": 143.96
+  },
+  {
+    "event": "sample",
+    "label": "window-2",
+    "mode": "mux",
+    "sample": 3,
+    "bytes": 33554432,
+    "seconds": 1.841396,
+    "Mbps": 145.78
+  },
+  {
+    "event": "negative_control",
+    "passed": true,
+    "rc": 28,
+    "bytes": 0
+  }
+]

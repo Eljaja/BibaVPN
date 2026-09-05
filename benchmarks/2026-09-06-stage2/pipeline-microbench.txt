@@ -1,0 +1,36 @@
+path=legacy bytes=1400 frames=47934 Mbps=5287.37 allocs_per_frame=2.000
+path=fused bytes=1400 frames=47934 Mbps=5441.69 allocs_per_frame=2.000
+path=legacy bytes=16384 frames=4096 Mbps=13272.63 allocs_per_frame=2.000
+path=fused bytes=16384 frames=4096 Mbps=13919.82 allocs_per_frame=2.000
+path=legacy bytes=65536 frames=1024 Mbps=14796.53 allocs_per_frame=2.000
+path=fused bytes=65536 frames=1024 Mbps=15825.57 allocs_per_frame=2.000
+path=legacy bytes=1400 frames=47934 Mbps=5312.75 allocs_per_frame=2.000
+path=fused bytes=1400 frames=47934 Mbps=5418.01 allocs_per_frame=2.000
+path=legacy bytes=16384 frames=4096 Mbps=13203.27 allocs_per_frame=2.000
+path=fused bytes=16384 frames=4096 Mbps=13769.66 allocs_per_frame=2.000
+path=legacy bytes=65536 frames=1024 Mbps=14774.33 allocs_per_frame=2.000
+path=fused bytes=65536 frames=1024 Mbps=15697.15 allocs_per_frame=2.000
+path=legacy bytes=1400 frames=47934 Mbps=5224.66 allocs_per_frame=2.000
+path=fused bytes=1400 frames=47934 Mbps=5430.40 allocs_per_frame=2.000
+path=legacy bytes=16384 frames=4096 Mbps=13380.87 allocs_per_frame=2.000
+path=fused bytes=16384 frames=4096 Mbps=13961.67 allocs_per_frame=2.000
+path=legacy bytes=65536 frames=1024 Mbps=14911.20 allocs_per_frame=2.000
+path=fused bytes=65536 frames=1024 Mbps=15819.79 allocs_per_frame=2.000
+path=legacy bytes=1400 frames=47934 Mbps=5266.03 allocs_per_frame=2.000
+path=fused bytes=1400 frames=47934 Mbps=5355.17 allocs_per_frame=2.000
+path=legacy bytes=16384 frames=4096 Mbps=13248.09 allocs_per_frame=2.000
+path=fused bytes=16384 frames=4096 Mbps=13837.50 allocs_per_frame=2.000
+path=legacy bytes=65536 frames=1024 Mbps=14721.20 allocs_per_frame=2.000
+path=fused bytes=65536 frames=1024 Mbps=15605.16 allocs_per_frame=2.000
+path=legacy bytes=1400 frames=47934 Mbps=5216.16 allocs_per_frame=2.000
+path=fused bytes=1400 frames=47934 Mbps=5342.23 allocs_per_frame=2.000
+path=legacy bytes=16384 frames=4096 Mbps=13126.61 allocs_per_frame=2.000
+path=fused bytes=16384 frames=4096 Mbps=13910.68 allocs_per_frame=2.000
+path=legacy bytes=65536 frames=1024 Mbps=14803.35 allocs_per_frame=2.000
+path=fused bytes=65536 frames=1024 Mbps=15682.60 allocs_per_frame=2.000
+('legacy', 1400) median_Mbps 5266.03 runs [5287.37, 5312.75, 5224.66, 5266.03, 5216.16]
+('fused', 1400) median_Mbps 5418.01 runs [5441.69, 5418.01, 5430.4, 5355.17, 5342.23]
+('legacy', 16384) median_Mbps 13248.09 runs [13272.63, 13203.27, 13380.87, 13248.09, 13126.61]
+('fused', 16384) median_Mbps 13910.68 runs [13919.82, 13769.66, 13961.67, 13837.5, 13910.68]
+('legacy', 65536) median_Mbps 14796.53 runs [14796.53, 14774.33, 14911.2, 14721.2, 14803.35]
+('fused', 65536) median_Mbps 15697.15 runs [15825.57, 15697.15, 15819.79, 15605.16, 15682.6]

@@ -1,0 +1,3 @@
+{"event": "setup", "label": "final-parallel4", "client": "/tmp/biba-stage2-final/bibavpn-client", "server": "/tmp/biba-stage2-final/bibavpn-server", "bytes": 1048583, "repeats": 1, "client_args": ["--ws-parallel", "4"], "origin_mss": 1200, "client_ready_seconds": 0.605, "full_readiness_seconds": 0.8847, "delay_per_direction_ms": 50.0}
+{"event": "sample", "label": "final-parallel4", "mode": "mux", "sample": 1, "bytes": 1048583, "seconds": 0.312545, "Mbps": 26.84}
+{"event": "negative_control", "passed": true, "rc": 28, "bytes": 0}
