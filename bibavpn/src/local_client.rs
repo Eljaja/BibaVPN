@@ -59,6 +59,38 @@ fn tcp_mux_connect_serial() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn tcp_mux_ready_notify() -> &'static tokio::sync::Notify {
+    static READY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    READY.get_or_init(tokio::sync::Notify::new)
+}
+
+async fn wait_for_mux_connect(
+    slot: &TcpMuxSlot,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Option<tokio::sync::MutexGuard<'static, ()>>> {
+    let serial = tcp_mux_connect_serial().lock();
+    tokio::pin!(serial);
+    loop {
+        // Register before observing the slot: publication between check and wait
+        // must wake this caller even while secondary handshakes own the lock.
+        let ready = tcp_mux_ready_notify().notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+        if *shutdown.borrow() {
+            anyhow::bail!("tcp mux: session stopped");
+        }
+        if tcp_mux_slot_has_sessions(slot).await {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stop| *stop) => anyhow::bail!("tcp mux: session stopped"),
+            _ = &mut ready => {},
+            serial = &mut serial => return Ok(Some(serial)),
+        }
+    }
+}
+
 async fn tcp_mux_slot_has_sessions(slot: &TcpMuxSlot) -> bool {
     let g = slot.lock().await;
     match g.as_ref() {
@@ -743,9 +775,8 @@ async fn connect_tcp_mux_handle_attempts(
     session: &SessionGuard,
 ) -> anyhow::Result<()> {
     let mut shutdown = session.shutdown_rx();
-    let serial = tokio::select! {
-        _ = shutdown.wait_for(|stop| *stop) => anyhow::bail!("tcp mux: session stopped"),
-        serial = tcp_mux_connect_serial().lock() => serial,
+    let Some(serial) = wait_for_mux_connect(tcp_mux_slot, &mut shutdown).await? else {
+        return Ok(());
     };
     if tcp_mux_slot_has_sessions(tcp_mux_slot).await {
         return Ok(());
@@ -767,6 +798,7 @@ async fn connect_tcp_mux_handle_attempts(
                 let mut ended = pool.ended.subscribe();
                 *slot = Some(pool);
                 drop(slot);
+                tcp_mux_ready_notify().notify_waiters();
                 // Transfer the same serialization guard to the bounded fill task.
                 // No connection task has been spawned before the first success.
                 let cfg = cfg.clone();
@@ -2435,6 +2467,42 @@ mod mux_startup_tests {
     struct Dropped(Arc<AtomicUsize>);
     impl Drop for Dropped {
         fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+    }
+
+    #[tokio::test]
+    async fn mux_startup_waiter_observes_first_ready_while_fill_holds_serial() {
+        let serial = tcp_mux_connect_serial().lock().await;
+        let slot: TcpMuxSlot = Arc::new(Mutex::new(None));
+        let (_stop, shutdown) = watch::channel(false);
+        let task_slot = slot.clone();
+        let task = tokio::spawn(async move {
+            let mut shutdown = shutdown;
+            wait_for_mux_connect(&task_slot, &mut shutdown).await.unwrap().is_none()
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        let (client, _server) = tokio::io::duplex(4096);
+        let ws = WebSocketStream::from_raw_socket(
+            client, tokio_tungstenite::tungstenite::protocol::Role::Client, None,
+        ).await;
+        let cfg = MuxClientConfig {
+            mux_window_mib: tcp_mux::MuxWindow::default(), max_pad: 0, decoy_max: 0,
+            max_ws_binary: 65536, ws_ping_secs: 0, ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0, ws_jitter_min_ms: 0, ws_jitter_max_ms: 0,
+            transport_v2: false, pad_mode: PadMode::Random, dummy_interval_secs: 0, activity: None,
+        };
+        let (_session_stop, session_rx) = watch::channel(false);
+        let mut tasks = Vec::new();
+        let mut current = slot.lock().await;
+        let connected = tcp_mux::spawn_tcp_mux_client(ws, None, cfg, slot.clone(), session_rx, &mut tasks);
+        *current = Some(TcpMuxSessionPool::from_sessions(vec![connected]));
+        drop(current);
+        tcp_mux_ready_notify().notify_waiters();
+        let result = timeout(Duration::from_secs(1), task).await;
+        for task in tasks { task.abort(); }
+        // The secondary connection group still owns the lock throughout this assertion.
+        assert!(result.unwrap().unwrap());
+        drop(serial);
     }
 
     #[tokio::test]
