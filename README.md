@@ -147,13 +147,6 @@ Every CLI flag is documented in **[AGENTS.md](AGENTS.md)**. Essentials:
 Secrets never go in the URL: the token travels in the sealed AUTH frame, and
 the WebSocket path (`--ws-path`, default `/ws`) carries no credentials.
 
-TCP mux receive windows can be tuned independently on client and server with
-`--mux-window-mib 1..=4` (default **1**). The JSON client setting is
-`"mux_window_mib": 1`. Larger windows may help high-latency links; each outer
-session keeps its 64 MiB logical receive budget and 128 MiB DATA backing bound,
-so admission is 64/32/16 streams with 1/2/4 MiB windows (21 with 3 MiB).
-The peer advertisement controls sending; local settings control receiving.
-
 ## Build from source
 
 | Crate | Role |
