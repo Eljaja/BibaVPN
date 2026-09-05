@@ -12,14 +12,34 @@ use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::frame::read_padded_frame_bytes;
 use crate::frame::AdaptivePadState;
+#[cfg(test)]
+use crate::read_padded_frame_into;
 use crate::retry::{maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration};
-use crate::{read_padded_frame_into, write_padded_frame_with_mode_state};
+use crate::write_padded_frame_with_mode_state;
 
 const OPEN_CREDIT: u8 = 0x20;
 const MAX_STREAMS: usize = 256;
-// Reserve before OPEN, without allocating the bytes: admitted windows cannot overcommit memory.
+// Logical DATA allowance reserved before OPEN; preserves 64 admitted 1MiB windows.
+// Each received slice retains at most twice its logical size (see compaction below),
+// so total backing is bounded by 128MiB, plus bounded queue metadata. A dequeue
+// does not return credit: both its Flow reservation and bytes live through write_all.
 const RECEIVE_BUDGET: usize = 64 * 1024 * 1024;
+const RECEIVE_BACKING_FACTOR: usize = 2;
+
+/// `backing_capacity` is captured from the owned Vec before any prefix slicing.
+/// Never clone the returned DATA outside its Flow: the window reservation covers
+/// the queue and active write, and is released only after their bytes are dropped.
+fn compact_received_payload(payload: Bytes, backing_capacity: usize) -> Bytes {
+    if payload.is_empty() {
+        Bytes::new()
+    } else if backing_capacity > payload.len().saturating_mul(RECEIVE_BACKING_FACTOR) {
+        Bytes::copy_from_slice(&payload)
+    } else {
+        payload
+    }
+}
 const OUTPUT_BUDGET: usize = 8 * 1024 * 1024;
 const MAX_QUEUED_RECORDS: usize = 8192;
 const NEGOTIATION_WAIT: Duration = Duration::from_millis(300);
@@ -49,7 +69,7 @@ enum Negotiation {
 }
 
 struct ReceiveState {
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<Bytes>,
     bytes: usize,
     credit: u32,
     fin: bool,
@@ -100,7 +120,8 @@ impl Flow {
         state.queue.clear();
     }
 
-    fn enqueue(&self, payload: Vec<u8>, fin: bool) -> anyhow::Result<()> {
+    fn enqueue(&self, payload: impl Into<Bytes>, fin: bool) -> anyhow::Result<()> {
+        let payload = payload.into();
         let mut state = self.receive.lock().unwrap();
         if state.fin || *self.cancelled.borrow() {
             bail!("DATA after stream FIN/reset");
@@ -122,7 +143,7 @@ impl Flow {
         Ok(())
     }
 
-    async fn receive(&self) -> Option<Vec<u8>> {
+    async fn receive(&self) -> Option<Bytes> {
         loop {
             let ready = self.receive_ready.notified();
             {
@@ -551,9 +572,10 @@ impl Endpoint {
         self: &Arc<Self>,
         sid: u32,
         flags: u8,
-        payload: Vec<u8>,
+        payload: impl Into<Bytes>,
         connect_timeout: Duration,
     ) -> anyhow::Result<()> {
+        let payload = payload.into();
         if flags == MUX_FLAG_WIN && sid == 0 {
             if self.client {
                 if let Some(window) = parse_capability(&payload, 2) {
@@ -653,7 +675,7 @@ impl Endpoint {
             let data = if flags & MUX_FLAG_DATA != 0 {
                 payload
             } else {
-                Vec::new()
+                Bytes::new()
             };
             flow.enqueue(data, flags & MUX_FLAG_CLOSE != 0)
         } else {
@@ -802,16 +824,24 @@ impl Endpoint {
                         if blob.len() > self.cfg.max_ws_binary.saturating_mul(4) {
                             bail!("oversized mux binary");
                         }
+                        // Own one exact wire allocation for in-place decryption. Bytes
+                        // from tungstenite may be shared/sliced; copying once gives a
+                        // known capacity that survives all subsequent zero-copy slices.
+                        let owned = blob.to_vec();
+                        let backing_capacity = owned.capacity();
                         let raw = match &crypto {
-                            Some(crypto) if self.client => crypto.open_server_to_client(&blob)?,
-                            Some(crypto) => crypto.open_client_to_server(&blob)?,
-                            None => blob.to_vec(),
+                            Some(crypto) if self.client => {
+                                crypto.open_server_to_client_owned(owned)?
+                            }
+                            Some(crypto) => crypto.open_client_to_server_owned(owned)?,
+                            None => Bytes::from(owned),
                         };
-                        let inner = read_padded_frame_into(raw)?;
+                        let inner = read_padded_frame_bytes(raw)?;
                         if inner.is_empty() {
                             continue;
                         }
-                        let (sid, flags, payload) = decode_mux_record(&inner)?;
+                        let (sid, flags, payload) = decode_mux_record_bytes(inner)?;
+                        let payload = compact_received_payload(payload, backing_capacity);
                         if let Some(activity) = &self.cfg.activity {
                             activity.touch();
                         }
@@ -940,6 +970,52 @@ mod tests {
                 return decode_mux_record(&read_padded_frame_into(blob.to_vec()).unwrap()).unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn retained_padding_is_compacted_and_dequeued_bytes_remain_reserved() {
+        let endpoint = endpoint(true);
+        let flow = endpoint.allocate(1, None).unwrap();
+        // Capacity, not visible wire length: simulate an oversized reused input.
+        let mut allocation = Vec::with_capacity(8192);
+        allocation.extend_from_slice(b"paddingx");
+        let capacity = allocation.capacity();
+        let bytes = Bytes::from(allocation).slice(7..);
+        let old = bytes.as_ptr();
+        let compact = compact_received_payload(bytes, capacity);
+        assert_eq!(compact.as_ref(), b"x");
+        assert_ne!(
+            compact.as_ptr(),
+            old,
+            "tiny slice must release oversized backing"
+        );
+        flow.enqueue(compact, false).unwrap();
+        let data = flow.receive().await.unwrap();
+        assert_eq!(flow.receive.lock().unwrap().bytes, 1);
+        endpoint.remove(1, flow.epoch);
+        assert_eq!(
+            endpoint.receive_budget.available_permits(),
+            RECEIVE_BUDGET - MUX_INITIAL_WINDOW as usize
+        );
+        // A dequeued socket write owns both data and its Flow until it completes.
+        drop(data);
+        flow.consumed(1);
+        drop(flow);
+        assert_eq!(endpoint.receive_budget.available_permits(), RECEIVE_BUDGET);
+    }
+
+    #[test]
+    fn useful_payload_keeps_its_backing_without_copying() {
+        let allocation = vec![7; 65536];
+        let capacity = allocation.capacity();
+        let bytes = Bytes::from(allocation).slice(553..);
+        let start = bytes.as_ptr();
+        let retained = compact_received_payload(bytes, capacity);
+        assert_eq!(retained.as_ptr(), start);
+        assert!(capacity <= retained.len() * RECEIVE_BACKING_FACTOR);
+        assert!(
+            compact_received_payload(Bytes::from(vec![0; 8192]).slice(8192..), 8192).is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1210,7 +1286,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(good.receive().await.unwrap(), b"healthy");
+        assert_eq!(good.receive().await.unwrap().as_ref(), b"healthy");
     }
 
     #[tokio::test]
@@ -1383,13 +1459,39 @@ mod tests {
 
     #[tokio::test]
     async fn new_peers_transfer_multiple_windows_and_respond_after_request_fin() {
-        let client = endpoint(true);
-        let server = endpoint(false);
+        transfer_multiple_windows(false).await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_peers_transfer_multiple_windows_with_padding_and_decoys() {
+        transfer_multiple_windows(true).await;
+    }
+
+    async fn transfer_multiple_windows(encrypted: bool) {
+        let mut cfg = config();
+        cfg.transport_v2 = encrypted;
+        cfg.max_pad = if encrypted { 255 } else { 0 };
+        cfg.decoy_max = if encrypted { 255 } else { 0 };
+        let crypto = encrypted.then(|| {
+            Arc::new(crate::crypto_layer::SessionCrypto::new(
+                "buffer-pipeline-test",
+                "test",
+                &[1; 32],
+                &[2; 32],
+                255,
+            ))
+        });
+        let server_crypto = crypto.clone();
+        let client = Endpoint::new(true, cfg.clone(), ServerWsOutTiming::default());
+        let server = Endpoint::new(false, cfg, ServerWsOutTiming::default());
         let (a, b) = ws_pair().await;
         let c = client.clone();
         let s = server.clone();
-        let ct = tokio::spawn(async move { c.run(a, None, None, Duration::from_secs(1)).await });
-        let st = tokio::spawn(async move { s.run(b, None, None, Duration::from_secs(1)).await });
+        let ct = tokio::spawn(async move { c.run(a, crypto, None, Duration::from_secs(1)).await });
+        let st =
+            tokio::spawn(
+                async move { s.run(b, server_crypto, None, Duration::from_secs(1)).await },
+            );
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = origin.local_addr().unwrap().port();
         let target = tokio::spawn(async move {
@@ -1498,7 +1600,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(healthy.receive().await.unwrap(), b"healthy");
+            assert_eq!(healthy.receive().await.unwrap().as_ref(), b"healthy");
             let mut control = endpoint.control_rx.lock().unwrap().take().unwrap();
             assert!(matches!(
                 control.try_recv(),

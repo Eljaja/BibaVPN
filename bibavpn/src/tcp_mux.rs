@@ -64,7 +64,7 @@ pub fn write_mux_record_to(buf: &mut Vec<u8>, stream_id: u32, flags: u8, payload
     buf.extend_from_slice(payload);
 }
 
-pub fn decode_mux_record(data: &[u8]) -> anyhow::Result<(u32, u8, Vec<u8>)> {
+fn mux_record_header(data: &[u8]) -> anyhow::Result<(u32, u8)> {
     if data.len() < 9 {
         anyhow::bail!("short mux record");
     }
@@ -78,7 +78,18 @@ pub fn decode_mux_record(data: &[u8]) -> anyhow::Result<(u32, u8, Vec<u8>)> {
     if data.len() != total {
         anyhow::bail!("mux record length mismatch (trailing bytes)");
     }
-    Ok((stream_id, flags, data[9..total].to_vec()))
+    Ok((stream_id, flags))
+}
+
+pub fn decode_mux_record(data: &[u8]) -> anyhow::Result<(u32, u8, Vec<u8>)> {
+    let (sid, flags) = mux_record_header(data)?;
+    Ok((sid, flags, data[9..].to_vec()))
+}
+
+/// Slice a validated mux record; its payload retains the complete backing allocation.
+pub fn decode_mux_record_bytes(data: bytes::Bytes) -> anyhow::Result<(u32, u8, bytes::Bytes)> {
+    let (sid, flags) = mux_record_header(&data)?;
+    Ok((sid, flags, data.slice(9..)))
 }
 
 pub fn decode_mux_open_target(payload: &[u8]) -> anyhow::Result<(String, u16)> {
@@ -278,6 +289,23 @@ where
 #[cfg(test)]
 mod decode_tests {
     use super::*;
+
+    #[test]
+    fn bytes_mux_decoder_preserves_backing_and_validates_lengths() {
+        let wire = bytes::Bytes::from(encode_mux_record(7, MUX_FLAG_DATA, b"payload"));
+        let start = wire.as_ptr().wrapping_add(9);
+        let (sid, flags, payload) = decode_mux_record_bytes(wire.clone()).unwrap();
+        assert_eq!((sid, flags), (7, MUX_FLAG_DATA));
+        assert_eq!(payload.as_ref(), b"payload");
+        assert_eq!(payload.as_ptr(), start);
+        assert!(decode_mux_record_bytes(wire.slice(..wire.len() - 1)).is_err());
+        assert!(decode_mux_record_bytes(bytes::Bytes::from_static(&[0; 8])).is_err());
+        let empty = bytes::Bytes::from(encode_mux_record(1, MUX_FLAG_CLOSE, b""));
+        assert!(decode_mux_record_bytes(empty).unwrap().2.is_empty());
+        let mut extra = wire.to_vec();
+        extra.push(0);
+        assert!(decode_mux_record_bytes(extra.into()).is_err());
+    }
 
     #[test]
     fn mux_record_rejects_trailing() {

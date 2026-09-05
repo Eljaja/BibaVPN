@@ -286,6 +286,18 @@ logical connection and the application can reconnect. Existing admitted
 streams retain their reserved credit and do not reset because another stream
 consumed the session budget.
 
+The **64 MiB** pool counts logical DATA bytes. Receive parsing retains owned
+buffers through `Bytes` slices, without moving nonce, decoy, padding, or mux
+prefixes. The receiver records the original `Vec` capacity before slicing;
+if that capacity exceeds twice the DATA length, it copies just the payload
+and releases the oversized allocation. Empty payloads retain no allocation.
+Thus queued and currently-writing DATA backing is bounded by **128 MiB per
+session**, plus bounded queue metadata, independently of the output and
+staging allowances below. Small heavily padded frames cannot bypass this
+bound. Queued receive buffers are not cloned outside their stream; the
+stream reservation covers the queue and the active write until both release
+their buffers.
+
 Per-stream queued and currently-writing bytes remain charged until the TCP
 write completes. Each queue is also limited to 8192 records to bound overhead
 from tiny DATA payloads. Exceeding credit, the legacy byte allowance, or this

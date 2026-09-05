@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context};
 use blake3::derive_key;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use bytes::Bytes;
+#[cfg(test)]
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use rand::rngs::OsRng;
 use rand::Rng;
@@ -101,60 +104,63 @@ impl ChaHalf {
     }
 
     fn seal(&self, decoy_max: u8, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let plain = if decoy_max == 0 {
-            let mut v = Vec::with_capacity(1 + inner.len());
-            v.push(0u8);
-            v.extend_from_slice(inner);
-            v
+        let dlen = if decoy_max == 0 {
+            0
         } else {
-            let mut plain = Vec::with_capacity(1 + usize::from(decoy_max) + inner.len());
-            let dlen: u8 = rand::thread_rng().gen_range(0..=decoy_max);
-            plain.push(dlen);
-            if dlen > 0 {
-                let mut noise = vec![0u8; usize::from(dlen)];
-                OsRng.fill_bytes(&mut noise);
-                plain.extend_from_slice(&noise);
-            }
-            plain.extend_from_slice(inner);
-            plain
+            rand::thread_rng().gen_range(0..=decoy_max)
         };
-
         let nonce = self.next_nonce();
-        let ct = self
-            .cipher
-            .encrypt(&nonce.into(), plain.as_slice())
-            .map_err(|e| anyhow::anyhow!("chacha encrypt: {e}"))?;
-        let mut out = Vec::with_capacity(12 + ct.len());
+        // One allocation, including space for the detached tag. Fill decoy directly
+        // in its final location rather than allocating temporary random scratch.
+        let mut out = Vec::with_capacity(12 + 1 + usize::from(dlen) + inner.len() + 16);
         out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
+        out.push(dlen);
+        out.resize(13 + usize::from(dlen), 0);
+        if dlen != 0 {
+            OsRng.fill_bytes(&mut out[13..]);
+        }
+        out.extend_from_slice(inner);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(&nonce.into(), b"", &mut out[12..])
+            .map_err(|e| anyhow::anyhow!("chacha encrypt: {e}"))?;
+        out.extend_from_slice(&tag);
         Ok(out)
     }
 
-    fn open(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
+    /// Decrypt in place; return the payload range without sliding nonce/decoy bytes.
+    fn open_range(&self, wire: &mut [u8]) -> anyhow::Result<std::ops::Range<usize>> {
         if wire.len() < 12 + 16 {
             bail!("short outer packet");
         }
-        let (n, ct) = wire.split_at(12);
-        let nonce: [u8; 12] = n.try_into().unwrap();
-        let pt = self
-            .cipher
-            .decrypt(&nonce.into(), ct)
+        let nonce: [u8; 12] = wire[..12].try_into().unwrap();
+        let end = wire.len() - 16;
+        let tag: [u8; 16] = wire[end..].try_into().unwrap();
+        self.cipher
+            .decrypt_in_place_detached(&nonce.into(), b"", &mut wire[12..end], &tag.into())
             .map_err(|_| anyhow::anyhow!("chacha decrypt"))?;
-        strip_decoy(pt)
+        if end == 12 {
+            bail!("empty plaintext");
+        }
+        let start = 13 + usize::from(wire[12]);
+        if start > end {
+            bail!("bad decoy length");
+        }
+        Ok(start..end)
     }
-}
 
-/// Drop outer decoy prefix in place (one allocation from decrypt, no extra copy).
-fn strip_decoy(mut pt: Vec<u8>) -> Result<Vec<u8>, anyhow::Error> {
-    if pt.is_empty() {
-        bail!("empty plaintext");
+    fn open_owned(&self, mut wire: Vec<u8>) -> anyhow::Result<Bytes> {
+        let payload = self.open_range(&mut wire)?;
+        Ok(Bytes::from(wire).slice(payload))
     }
-    let d = usize::from(pt[0]);
-    if pt.len() < 1 + d {
-        bail!("bad decoy length");
+
+    fn open(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut out = wire.to_vec();
+        let payload = self.open_range(&mut out)?;
+        out.truncate(payload.end);
+        out.drain(..payload.start);
+        Ok(out)
     }
-    pt.drain(..1 + d);
-    Ok(pt)
 }
 
 /// Bidirectional session keys. Each direction uses a lock-free nonce counter; seal/open are `Sync`.
@@ -186,6 +192,17 @@ impl SessionCrypto {
 
     pub fn open_client_to_server(&self, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.c2s.open(wire).context("chacha decrypt (c2s)")
+    }
+
+    /// Consume a wire buffer and decrypt without moving its payload. The returned
+    /// slice retains the full input allocation; bounded queues must account for it.
+    pub fn open_client_to_server_owned(&self, wire: Vec<u8>) -> anyhow::Result<Bytes> {
+        self.c2s.open_owned(wire).context("chacha decrypt (c2s)")
+    }
+
+    /// See [`Self::open_client_to_server_owned`] for backing-allocation ownership.
+    pub fn open_server_to_client_owned(&self, wire: Vec<u8>) -> anyhow::Result<Bytes> {
+        self.s2c.open_owned(wire).context("chacha decrypt (s2c)")
     }
 
     pub fn seal_server_to_client(&self, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -305,6 +322,64 @@ mod tests {
         assert!(secret_eq(&b""[..], ""));
         assert!(!secret_eq("", "token"));
         assert!(!secret_eq("token", ""));
+    }
+
+    // Build the old encrypt(plain) wire independently from the in-place implementation.
+    fn legacy_wire(cipher: &ChaCha20Poly1305, plain: &[u8]) -> Vec<u8> {
+        let nonce = [37u8; 12];
+        let mut wire = nonce.to_vec();
+        wire.extend(cipher.encrypt(&nonce.into(), plain).unwrap());
+        wire
+    }
+
+    #[test]
+    fn owned_open_matches_legacy_layout_without_moving_payload() {
+        let half = ChaHalf::new(&[17; 32]);
+        for decoy in [0usize, 1, 255] {
+            for payload in [&b""[..], &b"legacy payload"[..]] {
+                let mut plain = vec![91; 1 + decoy];
+                plain[0] = decoy as u8;
+                plain.extend_from_slice(payload);
+                let wire = legacy_wire(&half.cipher, &plain);
+                let start = wire.as_ptr().wrapping_add(12 + 1 + decoy);
+                let opened = half.open_owned(wire).unwrap();
+                assert_eq!(opened.as_ref(), payload);
+                if !payload.is_empty() {
+                    assert_eq!(opened.as_ptr(), start, "prefix removal must only slice");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_seal_is_readable_by_legacy_aead() {
+        let half = ChaHalf::new(&[17; 32]);
+        for decoy in [0, 255] {
+            for payload in [&b""[..], &b"new payload"[..]] {
+                let wire = half.seal(decoy, payload).unwrap();
+                let nonce: [u8; 12] = wire[..12].try_into().unwrap();
+                let plain = half.cipher.decrypt(&nonce.into(), &wire[12..]).unwrap();
+                assert!(plain[0] <= decoy);
+                assert_eq!(&plain[1 + usize::from(plain[0])..], payload);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_open_rejects_malformed_prefix_and_tampering() {
+        let half = ChaHalf::new(&[17; 32]);
+        for plain in [&b""[..], &[1][..], &[255, 9][..]] {
+            assert!(half.open_owned(legacy_wire(&half.cipher, plain)).is_err());
+        }
+        for n in 0..28 {
+            assert!(half.open_owned(vec![0; n]).is_err());
+        }
+        let original = legacy_wire(&half.cipher, b"\0ok");
+        for i in 0..original.len() {
+            let mut wire = original.clone();
+            wire[i] ^= 1;
+            assert!(half.open_owned(wire).is_err(), "tamper byte {i}");
+        }
     }
 
     #[test]

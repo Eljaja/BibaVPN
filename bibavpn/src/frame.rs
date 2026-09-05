@@ -201,6 +201,13 @@ pub fn read_padded_frame_borrow(raw: &[u8]) -> Result<&[u8], FrameError> {
     Ok(&raw[start..])
 }
 
+/// Consume a shared buffer and slice the padded payload without moving bytes.
+/// The slice retains the complete backing allocation, including padding.
+pub fn read_padded_frame_bytes(raw: bytes::Bytes) -> Result<bytes::Bytes, FrameError> {
+    let start = padded_frame_payload_start(&raw)?;
+    Ok(raw.slice(start..))
+}
+
 /// Consume `raw` and return only payload bytes (reuse buffer; no `to_vec` of payload).
 pub fn read_padded_frame_into(mut raw: Vec<u8>) -> Result<Vec<u8>, FrameError> {
     let start = padded_frame_payload_start(&raw)?;
@@ -217,6 +224,27 @@ pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_parser_slices_payload_and_rejects_bad_lengths() {
+        for pad in [0usize, 255] {
+            let mut wire = vec![1, 0, 0, 3, pad as u8];
+            wire.resize(5 + pad, 9);
+            wire.extend_from_slice(b"abc");
+            let wire = bytes::Bytes::from(wire);
+            let start = wire.as_ptr().wrapping_add(5 + pad);
+            let payload = read_padded_frame_bytes(wire.clone()).unwrap();
+            assert_eq!(payload.as_ref(), b"abc");
+            assert_eq!(payload.as_ptr(), start);
+            assert!(read_padded_frame_bytes(wire.slice(..wire.len() - 1)).is_err());
+        }
+        assert!(
+            read_padded_frame_bytes(bytes::Bytes::from_static(&[1, 0, 0, 0, 0]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(read_padded_frame_bytes(bytes::Bytes::from_static(&[2, 0, 0, 0, 0])).is_err());
+    }
 
     #[test]
     fn round_trip_zero_pad() {
