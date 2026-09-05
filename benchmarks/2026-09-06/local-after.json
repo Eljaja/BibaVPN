@@ -1,0 +1,53 @@
+[
+  {
+    "label": "buffer-candidate",
+    "mode": "direct",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 11291.14,
+    "seconds": 0.047548
+  },
+  {
+    "label": "buffer-candidate",
+    "mode": "direct",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 10821.39,
+    "seconds": 0.049612
+  },
+  {
+    "label": "buffer-candidate",
+    "mode": "direct",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 11496.9,
+    "seconds": 0.046697
+  },
+  {
+    "label": "buffer-candidate",
+    "mode": "mux",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 5252.57,
+    "seconds": 0.102211
+  },
+  {
+    "label": "buffer-candidate",
+    "mode": "mux",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 5454.84,
+    "seconds": 0.098421
+  },
+  {
+    "label": "buffer-candidate",
+    "mode": "mux",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 5780.26,
+    "seconds": 0.09288
+  },
+  {
+    "negative_control_rc": 28
+  }
+]

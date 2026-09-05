@@ -1,0 +1,74 @@
+[
+  {
+    "bytes": 1400,
+    "frames": 191739,
+    "Mbps": 4446.3,
+    "allocs_per_frame": 3.969
+  },
+  {
+    "bytes": 16384,
+    "frames": 16384,
+    "Mbps": 12643.75,
+    "allocs_per_frame": 3.97
+  },
+  {
+    "bytes": 65536,
+    "frames": 4096,
+    "Mbps": 8216.46,
+    "allocs_per_frame": 3.97
+  },
+  {
+    "bytes": 262000,
+    "frames": 1024,
+    "Mbps": 5711.92,
+    "allocs_per_frame": 3.971
+  },
+  {
+    "bytes": 1400,
+    "frames": 191739,
+    "Mbps": 4500.3,
+    "allocs_per_frame": 3.97
+  },
+  {
+    "bytes": 16384,
+    "frames": 16384,
+    "Mbps": 13120.27,
+    "allocs_per_frame": 3.97
+  },
+  {
+    "bytes": 65536,
+    "frames": 4096,
+    "Mbps": 8239.75,
+    "allocs_per_frame": 3.968
+  },
+  {
+    "bytes": 262000,
+    "frames": 1024,
+    "Mbps": 5735.04,
+    "allocs_per_frame": 3.965
+  },
+  {
+    "bytes": 1400,
+    "frames": 191739,
+    "Mbps": 4506.53,
+    "allocs_per_frame": 3.97
+  },
+  {
+    "bytes": 16384,
+    "frames": 16384,
+    "Mbps": 13043.37,
+    "allocs_per_frame": 3.97
+  },
+  {
+    "bytes": 65536,
+    "frames": 4096,
+    "Mbps": 8075.6,
+    "allocs_per_frame": 3.966
+  },
+  {
+    "bytes": 262000,
+    "frames": 1024,
+    "Mbps": 5561.21,
+    "allocs_per_frame": 3.973
+  }
+]

@@ -1,0 +1,53 @@
+[
+  {
+    "label": "baseline",
+    "mode": "direct",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 10458.8,
+    "seconds": 0.051332
+  },
+  {
+    "label": "baseline",
+    "mode": "direct",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 11509.97,
+    "seconds": 0.046644
+  },
+  {
+    "label": "baseline",
+    "mode": "direct",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 11432.76,
+    "seconds": 0.046959
+  },
+  {
+    "label": "baseline",
+    "mode": "mux",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 3698.99,
+    "seconds": 0.14514
+  },
+  {
+    "label": "baseline",
+    "mode": "mux",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 4983.12,
+    "seconds": 0.107738
+  },
+  {
+    "label": "baseline",
+    "mode": "mux",
+    "rc": 0,
+    "bytes": 67108864,
+    "Mbps": 5490.49,
+    "seconds": 0.097782
+  },
+  {
+    "negative_control_rc": 28
+  }
+]

@@ -1,0 +1,348 @@
+[
+  {
+    "label": "baseline-1",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 88.41,
+    "seconds": 6.072,
+    "server_CPU_pct": 4.0,
+    "client_CPU_pct": 8.1,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 78.2,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.063168,
+        "ttfb": 0.151184
+      }
+    ]
+  },
+  {
+    "label": "baseline-2",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 89.38,
+    "seconds": 6.006,
+    "server_CPU_pct": 3.5,
+    "client_CPU_pct": 7.3,
+    "host_steal_pct": 0.3,
+    "host_idle_pct": 83.9,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 5.996383,
+        "ttfb": 0.151312
+      }
+    ]
+  },
+  {
+    "label": "baseline-3",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 87.23,
+    "seconds": 6.155,
+    "server_CPU_pct": 3.6,
+    "client_CPU_pct": 7.8,
+    "host_steal_pct": 0.0,
+    "host_idle_pct": 85.9,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.144753,
+        "ttfb": 0.19355
+      }
+    ]
+  },
+  {
+    "label": "direct-before",
+    "mode": "direct",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 87.0,
+    "seconds": 6.171,
+    "server_CPU_pct": 0.0,
+    "client_CPU_pct": 0.0,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 85.2,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.161584,
+        "ttfb": 0.258964
+      }
+    ]
+  },
+  {
+    "label": "mux-only",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 88.71,
+    "seconds": 6.052,
+    "server_CPU_pct": 9.3,
+    "client_CPU_pct": 7.3,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 80.3,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.043393,
+        "ttfb": 0.204228
+      }
+    ]
+  },
+  {
+    "label": "candidate-1",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 84.35,
+    "seconds": 6.365,
+    "server_CPU_pct": 6.6,
+    "client_CPU_pct": 6.4,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 82.4,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.355187,
+        "ttfb": 0.257898
+      }
+    ]
+  },
+  {
+    "label": "candidate-2",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 86.89,
+    "seconds": 6.179,
+    "server_CPU_pct": 7.4,
+    "client_CPU_pct": 7.1,
+    "host_steal_pct": 0.0,
+    "host_idle_pct": 79.0,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.169154,
+        "ttfb": 0.198949
+      }
+    ]
+  },
+  {
+    "label": "candidate-3",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 81.14,
+    "seconds": 6.616,
+    "server_CPU_pct": 6.5,
+    "client_CPU_pct": 6.2,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 82.7,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.607377,
+        "ttfb": 0.26411
+      }
+    ]
+  },
+  {
+    "label": "candidate-four-streams",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 4,
+    "bytes_per_stream": 16777216,
+    "valid": true,
+    "Mbps": 86.96,
+    "seconds": 6.174,
+    "server_CPU_pct": 6.6,
+    "client_CPU_pct": 7.5,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 82.3,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 16777216,
+        "s": 6.150917,
+        "ttfb": 0.173732
+      },
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 16777216,
+        "s": 6.152983,
+        "ttfb": 0.441394
+      },
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 16777216,
+        "s": 6.164831,
+        "ttfb": 0.617324
+      },
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 16777216,
+        "s": 6.155484,
+        "ttfb": 0.530151
+      }
+    ]
+  },
+  {
+    "label": "old-client-new-server",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 86.63,
+    "seconds": 6.197,
+    "server_CPU_pct": 3.6,
+    "client_CPU_pct": 6.3,
+    "host_steal_pct": 0.14,
+    "host_idle_pct": 86.6,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.187798,
+        "ttfb": 0.257905
+      }
+    ]
+  },
+  {
+    "label": "new-client-old-server",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 85.42,
+    "seconds": 6.285,
+    "server_CPU_pct": 3.8,
+    "client_CPU_pct": 7.2,
+    "host_steal_pct": 0.13,
+    "host_idle_pct": 72.8,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.275945,
+        "ttfb": 0.200442
+      }
+    ]
+  },
+  {
+    "label": "new-client-production-image",
+    "mode": "mux",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 83.52,
+    "seconds": 6.428,
+    "server_CPU_pct": 4.2,
+    "client_CPU_pct": 6.2,
+    "host_steal_pct": 2.84,
+    "host_idle_pct": 0.0,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.417726,
+        "ttfb": 0.271727
+      }
+    ]
+  },
+  {
+    "label": "direct-after",
+    "mode": "direct",
+    "client_cap": 262144,
+    "parallel": 1,
+    "streams": 1,
+    "bytes_per_stream": 67108864,
+    "valid": true,
+    "Mbps": 86.74,
+    "seconds": 6.19,
+    "server_CPU_pct": 0.0,
+    "client_CPU_pct": 0.0,
+    "host_steal_pct": 2.98,
+    "host_idle_pct": 0.0,
+    "oom": false,
+    "flows": [
+      {
+        "rc": 0,
+        "http": 206,
+        "bytes": 67108864,
+        "s": 6.17871,
+        "ttfb": 0.260514
+      }
+    ]
+  }
+]
