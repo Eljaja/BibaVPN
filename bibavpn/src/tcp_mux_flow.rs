@@ -147,6 +147,29 @@ impl Flow {
         }
     }
 
+    fn publish_credit(
+        &self,
+        amount: u32,
+        publish: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut receive = self.receive.lock().unwrap();
+            receive.credit = receive
+                .credit
+                .checked_add(amount)
+                .filter(|credit| *credit <= MUX_INITIAL_WINDOW)
+                .context("mux receive credit overflow")?;
+        }
+        // Publication can be consumed immediately on another worker. Its allowance
+        // must already exist. Failure aborts this stream instead of rolling back
+        // credit that a concurrent reader may have consumed.
+        if let Err(error) = publish() {
+            self.cancel(false);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn add_credit(&self, payload: &[u8]) -> anyhow::Result<()> {
         if !self.negotiated {
             return Ok(());
@@ -216,6 +239,22 @@ pub(super) struct Endpoint {
     session_stop: watch::Sender<bool>,
 }
 
+/// Own admission until the bridge task has taken over, including cancellation of
+/// an OPEN waiting on output bytes or queue space.
+struct OpenAdmissionGuard<'a> {
+    endpoint: &'a Endpoint,
+    sid: u32,
+    epoch: Option<u64>,
+}
+
+impl Drop for OpenAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch {
+            self.endpoint.remove(self.sid, epoch);
+        }
+    }
+}
+
 struct SessionGuard<'a>(&'a Endpoint);
 
 impl Drop for SessionGuard<'_> {
@@ -250,7 +289,10 @@ impl Endpoint {
 
     fn allocate(&self, sid: u32, peer_window: Option<u32>) -> anyhow::Result<Arc<Flow>> {
         let mut streams = self.streams.lock().unwrap();
-        if sid == 0 || self.closed.load(Ordering::Acquire) || streams.contains_key(&sid) {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(MuxWriterStopped));
+        }
+        if sid == 0 || streams.contains_key(&sid) {
             bail!("mux stream unavailable");
         }
         if streams.len() >= MAX_STREAMS {
@@ -337,7 +379,8 @@ impl Endpoint {
             .output_budget
             .clone()
             .acquire_many_owned((payload.len() + 9) as u32)
-            .await?;
+            .await
+            .map_err(|_| anyhow::Error::new(MuxWriterStopped))?;
         self.output
             .send(Output::Record(Record {
                 sid,
@@ -392,15 +435,20 @@ impl Endpoint {
             Ok(value) => value,
             Err(err) => return Err(MuxOpenStreamDropped { local, err }),
         };
+        let mut admission = OpenAdmissionGuard {
+            endpoint: self,
+            sid,
+            epoch: Some(flow.epoch),
+        };
         let flags = MUX_FLAG_OPEN | if window.is_some() { OPEN_CREDIT } else { 0 };
         if let Err(err) = self.send(sid, flags, payload, flow.clone()).await {
-            self.remove(sid, flow.epoch);
             return Err(MuxOpenStreamDropped { local, err });
         }
         let endpoint = self.clone();
         tokio::spawn(async move {
             endpoint.bridge(local, sid, flow, prefix).await;
         });
+        admission.epoch = None;
         Ok(())
     }
 
@@ -462,13 +510,14 @@ impl Endpoint {
                     pending_credit += len as u32;
                     let empty = flow.receive.lock().unwrap().queue.is_empty();
                     if pending_credit >= MUX_INITIAL_WINDOW / 8 || empty {
-                        self.control(
-                            sid,
-                            MUX_FLAG_WIN,
-                            pending_credit.to_be_bytes().to_vec(),
-                            Some(flow.clone()),
-                        )?;
-                        flow.receive.lock().unwrap().credit += pending_credit;
+                        flow.publish_credit(pending_credit, || {
+                            self.control(
+                                sid,
+                                MUX_FLAG_WIN,
+                                pending_credit.to_be_bytes().to_vec(),
+                                Some(flow.clone()),
+                            )
+                        })?;
                         pending_credit = 0;
                     }
                 }
@@ -489,7 +538,10 @@ impl Endpoint {
         };
         if self.finish(sid, flow.epoch, result.is_ok()) && result.is_err() {
             tracing::debug!(target: "bibavpn_mux", stream_id = sid, "mux stream I/O failed: {result:?}");
-            if self.control(sid, MUX_FLAG_RST, Vec::new(), None).is_err() {
+            if self
+                .control(sid, MUX_FLAG_RST, Vec::new(), Some(flow.clone()))
+                .is_err()
+            {
                 self.shutdown();
             }
         }
@@ -525,7 +577,7 @@ impl Endpoint {
                 match *self.negotiation.borrow() {
                     Negotiation::Credit(window) => Some(window),
                     _ => {
-                        self.control(sid, MUX_FLAG_RST, Vec::new(), None)?;
+                        self.control(sid, MUX_FLAG_RST, Vec::new(), self.get(sid))?;
                         return Ok(());
                     }
                 }
@@ -541,7 +593,7 @@ impl Endpoint {
             let flow = match flow {
                 Ok(flow) => flow,
                 Err(_) => {
-                    self.control(sid, MUX_FLAG_RST, Vec::new(), None)?;
+                    self.control(sid, MUX_FLAG_RST, Vec::new(), self.get(sid))?;
                     return Ok(());
                 }
             };
@@ -561,7 +613,7 @@ impl Endpoint {
                     _ => {
                         if endpoint.remove(sid, flow.epoch)
                             && endpoint
-                                .control(sid, MUX_FLAG_RST, Vec::new(), None)
+                                .control(sid, MUX_FLAG_RST, Vec::new(), Some(flow.clone()))
                                 .is_err()
                         {
                             endpoint.shutdown();
@@ -608,7 +660,7 @@ impl Endpoint {
             Ok(())
         };
         if result.is_err() && self.remove(sid, flow.epoch) {
-            self.control(sid, MUX_FLAG_RST, Vec::new(), None)?;
+            self.control(sid, MUX_FLAG_RST, Vec::new(), Some(flow))?;
         }
         Ok(())
     }
@@ -687,11 +739,27 @@ impl Endpoint {
                     match command {
                         Output::Pong(payload) => sink.feed(Message::Pong(payload)).await?,
                         Output::Record(command) => {
-                            if let Some(flow) = &command.flow {
+                            if command.flags != MUX_FLAG_DATA && command.flags != MUX_FLAG_WIN {
+                                if !self.client {
+                                    maybe_server_ack_and_rtt_mask(self.timing).await;
+                                }
+                                maybe_ws_send_jitter(self.cfg.send_jitter()).await;
+                            }
+                            let current = self.get(command.sid);
+                            if command.flags == MUX_FLAG_RST {
+                                // A reset scopes to the old epoch, or to absence of a
+                                // stream when rejecting DATA/OPEN for an unknown id.
+                                if current.as_ref().is_some_and(|current| {
+                                    command
+                                        .flow
+                                        .as_ref()
+                                        .is_none_or(|old| old.epoch != current.epoch)
+                                }) {
+                                    continue;
+                                }
+                            } else if let Some(flow) = &command.flow {
                                 if !flow.output_valid.load(Ordering::Acquire)
-                                    || self
-                                        .get(command.sid)
-                                        .is_some_and(|current| current.epoch != flow.epoch)
+                                    || current.is_some_and(|current| current.epoch != flow.epoch)
                                 {
                                     continue;
                                 }
@@ -715,12 +783,6 @@ impl Endpoint {
                             let blob = self.seal(&wire, &crypto)?;
                             if blob.len() > self.cfg.max_ws_binary {
                                 bail!("mux ws binary cap");
-                            }
-                            if command.flags != MUX_FLAG_DATA && command.flags != MUX_FLAG_WIN {
-                                if !self.client {
-                                    maybe_server_ack_and_rtt_mask(self.timing).await;
-                                }
-                                maybe_ws_send_jitter(self.cfg.send_jitter()).await;
                             }
                             if let Some(activity) = &self.cfg.activity {
                                 activity.touch();
@@ -1464,5 +1526,215 @@ mod tests {
         ] {
             assert_eq!(parse_capability(&bad, 1), None);
         }
+    }
+
+    async fn local_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (local, _) = listener.accept().await.unwrap();
+        (app, local)
+    }
+
+    #[tokio::test]
+    async fn cancelled_open_reclaims_admission_during_byte_or_queue_backpressure() {
+        for saturate_bytes in [true, false] {
+            let endpoint = endpoint(true);
+            endpoint.negotiation.send_replace(Negotiation::Legacy);
+            let bytes = if saturate_bytes {
+                Some(
+                    endpoint
+                        .output_budget
+                        .clone()
+                        .acquire_many_owned(OUTPUT_BUDGET as u32)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                for _ in 0..512 {
+                    assert!(endpoint.output.try_send(Output::Pong(Bytes::new())).is_ok());
+                }
+                None
+            };
+            let (_app, local) = local_tcp_pair().await;
+            let opening = endpoint.clone();
+            let task = tokio::spawn(async move {
+                opening
+                    .open_stream(local, "example.test".into(), 80, Vec::new())
+                    .await
+                    .map_err(|e| e.err)
+            });
+            timeout(Duration::from_secs(1), async {
+                while endpoint.get(1).is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                endpoint.receive_budget.available_permits(),
+                RECEIVE_BUDGET - MUX_INITIAL_WINDOW as usize
+            );
+            task.abort();
+            let _ = task.await;
+            assert!(
+                endpoint.get(1).is_none(),
+                "cancelled open must remove its map entry"
+            );
+            assert_eq!(endpoint.receive_budget.available_permits(), RECEIVE_BUDGET);
+            drop(bytes);
+            assert_eq!(endpoint.output_budget.available_permits(), OUTPUT_BUDGET);
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_writer_open_errors_preserve_retry_type_and_local_socket() {
+        for closed_endpoint in [true, false] {
+            let endpoint = endpoint(true);
+            endpoint.negotiation.send_replace(Negotiation::Legacy);
+            if closed_endpoint {
+                endpoint.shutdown();
+            } else {
+                endpoint.output_budget.close();
+            }
+            let (mut app, local) = local_tcp_pair().await;
+            let handle = TcpMuxClientHandle {
+                endpoint: endpoint.clone(),
+            };
+            let mut failure = match handle
+                .open_stream(local, "example.test".into(), 80, Vec::new())
+                .await
+            {
+                Ok(()) => panic!("stopped writer must fail the open"),
+                Err(failure) => failure,
+            };
+            assert!(
+                failure
+                    .err
+                    .chain()
+                    .any(|error| error.downcast_ref::<MuxWriterStopped>().is_some()),
+                "retry classifier must recognize: {:#}",
+                failure.err
+            );
+            app.write_all(b"r").await.unwrap();
+            let mut marker = [0; 1];
+            failure.local.read_exact(&mut marker).await.unwrap();
+            assert_eq!(&marker, b"r");
+            assert_eq!(endpoint.receive_budget.available_permits(), RECEIVE_BUDGET);
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_allowance_is_restored_before_credit_publication() {
+        let endpoint = endpoint(false);
+        let flow = endpoint.allocate(1, Some(MUX_INITIAL_WINDOW)).unwrap();
+        flow.enqueue(vec![0; MUX_INITIAL_WINDOW as usize], false)
+            .unwrap();
+        let bytes = flow.receive().await.unwrap();
+        flow.consumed(bytes.len());
+        drop(bytes);
+        let publication = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let peer = flow.clone();
+        let barrier = publication.clone();
+        let peer_thread = std::thread::spawn(move || {
+            barrier.wait();
+            let result = peer.enqueue(vec![1; MUX_INITIAL_WINDOW as usize], false);
+            barrier.wait();
+            result
+        });
+        flow.publish_credit(MUX_INITIAL_WINDOW, || {
+            // The peer consumes WIN immediately at its publication boundary.
+            publication.wait();
+            publication.wait();
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            peer_thread.join().unwrap().is_ok(),
+            "published credit must already be usable by the shared reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_scoped_or_unknown_reset_does_not_reset_reused_id() {
+        for known_stream in [true, false] {
+            let server = endpoint(false);
+            if known_stream {
+                server.allocate(1, Some(MUX_INITIAL_WINDOW)).unwrap();
+                server
+                    .dispatch(1, MUX_FLAG_WIN, vec![0], Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            } else {
+                server
+                    .dispatch(
+                        1,
+                        MUX_FLAG_DATA,
+                        b"unknown".to_vec(),
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let current = server.allocate(1, Some(MUX_INITIAL_WINDOW)).unwrap();
+            server
+                .send(1, MUX_FLAG_DATA, b"current".to_vec(), current)
+                .await
+                .unwrap();
+            let (mut peer, ws) = ws_pair().await;
+            let running = server.clone();
+            let task =
+                tokio::spawn(
+                    async move { running.run(ws, None, None, Duration::from_secs(1)).await },
+                );
+            let (sid, flags, payload) = recv_record(&mut peer).await;
+            assert_eq!(
+                (sid, flags, payload),
+                (1, MUX_FLAG_DATA, b"current".to_vec())
+            );
+            server.shutdown();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_credit_publication_cancels_the_stream() {
+        let endpoint = endpoint(false);
+        let flow = endpoint.allocate(1, Some(MUX_INITIAL_WINDOW)).unwrap();
+        flow.enqueue(vec![0; 32], false).unwrap();
+        let data = flow.receive().await.unwrap();
+        flow.consumed(data.len());
+        assert!(flow
+            .publish_credit(32, || anyhow::bail!("control output closed"))
+            .is_err());
+        assert!(
+            *flow.cancelled.borrow(),
+            "failed publication must not leave a live stream with unadvertised allowance"
+        );
+        assert!(flow.enqueue(vec![1], false).is_err());
+    }
+
+    #[tokio::test]
+    async fn admission_exhaustion_is_not_a_stopped_writer_error() {
+        let endpoint = endpoint(true);
+        endpoint.negotiation.send_replace(Negotiation::Legacy);
+        let _reserved = endpoint
+            .receive_budget
+            .clone()
+            .acquire_many_owned(RECEIVE_BUDGET as u32)
+            .await
+            .unwrap();
+        let (_app, local) = local_tcp_pair().await;
+        let error = match endpoint
+            .open_stream(local, "example.test".into(), 80, Vec::new())
+            .await
+        {
+            Err(failure) => failure.err,
+            Ok(()) => panic!("exhausted admission must fail"),
+        };
+        assert!(!error
+            .chain()
+            .any(|error| error.downcast_ref::<MuxWriterStopped>().is_some()));
     }
 }

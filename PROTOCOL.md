@@ -261,7 +261,10 @@ credit; the shared WebSocket writer never waits for a stream's credit. After
 bytes have actually been written to the destination socket, the receiver
 returns credit in a stream-specific `WIN` record with exactly one nonzero
 `u32 BE` increment. Updates are batched at 128 KiB, or when the receive queue
-becomes empty. Available credit may never exceed the initial window; zero,
+becomes empty. The local allowance is restored before WIN is published so a
+concurrent peer/reader can immediately use it; publication failure cancels the
+stream instead of rolling back credit another worker may already have consumed.
+Available credit may never exceed the initial window; zero,
 malformed, mixed-flag, or overflowing updates reset only that stream. Legacy
 streams ignore WIN records and are never throttled waiting for them.
 
@@ -299,8 +302,12 @@ are independent in each direction and use at most **64 KiB** read scratch per
 stream (the configured WebSocket limit can reduce this further); `max_ws_binary`
 remains the wire-size ceiling, not a promise to fill every frame. Output batches
 flush after at most 64 records. Session exit or owner-task cancellation aborts
-pending connects and pumps, drops queues, and reclaims reservations. Epoch
-checks prevent stale cleanup or queued output from affecting a reused stream ID.
+pending connects and pumps, drops queues, and reclaims reservations. Cancelling
+an OPEN waiting for output capacity also reclaims its admission before a bridge
+exists. Epoch checks protect cleanup and queued DATA/FIN/WIN and known-stream
+RST records. An unknown-stream RST is discarded if the ID becomes active before
+writing. Output checks run after shaping delays and before writing; epochs are
+local metadata, so records already written to the WebSocket cannot be recalled.
 
 ### 6) UDP mux: channel open
 
