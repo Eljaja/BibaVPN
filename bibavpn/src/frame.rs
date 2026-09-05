@@ -1,6 +1,5 @@
 use std::str::FromStr;
 
-use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
 
 const FRAME_VER: u8 = 1;
@@ -107,65 +106,101 @@ pub fn write_padded_frame_with_mode_state(
     mode: PadMode,
     adaptive: Option<&mut AdaptivePadState>,
 ) -> Result<(), FrameError> {
-    if payload.len() > MAX_PAYLOAD {
-        return Err(FrameError::TooLarge);
-    }
-    let len = payload.len();
-    if len > 0xFF_FFFF {
-        return Err(FrameError::TooLarge);
-    }
-    let base = 5usize.saturating_add(len);
-    let pad_len: u8 = if max_pad == 0 {
-        0
-    } else {
-        let mut rng = rand::thread_rng();
-        match mode {
-            PadMode::Random => rng.gen_range(0..=max_pad),
-            PadMode::HttpBuckets => {
-                let mut target = HTTP_BUCKETS
-                    .iter()
-                    .copied()
-                    .find(|&b| b >= base)
-                    .unwrap_or(*HTTP_BUCKETS.last().unwrap_or(&base));
-                let j = rng.gen_range(95u16..=105u16);
-                target = (target.saturating_mul(j as usize) / 100).max(base);
-                let need = target.saturating_sub(base).min(usize::from(max_pad));
-                need as u8
-            }
-            PadMode::Adaptive => {
-                let target_total = if let Some(st) = adaptive {
-                    let c = st.count;
-                    st.count = st.count.saturating_add(1);
-                    if c < 7 {
-                        rng.gen_range(900usize..=1400)
-                    } else {
-                        rng.gen_range(128usize..=512)
-                    }
-                } else {
-                    // No session: still bias toward "fat" browser-like inner sizes.
-                    rng.gen_range(900usize..=1400)
-                };
-                let need = target_total.saturating_sub(base).min(usize::from(max_pad));
-                need as u8
-            }
-        }
-    };
-
+    let parts = [payload];
+    let frame = PreparedFrame::new(&parts, max_pad, mode, adaptive)?;
     buf.clear();
-    buf.reserve(1 + 3 + 1 + usize::from(pad_len) + len);
-    buf.push(FRAME_VER);
-    buf.push(((len >> 16) & 0xFF) as u8);
-    buf.push(((len >> 8) & 0xFF) as u8);
-    buf.push((len & 0xFF) as u8);
-    buf.push(pad_len);
-    if pad_len > 0 {
-        let pl = usize::from(pad_len);
-        let start = buf.len();
-        buf.resize(start + pl, 0);
-        OsRng.fill_bytes(&mut buf[start..]);
-    }
-    buf.extend_from_slice(payload);
+    frame.append_to(buf);
     Ok(())
+}
+
+/// Validated scatter/gather input; append directly into the final encryption buffer.
+pub(crate) struct PreparedFrame<'a> {
+    parts: &'a [&'a [u8]],
+    len: usize,
+    pad_len: u8,
+}
+
+impl<'a> PreparedFrame<'a> {
+    pub(crate) fn new(
+        parts: &'a [&'a [u8]],
+        max_pad: u8,
+        mode: PadMode,
+        adaptive: Option<&mut AdaptivePadState>,
+    ) -> Result<Self, FrameError> {
+        let len = parts
+            .iter()
+            .try_fold(0usize, |n, part| n.checked_add(part.len()))
+            .ok_or(FrameError::TooLarge)?;
+        if len > MAX_PAYLOAD || len > 0xFF_FFFF {
+            return Err(FrameError::TooLarge);
+        }
+        let base = 5usize.saturating_add(len);
+        let pad_len: u8 = if max_pad == 0 {
+            0
+        } else {
+            let mut rng = rand::thread_rng();
+            match mode {
+                PadMode::Random => rng.gen_range(0..=max_pad),
+                PadMode::HttpBuckets => {
+                    let mut target = HTTP_BUCKETS
+                        .iter()
+                        .copied()
+                        .find(|&b| b >= base)
+                        .unwrap_or(*HTTP_BUCKETS.last().unwrap_or(&base));
+                    let j = rng.gen_range(95u16..=105u16);
+                    target = (target.saturating_mul(j as usize) / 100).max(base);
+                    let need = target.saturating_sub(base).min(usize::from(max_pad));
+                    need as u8
+                }
+                PadMode::Adaptive => {
+                    let target_total = if let Some(st) = adaptive {
+                        let c = st.count;
+                        st.count = st.count.saturating_add(1);
+                        if c < 7 {
+                            rng.gen_range(900usize..=1400)
+                        } else {
+                            rng.gen_range(128usize..=512)
+                        }
+                    } else {
+                        // No session: still bias toward "fat" browser-like inner sizes.
+                        rng.gen_range(900usize..=1400)
+                    };
+                    let need = target_total.saturating_sub(base).min(usize::from(max_pad));
+                    need as u8
+                }
+            }
+        };
+
+        Ok(Self {
+            parts,
+            len,
+            pad_len,
+        })
+    }
+
+    pub(crate) fn wire_len(&self) -> usize {
+        5 + usize::from(self.pad_len) + self.len
+    }
+
+    pub(crate) fn append_to(&self, buf: &mut Vec<u8>) {
+        buf.reserve(1 + 3 + 1 + usize::from(self.pad_len) + self.len);
+        let len = self.len;
+        let pad_len = self.pad_len;
+        buf.push(FRAME_VER);
+        buf.push(((len >> 16) & 0xFF) as u8);
+        buf.push(((len >> 8) & 0xFF) as u8);
+        buf.push((len & 0xFF) as u8);
+        buf.push(pad_len);
+        if pad_len > 0 {
+            let pl = usize::from(pad_len);
+            let start = buf.len();
+            buf.resize(start + pl, 0);
+            rand::thread_rng().fill_bytes(&mut buf[start..]);
+        }
+        for part in self.parts {
+            buf.extend_from_slice(part);
+        }
+    }
 }
 
 /// Byte offset where inner payload starts (after `ver|len|pad_len|pad`).
@@ -201,6 +236,13 @@ pub fn read_padded_frame_borrow(raw: &[u8]) -> Result<&[u8], FrameError> {
     Ok(&raw[start..])
 }
 
+/// Consume a shared buffer and slice the padded payload without moving bytes.
+/// The slice retains the complete backing allocation, including padding.
+pub fn read_padded_frame_bytes(raw: bytes::Bytes) -> Result<bytes::Bytes, FrameError> {
+    let start = padded_frame_payload_start(&raw)?;
+    Ok(raw.slice(start..))
+}
+
 /// Consume `raw` and return only payload bytes (reuse buffer; no `to_vec` of payload).
 pub fn read_padded_frame_into(mut raw: Vec<u8>) -> Result<Vec<u8>, FrameError> {
     let start = padded_frame_payload_start(&raw)?;
@@ -217,6 +259,38 @@ pub fn read_padded_frame(raw: &[u8]) -> Result<Vec<u8>, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_parser_slices_payload_and_rejects_bad_lengths() {
+        for pad in [0usize, 255] {
+            let mut wire = vec![1, 0, 0, 3, pad as u8];
+            wire.resize(5 + pad, 9);
+            wire.extend_from_slice(b"abc");
+            let wire = bytes::Bytes::from(wire);
+            let start = wire.as_ptr().wrapping_add(5 + pad);
+            let payload = read_padded_frame_bytes(wire.clone()).unwrap();
+            assert_eq!(payload.as_ref(), b"abc");
+            assert_eq!(payload.as_ptr(), start);
+            assert!(read_padded_frame_bytes(wire.slice(..wire.len() - 1)).is_err());
+        }
+        assert!(
+            read_padded_frame_bytes(bytes::Bytes::from_static(&[1, 0, 0, 0, 0]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(read_padded_frame_bytes(bytes::Bytes::from_static(&[2, 0, 0, 0, 0])).is_err());
+    }
+
+    #[test]
+    fn prepared_parts_validate_combined_length_and_append_prefix() {
+        let oversized = vec![0; 0xFF_FFFF];
+        assert!(PreparedFrame::new(&[&oversized, b"x"], 0, PadMode::Random, None).is_err());
+        let parts: &[&[u8]] = &[b"ab", b"", b"cd"];
+        let frame = PreparedFrame::new(parts, 0, PadMode::Random, None).unwrap();
+        let mut out = vec![99];
+        frame.append_to(&mut out);
+        assert_eq!(out, [99, 1, 0, 0, 4, 0, b'a', b'b', b'c', b'd']);
+    }
 
     #[test]
     fn round_trip_zero_pad() {

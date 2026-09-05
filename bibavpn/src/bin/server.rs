@@ -59,6 +59,7 @@ struct ServerConnParams {
     pre_auth: PreAuthBudget,
     handshake_timeout: Duration,
     mux_connect_timeout: Duration,
+    mux_window_mib: bibavpn::tcp_mux::MuxWindow,
     udp_pool: Option<Arc<UdpSocketPool>>,
 }
 
@@ -232,6 +233,10 @@ struct Args {
     /// TCP connect timeout for each mux stream on the server (seconds).
     #[arg(long, default_value_t = 10)]
     mux_connect_timeout_secs: u64,
+
+    /// Per-stream TCP mux receive window in MiB (1–4); default 1.
+    #[arg(long, default_value = "1")]
+    mux_window_mib: bibavpn::tcp_mux::MuxWindow,
 
     /// Reuse up to N UDP sockets on the UDP mux server (0 = bind per datagram).
     #[arg(long, default_value_t = 64)]
@@ -638,6 +643,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let handshake_timeout = Duration::from_secs(args.handshake_timeout_secs.max(1));
     let mux_connect_timeout = Duration::from_secs(args.mux_connect_timeout_secs.max(1));
+    let mux_window_mib = args.mux_window_mib;
 
     log_server_listen_caps(
         args.legacy_path_auth,
@@ -719,6 +725,8 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+        // Small mux credit updates must not wait for Nagle/delayed ACK on the outer link.
+        let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         let token = token.clone();
         let ws_path = ws_path.clone();
@@ -782,6 +790,7 @@ async fn main() -> anyhow::Result<()> {
                 pre_auth,
                 handshake_timeout,
                 mux_connect_timeout,
+                mux_window_mib,
                 udp_pool,
             };
 
@@ -910,6 +919,7 @@ async fn run_session_after_v3_handshake<S>(
     dummy_interval_secs: u64,
     server_out: ServerWsOutTiming,
     mux_connect_timeout: Duration,
+    mux_window_mib: bibavpn::tcp_mux::MuxWindow,
     udp_socket_pool: Option<Arc<UdpSocketPool>>,
     handshake_timeout: Duration,
     pre_auth: &PreAuthBudget,
@@ -1040,7 +1050,7 @@ where
         }
         FirstChannel::Mux { ws } => {
             info!("TCP mux (many streams / one WSS)");
-            bibavpn::tcp_mux::bridge_ws_tcp_mux_server(
+            bibavpn::tcp_mux::bridge_ws_tcp_mux_server_with_window(
                 ws,
                 max_pad,
                 decoy_max,
@@ -1055,6 +1065,7 @@ where
                 dummy_interval_secs,
                 server_out,
                 mux_connect_timeout,
+                mux_window_mib,
             )
             .await?;
         }
@@ -1183,6 +1194,7 @@ async fn handle_one(
     let pre_auth = &params.pre_auth;
     let handshake_timeout = params.handshake_timeout;
     let mux_connect_timeout = params.mux_connect_timeout;
+    let mux_window_mib = params.mux_window_mib;
     let udp_pool = params.udp_pool.clone();
 
     if let Some(ref reality_cfg) = reality_config {
@@ -1246,7 +1258,7 @@ async fn handle_one(
         if is_v3_mux_open(next.as_ref()) {
             info!("REALITY: TCP mux (plaintext mux records)");
             params.stats.inc_handshake_success();
-            return bibavpn::tcp_mux::bridge_ws_tcp_mux_server(
+            return bibavpn::tcp_mux::bridge_ws_tcp_mux_server_with_window(
                 ws,
                 max_pad,
                 decoy_max,
@@ -1261,6 +1273,7 @@ async fn handle_one(
                 dummy_interval_secs,
                 server_out,
                 mux_connect_timeout,
+                mux_window_mib,
             )
             .await
             .context("REALITY TCP mux");
@@ -1303,6 +1316,7 @@ async fn handle_one(
                 dummy_interval_secs,
                 server_out,
                 mux_connect_timeout,
+                mux_window_mib,
                 udp_pool,
                 handshake_timeout,
                 pre_auth,
@@ -1359,6 +1373,7 @@ async fn handle_one(
         dummy_interval_secs,
         server_out,
         mux_connect_timeout,
+        mux_window_mib,
         udp_pool,
         handshake_timeout,
         pre_auth,
@@ -1883,3 +1898,30 @@ mod first_channel_wait_tests {
     }
 }
 
+#[cfg(test)]
+mod mux_window_cli_tests {
+    use super::*;
+    #[test]
+    fn mux_window_cli_validates_range() {
+        for value in ["1", "2", "3", "4"] {
+            assert!(Args::try_parse_from([
+                "server",
+                "--token",
+                "strong-token",
+                "--mux-window-mib",
+                value
+            ])
+            .is_ok());
+        }
+        for value in ["0", "5", "256", "-1", "1.5"] {
+            assert!(Args::try_parse_from([
+                "server",
+                "--token",
+                "strong-token",
+                "--mux-window-mib",
+                value
+            ])
+            .is_err());
+        }
+    }
+}

@@ -41,25 +41,25 @@ struct StartJson {
     http_proxy: Option<String>,
     #[serde(default)]
     insecure: bool,
-    #[serde(default = "default_max_pad")]
-    max_pad: u8,
     #[serde(default)]
-    junk_frames: u32,
+    max_pad: Option<u8>,
     #[serde(default)]
-    early_ws_frames: u8,
+    junk_frames: Option<u32>,
+    #[serde(default)]
+    early_ws_frames: Option<u8>,
     psk: Option<String>,
     #[serde(default)]
-    decoy_max: u8,
+    decoy_max: Option<u8>,
     ws_host: Option<String>,
     ws_origin: Option<String>,
     ws_user_agent: Option<String>,
     ws_accept_language: Option<String>,
     #[serde(default)]
     ws_headers: Vec<String>,
-    #[serde(default = "default_max_ws_binary")]
-    max_ws_binary: usize,
-    #[serde(default = "default_ws_ping")]
-    ws_ping_secs: u64,
+    #[serde(default)]
+    max_ws_binary: Option<usize>,
+    #[serde(default)]
+    ws_ping_secs: Option<u64>,
     #[serde(default)]
     from_invite: Option<String>,
     #[serde(default)]
@@ -67,33 +67,33 @@ struct StartJson {
     #[serde(default)]
     tls_profile: Option<String>,
     #[serde(default)]
-    ws_ping_jitter_percent: u8,
+    ws_ping_jitter_percent: Option<u8>,
     #[serde(default)]
-    ws_binary_send_jitter_ms: u8,
+    ws_binary_send_jitter_ms: Option<u8>,
     #[serde(default)]
-    ws_jitter_min_ms: u8,
+    ws_jitter_min_ms: Option<u8>,
     #[serde(default)]
-    ws_jitter_max_ms: u8,
+    ws_jitter_max_ms: Option<u8>,
     #[serde(default)]
     udp_max_pad: Option<u8>,
     #[serde(default)]
     udp_max_ws_binary: Option<usize>,
-    #[serde(default = "default_udp_mux_reply_timeout")]
-    udp_mux_reply_timeout_secs: u64,
+    #[serde(default)]
+    udp_mux_reply_timeout_secs: Option<u64>,
     #[serde(default)]
     pin_cert_pem: Option<String>,
     #[serde(default)]
     ws_path: Option<String>,
-    #[serde(default = "default_true")]
-    use_tcp_mux: bool,
+    #[serde(default)]
+    use_tcp_mux: Option<bool>,
     #[serde(default)]
     pad_mode: Option<String>,
     #[serde(default)]
     dummy_interval_secs: Option<u64>,
     #[serde(default)]
-    decoy_gets: bool,
-    #[serde(default = "default_decoy_interval")]
-    decoy_gets_interval_secs: u64,
+    decoy_gets: Option<bool>,
+    #[serde(default)]
+    decoy_gets_interval_secs: Option<u64>,
     #[serde(default)]
     decoy_gets_paths: Option<String>,
     #[serde(default)]
@@ -114,6 +114,8 @@ struct StartJson {
     /// Parallel WSS for TCP mux (1–4 when set; matches `bibavpn-client --ws-parallel`).
     #[serde(default)]
     ws_parallel: Option<u8>,
+    #[serde(default)]
+    mux_window_mib: crate::tcp_mux::MuxWindow,
     #[serde(default)]
     idle_decoy_secs: Option<u64>,
     #[serde(default)]
@@ -150,10 +152,6 @@ fn default_ws_ping() -> u64 {
 
 fn default_udp_mux_reply_timeout() -> u64 {
     DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_decoy_interval() -> u64 {
@@ -294,17 +292,20 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             h,
             p,
             sni,
-            inv.max_pad,
-            inv.junk_frames,
-            inv.early_ws_frames,
-            inv.decoy_max,
-            inv.max_ws_binary,
-            inv.ws_ping_secs,
-            inv.ws_ping_jitter_percent,
-            inv.ws_binary_send_jitter_ms,
-            inv.udp_max_pad,
-            inv.udp_max_ws_binary,
-            inv.udp_mux_reply_timeout_secs,
+            j.max_pad.unwrap_or(inv.max_pad),
+            j.junk_frames.unwrap_or(inv.junk_frames),
+            j.early_ws_frames.unwrap_or(inv.early_ws_frames),
+            j.decoy_max.unwrap_or(inv.decoy_max),
+            j.max_ws_binary.unwrap_or(inv.max_ws_binary),
+            j.ws_ping_secs.unwrap_or(inv.ws_ping_secs),
+            j.ws_ping_jitter_percent
+                .unwrap_or(inv.ws_ping_jitter_percent),
+            j.ws_binary_send_jitter_ms
+                .unwrap_or(inv.ws_binary_send_jitter_ms),
+            j.udp_max_pad.or(inv.udp_max_pad),
+            j.udp_max_ws_binary.or(inv.udp_max_ws_binary),
+            j.udp_mux_reply_timeout_secs
+                .unwrap_or(inv.udp_mux_reply_timeout_secs),
             j.insecure || inv.insecure,
         )
     } else {
@@ -317,17 +318,18 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             h,
             p,
             sni,
-            j.max_pad,
-            j.junk_frames,
-            j.early_ws_frames,
-            j.decoy_max,
-            j.max_ws_binary,
-            j.ws_ping_secs,
-            j.ws_ping_jitter_percent,
-            j.ws_binary_send_jitter_ms,
+            j.max_pad.unwrap_or_else(default_max_pad),
+            j.junk_frames.unwrap_or(0),
+            j.early_ws_frames.unwrap_or(0),
+            j.decoy_max.unwrap_or(0),
+            j.max_ws_binary.unwrap_or_else(default_max_ws_binary),
+            j.ws_ping_secs.unwrap_or_else(default_ws_ping),
+            j.ws_ping_jitter_percent.unwrap_or(0),
+            j.ws_binary_send_jitter_ms.unwrap_or(0),
             j.udp_max_pad,
             j.udp_max_ws_binary,
-            j.udp_mux_reply_timeout_secs,
+            j.udp_mux_reply_timeout_secs
+                .unwrap_or_else(default_udp_mux_reply_timeout),
             j.insecure,
         )
     };
@@ -404,12 +406,24 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
                 })
         });
 
-    let (base_jmin, base_jmax) = match invite_pair.as_ref() {
-        Some(inv) => (inv.ws_jitter_min_ms, inv.ws_jitter_max_ms),
-        None => (j.ws_jitter_min_ms, j.ws_jitter_max_ms),
-    };
+    let base_jmin = j
+        .ws_jitter_min_ms
+        .or(invite_pair.as_ref().map(|i| i.ws_jitter_min_ms))
+        .unwrap_or(0);
+    let base_jmax = j
+        .ws_jitter_max_ms
+        .or(invite_pair.as_ref().map(|i| i.ws_jitter_max_ms))
+        .unwrap_or(0);
+    // Explicit timing (including zero) must not be overwritten by a preset.
+    let explicit_jitter = j.ws_jitter_min_ms.is_some()
+        || j.ws_jitter_max_ms.is_some()
+        || j.ws_binary_send_jitter_ms.is_some();
     let (ws_jitter_min_ms, ws_jitter_max_ms) = crate::stealth_v12::apply_preset_ws_jitter(
-        pr_opt.as_ref(),
+        if explicit_jitter {
+            None
+        } else {
+            pr_opt.as_ref()
+        },
         base_jmin,
         base_jmax,
     );
@@ -421,10 +435,10 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             .unwrap_or("/ws"),
     );
 
-    let use_tcp_mux = invite_pair
-        .as_ref()
-        .map(|i| i.use_tcp_mux)
-        .unwrap_or(j.use_tcp_mux);
+    let use_tcp_mux = j
+        .use_tcp_mux
+        .or(invite_pair.as_ref().map(|i| i.use_tcp_mux))
+        .unwrap_or(true);
 
     let pad_mode: PadMode = match j
         .pad_mode
@@ -444,10 +458,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
                         .unwrap_or_default()
                 }
             } else {
-                pr_opt
-                    .as_ref()
-                    .map(|p| p.pad_mode)
-                    .unwrap_or_default()
+                pr_opt.as_ref().map(|p| p.pad_mode).unwrap_or_default()
             }
         }
     };
@@ -512,18 +523,18 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     )
     .context("tls_profile")?;
 
-    let decoy_gets = if let Some(ref pr) = pr_opt {
+    let decoy_gets = if let Some(value) = j.decoy_gets {
+        value
+    } else if let Some(ref pr) = pr_opt {
         pr.decoy_gets
     } else if let Some(ref inv) = invite_pair {
         inv.decoy_gets
     } else {
-        j.decoy_gets
+        false
     };
-    let decoy_gets_interval_secs = if let Some(ref inv) = invite_pair {
-        inv.decoy_gets_interval_secs
-    } else {
-        j.decoy_gets_interval_secs
-    };
+    let decoy_gets_interval_secs = j.decoy_gets_interval_secs
+        .or(invite_pair.as_ref().map(|i| i.decoy_gets_interval_secs))
+        .unwrap_or_else(default_decoy_interval);
 
     let decoy_mode: DecoyMode = (|| -> anyhow::Result<DecoyMode> {
         if let Some(s) = j
@@ -795,6 +806,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         tcp_fooling,
         tls_fragment,
         ws_parallel,
+        mux_window_mib: j.mux_window_mib,
         idle_decoy_secs,
         stealth_profile: stealth_for_merge,
         tls_stack,
@@ -904,6 +916,25 @@ mod merge_tests {
     }
 
     #[test]
+    fn mux_window_json_defaults_and_propagates_valid_values() {
+        assert_eq!(local_client_options_from_json_str(BASE).unwrap().mux_window_mib.bytes(), 1048576);
+        for (value, bytes) in [(1, 1048576), (2, 2097152), (3, 3145728), (4, 4194304)] {
+            let mut json: serde_json::Value = serde_json::from_str(BASE).unwrap();
+            json["mux_window_mib"] = value.into();
+            assert_eq!(local_client_options_from_json_str(&json.to_string()).unwrap().mux_window_mib.bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn mux_window_json_rejects_out_of_range_values() {
+        for value in [0, 5, 255] {
+            let mut json: serde_json::Value = serde_json::from_str(BASE).unwrap();
+            json["mux_window_mib"] = value.into();
+            assert!(local_client_options_from_json_str(&json.to_string()).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
     fn stealth_profile_and_ws_parallel_from_json() {
         let j = format!(
             r#"{{"server":"127.0.0.1:8443","token":"t","psk":"0123456789abcdef0123456789abcdef","stealth_profile":"balanced","ws_parallel":3,"proto_domain":"lab"}}"#
@@ -997,5 +1028,94 @@ mod merge_tests {
         assert_eq!(o.sni, "vpn.example.com");
         assert_eq!(o.server_host, "10.0.0.2");
         assert_eq!(o.server_port, 443);
+    }
+}
+
+#[cfg(test)]
+mod performance_precedence_tests {
+    use super::*;
+    #[test]
+    fn explicit_performance_defaults_override_invite() {
+        let inv: InviteV1 = serde_json::from_value(serde_json::json!({
+            "v": 1, "server": "vpn.example:443", "sni": "vpn.example", "token": "strong-token",
+            "psk": "0123456789abcdef0123456789abcdef", "insecure": false,
+            "max_pad": 99, "max_ws_binary": 1400, "decoy_max": 22,
+            "ws_ping_secs": 77, "ws_ping_jitter_percent": 33,
+            "ws_binary_send_jitter_ms": 9, "ws_jitter_min_ms": 4, "ws_jitter_max_ms": 8,
+            "udp_max_pad": 88, "udp_max_ws_binary": 2000, "udp_mux_reply_timeout_secs": 99,
+            "decoy_gets": true, "decoy_gets_interval_secs": 99, "use_tcp_mux": false, "ws_parallel": 4, "stealth_profile": "balanced"
+        }))
+        .unwrap();
+        let uri = crate::invite_uri::encode_invite_v1(&inv, "benchmark-test").unwrap();
+        let json = serde_json::json!({"from_invite":uri,"invite_passphrase":"benchmark-test","max_pad":64,"max_ws_binary":262144,"decoy_max":0,"ws_ping_secs":25,"ws_ping_jitter_percent":0,"ws_binary_send_jitter_ms":0,"ws_jitter_min_ms":0,"ws_jitter_max_ms":0,"udp_max_pad":0,"udp_max_ws_binary":262144,"udp_mux_reply_timeout_secs":0,"ws_parallel":1,"use_tcp_mux":true,"decoy_gets":false,"decoy_gets_interval_secs":30});
+        let o = local_client_options_from_json_str(&json.to_string()).unwrap();
+        assert_eq!(o.max_pad, 64, "max_pad");
+        assert_eq!(o.max_ws_binary, 262144, "max_ws_binary");
+        assert_eq!(o.decoy_max, 0, "decoy_max");
+        assert_eq!(o.ws_ping_secs, 25, "ws_ping_secs");
+        assert_eq!(o.ws_ping_jitter_percent, 0, "ws_ping_jitter_percent");
+        assert_eq!(o.ws_binary_send_jitter_ms, 0, "ws_binary_send_jitter_ms");
+        assert_eq!(o.ws_jitter_min_ms, 0, "ws_jitter_min_ms");
+        assert_eq!(o.ws_jitter_max_ms, 0, "ws_jitter_max_ms");
+        assert_eq!(o.udp_max_pad, Some(0), "udp_max_pad");
+        assert_eq!(o.udp_max_ws_binary, Some(262144), "udp_max_ws_binary");
+        assert_eq!(
+            o.udp_mux_reply_timeout_secs, 0,
+            "udp_mux_reply_timeout_secs"
+        );
+        assert_eq!(o.ws_parallel, 1, "ws_parallel");
+        assert_eq!(o.use_tcp_mux, true);
+        assert!(!o.insecure_tls);
+        assert_eq!(o.decoy_gets_interval_secs, 30);
+        assert!(!o.decoy_gets);
+    }
+
+    #[test]
+    fn omitted_performance_settings_preserve_invite() {
+        let inv: InviteV1 = serde_json::from_value(serde_json::json!({
+            "v": 1, "server": "vpn.example:443", "sni": "vpn.example", "token": "strong-token",
+            "psk": "0123456789abcdef0123456789abcdef", "insecure": false,
+            "max_pad": 99, "max_ws_binary": 1400, "decoy_max": 22,
+            "ws_ping_secs": 77, "ws_ping_jitter_percent": 33,
+            "ws_binary_send_jitter_ms": 9, "ws_jitter_min_ms": 4, "ws_jitter_max_ms": 8,
+            "udp_max_pad": 88, "udp_max_ws_binary": 2000, "udp_mux_reply_timeout_secs": 99,
+            "decoy_gets": true, "decoy_gets_interval_secs": 99, "use_tcp_mux": false, "ws_parallel": 4, "stealth_profile": "balanced"
+        }))
+        .unwrap();
+        let uri = crate::invite_uri::encode_invite_v1(&inv, "benchmark-test").unwrap();
+        let json = serde_json::json!({"from_invite":uri,"invite_passphrase":"benchmark-test"});
+        let o = local_client_options_from_json_str(&json.to_string()).unwrap();
+        assert_eq!(o.max_pad, 99);
+        assert_eq!(o.max_ws_binary, 1400);
+        assert_eq!(o.decoy_max, 22);
+        assert_eq!(o.ws_ping_secs, 77);
+        assert_eq!(o.ws_ping_jitter_percent, 33);
+        assert_eq!(o.ws_binary_send_jitter_ms, 9);
+        assert_eq!(o.ws_jitter_min_ms, 4);
+        assert_eq!(o.ws_jitter_max_ms, 8);
+        assert_eq!(o.udp_max_pad, Some(88));
+        assert_eq!(o.udp_max_ws_binary, Some(2000));
+        assert_eq!(o.udp_mux_reply_timeout_secs, 99);
+        assert_eq!(o.ws_parallel, 4);
+        assert_eq!(o.use_tcp_mux, false);
+    }
+
+    #[test]
+    fn explicit_zero_jitter_disables_preset_without_invite() {
+        let json = serde_json::json!({"server":"vpn.example:443", "token":"strong-token", "psk":"0123456789abcdef0123456789abcdef", "stealth_profile":"balanced", "ws_binary_send_jitter_ms":0});
+        let o = local_client_options_from_json_str(&json.to_string()).unwrap();
+        assert_eq!(
+            (
+                o.ws_jitter_min_ms,
+                o.ws_jitter_max_ms,
+                o.ws_binary_send_jitter_ms
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(o.max_ws_binary, DEFAULT_CLIENT_MAX_WS_BINARY);
+        assert_eq!(o.max_pad, 64);
+        assert_eq!(o.ws_ping_secs, 25);
+        assert_eq!(o.ws_parallel, 1);
+        assert!(o.use_tcp_mux);
     }
 }
