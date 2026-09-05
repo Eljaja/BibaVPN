@@ -295,6 +295,7 @@ pub struct LocalClientOptions {
     pub tls_fragment: bool,
     /// Parallel full mux sessions to the same server (round-robin new SOCKS streams); 1–4.
     pub ws_parallel: u8,
+    pub mux_window_mib: tcp_mux::MuxWindow,
     /// After this many seconds without main decoy activity, emit an extra browser-style decoy (0 = off).
     pub idle_decoy_secs: u64,
     /// When set (e.g. from CLI), overrides individual knob defaults for stealth presets.
@@ -348,6 +349,7 @@ struct ClientCfg {
     tcp_fooling: TcpFooling,
     tls_fragment: bool,
     ws_parallel: u8,
+    mux_window_mib: tcp_mux::MuxWindow,
     idle_decoy_secs: u64,
     /// Mux read/write activity for `idle_decoy_secs` (only set when that feature is on).
     activity: Option<Arc<ActivityTracker>>,
@@ -778,6 +780,7 @@ async fn connect_tcp_mux_handle_attempts(
                     .await
                     .context("send MUX_OPEN v3")?;
                 let mcfg = MuxClientConfig {
+                    mux_window_mib: cfg.mux_window_mib,
                     max_pad: cfg.max_pad,
                     decoy_max: cfg.decoy_max,
                     max_ws_binary: cfg.max_ws_binary,
@@ -875,6 +878,7 @@ async fn connect_reality_tcp_mux_handle_attempts(
                     .context("send MUX_OPEN v3 (REALITY)")?;
 
                 let mcfg = MuxClientConfig {
+                    mux_window_mib: cfg.mux_window_mib,
                     max_pad: cfg.max_pad,
                     decoy_max: cfg.decoy_max,
                     max_ws_binary: cfg.max_ws_binary,
@@ -1047,6 +1051,7 @@ pub async fn run_local_client(
         tcp_fooling: opts.tcp_fooling,
         tls_fragment: opts.tls_fragment,
         ws_parallel,
+        mux_window_mib: opts.mux_window_mib,
         idle_decoy_secs: opts.idle_decoy_secs,
         activity,
         socks_auth: opts.socks_auth.clone(),
@@ -2280,6 +2285,7 @@ mod http_split_bypass_tests {
             tcp_fooling: TcpFooling::default(),
             tls_fragment: false,
             ws_parallel: 1,
+            mux_window_mib: tcp_mux::MuxWindow::default(),
             idle_decoy_secs: 0,
             activity: None,
             socks_auth: None,

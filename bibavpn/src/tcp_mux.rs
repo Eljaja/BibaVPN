@@ -30,6 +30,44 @@ pub const MUX_FLAG_WIN: u8 = 0x10;
 
 pub const MUX_INITIAL_WINDOW: u32 = 1024 * 1024;
 
+/// Local receive allowance per stream. Each session reserves at most 64 MiB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "u8")]
+pub struct MuxWindow(u8);
+
+impl Default for MuxWindow {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl TryFrom<u8> for MuxWindow {
+    type Error = String;
+    fn try_from(mib: u8) -> Result<Self, Self::Error> {
+        if (1..=4).contains(&mib) {
+            Ok(Self(mib))
+        } else {
+            Err("mux-window-mib must be between 1 and 4".into())
+        }
+    }
+}
+
+impl std::str::FromStr for MuxWindow {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<u8>()
+            .map_err(|_| "mux-window-mib must be between 1 and 4".to_owned())?
+            .try_into()
+    }
+}
+
+impl MuxWindow {
+    pub fn bytes(self) -> u32 {
+        u32::from(self.0) * MUX_INITIAL_WINDOW
+    }
+}
+
 /// Returned when the mux WebSocket writer task stopped (e.g. reconnect).
 #[derive(Debug)]
 pub struct MuxWriterStopped;
@@ -108,6 +146,7 @@ pub fn encode_mux_open_target(host: &str, port: u16) -> anyhow::Result<Vec<u8>> 
 
 #[derive(Clone)]
 pub struct MuxClientConfig {
+    pub mux_window_mib: MuxWindow,
     pub max_pad: u8,
     pub decoy_max: u8,
     pub max_ws_binary: usize,
@@ -240,7 +279,49 @@ pub async fn bridge_ws_tcp_mux_server<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    bridge_ws_tcp_mux_server_with_window(
+        ws,
+        max_pad,
+        decoy_max,
+        crypto,
+        max_ws_binary,
+        ws_ping_secs,
+        ws_ping_jitter_percent,
+        ws_binary_send_jitter_ms,
+        ws_jitter_min_ms,
+        ws_jitter_max_ms,
+        pad_mode,
+        dummy_interval_secs,
+        server_out_timing,
+        mux_connect_timeout,
+        MuxWindow::default(),
+    )
+    .await
+}
+
+/// Server bridge with an explicitly bounded local receive window.
+pub async fn bridge_ws_tcp_mux_server_with_window<S>(
+    ws: WebSocketStream<S>,
+    max_pad: u8,
+    decoy_max: u8,
+    crypto: Option<SharedCrypto>,
+    max_ws_binary: usize,
+    ws_ping_secs: u64,
+    ws_ping_jitter_percent: u8,
+    ws_binary_send_jitter_ms: u8,
+    ws_jitter_min_ms: u8,
+    ws_jitter_max_ms: u8,
+    pad_mode: PadMode,
+    dummy_interval_secs: u64,
+    server_out_timing: ServerWsOutTiming,
+    mux_connect_timeout: Duration,
+    mux_window_mib: MuxWindow,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let cfg = MuxClientConfig {
+        mux_window_mib,
         max_pad,
         decoy_max,
         max_ws_binary,

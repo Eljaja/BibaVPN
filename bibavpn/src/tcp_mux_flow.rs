@@ -28,7 +28,7 @@ fn own_received_frame(blob: Bytes) -> Vec<u8> {
 
 const OPEN_CREDIT: u8 = 0x20;
 const MAX_STREAMS: usize = 256;
-// Logical DATA allowance reserved before OPEN; preserves 64 admitted 1MiB windows.
+// Logical DATA allowance reserved before OPEN: 64/32/16 streams at 1/2/4 MiB.
 // Each received slice retains at most twice its logical size (see compaction below),
 // so total backing is bounded by 128MiB, plus bounded queue metadata. A dequeue
 // does not return credit: both its Flow reservation and bytes live through write_all.
@@ -53,10 +53,10 @@ const NEGOTIATION_WAIT: Duration = Duration::from_millis(300);
 const MAX_PEER_WINDOW: u32 = 16 * 1024 * 1024;
 const CAP_MAGIC: &[u8; 4] = b"BFC1";
 
-fn capability(kind: u8) -> Vec<u8> {
+fn capability(kind: u8, local_window: u32) -> Vec<u8> {
     let mut bytes = CAP_MAGIC.to_vec();
     bytes.push(kind);
-    bytes.extend_from_slice(&MUX_INITIAL_WINDOW.to_be_bytes());
+    bytes.extend_from_slice(&local_window.to_be_bytes());
     bytes
 }
 
@@ -86,6 +86,7 @@ struct Flow {
     epoch: u64,
     negotiated: bool,
     send_limit: u32,
+    receive_limit: u32,
     send_available: StdMutex<u32>,
     send_ready: Notify,
     receive: StdMutex<ReceiveState>,
@@ -97,18 +98,24 @@ struct Flow {
 }
 
 impl Flow {
-    fn new(epoch: u64, peer_window: Option<u32>, reservation: OwnedSemaphorePermit) -> Arc<Self> {
+    fn new(
+        epoch: u64,
+        peer_window: Option<u32>,
+        local_window: u32,
+        reservation: OwnedSemaphorePermit,
+    ) -> Arc<Self> {
         let limit = peer_window.unwrap_or(0);
         Arc::new(Self {
             epoch,
             negotiated: peer_window.is_some(),
             send_limit: limit,
+            receive_limit: local_window,
             send_available: StdMutex::new(limit),
             send_ready: Notify::new(),
             receive: StdMutex::new(ReceiveState {
                 queue: VecDeque::new(),
                 bytes: 0,
-                credit: MUX_INITIAL_WINDOW,
+                credit: local_window,
                 fin: false,
             }),
             receive_ready: Notify::new(),
@@ -135,7 +142,7 @@ impl Flow {
         }
         if !payload.is_empty() {
             if payload.len() > state.credit as usize
-                || state.bytes.saturating_add(payload.len()) > MUX_INITIAL_WINDOW as usize
+                || state.bytes.saturating_add(payload.len()) > self.receive_limit as usize
                 || state.queue.len() >= MAX_QUEUED_RECORDS
             {
                 bail!("mux receive window exceeded");
@@ -185,7 +192,7 @@ impl Flow {
             receive.credit = receive
                 .credit
                 .checked_add(amount)
-                .filter(|credit| *credit <= MUX_INITIAL_WINDOW)
+                .filter(|credit| *credit <= self.receive_limit)
                 .context("mux receive credit overflow")?;
         }
         // Publication can be consumed immediately on another worker. Its allowance
@@ -329,11 +336,12 @@ impl Endpoint {
         let reservation = self
             .receive_budget
             .clone()
-            .try_acquire_many_owned(MUX_INITIAL_WINDOW)
+            .try_acquire_many_owned(self.cfg.mux_window_mib.bytes())
             .context("mux session receive budget exhausted")?;
         let flow = Flow::new(
             self.next_epoch.fetch_add(1, Ordering::Relaxed),
             peer_window,
+            self.cfg.mux_window_mib.bytes(),
             reservation,
         );
         streams.insert(sid, flow.clone());
@@ -452,7 +460,7 @@ impl Endpoint {
         let window = self.peer_window().await;
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed);
         let prepare = || -> anyhow::Result<_> {
-            if prefix.len() > MUX_INITIAL_WINDOW as usize {
+            if prefix.len() > self.cfg.mux_window_mib.bytes() as usize {
                 bail!("mux uplink prefix too large");
             }
             let payload = encode_mux_open_target(&host, port)?;
@@ -537,7 +545,7 @@ impl Endpoint {
                 if flow.negotiated {
                     pending_credit += len as u32;
                     let empty = flow.receive.lock().unwrap().queue.is_empty();
-                    if pending_credit >= MUX_INITIAL_WINDOW / 8 || empty {
+                    if pending_credit >= flow.receive_limit / 8 || empty {
                         flow.publish_credit(pending_credit, || {
                             self.control(
                                 sid,
@@ -597,7 +605,7 @@ impl Endpoint {
                 }
             } else if let Some(window) = parse_capability(&payload, 1) {
                 self.negotiation.send_replace(Negotiation::Credit(window));
-                self.control(0, MUX_FLAG_WIN, capability(2), None)?;
+                self.control(0, MUX_FLAG_WIN, capability(2, self.cfg.mux_window_mib.bytes()), None)?;
             }
             return Ok(());
         }
@@ -719,7 +727,7 @@ impl Endpoint {
             .take()
             .expect("one control writer");
         if self.client {
-            self.control(0, MUX_FLAG_WIN, capability(1), None)?;
+            self.control(0, MUX_FLAG_WIN, capability(1, self.cfg.mux_window_mib.bytes()), None)?;
         }
         let writer = async {
             let mut adaptive = AdaptivePadState::default();
@@ -914,6 +922,7 @@ mod tests {
 
     fn config() -> MuxClientConfig {
         MuxClientConfig {
+            mux_window_mib: MuxWindow::default(),
             max_pad: 0,
             decoy_max: 0,
             max_ws_binary: 65536,
@@ -933,6 +942,60 @@ mod tests {
         Endpoint::new(client, config(), ServerWsOutTiming::default())
     }
 
+    #[tokio::test]
+    async fn asymmetric_receive_window_reserves_local_bytes_and_limits_peer_credit() {
+        for (local_mib, peer_bytes, admitted) in [
+            (1, 4194304, 64),
+            (2, 1048576, 32),
+            (3, 4194304, 21),
+            (4, 1048576, 16),
+        ] {
+            let mut cfg = config();
+            cfg.mux_window_mib = MuxWindow::try_from(local_mib).unwrap();
+            let endpoint = Endpoint::new(true, cfg, ServerWsOutTiming::default());
+            let flow = endpoint.allocate(1, Some(peer_bytes)).unwrap();
+            let local_bytes = usize::from(local_mib) * 1048576;
+            assert_eq!(flow.take_credit(8 * 1048576).await, peer_bytes as usize);
+            assert!(flow.add_credit(&(peer_bytes + 1).to_be_bytes()).is_err());
+            flow.add_credit(&peer_bytes.to_be_bytes()).unwrap();
+            assert!(flow.add_credit(&1u32.to_be_bytes()).is_err());
+            flow.enqueue(vec![7; local_bytes], false).unwrap();
+            assert!(flow.enqueue(vec![0], false).is_err());
+            let data = flow.receive().await.unwrap();
+            flow.consumed(data.len());
+            assert!(flow
+                .publish_credit(local_bytes as u32 + 1, || Ok(()))
+                .is_err());
+            flow.publish_credit(local_bytes as u32, || Ok(())).unwrap();
+            for sid in 2..=admitted {
+                endpoint.allocate(sid, Some(peer_bytes)).unwrap();
+            }
+            assert!(endpoint.allocate(1000, Some(peer_bytes)).is_err());
+            assert!(endpoint.remove(1, flow.epoch));
+            assert!(
+                endpoint.allocate(1000, Some(peer_bytes)).is_err(),
+                "active write still owns reservation"
+            );
+            drop(data);
+            drop(flow);
+            assert!(endpoint.allocate(1000, Some(peer_bytes)).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_keeps_unlimited_send_with_configured_receive_bound() {
+        let mut cfg = config();
+        cfg.mux_window_mib = MuxWindow::try_from(4).unwrap();
+        let endpoint = Endpoint::new(true, cfg, ServerWsOutTiming::default());
+        let flow = endpoint.allocate(1, None).unwrap();
+        assert_eq!(flow.take_credit(8 * 1048576).await, 8 * 1048576);
+        flow.add_credit(b"old WIN").unwrap();
+        flow.enqueue(vec![0; 4 * 1048576], false).unwrap();
+        assert!(flow.enqueue(vec![0], false).is_err());
+        let data = flow.receive().await.unwrap();
+        flow.consumed(data.len());
+        flow.enqueue(vec![0; 4 * 1048576], false).unwrap();
+    }
     async fn write_test_payload(socket: &mut TcpStream, byte: u8, len: usize) {
         // Keep initial packets small: developer machines can inspect loopback TCP packets.
         // This affects only fixtures, never tunnel socket behavior.
@@ -1276,7 +1339,7 @@ mod tests {
         assert_eq!((sid, flag), (0, MUX_FLAG_WIN));
         assert_eq!(parse_capability(&request, 1), Some(MUX_INITIAL_WINDOW));
         assert_eq!(client.peer_window().await, None);
-        send_record(&mut old, 0, MUX_FLAG_WIN, &capability(2)).await;
+        send_record(&mut old, 0, MUX_FLAG_WIN, &capability(2, MUX_INITIAL_WINDOW)).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(
             client.peer_window().await,
@@ -1506,15 +1569,22 @@ mod tests {
 
     #[tokio::test]
     async fn new_peers_transfer_multiple_windows_and_respond_after_request_fin() {
-        transfer_multiple_windows(false).await;
+        transfer_multiple_windows(false, 1, 1).await;
     }
 
     #[tokio::test]
     async fn encrypted_peers_transfer_multiple_windows_with_padding_and_decoys() {
-        transfer_multiple_windows(true).await;
+        transfer_multiple_windows(true, 1, 1).await;
     }
 
-    async fn transfer_multiple_windows(encrypted: bool) {
+    #[tokio::test]
+    async fn asymmetric_peers_transfer_multiple_configured_windows_both_directions() {
+        for (client, server) in [(1, 4), (4, 1), (2, 2), (4, 4)] {
+            transfer_multiple_windows(true, client, server).await;
+        }
+    }
+
+    async fn transfer_multiple_windows(encrypted: bool, client_mib: u8, server_mib: u8) {
         let mut cfg = config();
         cfg.transport_v2 = encrypted;
         cfg.max_pad = if encrypted { 255 } else { 0 };
@@ -1528,8 +1598,12 @@ mod tests {
                 255,
             ))
         });
+        let request_len = 3 * usize::from(server_mib) * 1048576;
+        let response_len = 2 * usize::from(client_mib) * 1048576;
+        cfg.mux_window_mib = MuxWindow::try_from(client_mib).unwrap();
         let server_crypto = crypto.clone();
         let client = Endpoint::new(true, cfg.clone(), ServerWsOutTiming::default());
+        cfg.mux_window_mib = MuxWindow::try_from(server_mib).unwrap();
         let server = Endpoint::new(false, cfg, ServerWsOutTiming::default());
         let (a, b) = ws_pair().await;
         let c = client.clone();
@@ -1545,8 +1619,8 @@ mod tests {
             let (mut socket, _) = origin.accept().await.unwrap();
             let mut request = Vec::new();
             socket.read_to_end(&mut request).await.unwrap();
-            assert_eq!(request, vec![31; 3 * MUX_INITIAL_WINDOW as usize]);
-            write_test_payload(&mut socket, 47, 2 * MUX_INITIAL_WINDOW as usize).await;
+            assert_eq!(request, vec![31; request_len]);
+            write_test_payload(&mut socket, 47, response_len).await;
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut app = TcpStream::connect(listener.local_addr().unwrap())
@@ -1562,12 +1636,13 @@ mod tests {
             client.get(1).unwrap().negotiated,
             "the first stream receives negotiated credits"
         );
+        assert_eq!(client.get(1).unwrap().send_limit, u32::from(server_mib) * 1048576);
         timeout(Duration::from_secs(10), async {
-            write_test_payload(&mut app, 31, 3 * MUX_INITIAL_WINDOW as usize).await;
+            write_test_payload(&mut app, 31, request_len).await;
             app.shutdown().await.unwrap();
             let mut response = Vec::new();
             app.read_to_end(&mut response).await.unwrap();
-            assert_eq!(response, vec![47; 2 * MUX_INITIAL_WINDOW as usize]);
+            assert_eq!(response, vec![47; response_len]);
             target.await.unwrap();
         })
         .await
@@ -1663,10 +1738,10 @@ mod tests {
     #[test]
     fn malformed_capabilities_do_not_negotiate() {
         assert_eq!(
-            parse_capability(&capability(1), 1),
+            parse_capability(&capability(1, MUX_INITIAL_WINDOW), 1),
             Some(MUX_INITIAL_WINDOW)
         );
-        assert_eq!(parse_capability(&capability(2), 1), None);
+        assert_eq!(parse_capability(&capability(2, MUX_INITIAL_WINDOW), 1), None);
         for bad in [
             vec![],
             b"BFC1\x01\0\0\0\0".to_vec(),

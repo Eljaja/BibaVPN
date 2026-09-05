@@ -225,6 +225,10 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     ws_parallel: u8,
 
+    /// Per-stream TCP mux receive window in MiB (1–4); default 1.
+    #[arg(long, default_value = "1")]
+    mux_window_mib: bibavpn::tcp_mux::MuxWindow,
+
     /// After N seconds without mux data, run an extra HTTPS decoy. Omit to use `--stealth-profile` (balanced/aggressive: 10s); `0` = off.
     #[arg(long)]
     idle_decoy_secs: Option<u64>,
@@ -848,6 +852,7 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         tcp_fooling,
         tls_fragment,
         ws_parallel,
+        mux_window_mib: args.mux_window_mib,
         idle_decoy_secs,
         stealth_profile: stealth_for_merge,
         tls_stack,
@@ -994,5 +999,53 @@ mod performance_precedence_tests {
         assert_eq!(o.ws_ping_secs, 25);
         assert_eq!(o.ws_parallel, 1);
         assert!(o.use_tcp_mux);
+    }
+}
+
+#[cfg(test)]
+mod mux_window_cli_tests {
+    use super::*;
+    #[test]
+    fn mux_window_cli_validates_and_propagates_range() {
+        for value in ["1", "2", "3", "4"] {
+            let matches = Args::command()
+                .try_get_matches_from([
+                    "client",
+                    "--server",
+                    "127.0.0.1:8443",
+                    "--lab",
+                    "--mux-window-mib",
+                    value,
+                ])
+                .unwrap();
+            let args = Args::from_arg_matches(&matches).unwrap();
+            let options = options_from_args(args, &matches).unwrap();
+            assert_eq!(
+                options.mux_window_mib.bytes(),
+                value.parse::<u32>().unwrap() * 1048576
+            );
+        }
+        for value in ["0", "5", "256", "-1", "1.5"] {
+            assert!(Args::try_parse_from([
+                "client",
+                "--server",
+                "127.0.0.1:8443",
+                "--lab",
+                "--mux-window-mib",
+                value
+            ])
+            .is_err());
+        }
+        let matches = Args::command()
+            .try_get_matches_from(["client", "--server", "127.0.0.1:8443", "--lab"])
+            .unwrap();
+        let args = Args::from_arg_matches(&matches).unwrap();
+        assert_eq!(
+            options_from_args(args, &matches)
+                .unwrap()
+                .mux_window_mib
+                .bytes(),
+            1048576
+        );
     }
 }

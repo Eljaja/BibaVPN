@@ -240,7 +240,8 @@ After the mux channel opens, a new client sends one capability request using
 a formerly ignored record: `stream_id=0`, `flags=WIN`, payload
 `"BFC1" | kind:u8=1 | receive_window:u32 BE`. A supporting server replies on
 `stream_id=0`, `flags=WIN`, with the same layout and `kind=2`. Each direction
-advertises its own receive window. This implementation advertises **1 MiB**;
+advertises its own receive window. Both client and server accept `--mux-window-mib 1..=4` (JSON client field
+`mux_window_mib`), default **1 MiB**, and advertise their own configured allowance;
 peer windows must be nonzero and at most **16 MiB**. Malformed or unknown
 capabilities do not enable the extension.
 
@@ -260,7 +261,8 @@ RST, and padding do not. Before enqueueing DATA, its stream pump waits for
 credit; the shared WebSocket writer never waits for a stream's credit. After
 bytes have actually been written to the destination socket, the receiver
 returns credit in a stream-specific `WIN` record with exactly one nonzero
-`u32 BE` increment. Updates are batched at 128 KiB, or when the receive queue
+`u32 BE` increment. Updates are batched at one eighth of the local receive window (128 KiB by
+default), or when the receive queue
 becomes empty. The local allowance is restored before WIN is published so a
 concurrent peer/reader can immediately use it; publication failure cancels the
 stream instead of rolling back credit another worker may already have consumed.
@@ -275,10 +277,11 @@ or on reset/error. Legacy streams retain whole-stream CLOSE behavior.
 
 #### Memory and overload behavior
 
-Each accepted OPEN reserves its complete **1 MiB** receive allowance from a
+Each accepted OPEN reserves its complete **local configured receive window** from a
 **64 MiB per-session** budget, including while the target TCP connect is
 pending. Reservation is logical, not a preallocated buffer. This means at most
-**64 admitted streams per outer session**, even though the independent stream
+**64/32/16 admitted streams per outer session at 1/2/4 MiB** respectively
+(21 at 3 MiB), even though the independent stream
 ID table limit remains 256. A client rejects a new open before transferring
 its local socket to a pump when admission fails; a server rejects it with RST.
 There is no OPEN-success acknowledgement, so server rejection closes that
@@ -304,7 +307,11 @@ from tiny DATA payloads. Exceeding credit, the legacy byte allowance, or this
 record limit explicitly resets the stream; the shared reader never waits on
 an individual destination and never silently truncates a continuing stream.
 
-Client uplink prefixes are limited to **1 MiB per admitted stream** and released
+The peer window controls send credit only; local receive admission, memory
+bounds and credit returns use the local setting even with asymmetric peers.
+Invalid local values are rejected; legacy negotiation behavior is unchanged.
+
+Client uplink prefixes are limited to **the local window per admitted stream** and released
 once consumed; at most 64 MiB can therefore be staged across admitted streams.
 Queued outbound payloads and mux headers have a separate **8 MiB** byte budget
 and a 512-record queue. WIN/RST/capability/Pong use a separate bounded control

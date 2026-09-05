@@ -115,6 +115,8 @@ struct StartJson {
     #[serde(default)]
     ws_parallel: Option<u8>,
     #[serde(default)]
+    mux_window_mib: crate::tcp_mux::MuxWindow,
+    #[serde(default)]
     idle_decoy_secs: Option<u64>,
     #[serde(default)]
     stealth_profile: Option<String>,
@@ -804,6 +806,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         tcp_fooling,
         tls_fragment,
         ws_parallel,
+        mux_window_mib: j.mux_window_mib,
         idle_decoy_secs,
         stealth_profile: stealth_for_merge,
         tls_stack,
@@ -910,6 +913,25 @@ mod merge_tests {
     fn proto_domain_defaults_to_default_label() {
         let o = local_client_options_from_json_str(BASE).unwrap();
         assert_eq!(o.proto_domain, "default");
+    }
+
+    #[test]
+    fn mux_window_json_defaults_and_propagates_valid_values() {
+        assert_eq!(local_client_options_from_json_str(BASE).unwrap().mux_window_mib.bytes(), 1048576);
+        for (value, bytes) in [(1, 1048576), (2, 2097152), (3, 3145728), (4, 4194304)] {
+            let mut json: serde_json::Value = serde_json::from_str(BASE).unwrap();
+            json["mux_window_mib"] = value.into();
+            assert_eq!(local_client_options_from_json_str(&json.to_string()).unwrap().mux_window_mib.bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn mux_window_json_rejects_out_of_range_values() {
+        for value in [0, 5, 255] {
+            let mut json: serde_json::Value = serde_json::from_str(BASE).unwrap();
+            json["mux_window_mib"] = value.into();
+            assert!(local_client_options_from_json_str(&json.to_string()).is_err(), "accepted {value}");
+        }
     }
 
     #[test]
