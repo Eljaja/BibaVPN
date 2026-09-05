@@ -229,7 +229,78 @@ Sealed inner **`0x02`** + host/port/flags (see `encode_v3_open_with_flags`).
  stream_id u32 BE | flags u8 | payload_len u32 BE | payload
 ```
 
-Flags include stream open, data, close, RST, and window update (flow control). See `tcp_mux.rs`.
+Flags are `OPEN=0x01`, `DATA=0x02`, `CLOSE=0x04`, `RST=0x08`,
+`WIN=0x10`, and the optional `OPEN_CREDIT=0x20` modifier. The target address
+payload is unchanged. `DATA|CLOSE` delivers the payload before closing the
+receive direction; `RST` aborts the stream immediately.
+
+#### Optional byte-credit extension (`BFC1`)
+
+After the mux channel opens, a new client sends one capability request using
+a formerly ignored record: `stream_id=0`, `flags=WIN`, payload
+`"BFC1" | kind:u8=1 | receive_window:u32 BE`. A supporting server replies on
+`stream_id=0`, `flags=WIN`, with the same layout and `kind=2`. Each direction
+advertises its own receive window. This implementation advertises **1 MiB**;
+peer windows must be nonzero and at most **16 MiB**. Malformed or unknown
+capabilities do not enable the extension.
+
+The client waits at most **300 ms from session creation**, shared by all opens,
+for the ACK. Its first stream uses credits when the ACK arrives in time. Timeout
+latches legacy mode for the entire session: a late ACK never upgrades existing
+or later streams. The client then sends either ordinary `OPEN` (`0x01`) or
+`OPEN|OPEN_CREDIT` (`0x21`). The server accepts `OPEN_CREDIT` only after a valid
+capability request; the choice is immutable for that stream. Old servers ignore
+the request and receive ordinary opens; old clients send ordinary opens and
+never have to send or process credits. The PSK and REALITY mux paths share this
+extension without changing their handshakes.
+
+Each negotiated stream starts with the peer's advertised byte credit in each
+direction. Only DATA payload bytes debit credit; OPEN targets, headers, FIN,
+RST, and padding do not. Before enqueueing DATA, its stream pump waits for
+credit; the shared WebSocket writer never waits for a stream's credit. After
+bytes have actually been written to the destination socket, the receiver
+returns credit in a stream-specific `WIN` record with exactly one nonzero
+`u32 BE` increment. Updates are batched at 128 KiB, or when the receive queue
+becomes empty. Available credit may never exceed the initial window; zero,
+malformed, mixed-flag, or overflowing updates reset only that stream. Legacy
+streams ignore WIN records and are never throttled waiting for them.
+
+For negotiated streams, CLOSE is a directional FIN: it follows previously
+queued DATA, shuts down the destination write half, and leaves the opposite
+pump active until its own EOF. A stream is released after both directions end
+or on reset/error. Legacy streams retain whole-stream CLOSE behavior.
+
+#### Memory and overload behavior
+
+Each accepted OPEN reserves its complete **1 MiB** receive allowance from a
+**64 MiB per-session** budget, including while the target TCP connect is
+pending. Reservation is logical, not a preallocated buffer. This means at most
+**64 admitted streams per outer session**, even though the independent stream
+ID table limit remains 256. A client rejects a new open before transferring
+its local socket to a pump when admission fails; a server rejects it with RST.
+There is no OPEN-success acknowledgement, so server rejection closes that
+logical connection and the application can reconnect. Existing admitted
+streams retain their reserved credit and do not reset because another stream
+consumed the session budget.
+
+Per-stream queued and currently-writing bytes remain charged until the TCP
+write completes. Each queue is also limited to 8192 records to bound overhead
+from tiny DATA payloads. Exceeding credit, the legacy byte allowance, or this
+record limit explicitly resets the stream; the shared reader never waits on
+an individual destination and never silently truncates a continuing stream.
+
+Client uplink prefixes are limited to **1 MiB per admitted stream** and released
+once consumed; at most 64 MiB can therefore be staged across admitted streams.
+Queued outbound payloads and mux headers have a separate **8 MiB** byte budget
+and a 512-record queue. WIN/RST/capability/Pong use a separate bounded control
+lane; the reader uses nonblocking enqueue and terminates the session if that
+lane is exhausted. CLOSE remains in the DATA lane to preserve ordering. Pumps
+are independent in each direction and use at most **64 KiB** read scratch per
+stream (the configured WebSocket limit can reduce this further); `max_ws_binary`
+remains the wire-size ceiling, not a promise to fill every frame. Output batches
+flush after at most 64 records. Session exit or owner-task cancellation aborts
+pending connects and pumps, drops queues, and reclaims reservations. Epoch
+checks prevent stale cleanup or queued output from affecting a reused stream ID.
 
 ### 6) UDP mux: channel open
 
