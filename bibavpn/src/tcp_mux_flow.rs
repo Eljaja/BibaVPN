@@ -322,6 +322,22 @@ impl Endpoint {
         })
     }
 
+    /// Cheap, advisory admission/load snapshot. Reservations include retired flows
+    /// still retained by queued output, so they count until their memory is released.
+    pub(super) fn load(&self) -> Option<(bool, usize, usize)> {
+        if self.closed.load(Ordering::Acquire) || self.output.is_closed() {
+            return None;
+        }
+        let window = self.cfg.mux_window_mib.bytes() as usize;
+        let available = self.receive_budget.available_permits();
+        let reserved = (RECEIVE_BUDGET - available).div_ceil(window);
+        let full = available < window || self.streams.lock().unwrap().len() >= MAX_STREAMS;
+        let backlog = OUTPUT_BUDGET - self.output_budget.available_permits()
+            + self.output.max_capacity() - self.output.capacity()
+            + self.control.max_capacity() - self.control.capacity();
+        Some((full, reserved, backlog))
+    }
+
     fn allocate(&self, sid: u32, peer_window: Option<u32>) -> anyhow::Result<Arc<Flow>> {
         let mut streams = self.streams.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
@@ -940,6 +956,38 @@ mod tests {
 
     fn endpoint(client: bool) -> Arc<Endpoint> {
         Endpoint::new(client, config(), ServerWsOutTiming::default())
+    }
+
+    #[tokio::test]
+    async fn pool_pick_prefers_admissible_least_loaded_and_rotates_ties() {
+        let busy = endpoint(true);
+        let idle = endpoint(true);
+        let pool = super::super::TcpMuxSessionPool::from_sessions(vec![
+            (1, super::super::TcpMuxClientHandle { endpoint: busy.clone() }),
+            (2, super::super::TcpMuxClientHandle { endpoint: idle.clone() }),
+        ]);
+        let held = busy.allocate(1, Some(MUX_INITIAL_WINDOW)).unwrap();
+        assert!(Arc::ptr_eq(&pool.pick().await.unwrap().endpoint, &idle));
+        busy.remove(1, held.epoch);
+        // A removed flow still owns its reservation until retained output drops.
+        assert!(Arc::ptr_eq(&pool.pick().await.unwrap().endpoint, &idle));
+        drop(held);
+        let first = pool.pick().await.unwrap();
+        let second = pool.pick().await.unwrap();
+        assert!(!Arc::ptr_eq(&first.endpoint, &second.endpoint));
+        // Queue pressure breaks ties between otherwise idle endpoints.
+        busy.control(0, MUX_FLAG_WIN, vec![], None).unwrap();
+        for _ in 0..3 {
+            assert!(Arc::ptr_eq(&pool.pick().await.unwrap().endpoint, &idle));
+        }
+        let reservation = idle.receive_budget.clone().try_acquire_many_owned(RECEIVE_BUDGET as u32).unwrap();
+        assert!(Arc::ptr_eq(&pool.pick().await.unwrap().endpoint, &busy));
+        busy.shutdown();
+        // A full but healthy session is still preferable to a stopped writer.
+        assert!(Arc::ptr_eq(&pool.pick().await.unwrap().endpoint, &idle));
+        idle.shutdown();
+        assert!(pool.pick().await.is_none());
+        drop(reservation);
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::Context;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use rand::rngs::OsRng;
 use rand::Rng;
 use rand::RngCore;
@@ -134,12 +134,14 @@ impl SessionGuard {
 
     fn push_task(&self, handle: JoinHandle<()>) {
         if let Ok(mut g) = self.tasks.lock() {
+            g.retain(|task| !task.is_finished());
             g.push(handle);
         }
     }
 
     fn with_tasks<R>(&self, f: impl FnOnce(&mut Vec<JoinHandle<()>>) -> R) -> R {
         let mut g = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|task| !task.is_finished());
         f(&mut g)
     }
 
@@ -196,7 +198,7 @@ async fn tcp_mux_open_stream_with_retry(
             pool.pick().await
         };
         let Some(h) = h else {
-            *tcp_mux_slot.lock().await = None;
+            tcp_mux::prune_stopped_mux_sessions(&tcp_mux_slot).await;
             sleep_mux_slot_retry(attempt).await;
             continue;
         };
@@ -207,8 +209,7 @@ async fn tcp_mux_open_stream_with_retry(
             Ok(()) => return Ok(()),
             Err(MuxOpenStreamDropped { local: l, err }) => {
                 if tcp_mux_writer_gone(&err) {
-                    let mut slot = tcp_mux_slot.lock().await;
-                    *slot = None;
+                    tcp_mux::prune_stopped_mux_sessions(&tcp_mux_slot).await;
                     local = l;
                     if attempt + 1 >= TCP_MUX_SLOT_RETRIES {
                         return Err(err);
@@ -293,7 +294,7 @@ pub struct LocalClientOptions {
     pub tcp_fooling: TcpFooling,
     /// Log-only: TLS record fragmentation is not implemented for rustls.
     pub tls_fragment: bool,
-    /// Parallel full mux sessions to the same server (round-robin new SOCKS streams); 1–4.
+    /// Parallel full mux sessions to the same server (least-loaded session for new SOCKS streams); 1–4.
     pub ws_parallel: u8,
     pub mux_window_mib: tcp_mux::MuxWindow,
     /// After this many seconds without main decoy activity, emit an extra browser-style decoy (0 = off).
@@ -741,195 +742,166 @@ async fn connect_tcp_mux_handle_attempts(
     max_attempts: u32,
     session: &SessionGuard,
 ) -> anyhow::Result<()> {
-    // Check if REALITY mode is enabled
-    if cfg.reality_target.is_some() {
-        return connect_reality_tcp_mux_handle_attempts(cfg, tcp_mux_slot, max_attempts, session)
-            .await;
-    }
-
-    let _connect_serial = tcp_mux_connect_serial().lock().await;
+    let mut shutdown = session.shutdown_rx();
+    let serial = tokio::select! {
+        _ = shutdown.wait_for(|stop| *stop) => anyhow::bail!("tcp mux: session stopped"),
+        serial = tcp_mux_connect_serial().lock() => serial,
+    };
     if tcp_mux_slot_has_sessions(tcp_mux_slot).await {
         return Ok(());
     }
-
-    let n = cfg.ws_parallel.max(1).min(4) as usize;
-    let mut last_err: Option<anyhow::Error> = None;
+    let n = cfg.ws_parallel.clamp(1, 4) as usize;
+    let mut last_err = None;
     for attempt in 0..max_attempts {
-        let res: anyhow::Result<()> = async {
-            let mut sessions = Vec::with_capacity(n);
-            for _ in 0..n {
-                let (mut ws, crypto) = one_try_wss_session(cfg).await?;
-                let mo = encode_v3_mux_open();
-                let mut wire = Vec::new();
-                let mut pad_st = AdaptivePadState::default();
-                write_padded_frame_with_mode_state(
-                    &mut wire,
-                    &mo,
-                    cfg.max_pad,
-                    cfg.pad_mode,
-                    Some(&mut pad_st),
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let blob = crypto
-                    .seal_client_to_server(&wire)
-                    .context("seal MUX_OPEN v3")?;
-                if blob.len() > cfg.max_ws_binary {
-                    anyhow::bail!("sealed MUX_OPEN exceeds --max-ws-binary");
-                }
-                ws.send(Message::Binary(Bytes::from(blob)))
-                    .await
-                    .context("send MUX_OPEN v3")?;
-                let mcfg = MuxClientConfig {
-                    mux_window_mib: cfg.mux_window_mib,
-                    max_pad: cfg.max_pad,
-                    decoy_max: cfg.decoy_max,
-                    max_ws_binary: cfg.max_ws_binary,
-                    ws_ping_secs: cfg.ws_ping_secs,
-                    ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
-                    ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
-                    ws_jitter_min_ms: cfg.ws_jitter_min_ms,
-                    ws_jitter_max_ms: cfg.ws_jitter_max_ms,
-                    transport_v2: true,
-                    pad_mode: cfg.pad_mode,
-                    dummy_interval_secs: cfg.dummy_interval_secs,
-                    activity: cfg.activity.clone(),
-                };
-                let (sid, h) = session.with_tasks(|tasks| {
-                    tcp_mux::spawn_tcp_mux_client(
-                        ws,
-                        Some(crypto),
-                        mcfg,
-                        tcp_mux_slot.clone(),
-                        session.shutdown_rx(),
-                        tasks,
-                    )
-                });
-                sessions.push((sid, h));
-                info!(
-                    target: "bibavpn_client",
-                    session_id = sid,
-                    server = %cfg.server_host,
-                    port = cfg.server_port,
-                    parallel = n,
-                    "TCP mux WSS ready"
-                );
-            }
-            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::from_sessions(sessions));
-            Ok(())
+        let mut pending = FuturesUnordered::new();
+        for _ in 0..n {
+            let cfg = cfg.clone();
+            pending.push(async move { prepare_mux_connection(&cfg).await });
         }
-        .await;
-        match res {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                *tcp_mux_slot.lock().await = None;
-                last_err = Some(e);
-                if attempt + 1 >= max_attempts {
-                    break;
-                }
-                sleep_outbound_backoff(attempt).await;
+        match next_mux_ready(&mut pending, &mut shutdown).await {
+            Ok(ready) => {
+                let mut slot = tcp_mux_slot.lock().await;
+                let pool = TcpMuxSessionPool::new_empty();
+                publish_mux_connection(ready, cfg, tcp_mux_slot, session, &pool).await;
+                let expected = pool.sessions.clone();
+                let mut ended = pool.ended.subscribe();
+                *slot = Some(pool);
+                drop(slot);
+                // Transfer the same serialization guard to the bounded fill task.
+                // No connection task has been spawned before the first success.
+                let cfg = cfg.clone();
+                let slot = tcp_mux_slot.clone();
+                let session_task = session.clone();
+                session.push_task(tokio::spawn(async move {
+                    let _serial = serial;
+                    loop {
+                        let Some((ready, current)) = next_pool_mux_ready(
+                            &mut pending, &mut shutdown, &mut ended, &slot, &expected,
+                        ).await else { break };
+                        let pool = current.as_ref().expect("validated current pool");
+                        publish_mux_connection(ready, &cfg, &slot, &session_task, pool).await;
+                    }
+                    // Dropping pending closes unfinished sockets, including stalled handshakes.
+                }));
+                return Ok(());
+            }
+            Err(error) => last_err = Some(error),
+        }
+        if attempt + 1 < max_attempts {
+            tokio::select! {
+                _ = shutdown.wait_for(|stop| *stop) => anyhow::bail!("tcp mux: session stopped"),
+                _ = sleep_outbound_backoff(attempt) => {},
             }
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("tcp mux: connect failed")))
 }
 
-/// REALITY mode: one or more parallel WSS sessions (same as non-REALITY multi-WSS), each with REALITY handshake + MUX_OPEN.
-async fn connect_reality_tcp_mux_handle_attempts(
-    cfg: &Arc<ClientCfg>,
-    tcp_mux_slot: &TcpMuxSlot,
-    max_attempts: u32,
+/// The same bounded, completion-ordered batch serves both PSK and REALITY.
+/// Caller cancellation drops the batch; after publication SessionGuard owns it.
+async fn next_mux_ready<F, T>(
+    pending: &mut FuturesUnordered<F>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut last_error = None;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stop| *stop) => anyhow::bail!("tcp mux: session stopped"),
+            result = pending.next() => result,
+        };
+        match result {
+            Some(Ok(ready)) => return Ok(ready),
+            Some(Err(error)) => {
+                debug!(target: "bibavpn_client", "TCP mux connection attempt failed: {error:#}");
+                last_error = Some(error);
+            }
+            None => return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("tcp mux: no pending connections"))),
+        }
+    }
+}
+
+/// Keep the generation check and publication under the same slot lock.
+async fn next_pool_mux_ready<'a, F, T>(
+    pending: &mut FuturesUnordered<F>,
+    shutdown: &mut watch::Receiver<bool>,
+    ended: &mut watch::Receiver<bool>,
+    slot: &'a TcpMuxSlot,
+    expected: &Arc<Mutex<Vec<(u64, tcp_mux::TcpMuxClientHandle)>>>,
+) -> Option<(T, tokio::sync::MutexGuard<'a, Option<TcpMuxSessionPool>>)>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let ready = tokio::select! {
+        biased;
+        _ = ended.wait_for(|stop| *stop) => return None,
+        ready = next_mux_ready(pending, shutdown) => ready.ok()?,
+    };
+    let current = slot.lock().await;
+    let pool = current.as_ref()?;
+    if !Arc::ptr_eq(&pool.sessions, expected) || *shutdown.borrow() || *ended.borrow() {
+        return None;
+    }
+    Some((ready, current))
+}
+
+async fn prepare_mux_connection(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Option<SharedCrypto>)> {
+    if cfg.reality_target.is_some() {
+        let mut ws = dial_outer_wss(cfg, "REALITY mux").await?;
+        reality_client_handshake(&mut ws, cfg).await?;
+        ws.send(Message::Binary(Bytes::from(encode_v3_mux_open())))
+            .await.context("send MUX_OPEN v3 (REALITY)")?;
+        Ok((ws, None))
+    } else {
+        let (mut ws, crypto) = one_try_wss_session(cfg).await?;
+        let mut wire = Vec::new();
+        let mut pad_st = AdaptivePadState::default();
+        write_padded_frame_with_mode_state(
+            &mut wire, &encode_v3_mux_open(), cfg.max_pad, cfg.pad_mode, Some(&mut pad_st),
+        ).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let blob = crypto.seal_client_to_server(&wire).context("seal MUX_OPEN v3")?;
+        if blob.len() > cfg.max_ws_binary {
+            anyhow::bail!("sealed MUX_OPEN exceeds --max-ws-binary");
+        }
+        ws.send(Message::Binary(Bytes::from(blob))).await.context("send MUX_OPEN v3")?;
+        Ok((ws, Some(crypto)))
+    }
+}
+
+// Caller holds the slot lock through registration, so a fast-ending endpoint
+// cannot remove itself before it has been published.
+async fn publish_mux_connection(
+    (ws, crypto): (ClientWs, Option<SharedCrypto>),
+    cfg: &ClientCfg,
+    slot: &TcpMuxSlot,
     session: &SessionGuard,
-) -> anyhow::Result<()> {
-    use tokio_tungstenite::tungstenite::Message;
-
-    let _connect_serial = tcp_mux_connect_serial().lock().await;
-    if tcp_mux_slot_has_sessions(tcp_mux_slot).await {
-        return Ok(());
-    }
-
-    let n = cfg.ws_parallel.max(1).min(4) as usize;
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 0..max_attempts {
-        let res: anyhow::Result<()> = async {
-            let _target = cfg.reality_target.as_ref().expect("reality target");
-            let mut sessions = Vec::with_capacity(n);
-
-            for _ in 0..n {
-                let mut ws = dial_outer_wss(cfg, "REALITY mux").await?;
-
-                info!(
-                    target: "bibavpn_client",
-                    server = %cfg.server_host,
-                    port = cfg.server_port,
-                    parallel = n,
-                    "REALITY: WSS up, key exchange"
-                );
-
-                let (_session_key, short_id) = reality_client_handshake(&mut ws, cfg).await?;
-
-                info!(
-                    "REALITY: handshake complete, short_id={:02x?}",
-                    &short_id[..4]
-                );
-
-                let open = encode_v3_mux_open();
-                ws.send(Message::Binary(Bytes::from(open)))
-                    .await
-                    .context("send MUX_OPEN v3 (REALITY)")?;
-
-                let mcfg = MuxClientConfig {
-                    mux_window_mib: cfg.mux_window_mib,
-                    max_pad: cfg.max_pad,
-                    decoy_max: cfg.decoy_max,
-                    max_ws_binary: cfg.max_ws_binary,
-                    ws_ping_secs: cfg.ws_ping_secs,
-                    ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
-                    ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
-                    ws_jitter_min_ms: cfg.ws_jitter_min_ms,
-                    ws_jitter_max_ms: cfg.ws_jitter_max_ms,
-                    transport_v2: false,
-                    pad_mode: cfg.pad_mode,
-                    dummy_interval_secs: cfg.dummy_interval_secs,
-                    activity: cfg.activity.clone(),
-                };
-
-                let (sid, h) = session.with_tasks(|tasks| {
-                    tcp_mux::spawn_tcp_mux_client(
-                        ws,
-                        None,
-                        mcfg,
-                        tcp_mux_slot.clone(),
-                        session.shutdown_rx(),
-                        tasks,
-                    )
-                });
-                sessions.push((sid, h));
-                info!(
-                    target: "bibavpn_client",
-                    session_id = sid,
-                    server = %cfg.server_host,
-                    parallel = n,
-                    "REALITY tunnel ready"
-                );
-            }
-            *tcp_mux_slot.lock().await = Some(TcpMuxSessionPool::from_sessions(sessions));
-            Ok(())
-        }
-        .await;
-
-        match res {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                *tcp_mux_slot.lock().await = None;
-                last_err = Some(e);
-                if attempt + 1 >= max_attempts {
-                    break;
-                }
-                sleep_outbound_backoff(attempt).await;
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("REALITY tcp mux: connect failed")))
+    pool: &TcpMuxSessionPool,
+) {
+    let mcfg = MuxClientConfig {
+        mux_window_mib: cfg.mux_window_mib,
+        max_pad: cfg.max_pad,
+        decoy_max: cfg.decoy_max,
+        max_ws_binary: cfg.max_ws_binary,
+        ws_ping_secs: cfg.ws_ping_secs,
+        ws_ping_jitter_percent: cfg.ws_ping_jitter_percent,
+        ws_binary_send_jitter_ms: cfg.ws_binary_send_jitter_ms,
+        ws_jitter_min_ms: cfg.ws_jitter_min_ms,
+        ws_jitter_max_ms: cfg.ws_jitter_max_ms,
+        transport_v2: crypto.is_some(),
+        pad_mode: cfg.pad_mode,
+        dummy_interval_secs: cfg.dummy_interval_secs,
+        activity: cfg.activity.clone(),
+    };
+    let mut sessions = pool.sessions.lock().await;
+    let (sid, handle) = session.with_tasks(|tasks| {
+        tcp_mux::spawn_tcp_mux_client(ws, crypto, mcfg, slot.clone(), session.shutdown_rx(), tasks)
+    });
+    sessions.push((sid, handle));
+    info!(target: "bibavpn_client", session_id = sid, server = %cfg.server_host,
+        parallel = cfg.ws_parallel, reality = cfg.reality_target.is_some(), "TCP mux WSS ready");
 }
 
 /// Build TLS config and run SOCKS5 (+ optional HTTP CONNECT) until `shutdown` becomes `true`.
@@ -983,7 +955,7 @@ pub async fn run_local_client(
     if opts.use_tcp_mux {
         if ws_parallel > 1 {
             info!(
-                "TCP mode: multiplexed WSS, {ws_parallel} parallel outer connection(s) (round-robin new streams)"
+                "TCP mode: multiplexed WSS, {ws_parallel} parallel outer connection(s) (least-loaded session for new streams)"
             );
         } else {
             info!("TCP mode: multiplexed WSS (one outer connection)");
@@ -2451,5 +2423,113 @@ mod http_split_bypass_tests {
             .expect("handle_http_peer");
         client.await.expect("client");
         origin_task.await.expect("origin");
+    }
+}
+
+#[cfg(test)]
+mod mux_startup_tests {
+    use super::*;
+    use futures_util::stream::FuturesUnordered;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Dropped(Arc<AtomicUsize>);
+    impl Drop for Dropped {
+        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+    }
+
+    #[tokio::test]
+    async fn mux_fill_rejects_stale_generation_and_drops_ready_resource() {
+        let original = TcpMuxSessionPool::new_empty();
+        let expected = original.sessions.clone();
+        let mut ended = original.ended.subscribe();
+        let slot = Arc::new(Mutex::new(Some(TcpMuxSessionPool::new_empty())));
+        let (_stop, mut shutdown) = watch::channel(false);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource = Dropped(drops.clone());
+        let mut pending = FuturesUnordered::new();
+        pending.push(async move { Ok(resource) });
+        assert!(next_pool_mux_ready(&mut pending, &mut shutdown, &mut ended, &slot, &expected).await.is_none());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!Arc::ptr_eq(&slot.lock().await.as_ref().unwrap().sessions, &expected));
+    }
+
+    #[tokio::test]
+    async fn mux_fill_last_session_end_cancels_stalled_attempt_and_releases_serial() {
+        let pool = TcpMuxSessionPool::new_empty();
+        let expected = pool.sessions.clone();
+        let mut ended = pool.ended.subscribe();
+        let slot = Arc::new(Mutex::new(Some(pool)));
+        let (_stop, mut shutdown) = watch::channel(false);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource = Dropped(drops.clone());
+        let task_slot = slot.clone();
+        let serial = Arc::new(Mutex::new(()));
+        let guard = serial.clone().lock_owned().await;
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            let mut pending = FuturesUnordered::new();
+            pending.push(async move {
+                let _resource = resource;
+                std::future::pending::<anyhow::Result<usize>>().await
+            });
+            assert!(next_pool_mux_ready(&mut pending, &mut shutdown, &mut ended, &task_slot, &expected).await.is_none());
+        });
+        tokio::task::yield_now().await;
+        // Real removal/clear path signals the fill task even without another handshake result.
+        tcp_mux::remove_mux_session(&slot, 1).await;
+        timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(serial.try_lock().is_ok());
+        assert!(slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mux_batch_first_ready_partial_failure_and_cancellation() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut senders = Vec::new();
+        let mut pending = FuturesUnordered::new();
+        for _ in 0..4 {
+            let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<usize>>();
+            senders.push(tx);
+            let resource = Dropped(drops.clone());
+            pending.push(async move { let _resource = resource; rx.await.unwrap() });
+        }
+        let (_stop, mut shutdown) = watch::channel(false);
+        // First-created attempt is stalled; later successes must become usable.
+        senders.remove(2).send(Ok(2)).unwrap();
+        assert_eq!(timeout(Duration::from_secs(1), next_mux_ready(&mut pending, &mut shutdown)).await.unwrap().unwrap(), 2);
+        assert_eq!(pending.len(), 3);
+        senders.remove(0).send(Err(anyhow::anyhow!("failed peer"))).unwrap();
+        senders.remove(1).send(Ok(3)).unwrap();
+        assert_eq!(next_mux_ready(&mut pending, &mut shutdown).await.unwrap(), 3);
+        drop(pending);
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
+        assert!(senders.pop().unwrap().is_closed());
+    }
+
+    #[tokio::test]
+    async fn mux_batch_shutdown_and_cancelled_first_caller_drop_pending() {
+        for shutdown_first in [false, true] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (stop, mut shutdown) = watch::channel(false);
+            let resource = Dropped(drops.clone());
+            let task = tokio::spawn(async move {
+                let mut pending = FuturesUnordered::new();
+                pending.push(async move {
+                    let _resource = resource;
+                    std::future::pending::<anyhow::Result<usize>>().await
+                });
+                next_mux_ready(&mut pending, &mut shutdown).await
+            });
+            tokio::task::yield_now().await;
+            if shutdown_first {
+                stop.send(true).unwrap();
+                assert!(timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+            } else {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
     }
 }

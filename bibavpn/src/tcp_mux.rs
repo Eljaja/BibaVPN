@@ -203,10 +203,11 @@ impl TcpMuxClientHandle {
 
 static TCP_MUX_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 
-/// One or more parallel client→server WSS links, each a full `MUX_OPEN` session (round-robin `open_stream`).
+/// One or more parallel client→server WSS links, each a full `MUX_OPEN` session.
 pub struct TcpMuxSessionPool {
     pub sessions: Arc<Mutex<Vec<(u64, TcpMuxClientHandle)>>>,
     next: AtomicUsize,
+    pub(crate) ended: watch::Sender<bool>,
 }
 
 impl TcpMuxSessionPool {
@@ -214,6 +215,7 @@ impl TcpMuxSessionPool {
         Self {
             sessions: Arc::new(Mutex::new(Vec::new())),
             next: AtomicUsize::new(0),
+            ended: watch::channel(false).0,
         }
     }
 
@@ -221,22 +223,42 @@ impl TcpMuxSessionPool {
         Self {
             sessions: Arc::new(Mutex::new(sessions)),
             next: AtomicUsize::new(0),
+            ended: watch::channel(false).0,
         }
     }
 
-    /// `None` if every outer WSS session has been torn down but the slot was not yet cleared.
+    /// Prefer admissible sessions, then fewer reserved streams and less queued output.
+    /// Ties rotate. A full healthy fallback keeps admission errors distinct from a dead pool.
+    /// This snapshot does not reserve capacity; `open_stream` remains the admission authority.
     pub async fn pick(&self) -> Option<TcpMuxClientHandle> {
         let g = self.sessions.lock().await;
         let n = g.len();
         if n == 0 {
             return None;
         }
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % n;
-        Some(g[i].1.clone())
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        (0..n)
+            .map(|offset| &g[(start + offset) % n].1)
+            .filter_map(|handle| handle.endpoint.load().map(|load| (load, handle)))
+            .min_by_key(|(load, _)| *load)
+            .map(|(_, handle)| handle.clone())
     }
 }
 
 pub type TcpMuxClientSlot = Arc<tokio::sync::Mutex<Option<TcpMuxSessionPool>>>;
+
+/// Prune only stopped endpoints: a failed OPEN must not discard healthy siblings.
+pub(crate) async fn prune_stopped_mux_sessions(slot: &TcpMuxClientSlot) {
+    let mut current = slot.lock().await;
+    let Some(pool) = current.as_ref() else { return };
+    let mut sessions = pool.sessions.lock().await;
+    sessions.retain(|(_, handle)| handle.endpoint.load().is_some());
+    if sessions.is_empty() {
+        pool.ended.send_replace(true);
+        drop(sessions);
+        *current = None;
+    }
+}
 
 /// Remove one dead outer WSS; clear slot if that was the last session.
 pub async fn remove_mux_session(slot: &TcpMuxClientSlot, session_id: u64) {
@@ -248,6 +270,7 @@ pub async fn remove_mux_session(slot: &TcpMuxClientSlot, session_id: u64) {
     let before = v.len();
     v.retain(|(id, _)| *id != session_id);
     if v.is_empty() {
+        pool.ended.send_replace(true);
         drop(v);
         *g = None;
         info!("tcp mux: all {before} session(s) ended; slot cleared for reconnect");
@@ -402,27 +425,6 @@ mod decode_tests {
         assert_eq!(sid, 9);
         assert_eq!(f, MUX_FLAG_OPEN);
         assert!(pl.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod pick_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Mirrors `TcpMuxSessionPool::pick` index logic (round-robin over n parallel outer WSS).
-    fn rr_index(next: &AtomicUsize, n: usize) -> usize {
-        next.fetch_add(1, Ordering::Relaxed) % n
-    }
-
-    #[test]
-    fn round_robin_indices_cycle() {
-        let next = AtomicUsize::new(0);
-        let n = 3;
-        let mut out = Vec::new();
-        for _ in 0..9 {
-            out.push(rr_index(&next, n));
-        }
-        assert_eq!(out, vec![0, 1, 2, 0, 1, 2, 0, 1, 2]);
     }
 }
 
