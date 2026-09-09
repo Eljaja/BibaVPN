@@ -2,79 +2,83 @@ SIZE: SMALL
 # Spec
 ## Summary
 
-Literal LAN / loopback / RFC1918 / CGNAT / IPv6 ULA / link-local targets are sent through the tunnel. The VPS cannot reach them, so `curl -x http://127.0.0.1:17890 http://192.168.x.x/` hangs while a direct request succeeds.
-
-Root cause is two missing always-direct paths: `domain_route::decide` / `should_bypass` only treat an IP as `Direct` after a DNS-snoop map hit (and both short-circuit to Tunnel when the split-tunnel list is empty), and desktop OS proxy ignore lists only force loopback. Fix both in one PR: always classify private/local hosts as `Route::Direct` in the core matcher, and add the matching RFC1918 / ULA / link-local / `*.local` entries to Linux, macOS, and Windows system-proxy bypass lists.
+Android and iOS `snapshot()` in `apps/bibavpn-desktop/src-tauri/src/lib.rs` waits on tunnel callbacks (`tunnel_is_active`, then uptime, then Android `last_connect_error`) while callers still hold `Mutex<Inner>`. Those waits serialize other save/import/connect/disconnect/tray work. Split the snapshot into a short locked copy, a lock-free probe, and an epoch-gated assemble so a late probe cannot revive connected state, an old profile, or a stale error. Persistence, combined JNI, Settings, and fonts stay out.
 
 ## In scope
 
-1. **Core matcher.** Add `host_is_local_or_private(host: &str) -> bool` in `bibavpn/src/domain_route.rs`. Call it at the **top** of both `decide` and `should_bypass` (before the empty-bypass early returns). Those early returns stay for public hosts: empty split-tunnel list still means `Tunnel` for `example.com` and `1.1.1.1`.
+1. **`Inner.epoch: u64`** (start at `0`). Bump under the lock on: disconnect start (when clearing `tunnel_server`); connect completion (success that sets `tunnel_server`, or a mapped failure that writes `last_error`); successful `apply_invite_to_cfg`; `apply_pending_import` apply; successful `save_config_cmd` after `merge_saved_config`. Do not reuse `VpnPhase` / `ConnectingPhaseGuard` (desktop-only). Do not persist epoch.
 
-   Treat as local/private:
-   - IPv4: loopback `127.0.0.0/8`, RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local `169.254.0.0/16`, CGNAT `100.64.0.0/10`.
-   - IPv6: loopback `::1`, ULA `fc00::/7`, link-local `fe80::/10`, and IPv4-mapped `::ffff:x.x.x.x` after mapping to the inner v4.
-   - Hostname `localhost` (ASCII case-insensitive; trim a single trailing `.`).
+2. **Replace `snapshot(app, &inner)` held across probes** with a shared helper used by every listed caller:
+   - Brief lock: copy `to_public_saved_config(&inner.cfg)`, `display_host` / `server_subtitle`, `tunnel_server`, `last_error`, `can_connect`, `epoch`. Desktop `connected` is `inner.vpn.is_some()` and needs no probe.
+   - Drop `Inner`. Android/iOS probe **without** `Inner`. Keep `VPN_WEBVIEW_JNI_MUTEX` and existing 5s / 18s timeouts. Never call Kotlin/Swift while holding `Inner`.
+   - Re-lock and assemble. If `epoch` is unchanged, attach probe `connected` / uptime. If `epoch` changed, **discard** the probe; rebuild cfg/error/`tunnel_server` from current `Inner`. If `tunnel_server` is `None`, force `connected = false` and no uptime. Do not write probe fields back into `Inner`.
+   - `android_snapshot_error` stays: Rust `last_error` wins; JNI error overlays only when the tunnel is inactive. Timeouts stay errors (`map_android_jni_connect_error` / existing strings); do not invent success.
 
-   CGNAT: match octets (`first == 100 && second >= 64 && second <= 127`). Do **not** use unstable `Ipv4Addr::is_shared`.
+3. **Wire every current `snapshot()` holder**, including:
+   - `get_state`
+   - `save_config_cmd`
+   - `apply_invite_cmd`
+   - `apply_pending_import` / `confirm_pending_import_cmd`
+   - `clear_error_cmd` — drop `Inner` before `clear_last_connect_error`, then assemble
+   - `connect_cmd` success and error snapshots
+   - Android / iOS `connect_inner` post-connect `tunnel_is_active` (copy tray inputs, drop, probe, short lock for tray + epoch)
+   - Android / iOS `disconnect_inner` (keep `connected = false` override after a successful stop)
+   - `disconnect_cmd` follow-up snapshot
+   - `open_control_plane_refresh_cmd` final snapshot
+   Pre-connect “already active?” probes in `connect_inner` already run without `Inner`; leave that order.
 
-2. **Existing unit tests that used `10.0.0.1` as a stand-in public IP** in `domain_route.rs` (`decide_ip_via_map`, `record_accepts_legitimate_match`, and any expiry/unknown-IP assertion on that address) must switch the mapped address to TEST-NET `203.0.113.0/24`. After this change `10.0.0.1` is always `Direct`, so those cases would otherwise become tautologies. Do not rewrite unrelated `10.0.0.1` fixtures in `protocol.rs` / `http_connect.rs` / `incoming.rs`.
+4. **`spawn_blocking` for today’s sync commands that can JNI-wait** (`get_state`, `save_config_cmd`, `clear_error_cmd`, `apply_invite_cmd`, `confirm_pending_import_cmd`, and the refresh snapshot). Match `connect_cmd` / `get_tunnel_status_cmd`: do not add a worker that the UI thread then joins.
 
-3. **HTTP CONNECT regression** in `local_client.rs` (next to `http_connect_split_bypass_reaches_origin_directly`): `set_bypass_domains(&[])`, `CONNECT 127.0.0.1:<origin-port>` to a local origin, 3s timeout. Must reach the origin (200 + ping/pong) and must not wait on mux. Reset the global list in a `finally`-style cleanup as the existing test does.
-
-4. **Desktop OS bypass lists** (always merged, not only when split-tunnel domains are set):
-   - Linux `merge_ignore_hosts` and `no_proxy_list`: add `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`, `fc00::/7`, `fe80::/10`, `*.local` (Linux ignore-hosts already has loopback).
-   - macOS `merge_bypass_for_apply`: the same CIDRs (it already has `*.local`).
-   - Windows `merge_proxy_override`: `<local>`, `10.*`, `192.168.*`, `169.254.*`, `100.*`, and `172.16.*` … `172.31.*` (WinInet has no CIDR). Keep existing `<-loopback>` and Steam/WebView entries.
+5. **Extract assemble + epoch** into a unit-testable function that takes copied fields plus a `TunnelProbe` (or injected closures), not live JNI/`AppHandle`.
 
 ## Out of scope
 
-- Hostname `.local` / mDNS matching in the **core** matcher (OS `*.local` lists are enough).
-- Sending any LAN/private range through the VPS under any profile or flag.
-- Mux epoch / stream-id wrap, EMFILE accept-loop recovery, camouflage, proto 3 / REALITY / PSK, wire format.
-- New CLI flags, UI toggles, invite fields, or a user-facing “bypass LAN” setting.
-- Android TUN `excludeRoute` / iOS Packet Tunnel routing tables (desktop HTTP/SOCKS + OS proxy lists only).
-- UDP mux datagrams to LAN resolvers (SOCKS/HTTP CONNECT TCP is the reported bug).
+- Moving `persist_cfg` / `fs::write` off `Inner`, persist mutex / `write_seq`.
+- Combined Kotlin `tunnelSnapshot()`; removing or reordering `VPN_WEBVIEW_JNI_MUTEX`.
+- Settings keystroke / package-list / font bundling.
+- Changing `get_tunnel_status_cmd` (already `spawn_blocking`, no `Inner` on Android/iOS) or restoring full-config polling in `App.jsx` / `ConnectScreen.jsx` / `useVpn.jsx`.
+- `bibavpn` / `biba` crates, PROTOCOL, invite URI, REALITY, Kotlin/Swift API changes.
 
 ## Files to change
 
-- `bibavpn/src/domain_route.rs` — `host_is_local_or_private`; call it first in `decide` and `should_bypass`; retarget `10.0.0.1` DNS-map tests to `203.0.113.x`; add private/empty-list unit cases.
-- `bibavpn/src/local_client.rs` — HTTP CONNECT empty-list + `127.0.0.1` regression (HTTP CONNECT already uses `should_bypass` / `resolve_domain_split_route`; no production path change beyond the matcher).
-- `apps/bibavpn-desktop/src-tauri/src/proxy_linux.rs` — required CIDRs / `*.local` in `merge_ignore_hosts` and `no_proxy_list`; extend existing merge / `NO_PROXY` unit tests.
-- `apps/bibavpn-desktop/src-tauri/src/proxy_mac.rs` — same CIDRs in `merge_bypass_for_apply`; add a small merge unit test (none exists today).
-- `apps/bibavpn-desktop/src-tauri/src/proxy_win.rs` — WinInet wildcards in `merge_proxy_override`; add a small merge unit test.
+- `apps/bibavpn-desktop/src-tauri/src/lib.rs` — `Inner.epoch`; split copy/probe/assemble; all callers above; `Inner { … }` literals at startup (~L1175), any other constructor (~L1944), and `deeplink_tests` (~L2174); new unit tests next to `android_connect_error_tests`.
+- `apps/bibavpn-desktop/src-tauri/src/android_vpn.rs` — no API change unless a thin probe wrapper is needed; keep mutex and timeouts.
+- `apps/bibavpn-desktop/src-tauri/src/ios_vpn.rs` — same lock-free probe contract (`tunnel_is_active` 18s must not run under `Inner`).
+- `apps/bibavpn-desktop/src-tauri/src/config.rs` — do not change `to_public_saved_config` (callers must still use it).
 
 ## Tests
 
-Concrete commands (no new harness):
-
 ```bash
-cargo test -p bibavpn
 cargo test -p bibavpn-desktop
+npm run build --prefix apps/bibavpn-desktop/ui
 ```
 
-Required cases:
+Do **not** run `cargo test -p bibavpn` (core crate untouched). No new harness, Perfetto, or device CI.
 
-- `decide("192.168.88.1", &[], …) == Direct`; same for `10.0.0.1`, `172.16.1.1`, `127.0.0.1`, `localhost`, `::1`, `fc00::1`, `::ffff:192.168.1.1`. Also `100.64.1.1` (CGNAT) and `169.254.1.1` / `fe80::1`.
-- `decide("1.1.1.1", &[], …) == Tunnel`; `decide("example.com", &[], …) == Tunnel`.
-- DNS-map tests that previously used `10.0.0.1` as a mapped public IP now use `203.0.113.x`: known+live → Direct, unknown / expired → Tunnel.
-- `should_bypass("192.168.88.1")` is true after `set_bypass_domains(&[])` (or equivalent: empty global list must not hide the always-direct check). Reset globals after the test.
-- HTTP CONNECT: empty bypass list + `CONNECT 127.0.0.1` reaches the origin within 3s (does not block on mux).
-- `bibavpn/tests/split_bypass_wiring.rs` still passes (`example.com` / public `93.184.216.34` behavior unchanged).
-- Linux: merged `ignore-hosts` and `NO_PROXY` contain `192.168.0.0/16` and `10.0.0.0/8` (extend `merge_adds_loopback_and_split` / `proxy_env_assignments`).
-- macOS merge includes `192.168.0.0/16` and `10.0.0.0/8`; Windows merge includes `<local>`, `10.*`, `192.168.*`, and `172.16.*`.
+Required cases (inject probe; no live JNI):
+
+- Contending lock: a probe that sleeps (e.g. 200ms) does not hold `Inner`; a second thread acquires the mutex in well under that sleep.
+- Epoch bump + `tunnel_server = None` while a probe is in flight → assembled `connected == false`, no uptime, current cfg/error (not the pre-disconnect copy).
+- Import / invite-style cfg replace bumps epoch → late probe cannot emit the old public cfg.
+- `android_snapshot_error`: Rust `last_error` wins; permission-denial overlay only when inactive; empty/timeout strings are not success.
+- Assembled `cfg` still goes through `to_public_saved_config` (no `token` / `psk` / invite / PEM in the public payload).
+- Desktop path: `connected` follows `vpn.is_some()` with no probe.
+- Existing `android_connect_error_tests` and `deeplink_tests` still pass.
 
 ## Acceptance criteria
 
-- Private / loopback / CGNAT / ULA / link-local literals and `localhost` are `Route::Direct` even when the split-tunnel domain list is empty.
-- Public IPs and ordinary hostnames with an empty bypass list remain `Tunnel`.
-- HTTP CONNECT to `127.0.0.1` with `set_bypass_domains(&[])` reaches the origin; it does not wait on mux.
-- Linux merged `ignore-hosts` / `NO_PROXY` contain `192.168.0.0/16` and `10.0.0.0/8`. macOS and Windows merge helpers include the lists in **In scope**.
-- `cargo test -p bibavpn` and `cargo test -p bibavpn-desktop` pass. No protocol / mux / wire-format changes.
+- Listed full-snapshot / connect / save / invite / import / clear-error / disconnect / refresh paths do not hold `Inner` while waiting on Android/iOS tunnel callbacks.
+- A delayed mocked probe does not block unrelated `Inner` access for the duration of that wait.
+- A late probe cannot restore stale connected state, apply a pre-import/pre-save profile, erase a newer `last_error`, or undo disconnect (`tunnel_server == None` → disconnected).
+- Permission denial, bootstrap failure, cancellation, and connect/disconnect errors stay visible; JNI timeout is not mapped to success.
+- Public `vpn-state` / `StateSnapshot` payloads keep #87 redaction.
+- `get_tunnel_status_cmd` keeps its in-flight/`cancelled` UI contract; no extra timers or full-config polls.
+- `cargo test -p bibavpn-desktop` and `npm run build --prefix apps/bibavpn-desktop/ui` pass. Device traces are not required; do not claim a frame-time win.
 
 ## Non-goals
 
-- Do not send LAN through the VPS under any profile.
-- Do not change mux/epoch or the EMFILE accept loop.
-- Do not match `.local` hostnames in `host_is_local_or_private` (OS `*.local` only).
-- Do not add a user-facing toggle to force private ranges into the tunnel.
-- Do not invent a new test harness or live `curl` / GNOME e2e job.
+- Do not remove all mutexes, switch UI frameworks, or change the VPN protocol.
+- Do not debounce Settings input or bundle Google Fonts.
+- Do not persist-outside-lock or combine the three JNI queries in this PR.
+- Do not enable `ConnectingPhaseGuard` on Android/iOS.
+- Do not invent success to hide a timeout, or treat the 5s/18s bounds as typical latency.

@@ -1,6 +1,3 @@
-VERDICT: PASS
+VERDICT: FAIL
 
-- Core matcher `host_is_local_or_private` runs first in `decide` and `should_bypass` (before empty-list early returns). Required literals (`192.168.88.1`, `10.0.0.1`, `172.16.1.1`, `127.0.0.1`, `localhost`, `::1`, `fc00::1`, `::ffff:192.168.1.1`, `100.64.1.1`, `169.254.1.1`, `fe80::1`) are `Direct` on an empty list; `1.1.1.1` and `example.com` stay `Tunnel`. CGNAT uses octet ranges, not `Ipv4Addr::is_shared`.
-- DNS-map cases that used `10.0.0.1` as a stand-in public IP now use `203.0.113.x`. HTTP CONNECT empty-list + `CONNECT 127.0.0.1` reaches the origin within 3s; `split_bypass_wiring` is unchanged and passed. Named `bibavpn` cases appear in TEST.log.
-- Linux `merge_ignore_hosts` / `no_proxy_list` always include the required CIDRs and `*.local`; unit tests cover `192.168.0.0/16` and `10.0.0.0/8`. macOS `merge_bypass_for_apply` and Windows `merge_proxy_override` include the listed CIDRs/wildcards (`<local>`, `10.*`, `192.168.*`, `172.16.*`…`172.31.*`) and keep loopback/Steam/WebView entries. Merge unit tests exist (macOS/Windows modules are OS-gated).
-- Diff is limited to the spec files; no `.local` matching in the core matcher, no mux/wire/CLI/UI/mobile routing changes, no secrets.
+- `.github/agent/work/TEST.log` is still a `cargo test -p bibavpn` run (core crate; spec forbids that) and does not contain `cargo test -p bibavpn-desktop` or `npm run build --prefix apps/bibavpn-desktop/ui`. Re-run only those two named commands and replace TEST.log with that output.
