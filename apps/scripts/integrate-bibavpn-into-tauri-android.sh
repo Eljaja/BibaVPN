@@ -15,7 +15,7 @@ fi
 
 APP_JAVA="$GEN/app/src/main/java/dev/bibavpn"
 mkdir -p "$APP_JAVA/core"
-for f in BibaVpnService.kt TauriVpnBridge.kt BibaApplication.kt AppLocale.kt PickInstalledPackageActivity.kt; do
+for f in BibaVpnService.kt UnlockRestartPolicy.kt TauriVpnBridge.kt BibaApplication.kt AppLocale.kt PickInstalledPackageActivity.kt; do
   cp -f "$EXTRAS/java/dev/bibavpn/$f" "$APP_JAVA/"
 done
 cp -f "$EXTRAS/java/dev/bibavpn/core/BibaNative.kt" "$APP_JAVA/core/"

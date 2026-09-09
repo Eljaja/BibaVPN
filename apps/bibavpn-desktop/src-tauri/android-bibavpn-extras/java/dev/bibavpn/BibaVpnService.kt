@@ -103,6 +103,10 @@ class BibaVpnService : VpnService() {
     @Volatile
     private var fullStackRestartQueued: Boolean = false
 
+    /** Set on [ACTION_STOP] / [enqueueTeardownWorker]; cleared on user connect. Blocks queued restarts. */
+    @Volatile
+    private var stopRequested: Boolean = false
+
     private val physicalNetworkCallback =
         object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
@@ -141,14 +145,14 @@ class BibaVpnService : VpnService() {
                             acquireTunnelWakeLock()
                             Log.i(TAG, "SCREEN_ON: wake lock re-acquired (battery saver)")
                         }
-                        maybeRestartStackAfterUnlockEvent("SCREEN_ON")
+                        maybeRestartStackAfterUnlockEvent(UnlockRestartEvent.SCREEN_ON)
                     }
                     Intent.ACTION_USER_PRESENT -> {
                         if (screenOffBatterySaverEnabled() && isTunnelActive) {
                             acquireTunnelWakeLock()
                             Log.i(TAG, "USER_PRESENT: wake lock re-acquired (battery saver)")
                         }
-                        maybeRestartStackAfterUnlockEvent("USER_PRESENT")
+                        maybeRestartStackAfterUnlockEvent(UnlockRestartEvent.USER_PRESENT)
                     }
                 }
             }
@@ -159,34 +163,38 @@ class BibaVpnService : VpnService() {
      * - [Intent.ACTION_SCREEN_ON] без debounce ловит ложные срабатывания (AOD за сотни мс после OFF) — отсекаем короткий интервал.
      * - [Intent.ACTION_USER_PRESENT] — реальная разблокировка; debounce с SCREEN_OFF не применяем (иначе после AOD VPN не восстанавливается).
      */
-    private fun maybeRestartStackAfterUnlockEvent(source: String) {
+    private fun maybeRestartStackAfterUnlockEvent(event: UnlockRestartEvent) {
         val now = SystemClock.elapsedRealtime()
-        if (!allowScreenOnStackRestart) {
-            Log.d(TAG, "$source: skip full restart (allowScreenOnStackRestart=false)")
-            return
-        }
-        if (source == Intent.ACTION_SCREEN_ON && now - lastScreenOffElapsed < 500L) {
-            Log.d(
-                TAG,
-                "$source: skip full restart (display bounce: ${now - lastScreenOffElapsed}ms since SCREEN_OFF)",
-            )
-            return
-        }
-        if (now - lastFullStackRestartElapsed < 2500L) {
-            Log.d(
-                TAG,
-                "$source: skip full restart (throttle: ${now - lastFullStackRestartElapsed}ms since last restart)",
-            )
-            return
-        }
+        val sinceScreenOffMs = now - lastScreenOffElapsed
+        val sinceLastRestartMs = now - lastFullStackRestartElapsed
         val json = loadSavedConfigJson()
-        if (json.isNullOrBlank()) {
-            Log.w(TAG, "$source: skip full restart (no saved config)")
-            return
+        val decision =
+            UnlockRestartPolicy.decide(
+                event = event,
+                nowElapsed = now,
+                lastScreenOffElapsed = lastScreenOffElapsed,
+                lastFullStackRestartElapsed = lastFullStackRestartElapsed,
+                allowRestart = allowScreenOnStackRestart,
+                hasSavedConfig = !json.isNullOrBlank(),
+            )
+        when (decision) {
+            is UnlockRestartDecision.Skip ->
+                Log.d(
+                    TAG,
+                    "${event.name}: skip full restart (decision=${decision.skipReason}; " +
+                        "since_screen_off_ms=$sinceScreenOffMs since_last_restart_ms=$sinceLastRestartMs)",
+                )
+            UnlockRestartDecision.Restart -> {
+                lastFullStackRestartElapsed = now
+                Log.i(
+                    TAG,
+                    "${event.name}: scheduling full stack restart (decision=restart; " +
+                        "since_screen_off_ms=$sinceScreenOffMs since_last_restart_ms=$sinceLastRestartMs; " +
+                        "nativeStop + nativeStart + new TUN + tun2socks)",
+                )
+                requestFullStackRestart(event.name, json!!)
+            }
         }
-        lastFullStackRestartElapsed = now
-        Log.i(TAG, "$source: scheduling full stack restart (nativeStop + nativeStart + new TUN + tun2socks)")
-        requestFullStackRestart(source, json)
     }
 
     override fun onBind(intent: Intent?) = null
@@ -394,31 +402,51 @@ class BibaVpnService : VpnService() {
             {
                 try {
                     Log.i(TAG, "$reason: begin full stack restart")
-                    synchronized(nativeLifecycleLock) {
-                        stopTunnelAndNative()
-                        allowScreenOnStackRestart = false
-                        val err =
-                            try {
-                                BibaNative.nativeStart(sessionJson)
-                            } catch (e: Throwable) {
-                                Log.e(TAG, "$reason: nativeStart", e)
-                                e.message ?: e.javaClass.simpleName
-                            }
-                        if (err != null) {
-                            Log.e(TAG, "$reason: nativeStart failed: $err")
-                            allowScreenOnStackRestart = true
-                            mainHandler.post {
-                                setTunnelActive(false)
-                                android.widget.Toast.makeText(
-                                    applicationContext,
-                                    err,
-                                    android.widget.Toast.LENGTH_LONG,
-                                ).show()
-                            }
-                            return@Thread
+                    val stopBegin = SystemClock.elapsedRealtime()
+                    val nativeStopMs: Long
+                    val nativeStartMs: Long
+                    val err =
+                        synchronized(nativeLifecycleLock) {
+                            stopTunnelAndNative()
+                            allowScreenOnStackRestart = false
+                            nativeStopMs = SystemClock.elapsedRealtime() - stopBegin
+                            val nativeStartBegin = SystemClock.elapsedRealtime()
+                            val startErr =
+                                try {
+                                    BibaNative.nativeStart(sessionJson)
+                                } catch (e: Throwable) {
+                                    Log.e(TAG, "$reason: nativeStart", e)
+                                    e.message ?: e.javaClass.simpleName
+                                }
+                            nativeStartMs = SystemClock.elapsedRealtime() - nativeStartBegin
+                            startErr
                         }
+                    if (err != null) {
+                        Log.e(
+                            TAG,
+                            "$reason: nativeStart failed: $err " +
+                                "(nativeStop_ms=$nativeStopMs nativeStart_ms=$nativeStartMs)",
+                        )
+                        allowScreenOnStackRestart = true
+                        mainHandler.post {
+                            setTunnelActive(false)
+                            android.widget.Toast.makeText(
+                                applicationContext,
+                                err,
+                                android.widget.Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                        return@Thread
                     }
-                    if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
+                    val tunBegin = SystemClock.elapsedRealtime()
+                    val tunOk = startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))
+                    val tun2socksMs = SystemClock.elapsedRealtime() - tunBegin
+                    Log.i(
+                        TAG,
+                        "$reason: full restart phases " +
+                            "nativeStop_ms=$nativeStopMs nativeStart_ms=$nativeStartMs tun2socks_ms=$tun2socksMs",
+                    )
+                    if (!tunOk) {
                         setTunnelActive(false)
                         synchronized(nativeLifecycleLock) {
                             BibaNative.nativeStop()
@@ -437,12 +465,14 @@ class BibaVpnService : VpnService() {
                             fullStackRestartInProgress = false
                             queued
                         }
-                    if (rerun) {
+                    if (rerun && !stopRequested) {
                         val latestJson = loadSavedConfigJson()
                         if (!latestJson.isNullOrBlank()) {
                             Log.i(TAG, "$reason: running queued full restart")
                             requestFullStackRestart("$reason (queued)", latestJson)
                         }
+                    } else if (rerun && stopRequested) {
+                        Log.i(TAG, "$reason: skip queued full restart (stop requested)")
                     }
                 }
             },
@@ -459,6 +489,7 @@ class BibaVpnService : VpnService() {
             ACTION_STOP -> {
                 networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
                 networkRestartRunnable = null
+                stopRequested = true
                 enqueueTeardownWorker("ACTION_STOP") {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
@@ -486,6 +517,8 @@ class BibaVpnService : VpnService() {
             stopSelf()
             return START_NOT_STICKY
         }
+
+        stopRequested = false
 
         val sessionJson = configJsonWithSessionSocksAuth(json)
         val socks = runCatching {
@@ -878,6 +911,7 @@ class BibaVpnService : VpnService() {
      * @param onDone выполняется на главном потоке после завершения разбора.
      */
     private fun enqueueTeardownWorker(reason: String, onDone: (() -> Unit)? = null) {
+        stopRequested = true
         if (teardownInProgress) {
             Log.i(TAG, "$reason: teardown already in progress")
             return
