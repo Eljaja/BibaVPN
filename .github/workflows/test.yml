@@ -34,6 +34,8 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/test.yml"
+      - ".github/agent/test-changes.sh"
+      - ".github/agent/tests/**"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, master]
@@ -52,12 +54,21 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/test.yml"
+      - ".github/agent/test-changes.sh"
+      - ".github/agent/tests/**"
 
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  agent-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate component selection and test log handling
+        run: python3 .github/agent/tests/test_validation.py
+
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -72,32 +83,17 @@ jobs:
         if: github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call'
         uses: dorny/paths-filter@v3
         with:
+          predicate-quantifier: every
           filters: |
             core:
-              - 'bibavpn/**'
-              - '!bibavpn/**/*.md'
-              - 'biba/**'
-              - '!biba/**/*.md'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.github/workflows/test.yml'
+              - '{bibavpn/**,biba/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '!**/*.md'
             desktop:
-              - 'apps/bibavpn-desktop/**'
-              - '!apps/bibavpn-desktop/**/*.md'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.github/workflows/test.yml'
+              - '{apps/bibavpn-desktop/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '!**/*.md'
             mobile:
-              - 'apps/bibavpn-jni/**'
-              - '!apps/bibavpn-jni/**/*.md'
-              - 'apps/bibavpn-ffi/**'
-              - '!apps/bibavpn-ffi/**/*.md'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.github/workflows/test.yml'
+              - '{apps/bibavpn-jni/**,apps/bibavpn-ffi/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '!**/*.md'
 
       - name: Plan which test jobs to run
         id: plan
