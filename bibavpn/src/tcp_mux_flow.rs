@@ -1044,16 +1044,37 @@ mod tests {
         flow.consumed(data.len());
         flow.enqueue(vec![0; 4 * 1048576], false).unwrap();
     }
-    async fn write_test_payload(socket: &mut TcpStream, byte: u8, len: usize) {
-        // Keep initial packets small: developer machines can inspect loopback TCP packets.
-        // This affects only fixtures, never tunnel socket behavior.
-        socket.set_nodelay(true).unwrap();
-        let prefix = len.min(8);
-        for _ in 0..prefix {
-            socket.write_all(&[byte]).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    async fn read_test_payload(socket: &mut TcpStream, output: &mut Vec<u8>, stage: &str) {
+        let mut buffer = [0; 65536];
+        loop {
+            let n = timeout(Duration::from_secs(10), socket.read(&mut buffer))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{stage}: no progress for 10s after {} bytes", output.len())
+                })
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..n]);
         }
-        socket.write_all(&vec![byte; len - prefix]).await.unwrap();
+    }
+
+    async fn write_test_payload(socket: &mut TcpStream, byte: u8, len: usize) {
+        socket.set_nodelay(true).unwrap();
+        let buffer = [byte; 65536];
+        let mut written = 0;
+        while written < len {
+            let chunk = &buffer[..buffer.len().min(len - written)];
+            let n = timeout(Duration::from_secs(10), socket.write(chunk))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("payload write: no progress for 10s after {written}/{len} bytes")
+                })
+                .unwrap();
+            assert!(n > 0, "payload write closed after {written}/{len} bytes");
+            written += n;
+        }
     }
 
     async fn ws_pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>) {
@@ -1666,7 +1687,7 @@ mod tests {
         let target = tokio::spawn(async move {
             let (mut socket, _) = origin.accept().await.unwrap();
             let mut request = Vec::new();
-            socket.read_to_end(&mut request).await.unwrap();
+            read_test_payload(&mut socket, &mut request, "origin receiving request").await;
             assert_eq!(request, vec![31; request_len]);
             write_test_payload(&mut socket, 47, response_len).await;
         });
@@ -1684,17 +1705,22 @@ mod tests {
             client.get(1).unwrap().negotiated,
             "the first stream receives negotiated credits"
         );
-        assert_eq!(client.get(1).unwrap().send_limit, u32::from(server_mib) * 1048576);
-        timeout(Duration::from_secs(10), async {
+        assert_eq!(
+            client.get(1).unwrap().send_limit,
+            u32::from(server_mib) * 1048576
+        );
+        // The debug crypto fixture moves up to 20 MiB on a shared runner.
+        // Bound stalled reads/writes separately from total transfer duration.
+        timeout(Duration::from_secs(60), async {
             write_test_payload(&mut app, 31, request_len).await;
             app.shutdown().await.unwrap();
             let mut response = Vec::new();
-            app.read_to_end(&mut response).await.unwrap();
+            read_test_payload(&mut app, &mut response, "client receiving response").await;
             assert_eq!(response, vec![47; response_len]);
             target.await.unwrap();
         })
         .await
-        .expect("multiple windows and half-close must complete");
+        .unwrap_or_else(|_| panic!("transfer exceeded total deadline (client={client_mib} MiB, server={server_mib} MiB)"));
         client.shutdown();
         server.shutdown();
         let _ = ct.await;
