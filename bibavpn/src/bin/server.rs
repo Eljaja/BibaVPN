@@ -645,11 +645,18 @@ async fn main() -> anyhow::Result<()> {
     let mux_connect_timeout = Duration::from_secs(args.mux_connect_timeout_secs.max(1));
     let mux_window_mib = args.mux_window_mib;
 
+    let psk_present = args.psk.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     log_server_listen_caps(
         args.legacy_path_auth,
         !args.no_auth_rate_limit,
         args.max_concurrent_sessions,
         args.udp_socket_pool_size,
+        mux_window_mib,
+        max_pad,
+        max_ws_binary,
+        dummy_interval_secs,
+        psk_present,
+        reality_configured,
     );
 
     if let Some(ref metrics_listen) = args.metrics_listen {

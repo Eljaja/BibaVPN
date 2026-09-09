@@ -1,7 +1,7 @@
 //! Optional byte-credit extension and bounded, independent duplex stream pumps.
 use super::*;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex as StdMutex;
 
 use anyhow::{bail, Context};
@@ -270,6 +270,7 @@ pub(super) struct Endpoint {
     next_epoch: AtomicU64,
     closed: AtomicBool,
     negotiation: watch::Sender<Negotiation>,
+    negotiation_logged: AtomicBool,
     negotiation_deadline: Instant,
     session_stop: watch::Sender<bool>,
 }
@@ -317,9 +318,53 @@ impl Endpoint {
             next_epoch: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             negotiation: watch::channel(Negotiation::Pending).0,
+            negotiation_logged: AtomicBool::new(false),
             negotiation_deadline: Instant::now() + NEGOTIATION_WAIT,
             session_stop: watch::channel(false).0,
         })
+    }
+
+    fn on_negotiation_settled(&self, state: Negotiation) {
+        if self.negotiation_logged.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let local = self.cfg.mux_window_mib.bytes();
+        match state {
+            Negotiation::Credit(peer) => {
+                tracing::info!(
+                    target: "bibavpn_mux",
+                    credit_negotiated = true,
+                    local_receive_window_bytes = local,
+                    peer_window_bytes = peer,
+                    "mux credit negotiation settled"
+                );
+            }
+            Negotiation::Legacy => {
+                tracing::info!(
+                    target: "bibavpn_mux",
+                    credit_negotiated = false,
+                    local_receive_window_bytes = local,
+                    peer_window_bytes = 0u32,
+                    "mux credit negotiation settled (legacy fallback)"
+                );
+            }
+            Negotiation::Pending => {}
+        }
+    }
+
+    fn settle_negotiation_if_pending(&self, new_state: Negotiation) -> bool {
+        let changed = self.negotiation.send_if_modified(|state| {
+            if matches!(state, Negotiation::Pending) {
+                *state = new_state;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            self.on_negotiation_settled(new_state);
+        }
+        changed
     }
 
     /// Cheap, advisory admission/load snapshot. Reservations include retired flows
@@ -391,14 +436,7 @@ impl Endpoint {
         for (_, flow) in streams.drain() {
             flow.cancel(false);
         }
-        self.negotiation.send_if_modified(|state| {
-            if matches!(state, Negotiation::Pending) {
-                *state = Negotiation::Legacy;
-                true
-            } else {
-                false
-            }
-        });
+        self.settle_negotiation_if_pending(Negotiation::Legacy);
     }
 
     fn control(
@@ -456,11 +494,7 @@ impl Endpoint {
             tokio::select! {
                 _ = state.changed() => {},
                 _ = tokio::time::sleep_until(self.negotiation_deadline) => {
-                    self.negotiation.send_if_modified(|value| {
-                        if matches!(value, Negotiation::Pending) {
-                            *value = Negotiation::Legacy; true
-                        } else { false }
-                    });
+                    self.settle_negotiation_if_pending(Negotiation::Legacy);
                 }
             }
         }
@@ -610,17 +644,14 @@ impl Endpoint {
         if flags == MUX_FLAG_WIN && sid == 0 {
             if self.client {
                 if let Some(window) = parse_capability(&payload, 2) {
-                    self.negotiation.send_if_modified(|state| {
-                        if matches!(state, Negotiation::Pending) {
-                            *state = Negotiation::Credit(window);
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                    self.settle_negotiation_if_pending(Negotiation::Credit(window));
                 }
             } else if let Some(window) = parse_capability(&payload, 1) {
+                let was_pending = matches!(*self.negotiation.borrow(), Negotiation::Pending);
                 self.negotiation.send_replace(Negotiation::Credit(window));
+                if was_pending {
+                    self.on_negotiation_settled(Negotiation::Credit(window));
+                }
                 self.control(0, MUX_FLAG_WIN, capability(2, self.cfg.mux_window_mib.bytes()), None)?;
             }
             return Ok(());
@@ -956,6 +987,14 @@ mod tests {
 
     fn endpoint(client: bool) -> Arc<Endpoint> {
         Endpoint::new(client, config(), ServerWsOutTiming::default())
+    }
+
+    fn multi_window_transfer_timeout() -> Duration {
+        if cfg!(debug_assertions) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(10)
+        }
     }
 
     #[tokio::test]
@@ -1711,7 +1750,7 @@ mod tests {
         );
         // The debug crypto fixture moves up to 20 MiB on a shared runner.
         // Bound stalled reads/writes separately from total transfer duration.
-        timeout(Duration::from_secs(60), async {
+        timeout(multi_window_transfer_timeout(), async {
             write_test_payload(&mut app, 31, request_len).await;
             app.shutdown().await.unwrap();
             let mut response = Vec::new();

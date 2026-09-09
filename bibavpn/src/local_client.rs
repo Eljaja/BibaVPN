@@ -19,6 +19,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, info, warn};
 
 use crate::accept::classify_accept_error;
+use crate::transport_capabilities::log_client_transport_caps;
 
 use crate::client_tls_stream::ClientTlsStream;
 use crate::crypto_layer::{self, SessionCrypto};
@@ -963,6 +964,7 @@ pub async fn run_local_client(
     }
 
     let ws_parallel = opts.ws_parallel.max(1).min(4);
+    log_client_transport_caps(&opts, ws_parallel);
     let activity = if opts.use_tcp_mux && opts.idle_decoy_secs > 0 {
         Some(Arc::new(ActivityTracker::new()))
     } else {
