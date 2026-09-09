@@ -143,7 +143,6 @@ dedicated WSS.
 | `docker-compose.yml`     | Local lab: server + client on one Docker network                                      |
 | `docker-compose.hub.yml` | Pull prebuilt images from Docker Hub for a quick start                                |
 | `scripts/`               | Server/client smoke tests, deploy helpers, benchmarks, packet-capture labs            |
-| `docs/`                  | Static landing pages / extra documentation                                            |
 | `branding/`              | Logos and design assets (see also `DESIGN.md`)                                        |
 | `start.sh`               | One-shot local server launcher; mints token/PSK/invite, runs compose                  |
 | `rust-toolchain.toml`    | Pinned stable Rust toolchain for reproducible builds                                  |
