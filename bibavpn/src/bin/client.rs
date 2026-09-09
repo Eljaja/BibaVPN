@@ -262,8 +262,6 @@ async fn main() -> anyhow::Result<()> {
     install_ring_crypto();
     let opts = options_from_args(args, &matches)?;
 
-    bibavpn::transport_capabilities::log_client_transport_caps(&opts);
-
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(async move {
         bibavpn::local_client::run_local_client(opts, shutdown_rx, None).await
