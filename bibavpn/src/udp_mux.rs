@@ -27,15 +27,13 @@ use crate::protocol::{
     encode_v3_udp_mux_open,
 };
 use crate::retry::{
-    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, sleep_outbound_backoff, sleep_ws_ping_period,
-    ServerWsOutTiming, WsSendJitter,
+    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, sleep_outbound_backoff,
+    sleep_ws_ping_period, ServerWsOutTiming, WsSendJitter,
 };
 use crate::stealth::{build_websocket_request, WsHandshakeParams};
 use crate::tls_util::TlsClientProfile;
 use crate::ws_bridge::SharedCrypto;
-use crate::{
-    read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode_state,
-};
+use crate::{read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode_state};
 
 /// Max concurrent server-side UDP request tasks per mux session.
 const UDP_MUX_SERVER_MAX_INFLIGHT: usize = 512;
@@ -68,25 +66,42 @@ pub(crate) mod test_hooks {
     pub static WS_SEND_BLOCKED_WAITERS: AtomicUsize = AtomicUsize::new(0);
     pub static SERVER_INFLIGHT_SEM: Mutex<Option<Arc<Semaphore>>> = Mutex::const_new(None);
     pub static SERVER_SESSION_TASKS: AtomicUsize = AtomicUsize::new(0);
+    pub static CLIENT_IDLE_PENDING: AtomicUsize = AtomicUsize::new(0);
+    pub static CLIENT_IDLE_TICKS: AtomicUsize = AtomicUsize::new(0);
+    pub static DRAIN_REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct CountGuard(&'static AtomicUsize);
+    impl CountGuard {
+        pub fn new(counter: &'static AtomicUsize) -> Self {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Self(counter)
+        }
+    }
+    impl Drop for CountGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
     /// Serializes tests that spawn hundreds of UDP workers (avoids fd / static races).
     pub static SERVER_STRESS_LOCK: Mutex<()> = Mutex::const_new(());
 
     pub async fn server_stress_lock() -> tokio::sync::MutexGuard<'static, ()> {
-        SERVER_STRESS_LOCK.lock().await
+        let guard = SERVER_STRESS_LOCK.lock().await;
+        *SERVER_INFLIGHT_SEM.lock().await = None;
+        guard
     }
 
     pub async fn maybe_block_ws_send() {
         if !BLOCK_WS_SEND.load(Ordering::SeqCst) {
             return;
         }
-        WS_SEND_BLOCKED_WAITERS.fetch_add(1, Ordering::SeqCst);
+        let _waiting = CountGuard::new(&WS_SEND_BLOCKED_WAITERS);
         loop {
             if !BLOCK_WS_SEND.load(Ordering::SeqCst) {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        WS_SEND_BLOCKED_WAITERS.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn server_session_tasks() -> usize {
@@ -106,9 +121,7 @@ pub async fn resolve_udp_dest(host: &str, port: u16) -> anyhow::Result<Vec<Socke
 
 async fn bind_udp_for_family(want_v6: bool) -> anyhow::Result<UdpSocket> {
     if want_v6 {
-        UdpSocket::bind("[::]:0")
-            .await
-            .context("udp mux bind v6")
+        UdpSocket::bind("[::]:0").await.context("udp mux bind v6")
     } else {
         UdpSocket::bind("0.0.0.0:0")
             .await
@@ -218,11 +231,7 @@ impl Drop for UdpLease {
         let inner = self.inner.clone();
         let v6 = self.v6;
         tokio::spawn(async move {
-            let idle = if v6 {
-                &inner.v6_idle
-            } else {
-                &inner.v4_idle
-            };
+            let idle = if v6 { &inner.v6_idle } else { &inner.v4_idle };
             let mut g = idle.lock().await;
             if g.len() < inner.max_idle_per_family {
                 g.push(sock);
@@ -285,6 +294,8 @@ async fn drain_session_tasks(mut tasks: JoinSet<()>) {
             Err(_) => break,
         }
     }
+    #[cfg(test)]
+    test_hooks::DRAIN_REMAINING.store(tasks.len(), std::sync::atomic::Ordering::SeqCst);
 }
 
 fn spawn_udp_mux_ping<S>(
@@ -523,7 +534,10 @@ async fn connect_udp_mux_ws(
     WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
     SharedCrypto,
 )> {
-    anyhow::ensure!(cfg.proto >= 3, "only Biba protocol v3 is supported (proto 3)");
+    anyhow::ensure!(
+        cfg.proto >= 3,
+        "only Biba protocol v3 is supported (proto 3)"
+    );
     anyhow::ensure!(
         cfg.psk.is_some(),
         "Biba v3 UDP mux requires --psk (or invite psk)"
@@ -590,8 +604,7 @@ async fn connect_udp_mux_ws(
         let m = ws.next().await.context("eof before ACK (udp mux)")??;
         match m {
             Message::Binary(b) => {
-                let s_rand =
-                    crypto_layer::parse_ack(secret, dom.as_str(), b.as_ref(), &c_rand)?;
+                let s_rand = crypto_layer::parse_ack(secret, dom.as_str(), b.as_ref(), &c_rand)?;
                 let crypto = Arc::new(SessionCrypto::new(
                     secret,
                     dom.as_str(),
@@ -656,14 +669,8 @@ fn pack_tunnel_out(
     adaptive: &mut AdaptivePadState,
 ) -> anyhow::Result<Vec<u8>> {
     let mut wire = Vec::new();
-    write_padded_frame_with_mode_state(
-        &mut wire,
-        body,
-        max_pad,
-        pad_mode,
-        Some(adaptive),
-    )
-    .context("pack frame")?;
+    write_padded_frame_with_mode_state(&mut wire, body, max_pad, pad_mode, Some(adaptive))
+        .context("pack frame")?;
     let blob: Vec<u8> = crypto
         .seal_client_to_server(&wire)
         .context("seal c2s (udp mux)")?;
@@ -831,12 +838,19 @@ where
             }
             _ = reclaim_tick.tick() => {
                 reclaim_closed_pending(&mut pending);
+                #[cfg(test)]
+                {
+                    test_hooks::CLIENT_IDLE_PENDING.store(pending.len(), std::sync::atomic::Ordering::SeqCst);
+                    test_hooks::CLIENT_IDLE_TICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         }
     }
 
     for (_, entry) in pending.drain() {
-        let _ = entry.reply.send(Err(anyhow::anyhow!("udp mux session ended")));
+        let _ = entry
+            .reply
+            .send(Err(anyhow::anyhow!("udp mux session ended")));
     }
     drain_session_tasks(session_tasks).await;
     Ok(shutdown)
@@ -874,7 +888,6 @@ where
     #[cfg(test)]
     {
         *test_hooks::SERVER_INFLIGHT_SEM.lock().await = Some(sem.clone());
-        test_hooks::SERVER_SESSION_TASKS.store(0, std::sync::atomic::Ordering::SeqCst);
     }
     let (ws_sink, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_sink));
@@ -889,11 +902,7 @@ where
 
     loop {
         reap_finished_tasks(&mut session_tasks);
-        #[cfg(test)]
-        test_hooks::SERVER_SESSION_TASKS.store(
-            session_tasks.len(),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+
         let m = ws_rx.next().await;
         let Some(m) = m else {
             break;
@@ -942,7 +951,11 @@ where
                 let wsj = ws_send_j;
                 let server_out = server_out_timing;
                 let udp_pool = udp_socket_pool.clone();
+                #[cfg(test)]
+                let worker_count = test_hooks::CountGuard::new(&test_hooks::SERVER_SESSION_TASKS);
                 session_tasks.spawn(async move {
+                    #[cfg(test)]
+                    let _worker_count = worker_count;
                     let _permit = permit;
                     if let Err(e) = async {
                         let addrs = resolve_udp_dest(&host, port).await?;
@@ -1078,7 +1091,6 @@ where
     #[cfg(test)]
     {
         *test_hooks::SERVER_INFLIGHT_SEM.lock().await = None;
-        test_hooks::SERVER_SESSION_TASKS.store(0, std::sync::atomic::Ordering::SeqCst);
     }
     Ok(())
 }
@@ -1110,8 +1122,8 @@ mod tests {
         let crypto = test_session_crypto();
         let mut adaptive = AdaptivePadState::default();
         let inner = encode_udp_req(0xDEAD_BEEF_0000_0001, "1.1.1.1", 53, b"dns-q").unwrap();
-        let blob = pack_tunnel_out(&crypto, 16, PadMode::Random, 65_536, &inner, &mut adaptive)
-            .unwrap();
+        let blob =
+            pack_tunnel_out(&crypto, 16, PadMode::Random, 65_536, &inner, &mut adaptive).unwrap();
         let raw = crypto.open_client_to_server(&blob).unwrap();
         let plain = read_padded_frame_into(raw).unwrap();
         assert_eq!(plain, inner);
@@ -1152,8 +1164,8 @@ mod tests {
         let crypto = test_session_crypto();
         let mut adaptive = AdaptivePadState::default();
         let inner = encode_udp_req(1, "example.com", 443, &vec![0u8; 2048]).unwrap();
-        let err = pack_tunnel_out(&crypto, 64, PadMode::Random, 256, &inner, &mut adaptive)
-            .unwrap_err();
+        let err =
+            pack_tunnel_out(&crypto, 64, PadMode::Random, 256, &inner, &mut adaptive).unwrap_err();
         assert!(format!("{err:#}").contains("max_ws_binary"));
     }
 
@@ -1315,6 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn pooled_lease_recycles_when_never_sent() {
+        let _guard = test_hooks::server_stress_lock().await;
         let pool = UdpSocketPool::new(2);
         let lease = pool.lease(false).await.unwrap();
         drop(lease);
@@ -1325,6 +1338,7 @@ mod tests {
 
     #[tokio::test]
     async fn pooled_lease_discarded_after_send_without_recv() {
+        let _guard = test_hooks::server_stress_lock().await;
         let pool = UdpSocketPool::new(2);
         let mut lease = pool.lease(false).await.unwrap();
         lease.mark_sent_awaiting_reply();
@@ -1336,6 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn pooled_lease_recycles_after_recv_consumed() {
+        let _guard = test_hooks::server_stress_lock().await;
         let pool = UdpSocketPool::new(2);
         let mut lease = pool.lease(false).await.unwrap();
         lease.mark_sent_awaiting_reply();
@@ -1351,6 +1366,35 @@ mod tests {
             let (_tx, mut rx) = peer.split();
             while rx.next().await.is_some() {}
         })
+    }
+
+    async fn recv_udp_req_on_peer(
+        peer: &mut WebSocketStream<DuplexStream>,
+        crypto: &SessionCrypto,
+    ) -> u64 {
+        let msg = timeout(Duration::from_secs(3), peer.next())
+            .await
+            .expect("request must reach peer")
+            .unwrap()
+            .unwrap();
+        let Message::Binary(blob) = msg else {
+            panic!("expected UDP request")
+        };
+        let wire = crypto.open_client_to_server(&blob).unwrap();
+        decode_udp_req(read_padded_frame_borrow(&wire).unwrap())
+            .unwrap()
+            .0
+    }
+
+    async fn wait_for_blocked_send() {
+        timeout(Duration::from_secs(3), async {
+            while test_hooks::WS_SEND_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("WS send must be blocked before cancellation");
     }
 
     async fn inject_udp_rep_on_peer(
@@ -1385,6 +1429,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_task_owned_by_join_set_and_drained() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (client_ws, _server_ws) = ws_duplex_pair().await;
         let (ws_tx, _ws_rx) = client_ws.split();
         let ws_tx = Arc::new(Mutex::new(ws_tx));
@@ -1407,8 +1452,14 @@ mod tests {
 
     #[tokio::test]
     async fn client_session_reclaims_on_idle_tick() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (mut peer_ws, server_ws) = ws_duplex_pair().await;
-        let _drain = spawn_peer_ws_drain(peer_ws);
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let drain = tokio::spawn(async move {
+            while let Some(Ok(Message::Binary(_))) = peer_ws.next().await {
+                observed_tx.send(()).unwrap();
+            }
+        });
         let crypto = test_session_crypto();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(UDP_MUX_CMD_QUEUE_CAP);
         let cfg = test_udp_mux_cfg(0);
@@ -1430,9 +1481,44 @@ mod tests {
                 })
                 .unwrap();
         }
+        let (cap_tx, cap_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ClientUdpCmd::Forward {
+                xid: 9_998,
+                dst_host: "1.1.1.1".into(),
+                dst_port: 53,
+                payload: vec![0, 1],
+                reply: cap_tx,
+            })
+            .await
+            .unwrap();
+        let cap_error = timeout(Duration::from_secs(3), cap_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(cap_error.to_string().contains("too many pending replies"));
+        for _ in 0..UDP_MUX_CLIENT_PENDING_CAP {
+            timeout(Duration::from_secs(3), observed_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let tick = test_hooks::CLIENT_IDLE_TICKS.load(std::sync::atomic::Ordering::SeqCst);
         receivers.clear();
-
-        tokio::time::sleep(CLIENT_PENDING_RECLAIM_TICK + Duration::from_millis(80)).await;
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if test_hooks::CLIENT_IDLE_TICKS.load(std::sync::atomic::Ordering::SeqCst) > tick
+                    && test_hooks::CLIENT_IDLE_PENDING.load(std::sync::atomic::Ordering::SeqCst)
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle tick must reclaim the full map without another Forward");
 
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         cmd_tx
@@ -1444,8 +1530,14 @@ mod tests {
                 reply: tx,
             })
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(rx.try_recv().is_err(), "admit should succeed without cap error");
+        timeout(Duration::from_secs(3), observed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
 
         drop(cmd_tx);
         let stop = tokio::time::timeout(Duration::from_secs(2), session)
@@ -1454,10 +1546,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stop);
+        drain.abort();
     }
 
     #[tokio::test]
     async fn client_session_pending_cap_rejects_excess_forward() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (mut peer_ws, server_ws) = ws_duplex_pair().await;
         let _drain = spawn_peer_ws_drain(peer_ws);
         let crypto = test_session_crypto();
@@ -1505,6 +1599,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_session_xid_collision_through_driver() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (mut peer_ws, server_ws) = ws_duplex_pair().await;
         let _drain = spawn_peer_ws_drain(peer_ws);
         let crypto = test_session_crypto();
@@ -1549,6 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_session_late_rep_after_reclaim_not_delivered_to_reuse() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (mut peer_ws, server_ws) = ws_duplex_pair().await;
         let crypto = test_session_crypto();
         let crypto_peer = crypto.clone();
@@ -1568,12 +1664,42 @@ mod tests {
                 reply: tx_old,
             })
             .unwrap();
+        assert_eq!(
+            recv_udp_req_on_peer(&mut peer_ws, crypto_peer.as_ref()).await,
+            5
+        );
+        let tick = test_hooks::CLIENT_IDLE_TICKS.load(std::sync::atomic::Ordering::SeqCst);
         drop(rx_old);
-        tokio::time::sleep(CLIENT_PENDING_RECLAIM_TICK + Duration::from_millis(80)).await;
+        timeout(Duration::from_secs(3), async {
+            while test_hooks::CLIENT_IDLE_TICKS.load(std::sync::atomic::Ordering::SeqCst) == tick
+                || test_hooks::CLIENT_IDLE_PENDING.load(std::sync::atomic::Ordering::SeqCst) != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
-        inject_udp_rep_on_peer(&mut peer_ws, crypto_peer.as_ref(), 5, "8.8.8.8", 53, b"late")
-            .await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        inject_udp_rep_on_peer(
+            &mut peer_ws,
+            crypto_peer.as_ref(),
+            5,
+            "8.8.8.8",
+            53,
+            b"late",
+        )
+        .await;
+        // Pong proves the preceding stale reply has been consumed.
+        peer_ws
+            .send(Message::Ping(Bytes::from_static(b"barrier")))
+            .await
+            .unwrap();
+        let pong = timeout(Duration::from_secs(3), peer_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(pong, Message::Pong(_)));
 
         let (tx_new, mut rx_new) = tokio::sync::oneshot::channel();
         cmd_tx
@@ -1585,10 +1711,27 @@ mod tests {
                 reply: tx_new,
             })
             .unwrap();
-        assert!(rx_new.try_recv().is_err(), "late REP must not complete reuse");
+        assert_eq!(
+            recv_udp_req_on_peer(&mut peer_ws, crypto_peer.as_ref()).await,
+            5
+        );
+        assert!(
+            matches!(
+                rx_new.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "late REP must not complete reuse"
+        );
 
-        inject_udp_rep_on_peer(&mut peer_ws, crypto_peer.as_ref(), 5, "9.9.9.9", 53, b"fresh")
-            .await;
+        inject_udp_rep_on_peer(
+            &mut peer_ws,
+            crypto_peer.as_ref(),
+            5,
+            "9.9.9.9",
+            53,
+            b"fresh",
+        )
+        .await;
         let body = tokio::time::timeout(Duration::from_secs(1), rx_new)
             .await
             .unwrap()
@@ -1602,6 +1745,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_session_ping_does_not_outlive_cmd_close() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (mut peer_ws, server_ws) = ws_duplex_pair().await;
         let _drain = spawn_peer_ws_drain(peer_ws);
         let crypto = test_session_crypto();
@@ -1622,6 +1766,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_session_ping_aborted_while_send_blocked() {
+        let _guard = test_hooks::server_stress_lock().await;
         test_hooks::BLOCK_WS_SEND.store(true, std::sync::atomic::Ordering::SeqCst);
         let (mut peer_ws, server_ws) = ws_duplex_pair().await;
         let _drain = spawn_peer_ws_drain(peer_ws);
@@ -1631,14 +1776,7 @@ mod tests {
         let session = tokio::spawn(async move {
             run_udp_mux_one_session(server_ws, crypto, &cfg, &mut cmd_rx).await
         });
-        for _ in 0..100 {
-            if test_hooks::WS_SEND_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::SeqCst) > 0
-                || test_hooks::PING_TASKS_ALIVE.load(std::sync::atomic::Ordering::SeqCst) > 0
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_blocked_send().await;
         session.abort();
         let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
         test_hooks::BLOCK_WS_SEND.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1648,6 +1786,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_empty_timeout_rep_reaches_client_pending() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (client_ws, server_ws) = ws_duplex_pair().await;
         let crypto = test_session_crypto();
         let crypto_srv = crypto.clone();
@@ -1731,10 +1870,11 @@ mod tests {
 
     async fn wait_for_server_sem() -> Arc<Semaphore> {
         for _ in 0..200 {
-            let g = test_hooks::SERVER_INFLIGHT_SEM.lock().await;
-            if let Some(sem) = g.clone() {
+            let mut g = test_hooks::SERVER_INFLIGHT_SEM.lock().await;
+            if let Some(sem) = g.take() {
                 return sem;
             }
+            drop(g);
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("server inflight semaphore was not registered");
@@ -1784,14 +1924,7 @@ mod tests {
             let crypto = test_session_crypto();
             let crypto_srv = crypto.clone();
             let server = tokio::spawn(async move {
-                run_server_bridge(
-                    server_ws,
-                    crypto_srv,
-                    Duration::from_secs(120),
-                    None,
-                    0,
-                )
-                .await
+                run_server_bridge(server_ws, crypto_srv, Duration::from_secs(120), None, 0).await
             });
             let sem = wait_for_server_sem().await;
 
@@ -1801,13 +1934,15 @@ mod tests {
             wait_for_sem_available(&sem, 0).await;
 
             client_ws.close(None).await.ok();
-            assert!(
-                tokio::time::timeout(Duration::from_secs(3), server)
-                    .await
-                    .is_ok()
-            );
+            assert!(tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .is_ok());
             wait_for_sem_available(&sem, UDP_MUX_SERVER_MAX_INFLIGHT).await;
             assert_eq!(test_hooks::server_session_tasks(), 0);
+            assert_eq!(
+                test_hooks::DRAIN_REMAINING.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
         }
     }
 
@@ -1815,44 +1950,34 @@ mod tests {
     async fn server_session_abort_drains_inflight_during_blocked_ws_send() {
         let _guard = test_hooks::server_stress_lock().await;
         test_hooks::BLOCK_WS_SEND.store(true, std::sync::atomic::Ordering::SeqCst);
-        for _ in 0..2 {
+        for use_pool in [false, true] {
+            let pool = use_pool.then(|| UdpSocketPool::new(2));
             let (mut client_ws, server_ws) = ws_duplex_pair().await;
             let crypto = test_session_crypto();
             let crypto_srv = crypto.clone();
             let server = tokio::spawn(async move {
-                run_server_bridge(
-                    server_ws,
-                    crypto_srv,
-                    Duration::from_millis(5),
-                    None,
-                    0,
-                )
-                .await
+                run_server_bridge(server_ws, crypto_srv, Duration::from_millis(5), pool, 0).await
             });
             let sem = wait_for_server_sem().await;
 
             flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
                 .await;
-            for _ in 0..300 {
-                if test_hooks::WS_SEND_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::SeqCst)
-                    > 0
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert!(
-                test_hooks::WS_SEND_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::SeqCst) > 0
-            );
+            wait_for_server_workers_inflight().await;
+            wait_for_sem_available(&sem, 0).await;
+            wait_for_blocked_send().await;
 
-            client_ws.close(None).await.ok();
-            assert!(
-                tokio::time::timeout(Duration::from_secs(3), server)
-                    .await
-                    .is_ok()
-            );
+            server.abort();
+            assert!(timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled());
             wait_for_sem_available(&sem, UDP_MUX_SERVER_MAX_INFLIGHT).await;
             assert_eq!(test_hooks::server_session_tasks(), 0);
+            assert_eq!(
+                test_hooks::WS_SEND_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
         }
         test_hooks::BLOCK_WS_SEND.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1883,11 +2008,9 @@ mod tests {
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
             client_ws.close(None).await.ok();
-            assert!(
-                tokio::time::timeout(Duration::from_secs(3), server)
-                    .await
-                    .is_ok()
-            );
+            assert!(tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .is_ok());
             wait_for_sem_available(&sem, UDP_MUX_SERVER_MAX_INFLIGHT).await;
             assert_eq!(test_hooks::server_session_tasks(), 0);
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1897,22 +2020,22 @@ mod tests {
 
     #[tokio::test]
     async fn server_ping_does_not_outlive_session_close() {
+        let _guard = test_hooks::server_stress_lock().await;
         let (mut client_ws, server_ws) = ws_duplex_pair().await;
         let crypto = test_session_crypto();
         let server = tokio::spawn(async move {
             run_server_bridge(server_ws, crypto, Duration::from_millis(5), None, 1).await
         });
         client_ws.close(None).await.ok();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), server)
-                .await
-                .is_ok()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .is_ok());
         assert_ping_tasks_gone().await;
     }
 
     #[tokio::test]
     async fn server_ping_aborted_while_send_blocked() {
+        let _guard = test_hooks::server_stress_lock().await;
         test_hooks::BLOCK_WS_SEND.store(true, std::sync::atomic::Ordering::SeqCst);
         let (mut client_ws, server_ws) = ws_duplex_pair().await;
         let _drain = spawn_peer_ws_drain(client_ws);
@@ -1920,12 +2043,7 @@ mod tests {
         let server = tokio::spawn(async move {
             run_server_bridge(server_ws, crypto, Duration::from_millis(5), None, 1).await
         });
-        for _ in 0..100 {
-            if test_hooks::WS_SEND_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_blocked_send().await;
         server.abort();
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         test_hooks::BLOCK_WS_SEND.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1934,6 +2052,7 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_pooled_lease_not_recycled_after_send() {
+        let _guard = test_hooks::server_stress_lock().await;
         let pool = UdpSocketPool::new(2);
         let pool_srv = pool.clone();
         let (mut client_ws, server_ws) = ws_duplex_pair().await;
@@ -1965,6 +2084,7 @@ mod tests {
 
     #[tokio::test]
     async fn discarded_pool_lease_does_not_recv_queued_datagram_on_next_lease() {
+        let _guard = test_hooks::server_stress_lock().await;
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
@@ -1986,9 +2106,11 @@ mod tests {
         let mut lease2 = pool.lease(false).await.unwrap();
         assert_ne!(lease2.sock_mut().local_addr().unwrap(), local);
         let mut buf = [0u8; 64];
-        let res =
-            tokio::time::timeout(Duration::from_millis(100), lease2.sock_mut().recv_from(&mut buf))
-                .await;
+        let res = tokio::time::timeout(
+            Duration::from_millis(100),
+            lease2.sock_mut().recv_from(&mut buf),
+        )
+        .await;
         assert!(res.is_err(), "next lease must not inherit queued reply");
         drop(lease2);
         echo_task.abort();

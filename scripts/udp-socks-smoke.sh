@@ -3,10 +3,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+PYTHON="${PYTHON:-python3}"
+"$PYTHON" -c "import socks"  # fail before starting processes if PySocks is missing
 export RUST_LOG="${RUST_LOG:-warn}"
 
 pick_port() {
-  /usr/bin/python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])"
+  "$PYTHON" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1])"
 }
 
 SRV_PORT="${SRV_PORT:-$(pick_port)}"
@@ -85,7 +87,7 @@ curl -fsS -o /dev/null -w "http example.com %{http_code}\n" \
   http://example.com/
 
 echo "--- UDP DNS via SOCKS (8.8.8.8:53) ---"
-/usr/bin/python3 - "$SOCK_PORT" << 'PY'
+"$PYTHON" - "$SOCK_PORT" << 'PY'
 import socket, socks, sys
 port = int(sys.argv[1])
 q = bytes.fromhex("1234010000010000000000076578616d706c6503636f6d0000010001")
