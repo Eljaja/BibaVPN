@@ -72,32 +72,17 @@ jobs:
         if: github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call'
         uses: dorny/paths-filter@v3
         with:
+          predicate-quantifier: every
           filters: |
             core:
-              - 'bibavpn/**'
-              - '!bibavpn/**/*.md'
-              - 'biba/**'
-              - '!biba/**/*.md'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.github/workflows/test.yml'
+              - '{bibavpn/**,biba/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '!**/*.md'
             desktop:
-              - 'apps/bibavpn-desktop/**'
-              - '!apps/bibavpn-desktop/**/*.md'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.github/workflows/test.yml'
+              - '{apps/bibavpn-desktop/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '!**/*.md'
             mobile:
-              - 'apps/bibavpn-jni/**'
-              - '!apps/bibavpn-jni/**/*.md'
-              - 'apps/bibavpn-ffi/**'
-              - '!apps/bibavpn-ffi/**/*.md'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - '.github/workflows/test.yml'
+              - '{apps/bibavpn-jni/**,apps/bibavpn-ffi/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '!**/*.md'
 
       - name: Plan which test jobs to run
         id: plan

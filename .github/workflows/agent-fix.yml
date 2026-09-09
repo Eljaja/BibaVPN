@@ -7,7 +7,7 @@
 #      - LARGE: posts a proposal, @-mentions the owner, stops (no code)
 #      - SMALL: writes .github/agent/work/SPEC.md and continues
 #   2. Composer 2.5 (standard, not Fast) implements the spec (SMALL / approved only)
-#   3. cargo test -p bibavpn -p biba --locked (deterministic; not the agent's word)
+#   3. Path-scoped Rust/UI validation (runner-owned commands and logs)
 #   4. Grok 4.6 reviews the diff vs the spec
 # One implement retry if review or tests fail. Git/PR are workflow steps, not the agent
 # (Cursor CLI restricted-autonomy cookbook).
@@ -218,6 +218,8 @@ jobs:
         if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
         run: |
           set -euo pipefail
+          # Keep runner-owned validation outside the implementer's working tree.
+          cp .github/agent/test-changes.sh "${RUNNER_TEMP}/test-changes.sh"
           max=2
           round=1
           while [ "$round" -le "$max" ]; do
@@ -237,22 +239,21 @@ jobs:
             bash .github/agent/run-agent.sh implement "$CHEAP_MODEL" .github/agent/prompts/implement.md
             echo "::endgroup::"
 
-            echo "::group::cargo test (deterministic)"
+            echo "::group::Validate changed components"
             set +e
-            cargo test -p bibavpn -p biba --locked >"${RUNNER_TEMP}/cargo-test.log" 2>&1
+            bash "${RUNNER_TEMP}/test-changes.sh"
             test_ec=$?
             set -e
-            cp "${RUNNER_TEMP}/cargo-test.log" .github/agent/work/TEST.log
             if [ "$test_ec" -ne 0 ]; then
-              echo "::error::cargo test failed (log not printed)"
+              echo "::error::Component validation failed (see TEST.log)"
             else
-              echo "cargo test: ok"
+              echo "Component validation: ok"
             fi
             echo "::endgroup::"
 
             echo "::group::review round $round ($SMART_MODEL)"
             if [ "$test_ec" -ne 0 ]; then
-              export AGENT_EXTRA_PROMPT="cargo test failed. Log is .github/agent/work/TEST.log. Verdict must be FAIL unless the spec says those tests are out of scope."
+              export AGENT_EXTRA_PROMPT="Component validation failed. Read .github/agent/work/TEST.log. Verdict must be FAIL until the failed checks are addressed."
             else
               unset AGENT_EXTRA_PROMPT || true
             fi
@@ -281,7 +282,7 @@ jobs:
           git config user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
           git checkout -B "agent/issue-${n}"
           git add -A
-          git reset -q -- .github/agent/work/ISSUE.md .github/agent/work/TEST.log .github/agent/work/GATE.txt 2>/dev/null || true
+          git reset -q -- .github/agent/work/ISSUE.md .github/agent/work/TEST.log '.github/agent/work/TEST-*.log' .github/agent/work/GATE.txt 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "::error::Agent produced no file changes"
             exit 1
@@ -309,3 +310,11 @@ jobs:
           )"
           gh pr create --draft --assignee "$GITHUB_ACTOR" --title "fix: ${title}" --body "$body"
           gh issue comment "$n" --body "Draft PR opened (closes #${n})."
+
+      - name: Require passing validation and review
+        if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
+        run: |
+          if ! grep -qx 'ok=true' .github/agent/work/GATE.txt; then
+            echo "::error::Draft PR created, but validation or review still fails."
+            exit 1
+          fi
