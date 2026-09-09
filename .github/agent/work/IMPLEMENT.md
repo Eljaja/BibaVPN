@@ -1,22 +1,34 @@
 # Implementation notes
 
+**Note:** `bash scripts/udp-socks-smoke.sh` TCP leg passed; the UDP DNS step failed in this environment (`ModuleNotFoundError: No module named 'socks'`). `cargo test -p bibavpn` passed fully (301 tests).
+
 ## Summary
 
-Private / loopback / CGNAT / ULA / link-local literals and `localhost` are always routed `Direct`, even when the split-tunnel domain list is empty. Desktop OS proxy bypass lists now include matching RFC1918 / ULA / link-local / `*.local` entries on Linux, macOS, and Windows.
+Fixed UDP-mux session lifetime defects in `bibavpn/src/udp_mux.rs` (no wire-format, cap, or crypto changes):
+
+1. **Session-owned children** — Client and server Ping tasks plus server per-request workers live in a `JoinSet`; `drain_session_tasks` aborts and reaps on session exit. Server read loop calls `reap_finished_tasks` so the set does not grow with completed workers.
+2. **Client pending reclaim** — `reclaim_closed_pending` drops map entries whose oneshot `Sender::is_closed()` before each admission check and on a 1 s idle `select!` tick (50 ms in unit tests). The 2048 cap is unchanged; SOCKS timeouts in `local_client.rs` need no production change.
+3. **Pooled socket safety** — `UdpLease::recycle_on_drop` is cleared after `send_to` without a matching `recv_from`; abandoned in-flight leases are not returned to `UdpSocketPool` idle lists.
+4. **Server outbound errors** — Unchanged: resolve/bind/send failures log only; empty timeout `UDP_REP` still sent when `recv_timeout` fires.
+
+This addresses detached Ping tasks, stale pending `xid` slots on a live WSS, and untracked server workers — not unmeasured production RSS/CPU.
 
 ## Tests
 
 ```bash
-cargo test -p bibavpn          # passed (all tests, incl. split_bypass_wiring + new domain_route/local_client cases)
-cargo test -p bibavpn-desktop  # passed after installing libgtk-3-dev / libwebkit2gtk-4.1-dev and stub ui/dist/index.html
+cargo test -p bibavpn          # passed (301 tests, incl. new udp_mux::tests)
+bash scripts/udp-socks-smoke.sh  # TCP OK; UDP step needs PySocks in this CI image
 ```
 
-macOS (`proxy_mac::tests`) and Windows (`proxy_win::tests`) merge unit tests compile but run only on their respective targets (`#[cfg(target_os = ...)]` modules).
+New / strengthened deterministic regressions in `bibavpn/src/udp_mux.rs`:
+
+- **Ping ownership (client + server):** `PING_TASKS_ALIVE` counter; cmd-channel close with live peer; abort while `BLOCK_WS_SEND` holds Ping/worker WS send
+- **Pending reclaim on live WSS:** `client_session_reclaims_on_idle_tick` fills 2048 slots with live receivers, drops them, idle tick frees capacity without another `Forward`
+- **Cap / xid through session driver:** `client_session_pending_cap_rejects_excess_forward`, `client_session_xid_collision_through_driver`, `client_session_late_rep_after_reclaim_not_delivered_to_reuse`
+- **Server workers:** fill `UDP_MUX_SERVER_MAX_INFLIGHT`, abort during `recv_from` and blocked WS send; repeat sessions; pool and no-pool modes; semaphore permits and `JoinSet` drain via test hooks
+- **Pool discard:** `discarded_pool_lease_does_not_recv_queued_datagram_on_next_lease` (real UDP echo; next lease cannot inherit queued reply)
+- Empty timeout `UDP_REP` end-to-end via duplex WSS (existing test retained)
 
 ## Files changed
 
-- `bibavpn/src/domain_route.rs` — `host_is_local_or_private`; early Direct in `decide` / `should_bypass`; DNS-map tests retargeted to `203.0.113.x`; new private/empty-list unit cases
-- `bibavpn/src/local_client.rs` — HTTP CONNECT empty bypass list + `127.0.0.1` regression test
-- `apps/bibavpn-desktop/src-tauri/src/proxy_linux.rs` — private CIDRs in `merge_ignore_hosts` / `no_proxy_list`; extended unit tests
-- `apps/bibavpn-desktop/src-tauri/src/proxy_mac.rs` — private CIDRs in `merge_bypass_for_apply`; merge unit test
-- `apps/bibavpn-desktop/src-tauri/src/proxy_win.rs` — WinInet wildcards in `merge_proxy_override`; merge unit test
+- `bibavpn/src/udp_mux.rs` — production fixes, `#[cfg(test)]` hooks, and tests only (`local_client.rs` untouched)
