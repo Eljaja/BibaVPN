@@ -140,6 +140,9 @@ pub(crate) struct Inner {
     recovery_pending: bool,
     /// Control-plane import awaiting user confirmation (not persisted).
     pending_import: Option<PendingControlPlaneImport>,
+    /// Generation counter for snapshot assembly; not persisted. Bumped when tunnel
+    /// identity, cfg, or connect errors change so a late mobile probe cannot revive stale state.
+    epoch: u64,
 }
 
 #[derive(Clone)]
@@ -245,48 +248,187 @@ fn android_snapshot_error(
         .filter(|s| !s.is_empty())
 }
 
-fn snapshot(app: &AppHandle, inner: &Inner) -> StateSnapshot {
+fn bump_epoch(inner: &mut Inner) {
+    inner.epoch = inner.epoch.wrapping_add(1);
+}
+
+/// Fields copied under `Inner` before a lock-free mobile tunnel probe.
+#[derive(Clone)]
+struct SnapshotCopy {
+    epoch: u64,
+    public_cfg: PublicSavedConfig,
+    display_host: String,
+    server_subtitle: String,
+    tunnel_server: Option<String>,
+    last_error: Option<String>,
+    can_connect: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TunnelProbe {
+    connected: bool,
+    vpn_session_uptime_secs: Option<u64>,
     #[cfg(target_os = "android")]
-    let connected = android_vpn::tunnel_is_active(app).unwrap_or(false);
-    #[cfg(target_os = "ios")]
-    let connected = ios_vpn::tunnel_is_active(app).unwrap_or(false);
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let connected = {
-        let _ = app;
-        inner.vpn.is_some()
-    };
-    #[cfg(target_os = "android")]
-    let vpn_session_uptime_secs = if connected {
-        Some(android_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000)
-    } else {
-        None
-    };
-    #[cfg(target_os = "ios")]
-    let vpn_session_uptime_secs = if connected {
-        Some(ios_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000)
-    } else {
-        None
-    };
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let vpn_session_uptime_secs = None;
-    #[cfg(target_os = "android")]
-    let jni_connect_error = android_vpn::last_connect_error(app).ok().flatten();
-    #[cfg(not(target_os = "android"))]
-    let jni_connect_error: Option<String> = None;
-    let error = android_snapshot_error(&inner.last_error, connected, jni_connect_error);
-    StateSnapshot {
-        cfg: to_public_saved_config(&inner.cfg),
-        connected,
+    jni_connect_error: Option<String>,
+}
+
+fn snapshot_copy_from_inner(inner: &Inner) -> SnapshotCopy {
+    SnapshotCopy {
+        epoch: inner.epoch,
+        public_cfg: to_public_saved_config(&inner.cfg),
         display_host: display_host_line(&inner.cfg),
         server_subtitle: server_card_subtitle(&inner.cfg),
         tunnel_server: inner.tunnel_server.clone(),
-        error,
+        last_error: inner.last_error.clone(),
         can_connect: inner.cfg.can_connect(),
+    }
+}
+
+fn run_tunnel_probe(app: &AppHandle) -> TunnelProbe {
+    #[cfg(target_os = "android")]
+    {
+        let connected = android_vpn::tunnel_is_active(app).unwrap_or(false);
+        let vpn_session_uptime_secs = if connected {
+            Some(android_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000)
+        } else {
+            None
+        };
+        let jni_connect_error = android_vpn::last_connect_error(app).ok().flatten();
+        TunnelProbe {
+            connected,
+            vpn_session_uptime_secs,
+            jni_connect_error,
+        }
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let connected = ios_vpn::tunnel_is_active(app).unwrap_or(false);
+        let vpn_session_uptime_secs = if connected {
+            Some(ios_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000)
+        } else {
+            None
+        };
+        TunnelProbe {
+            connected,
+            vpn_session_uptime_secs,
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = app;
+        TunnelProbe::default()
+    }
+}
+
+/// Pure assembly: if `current.epoch != copy.epoch`, discard `probe` and rebuild from `current`.
+pub(crate) fn assemble_state_snapshot(
+    copy: &SnapshotCopy,
+    current: &Inner,
+    probe: Option<TunnelProbe>,
+    force_disconnected: bool,
+) -> StateSnapshot {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let _ = &probe;
+    let stale = current.epoch != copy.epoch;
+    let (public_cfg, display_host, server_subtitle, tunnel_server, last_error, can_connect) =
+        if stale {
+            (
+                to_public_saved_config(&current.cfg),
+                display_host_line(&current.cfg),
+                server_card_subtitle(&current.cfg),
+                current.tunnel_server.clone(),
+                current.last_error.clone(),
+                current.cfg.can_connect(),
+            )
+        } else {
+            (
+                copy.public_cfg.clone(),
+                copy.display_host.clone(),
+                copy.server_subtitle.clone(),
+                copy.tunnel_server.clone(),
+                copy.last_error.clone(),
+                copy.can_connect,
+            )
+        };
+
+    let (mut connected, mut vpn_session_uptime_secs) = if tunnel_server.is_none() {
+        (false, None)
+    } else if stale {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            (current.vpn.is_some(), None)
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            (false, None)
+        }
+    } else {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            (current.vpn.is_some(), None)
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let p = probe.as_ref();
+            (
+                p.map(|p| p.connected).unwrap_or(false),
+                p.and_then(|p| p.vpn_session_uptime_secs),
+            )
+        }
+    };
+
+    if force_disconnected {
+        connected = false;
+        vpn_session_uptime_secs = None;
+    }
+
+    #[cfg(target_os = "android")]
+    let jni_connect_error = if stale {
+        None
+    } else {
+        probe
+            .as_ref()
+            .and_then(|p| p.jni_connect_error.clone())
+    };
+    #[cfg(not(target_os = "android"))]
+    let jni_connect_error: Option<String> = None;
+
+    let error = android_snapshot_error(&last_error, connected, jni_connect_error);
+
+    StateSnapshot {
+        cfg: public_cfg,
+        connected,
+        display_host,
+        server_subtitle,
+        tunnel_server,
+        error,
+        can_connect,
         capabilities: ClientCapabilities {
             boring_tls_available: cfg!(feature = "boring-tls"),
         },
         vpn_session_uptime_secs,
     }
+}
+
+fn snapshot_with_probe<F>(
+    state: &AppState,
+    probe_fn: F,
+    force_disconnected: bool,
+) -> StateSnapshot
+where
+    F: FnOnce() -> TunnelProbe,
+{
+    let copy = {
+        let g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        snapshot_copy_from_inner(&g)
+    };
+    let probe = probe_fn();
+    let g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+    assemble_state_snapshot(&copy, &g, Some(probe), force_disconnected)
+}
+
+fn snapshot_from_state(app: &AppHandle, state: &AppState) -> StateSnapshot {
+    snapshot_with_probe(state, || run_tunnel_probe(app), false)
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -415,8 +557,9 @@ fn spawn_import_deeplink(state: AppState, app: AppHandle, raw_url: String) {
             warn!(target: "bibavpn_desktop", "deep link: {e}");
             let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
             g.last_error = Some(e);
-            let snap = snapshot(&app, &g);
+            bump_epoch(&mut g);
             drop(g);
+            let snap = snapshot_from_state(&app, &state);
             let _ = app.emit("vpn-state", &snap);
         }
     });
@@ -560,8 +703,9 @@ fn fail_fd_exhaustion_recovery(state: &AppState, app: &AppHandle, detail: &str) 
     g.last_error = Some(format!(
         "Слишком много открытых соединений — перезапустите BibaVPN. ({detail})"
     ));
-    let snap = snapshot(app, &g);
+    bump_epoch(&mut g);
     drop(g);
+    let snap = snapshot_from_state(app, state);
     let _ = app.emit("vpn-state", &snap);
 }
 
@@ -635,8 +779,9 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
                     };
                     g.last_error =
                         Some(format!("Нет связи с сервером, переподключение… ({e})"));
-                    let snap = snapshot(&app, &g);
+                    bump_epoch(&mut g);
                     drop(g);
+                    let snap = snapshot_from_state(&app, &state);
                     let _ = app.emit("vpn-state", &snap);
                 }
             }
@@ -703,17 +848,13 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
                 Err(p) => p.into_inner(),
             };
             g.last_error = Some(format!("Нет связи с сервером, переподключение… ({e})"));
-            let snap = snapshot(&app, &g);
+            bump_epoch(&mut g);
             drop(g);
+            let snap = snapshot_from_state(&app, &state);
             let _ = app.emit("vpn-state", &snap);
         } else {
             retry_backoff = Duration::from_secs(0);
-            let g = match state.inner.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            let snap = snapshot(&app, &g);
-            drop(g);
+            let snap = snapshot_from_state(&app, &state);
             let _ = app.emit("vpn-state", &snap);
         }
         }
@@ -742,12 +883,11 @@ fn spawn_tray_connect(state: AppState, app: AppHandle) {
                 warn!(target: "bibavpn_desktop", "подключение из трея: {e}");
                 let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
                 g.last_error = Some(e);
+                bump_epoch(&mut g);
                 true
             }
         };
-        let g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let snap = snapshot(&app, &g);
-        drop(g);
+        let snap = snapshot_from_state(&app, &state);
         let _ = app.emit("vpn-state", &snap);
         if failed {
             show_main_window(&app);
@@ -854,6 +994,7 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             info!(target: "bibavpn_desktop", "отключение VPN");
             g.last_error = None;
             g.tunnel_server = None;
+            bump_epoch(&mut g);
         }
 
         let _ = android_vpn::clear_last_connect_error(app);
@@ -867,12 +1008,10 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             g.last_error = Some(e.clone());
         }
         sync_tray_tooltip_i18n(app, false, &g.cfg);
-        let mut snap = snapshot(app, &g);
-        // Остановка сервиса асинхронна — tunnel_is_active ещё может быть true в snapshot().
-        if jni_result.is_ok() {
-            snap.connected = false;
-        }
         drop(g);
+        // Остановка сервиса асинхронна — tunnel_is_active ещё может быть true в snapshot().
+        let force_disconnected = jni_result.is_ok();
+        let snap = snapshot_with_probe(state, || run_tunnel_probe(app), force_disconnected);
         let _ = app.emit("vpn-state", &snap);
         return;
     }
@@ -884,6 +1023,7 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             info!(target: "bibavpn_desktop", "отключение VPN (iOS)");
             g.last_error = None;
             g.tunnel_server = None;
+            bump_epoch(&mut g);
         }
 
         let stop_res = ios_vpn::request_disconnect(app);
@@ -894,11 +1034,9 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             g.last_error = Some(e.clone());
         }
         sync_tray_tooltip_i18n(app, false, &g.cfg);
-        let mut snap = snapshot(app, &g);
-        if stop_res.is_ok() {
-            snap.connected = false;
-        }
         drop(g);
+        let force_disconnected = stop_res.is_ok();
+        let snap = snapshot_with_probe(state, || run_tunnel_probe(app), force_disconnected);
         let _ = app.emit("vpn-state", &snap);
         return;
     }
@@ -920,6 +1058,7 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             info!(target: "bibavpn_desktop", "отключение VPN");
             g.last_error = None;
             g.tunnel_server = None;
+            bump_epoch(&mut g);
             if restore_system_proxy {
                 // Явное отключение пользователем: авто-восстановление отменяется,
                 // иначе watchdog будет драться с пользователем и поднимать туннель
@@ -954,8 +1093,8 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
         }
         g.phase = VpnPhase::Idle;
         sync_tray_tooltip_i18n(app, false, &g.cfg);
-        let snap = snapshot(app, &g);
         drop(g);
+        let snap = snapshot_from_state(app, state);
         let _ = app.emit("vpn-state", &snap);
     }
 }
@@ -1063,8 +1202,9 @@ fn apply_pending_import(state: &AppState, app: &AppHandle) -> Result<(), String>
         config_version = %pending.payload.config_version,
         "control plane import ok"
     );
-    let snap = snapshot(app, &g);
+    bump_epoch(&mut g);
     drop(g);
+    let snap = snapshot_from_state(app, state);
     let _ = app.emit("vpn-state", &snap);
     let _ = app.emit("control-plane-import", ());
     Ok(())
@@ -1181,6 +1321,7 @@ mod connecting_phase_guard_tests {
             phase,
             recovery_pending: false,
             pending_import: None,
+            epoch: 0,
         }))
     }
 
@@ -1423,6 +1564,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         join,
     });
     g.tunnel_server = Some(remote_label);
+    bump_epoch(&mut g);
     g.phase = VpnPhase::Connected;
     // Туннель снова живой: авто-восстановление завершено.
     g.recovery_pending = false;
@@ -1481,12 +1623,20 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     )
     .map_err(|code| map_android_jni_connect_error(&code))?;
 
-    let mut g = match state.inner.lock() {
+    {
+        let mut g = match state.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.tunnel_server = Some(remote_label);
+        bump_epoch(&mut g);
+    }
+
+    let tray_up = android_vpn::tunnel_is_active(app).unwrap_or(false);
+    let g = match state.inner.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.tunnel_server = Some(remote_label);
-    let tray_up = android_vpn::tunnel_is_active(app).unwrap_or(false);
     sync_tray_tooltip_i18n(app, tray_up, &g.cfg);
     Ok(())
 }
@@ -1520,12 +1670,20 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     ios_vpn::request_connect(app, &json)?;
 
-    let mut g = match state.inner.lock() {
+    {
+        let mut g = match state.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.tunnel_server = Some(remote_label);
+        bump_epoch(&mut g);
+    }
+
+    let tray_up = ios_vpn::tunnel_is_active(app).unwrap_or(false);
+    let g = match state.inner.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.tunnel_server = Some(remote_label);
-    let tray_up = ios_vpn::tunnel_is_active(app).unwrap_or(false);
     sync_tray_tooltip_i18n(app, tray_up, &g.cfg);
     Ok(())
 }
@@ -1564,9 +1722,11 @@ async fn measure_server_rtt_cmd(state: State<'_, AppState>) -> Result<Option<u32
 }
 
 #[tauri::command]
-fn get_state(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    Ok(snapshot(&app, &g))
+async fn get_state(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || snapshot_from_state(&app, &state))
+        .await
+        .map_err(|e| format!("state task: {e}"))
 }
 
 #[tauri::command]
@@ -1632,31 +1792,40 @@ fn get_edit_config(state: State<'_, AppState>) -> Result<SavedConfig, String> {
 }
 
 #[tauri::command]
-fn save_config_cmd(
+async fn save_config_cmd(
     cfg: serde_json::Value,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<StateSnapshot, String> {
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    let old_locale = g.cfg.ui_locale.clone();
-    g.cfg = merge_saved_config(&g.cfg, &cfg)?;
-    normalize_loaded(&mut g.cfg);
-    let locale_changed = old_locale != g.cfg.ui_locale;
-    persist_cfg(&app, &g.cfg)?;
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let cfg_for_tray = g.cfg.clone();
-    let snap = snapshot(&app, &g);
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let connected = snap.connected;
-    drop(g);
-    let _ = app.emit("vpn-state", &snap);
-    if locale_changed {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if let Err(e) = apply_tray_menu_locale(&app, &cfg_for_tray, connected) {
-            warn!(target: "bibavpn_desktop", "обновление меню трея: {e}");
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (locale_changed, cfg_for_tray) = {
+            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            let old_locale = g.cfg.ui_locale.clone();
+            g.cfg = merge_saved_config(&g.cfg, &cfg)?;
+            normalize_loaded(&mut g.cfg);
+            let locale_changed = old_locale != g.cfg.ui_locale;
+            persist_cfg(&app, &g.cfg)?;
+            bump_epoch(&mut g);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let cfg_for_tray = g.cfg.clone();
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let cfg_for_tray = SavedConfig::default();
+            (locale_changed, cfg_for_tray)
+        };
+        let snap = snapshot_from_state(&app, &state);
+        let connected = snap.connected;
+        let _ = app.emit("vpn-state", &snap);
+        if locale_changed {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if let Err(e) = apply_tray_menu_locale(&app, &cfg_for_tray, connected) {
+                warn!(target: "bibavpn_desktop", "обновление меню трея: {e}");
+            }
         }
-    }
-    Ok(snap)
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("save config task: {e}"))?
 }
 
 #[tauri::command]
@@ -1666,12 +1835,13 @@ async fn connect_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<State
         if let Err(e) = connect_inner(&state, &app) {
             let mut g = state.inner.lock().map_err(|e2| e2.to_string())?;
             g.last_error = Some(e.clone());
-            let snap = snapshot(&app, &g);
+            bump_epoch(&mut g);
+            drop(g);
+            let snap = snapshot_from_state(&app, &state);
             let _ = app.emit("vpn-state", &snap);
             return Err(e);
         }
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
-        let snap = snapshot(&app, &g);
+        let snap = snapshot_from_state(&app, &state);
         let _ = app.emit("vpn-state", &snap);
         Ok(snap)
     })
@@ -1687,8 +1857,7 @@ async fn disconnect_cmd(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         disconnect_inner(&state, &app, true);
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
-        let snap = snapshot(&app, &g);
+        let snap = snapshot_from_state(&app, &state);
         let _ = app.emit("vpn-state", &snap);
         Ok(snap)
     })
@@ -1697,45 +1866,63 @@ async fn disconnect_cmd(
 }
 
 #[tauri::command]
-fn apply_invite_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.last_error = None;
-    match apply_invite_to_cfg(&mut g.cfg) {
-        Ok(()) => {
-            persist_cfg(&app, &g.cfg)?;
-            let snap = snapshot(&app, &g);
-            let _ = app.emit("vpn-state", &snap);
-            Ok(snap)
-        }
-        Err(e) => {
-            g.last_error = Some(e.clone());
-            let snap = snapshot(&app, &g);
-            let _ = app.emit("vpn-state", &snap);
-            Err(e)
-        }
-    }
-}
-
-#[tauri::command]
-fn open_control_plane_refresh_cmd(
+async fn apply_invite_cmd(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<StateSnapshot, String> {
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    let p = g
-        .cfg
-        .active_profile()
-        .ok_or_else(|| "Нет активного профиля.".to_string())?;
-    let base = p.control_plane_base_url.trim();
-    let inst = p.control_plane_instance_id;
-    if base.is_empty() || inst == 0 {
-        return Err("Профиль не привязан к control plane. Откройте конфиг из веб-кабинета.".into());
-    }
-    let url = format!("{base}/me/instances/{inst}/open");
-    drop(g);
-    open_portal_url(&url)?;
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    Ok(snapshot(&app, &g))
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = {
+            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            g.last_error = None;
+            match apply_invite_to_cfg(&mut g.cfg) {
+                Ok(()) => {
+                    persist_cfg(&app, &g.cfg)?;
+                    bump_epoch(&mut g);
+                    Ok(())
+                }
+                Err(e) => {
+                    g.last_error = Some(e.clone());
+                    Err(e)
+                }
+            }
+        };
+        let snap = snapshot_from_state(&app, &state);
+        let _ = app.emit("vpn-state", &snap);
+        result.map(|()| snap)
+    })
+    .await
+    .map_err(|e| format!("apply invite task: {e}"))?
+}
+
+#[tauri::command]
+async fn open_control_plane_refresh_cmd(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StateSnapshot, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = {
+            let g = state.inner.lock().map_err(|e| e.to_string())?;
+            let p = g
+                .cfg
+                .active_profile()
+                .ok_or_else(|| "Нет активного профиля.".to_string())?;
+            let base = p.control_plane_base_url.trim();
+            let inst = p.control_plane_instance_id;
+            if base.is_empty() || inst == 0 {
+                return Err(
+                    "Профиль не привязан к control plane. Откройте конфиг из веб-кабинета."
+                        .into(),
+                );
+            }
+            format!("{base}/me/instances/{inst}/open")
+        };
+        open_portal_url(&url)?;
+        Ok(snapshot_from_state(&app, &state))
+    })
+    .await
+    .map_err(|e| format!("control plane refresh task: {e}"))?
 }
 
 fn open_portal_url(url: &str) -> Result<(), String> {
@@ -1799,14 +1986,24 @@ fn open_portal_url(url: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn clear_error_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<StateSnapshot, String> {
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
-    g.last_error = None;
-    #[cfg(target_os = "android")]
-    let _ = android_vpn::clear_last_connect_error(&app);
-    let snap = snapshot(&app, &g);
-    let _ = app.emit("vpn-state", &snap);
-    Ok(snap)
+async fn clear_error_cmd(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StateSnapshot, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        {
+            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            g.last_error = None;
+        }
+        #[cfg(target_os = "android")]
+        let _ = android_vpn::clear_last_connect_error(&app);
+        let snap = snapshot_from_state(&app, &state);
+        let _ = app.emit("vpn-state", &snap);
+        Ok(snap)
+    })
+    .await
+    .map_err(|e| format!("clear error task: {e}"))?
 }
 
 #[tauri::command]
@@ -1819,13 +2016,17 @@ fn get_pending_import(state: State<'_, AppState>) -> Result<Option<PendingImport
 }
 
 #[tauri::command]
-fn confirm_pending_import_cmd(
+async fn confirm_pending_import_cmd(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<StateSnapshot, String> {
-    apply_pending_import(&state, &app)?;
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    Ok(snapshot(&app, &g))
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_pending_import(&state, &app)?;
+        Ok(snapshot_from_state(&app, &state))
+    })
+    .await
+    .map_err(|e| format!("confirm import task: {e}"))?
 }
 
 #[tauri::command]
@@ -1950,6 +2151,7 @@ pub fn run() -> anyhow::Result<()> {
             phase: VpnPhase::Idle,
             recovery_pending: false,
             pending_import: None,
+            epoch: 0,
         })),
     };
 
@@ -2074,12 +2276,7 @@ pub fn run() -> anyhow::Result<()> {
                     };
                     inner.cfg = cfg;
                     drop(inner);
-                    let g = match state.inner.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    let snap = snapshot(&handle, &g);
-                    drop(g);
+                    let snap = snapshot_from_state(&handle, &*state);
                     let _ = handle.emit("vpn-state", &snap);
                 }
                 Err(e) => {
@@ -2183,6 +2380,7 @@ mod deeplink_tests {
                     origin: origin.clone(),
                     payload: payload.clone(),
                 }),
+                epoch: 0,
             })),
         };
         let cfg_before = state.inner.lock().unwrap().cfg.clone();
@@ -2204,6 +2402,281 @@ mod deeplink_tests {
         }
         let origins = allowed_origins_for_import(&cfg);
         assert!(origins.iter().any(|o| o == "https://saved.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_assemble_tests {
+    use super::{
+        assemble_state_snapshot, bump_epoch, snapshot_copy_from_inner, snapshot_with_probe,
+        AppState, Inner, SavedConfig, SnapshotCopy, TunnelProbe, VpnPhase,
+    };
+    use crate::config::{to_public_saved_config, TunnelProfile};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn test_state(inner: Inner) -> AppState {
+        AppState {
+            rt: Arc::new(tokio::runtime::Runtime::new().expect("runtime")),
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    fn secret_profile() -> TunnelProfile {
+        TunnelProfile {
+            id: "p-test".to_string(),
+            name: "Secret".to_string(),
+            server: "vpn.example.com:8443".to_string(),
+            token: "super-secret-token".to_string(),
+            psk: "super-secret-psk".to_string(),
+            from_invite: "biba://invite-body-secret".to_string(),
+            invite_passphrase: "passphrase-secret".to_string(),
+            pin_cert_pem: "-----BEGIN CERTIFICATE-----SECRET-----END CERTIFICATE-----".to_string(),
+            ..TunnelProfile::default()
+        }
+    }
+
+    #[test]
+    fn probe_sleep_does_not_hold_inner_lock() {
+        let state = test_state(Inner {
+            cfg: SavedConfig::default(),
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: Some("203.0.113.1:8443".into()),
+            last_error: None,
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 0,
+        });
+        let probe_started = Arc::new(AtomicBool::new(false));
+        let ps = Arc::clone(&probe_started);
+        let state2 = state.clone();
+        let worker = std::thread::spawn(move || {
+            snapshot_with_probe(&state, move || {
+                ps.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                TunnelProbe {
+                    connected: true,
+                    vpn_session_uptime_secs: Some(99),
+                    ..TunnelProbe::default()
+                }
+            }, false)
+        });
+        while !probe_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let lock_start = Instant::now();
+        let _g = state2.inner.lock().expect("lock during probe");
+        assert!(
+            lock_start.elapsed() < Duration::from_millis(100),
+            "Inner mutex must be free while the probe sleeps"
+        );
+        drop(_g);
+        worker.join().expect("snapshot thread");
+    }
+
+    #[test]
+    fn stale_probe_after_disconnect_is_disconnected() {
+        let mut cfg = SavedConfig::default();
+        cfg.profiles = vec![secret_profile()];
+        cfg.active_profile_id = "p-test".to_string();
+        let copy = SnapshotCopy {
+            epoch: 0,
+            public_cfg: to_public_saved_config(&cfg),
+            display_host: "old-host".into(),
+            server_subtitle: "old".into(),
+            tunnel_server: Some("203.0.113.1:8443".into()),
+            last_error: None,
+            can_connect: true,
+        };
+        let stale_probe = TunnelProbe {
+            connected: true,
+            vpn_session_uptime_secs: Some(42),
+            ..TunnelProbe::default()
+        };
+        let mut current = Inner {
+            cfg: cfg.clone(),
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: None,
+            last_error: Some("disconnect err".into()),
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 1,
+        };
+        let snap = assemble_state_snapshot(&copy, &current, Some(stale_probe), false);
+        assert!(!snap.connected);
+        assert!(snap.vpn_session_uptime_secs.is_none());
+        assert!(snap.tunnel_server.is_none());
+        assert_eq!(snap.error.as_deref(), Some("disconnect err"));
+        current.last_error = None;
+        let snap2 = assemble_state_snapshot(&copy, &current, Some(TunnelProbe {
+            connected: true,
+            vpn_session_uptime_secs: Some(42),
+            ..TunnelProbe::default()
+        }), false);
+        assert!(!snap2.connected);
+        assert!(snap2.vpn_session_uptime_secs.is_none());
+    }
+
+    #[test]
+    fn stale_probe_cannot_emit_old_public_cfg_after_import() {
+        let mut old_cfg = SavedConfig::default();
+        old_cfg.profiles = vec![TunnelProfile {
+            id: "p-old".into(),
+            server: "old.example.com:8443".into(),
+            ..TunnelProfile::default()
+        }];
+        old_cfg.active_profile_id = "p-old".into();
+        let copy = snapshot_copy_from_inner(&Inner {
+            cfg: old_cfg,
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: Some("old.example.com:8443".into()),
+            last_error: None,
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 0,
+        });
+        let mut new_cfg = SavedConfig::default();
+        new_cfg.profiles = vec![TunnelProfile {
+            id: "p-new".into(),
+            server: "new.example.com:9443".into(),
+            ..TunnelProfile::default()
+        }];
+        new_cfg.active_profile_id = "p-new".into();
+        let current = Inner {
+            cfg: new_cfg,
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: Some("new.example.com:9443".into()),
+            last_error: None,
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 1,
+        };
+        let snap = assemble_state_snapshot(
+            &copy,
+            &current,
+            Some(TunnelProbe {
+                connected: true,
+                vpn_session_uptime_secs: Some(10),
+                ..TunnelProbe::default()
+            }),
+            false,
+        );
+        assert_eq!(snap.cfg.active_profile_id, "p-new");
+        assert_eq!(snap.cfg.profiles[0].server, "new.example.com:9443");
+        assert!(!snap.connected);
+    }
+
+    #[test]
+    fn assembled_public_cfg_omits_secrets() {
+        let mut cfg = SavedConfig::default();
+        cfg.profiles = vec![secret_profile()];
+        cfg.active_profile_id = "p-test".to_string();
+        let inner = Inner {
+            cfg,
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: Some("203.0.113.1:8443".into()),
+            last_error: None,
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 0,
+        };
+        let copy = snapshot_copy_from_inner(&inner);
+        let snap = assemble_state_snapshot(&copy, &inner, None, false);
+        let text = serde_json::to_string(&snap.cfg).expect("serialize");
+        assert!(!text.contains("super-secret-token"));
+        assert!(!text.contains("super-secret-psk"));
+        assert!(!text.contains("biba://"));
+        assert!(!text.contains("passphrase-secret"));
+        assert!(!text.contains("-----BEGIN CERTIFICATE-----SECRET-----END CERTIFICATE-----"));
+        assert!(!text.contains("pinCertPem"));
+        assert!(!text.contains("pin_cert_pem"));
+        assert!(snap.cfg.profiles[0].has_pin_cert);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_connected_follows_vpn_handle() {
+        let mut cfg = SavedConfig::default();
+        cfg.profiles = vec![TunnelProfile {
+            id: "p1".into(),
+            server: "203.0.113.1:8443".into(),
+            ..TunnelProfile::default()
+        }];
+        cfg.active_profile_id = "p1".into();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let join = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .spawn(async move {
+                let _ = shutdown_rx;
+                Ok::<(), anyhow::Error>(())
+            });
+        let inner = Inner {
+            cfg,
+            proxy_backup: None,
+            vpn: Some(super::ActiveVpn {
+                shutdown: shutdown_tx,
+                join,
+            }),
+            tunnel_server: Some("203.0.113.1:8443".into()),
+            last_error: None,
+            phase: VpnPhase::Connected,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 0,
+        };
+        let copy = snapshot_copy_from_inner(&inner);
+        let snap = assemble_state_snapshot(
+            &copy,
+            &inner,
+            Some(TunnelProbe {
+                connected: false,
+                ..TunnelProbe::default()
+            }),
+            false,
+        );
+        assert!(snap.connected, "desktop must ignore mobile probe and use vpn.is_some()");
+    }
+
+    #[test]
+    fn android_snapshot_error_timeout_is_not_success() {
+        use super::android_snapshot_error;
+        let err = android_snapshot_error(
+            &None,
+            false,
+            Some("connect_ui_thread_timeout".into()),
+        );
+        assert!(err.is_some());
+        assert!(err.as_ref().unwrap().contains("Таймаут"));
+        assert!(android_snapshot_error(&None, false, Some("".into())).is_none());
+        assert!(android_snapshot_error(&None, false, Some("   ".into())).is_none());
+    }
+
+    #[test]
+    fn bump_epoch_increments() {
+        let mut inner = Inner {
+            cfg: SavedConfig::default(),
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: None,
+            last_error: None,
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 0,
+        };
+        bump_epoch(&mut inner);
+        assert_eq!(inner.epoch, 1);
     }
 }
 
