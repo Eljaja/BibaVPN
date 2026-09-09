@@ -1,6 +1,7 @@
 VERDICT: PASS
 
-- Core matcher `host_is_local_or_private` runs first in `decide` and `should_bypass` (before empty-list early returns). Required literals (`192.168.88.1`, `10.0.0.1`, `172.16.1.1`, `127.0.0.1`, `localhost`, `::1`, `fc00::1`, `::ffff:192.168.1.1`, `100.64.1.1`, `169.254.1.1`, `fe80::1`) are `Direct` on an empty list; `1.1.1.1` and `example.com` stay `Tunnel`. CGNAT uses octet ranges, not `Ipv4Addr::is_shared`.
-- DNS-map cases that used `10.0.0.1` as a stand-in public IP now use `203.0.113.x`. HTTP CONNECT empty-list + `CONNECT 127.0.0.1` reaches the origin within 3s; `split_bypass_wiring` is unchanged and passed. Named `bibavpn` cases appear in TEST.log.
-- Linux `merge_ignore_hosts` / `no_proxy_list` always include the required CIDRs and `*.local`; unit tests cover `192.168.0.0/16` and `10.0.0.0/8`. macOS `merge_bypass_for_apply` and Windows `merge_proxy_override` include the listed CIDRs/wildcards (`<local>`, `10.*`, `192.168.*`, `172.16.*`…`172.31.*`) and keep loopback/Steam/WebView entries. Merge unit tests exist (macOS/Windows modules are OS-gated).
-- Diff is limited to the spec files; no `.local` matching in the core matcher, no mux/wire/CLI/UI/mobile routing changes, no secrets.
+- Typed `UnlockRestartEvent` is shared by the receiver and `UnlockRestartPolicy.decide`; bounce uses the same identity (`SCREEN_ON`), so the old `"SCREEN_ON"` vs `Intent.ACTION_SCREEN_ON` mismatch is gone.
+- Extracted policy matches the specified table (499 ms bounce, 500 ms restart, `USER_PRESENT` not bounced, 2499 ms throttle, `allowRestart=false`, missing config). `lastRestart` is recorded before enqueue. No `android.*` in the helper.
+- `stopRequested` is set on `ACTION_STOP` and at the top of `enqueueTeardownWorker` (before the in-progress return), cleared only on a connect path, and gates the `finally` queued rerun.
+- `stopTunnelAndNative` + `nativeStart` stay in one `nativeLifecycleLock`; phase timings are inside that block. Network-change recovery is unchanged. Restart work stays on the existing worker thread.
+- Named host tests exist and pass (`test_unlock_restart_policy.py` including kotlinc table, `test_merge_bibavpn_manifest.py`). Integrate script copies `UnlockRestartPolicy.kt`. No secrets, no JNI/core/PROTOCOL, no extra product scope.
