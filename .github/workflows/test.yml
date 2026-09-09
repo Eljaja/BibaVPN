@@ -34,6 +34,8 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/test.yml"
+      - ".github/agent/test-changes.sh"
+      - ".github/agent/tests/**"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, master]
@@ -52,12 +54,21 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/test.yml"
+      - ".github/agent/test-changes.sh"
+      - ".github/agent/tests/**"
 
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  agent-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate component selection and test log handling
+        run: python3 .github/agent/tests/test_validation.py
+
   changes:
     runs-on: ubuntu-latest
     outputs:
