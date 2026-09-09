@@ -282,7 +282,7 @@ jobs:
           git config user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
           git checkout -B "agent/issue-${n}"
           git add -A
-          git reset -q -- .github/agent/work/ISSUE.md .github/agent/work/TEST.log '.github/agent/work/TEST-*.log' .github/agent/work/GATE.txt 2>/dev/null || true
+          git reset -q -- .github/agent/work/ 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "::error::Agent produced no file changes"
             exit 1
