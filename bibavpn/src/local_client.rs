@@ -241,6 +241,16 @@ async fn tcp_mux_open_stream_with_retry(
         {
             Ok(()) => return Ok(()),
             Err(MuxOpenStreamDropped { local: l, err }) => {
+                if cfg.reality_target.is_none() && err.is::<tcp_mux::MuxSessionFull>() {
+                    // Admission failed before OPEN or local payload consumption. Keep
+                    // the full mux alive and use the existing authenticated v3 path.
+                    static CAPACITY_LOG: crate::log_ratelimit::LogEvery =
+                        crate::log_ratelimit::LogEvery::new(4, 64);
+                    if CAPACITY_LOG.should_emit() {
+                        info!(target: "bibavpn_client", "mux full; opening a dedicated encrypted tunnel");
+                    }
+                    return tunnel_to_biba(l, host, port, cfg, tcp_uplink_prefix).await;
+                }
                 if tcp_mux_writer_gone(&err) {
                     tcp_mux::prune_stopped_mux_sessions(&tcp_mux_slot).await;
                     local = l;

@@ -392,13 +392,13 @@ impl Endpoint {
             bail!("mux stream unavailable");
         }
         if streams.len() >= MAX_STREAMS {
-            bail!("mux stream limit");
+            return Err(anyhow::Error::new(MuxSessionFull));
         }
         let reservation = self
             .receive_budget
             .clone()
             .try_acquire_many_owned(self.cfg.mux_window_mib.bytes())
-            .context("mux session receive budget exhausted")?;
+            .map_err(|_| anyhow::Error::new(MuxSessionFull))?;
         let flow = Flow::new(
             self.next_epoch.fetch_add(1, Ordering::Relaxed),
             peer_window,

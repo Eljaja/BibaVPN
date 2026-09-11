@@ -80,6 +80,11 @@ impl std::fmt::Display for MuxWriterStopped {
 
 impl std::error::Error for MuxWriterStopped {}
 
+/// The live session cannot reserve another stream; existing streams are healthy.
+#[derive(Debug, thiserror::Error)]
+#[error("mux session admission capacity exhausted")]
+pub struct MuxSessionFull;
+
 pub fn is_mux_open(data: &[u8]) -> bool {
     data == MUX_OPEN_MAGIC
 }
