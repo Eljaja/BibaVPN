@@ -6,14 +6,13 @@ use rand::Rng;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -21,12 +20,10 @@ use crate::crypto_layer::SessionCrypto;
 use crate::frame::{AdaptivePadState, PadMode};
 use crate::protocol::{decode_open_err, decode_v3_open_err, is_open_ok, is_v3_open_ok};
 use crate::retry::{
-    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration, ServerWsOutTiming,
-    WsSendJitter,
+    maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration,
+    ServerWsOutTiming, WsSendJitter,
 };
-use crate::{
-    read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode_state,
-};
+use crate::{read_padded_frame_borrow, read_padded_frame_into, write_padded_frame_with_mode_state};
 
 pub type SharedCrypto = Arc<SessionCrypto>;
 
@@ -149,46 +146,45 @@ where
     let ws_out_up = ws_out_tx.clone();
     let ws_out_dn = ws_out_tx.clone();
     let ws_out_dummy = ws_out_tx.clone();
-    drop(ws_out_tx);
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_up = shutdown.clone();
-    let shutdown_dn = shutdown.clone();
-    let shutdown_dummy = shutdown.clone();
+    let (peer_closed_tx, mut peer_closed_rx) = oneshot::channel::<()>();
 
     let writer = async move {
-        let mut ping_sleep: Option<Pin<Box<tokio::time::Sleep>>> = if ws_ping_secs > 0 {
-            Some(Box::pin(sleep(ws_ping_period_duration(
-                ws_ping_secs,
-                ws_ping_jitter_percent,
-            ))))
-        } else {
-            None
-        };
+        let ping_sleep = sleep(ws_ping_period_duration(
+            ws_ping_secs,
+            ws_ping_jitter_percent,
+        ));
+        tokio::pin!(ping_sleep);
         loop {
-            let msg = match ping_sleep.as_mut() {
-                Some(sleep_pin) => {
-                    tokio::select! {
-                        m = ws_out_rx.recv() => m,
-                        _ = sleep_pin.as_mut() => {
-                            ws_sink
-                                .send(Message::Ping(bytes::Bytes::new()))
-                                .await
-                                .context("ws ping")?;
-                            *sleep_pin = Box::pin(sleep(ws_ping_period_duration(
-                                ws_ping_secs,
-                                ws_ping_jitter_percent,
-                            )));
-                            continue;
-                        }
-                    }
+            let msg = tokio::select! {
+                biased;
+                _ = &mut peer_closed_rx => {
+                    // Tungstenite queued the close reply while the reader handled
+                    // Close. Flush it; application writes are no longer legal.
+                    ws_sink.flush().await.context("ws close reply")?;
+                    return Ok::<_, anyhow::Error>(());
                 }
-                None => ws_out_rx.recv().await,
+                m = ws_out_rx.recv() => m,
+                _ = &mut ping_sleep, if ws_ping_secs > 0 => {
+                    ws_sink.send(Message::Ping(bytes::Bytes::new())).await.context("ws ping")?;
+                    ping_sleep.as_mut().reset(tokio::time::Instant::now()
+                        + ws_ping_period_duration(ws_ping_secs, ws_ping_jitter_percent));
+                    continue;
+                }
             };
-            let Some(msg) = msg else { break };
-            ws_sink.feed(msg).await.context("ws feed")?;
-            while let Ok(msg) = ws_out_rx.try_recv() {
+            let Some(mut msg) = msg else { break };
+            loop {
+                let closing = matches!(msg, Message::Close(_));
                 ws_sink.feed(msg).await.context("ws feed")?;
+                if closing {
+                    // Close is queued after all TCP payload. Never feed anything
+                    // after it (including concurrent dummy/Pong messages).
+                    ws_sink.flush().await.context("ws close")?;
+                    return Ok(());
+                }
+                match ws_out_rx.try_recv() {
+                    Ok(next) => msg = next,
+                    Err(_) => break,
+                }
             }
             ws_sink.flush().await.context("ws flush")?;
         }
@@ -220,13 +216,11 @@ where
                 }
             } else {
                 let Some(msg) = ws_rx.next().await else {
-                    shutdown_up.store(true, Ordering::SeqCst);
                     break;
                 };
                 match msg {
                     Ok(m) => m,
                     Err(e) => {
-                        shutdown_up.store(true, Ordering::SeqCst);
                         return Err(anyhow::Error::from(e).context("websocket read"));
                     }
                 }
@@ -247,9 +241,7 @@ where
                     }
                     match (&crypto_up, end) {
                         (Some(c), TunnelEnd::Client) => {
-                            let raw = c
-                                .open_server_to_client(b.as_ref())
-                                .context("v2 open s2c")?;
+                            let raw = c.open_server_to_client(b.as_ref()).context("v2 open s2c")?;
                             let payload = read_padded_frame_into(raw).context("padded frame")?;
                             if let Some(tcp_payload) = filter_client_downlink(&payload)? {
                                 if !tcp_payload.is_empty() {
@@ -258,9 +250,7 @@ where
                             }
                         }
                         (Some(c), TunnelEnd::Server) => {
-                            let raw = c
-                                .open_client_to_server(b.as_ref())
-                                .context("v2 open c2s")?;
+                            let raw = c.open_client_to_server(b.as_ref()).context("v2 open c2s")?;
                             let payload = read_padded_frame_into(raw).context("padded frame")?;
                             if !payload.is_empty() {
                                 tcp_write.write_all(&payload).await?;
@@ -280,13 +270,11 @@ where
                 }
                 Message::Pong(_) => {}
                 Message::Close(_) => {
-                    shutdown_up.store(true, Ordering::SeqCst);
                     break;
                 }
                 _ => {}
             }
         }
-        shutdown_up.store(true, Ordering::SeqCst);
         Ok::<_, anyhow::Error>(())
     };
 
@@ -300,9 +288,6 @@ where
         let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
         let mut adaptive = AdaptivePadState::default();
         loop {
-            if shutdown_dn.load(Ordering::Relaxed) {
-                break;
-            }
             let n = tcp_read.read(&mut buf).await?;
             if n == 0 {
                 break;
@@ -319,14 +304,12 @@ where
                 )
                 .context("pack frame")?;
                 let blob = match (&crypto_dn, end) {
-                    (Some(c), TunnelEnd::Client) => bytes::Bytes::from(
-                        c.seal_client_to_server(&wire)
-                            .context("v2 seal c2s")?,
-                    ),
-                    (Some(c), TunnelEnd::Server) => bytes::Bytes::from(
-                        c.seal_server_to_client(&wire)
-                            .context("v2 seal s2c")?,
-                    ),
+                    (Some(c), TunnelEnd::Client) => {
+                        bytes::Bytes::from(c.seal_client_to_server(&wire).context("v2 seal c2s")?)
+                    }
+                    (Some(c), TunnelEnd::Server) => {
+                        bytes::Bytes::from(c.seal_server_to_client(&wire).context("v2 seal s2c")?)
+                    }
                     (None, _) => bytes::Bytes::from(std::mem::take(&mut wire)),
                 };
                 if blob.len() > max_ws_binary {
@@ -360,14 +343,11 @@ where
 
     let dummy = async move {
         if dummy_interval_secs == 0 {
-            return Ok::<_, anyhow::Error>(());
+            return std::future::pending::<anyhow::Result<()>>().await;
         }
         let mut wire = Vec::with_capacity(max_ws_binary.min(256 * 1024));
         let mut adaptive_d = AdaptivePadState::default();
         loop {
-            if shutdown_dummy.load(Ordering::Relaxed) {
-                return Ok::<_, anyhow::Error>(());
-            }
             let lo = dummy_interval_secs
                 .saturating_mul(1)
                 .saturating_div(2)
@@ -412,14 +392,142 @@ where
         }
     };
 
-    tokio::try_join!(writer, up, down, dummy)?;
-    Ok(())
+    // Dedicated WSS has no directional FIN: TCP EOF closes the whole tunnel.
+    // Mux handles TCP half-close separately. Keep the writer and reader running
+    // during the close handshake so queued payload reaches TCP before teardown.
+    const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+    tokio::pin!(writer, up, down, dummy);
+    tokio::select! {
+        result = &mut writer => result,
+        result = &mut dummy => result,
+        result = &mut up => {
+            result?;
+            let _ = peer_closed_tx.send(());
+            timeout(CLOSE_TIMEOUT, &mut writer).await.context("WS close reply timed out")?
+        }
+        result = &mut down => {
+            result?;
+            let close = async {
+                ws_out_tx.send(Message::Close(None)).await.context("queue WS close")
+            };
+            timeout(CLOSE_TIMEOUT, async {
+                tokio::try_join!(close, writer, up).map(|_| ())
+            }).await.context("WS close handshake timed out")?
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::encode_v3_open_ok;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    async fn bridge_fixture(
+        end: TunnelEnd,
+        dummy_interval_secs: u64,
+    ) -> (
+        TcpStream,
+        WebSocketStream<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let (a, b) = tokio::io::duplex(1024);
+        let (role, peer_role) = match end {
+            TunnelEnd::Client => (Role::Client, Role::Server),
+            TunnelEnd::Server => (Role::Server, Role::Client),
+        };
+        let ws = WebSocketStream::from_raw_socket(a, role, None).await;
+        let peer = WebSocketStream::from_raw_socket(b, peer_role, None).await;
+        let task = tokio::spawn(bridge_ws_tcp_padded(
+            ws,
+            Vec::new(),
+            tcp,
+            Vec::new(),
+            0,
+            0,
+            None,
+            16384,
+            1,
+            0,
+            0,
+            0,
+            0,
+            end,
+            PadMode::Random,
+            dummy_interval_secs,
+            ServerWsOutTiming::default(),
+        ));
+        (local, peer, task)
+    }
+
+    #[tokio::test]
+    async fn tcp_eof_flushes_payload_before_ws_close() {
+        for (end, dummy) in [(TunnelEnd::Client, 0), (TunnelEnd::Server, 60)] {
+            let (mut local, mut peer, task) = bridge_fixture(end, dummy).await;
+            let payload = vec![0x5a; 1024 * 1024];
+            timeout(Duration::from_secs(3), async {
+                let upload = async {
+                    local.write_all(&payload).await.unwrap();
+                    local.shutdown().await.unwrap();
+                };
+                let download = async {
+                    let mut received = Vec::new();
+                    while let Some(message) = peer.next().await {
+                        match message.unwrap() {
+                            Message::Binary(data) => {
+                                received.extend_from_slice(read_padded_frame_borrow(&data).unwrap())
+                            }
+                            Message::Close(_) => {
+                                peer.flush().await.unwrap();
+                                break;
+                            }
+                            Message::Ping(_) => peer.flush().await.unwrap(),
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(received, payload, "TCP EOF truncated queued data");
+                };
+                tokio::join!(upload, download);
+                task.await.unwrap().unwrap();
+            })
+            .await
+            .expect("TCP EOF leaked the WSS bridge");
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_close_finishes_idle_tcp_and_dummy_tasks() {
+        let (mut local, mut peer, task) = bridge_fixture(TunnelEnd::Client, 60).await;
+        timeout(Duration::from_secs(2), async {
+            peer.send(Message::Close(None)).await.unwrap();
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap(),
+                Message::Close(_)
+            ));
+            task.await.unwrap().unwrap();
+            assert_eq!(local.read(&mut [0u8; 1]).await.unwrap(), 0);
+        })
+        .await
+        .expect("WS close left the TCP read or dummy timer alive");
+    }
+
+    #[tokio::test]
+    async fn tcp_eof_bounds_wait_for_unresponsive_ws_peer() {
+        let (mut local, _peer, task) = bridge_fixture(TunnelEnd::Client, 0).await;
+        local.shutdown().await.unwrap();
+        let result = timeout(Duration::from_secs(7), task)
+            .await
+            .expect("unresponsive peer retained the bridge")
+            .unwrap();
+        assert!(result.is_err(), "missing close reply must report a timeout");
+    }
 
     #[test]
     fn late_v3_open_ok_filtered_from_client_downlink() {

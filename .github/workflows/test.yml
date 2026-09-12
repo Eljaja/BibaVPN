@@ -133,6 +133,12 @@ jobs:
       - name: cargo test -p bibavpn -p biba
         run: cargo test -p bibavpn -p biba --locked
 
+      - name: Build local tunnel regression binaries
+        run: cargo build -p bibavpn --bins --locked
+
+      - name: Mux capacity and fallback session cleanup
+        run: python3 bibavpn/tests/mux_capacity.py target/debug
+
   desktop:
     name: cargo test (bibavpn-desktop)
     needs: changes
