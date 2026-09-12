@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 
@@ -84,11 +85,13 @@ def main():
             stack.callback(echo.server_close)
             threading.Thread(target=echo.serve_forever, daemon=True).start()
             stack.callback(echo.shutdown)
-            server_port, socks_port, http_port = (free_port() for _ in range(3))
+            server_port, socks_port, http_port, metrics_port = (free_port() for _ in range(4))
             token, psk = secrets.token_hex(32), secrets.token_hex(32)
             server = stack.enter_context(process([
                 str(binaries / "bibavpn-server"), "--listen", f"127.0.0.1:{server_port}",
                 "--self-signed-san", "localhost", "--token", token, "--psk", psk,
+                "--max-concurrent-sessions", "4",
+                "--metrics-listen", f"127.0.0.1:{metrics_port}",
             ], logs / "server.log"))
             ready(server_port, server)
             client = stack.enter_context(process([
@@ -102,6 +105,22 @@ def main():
             # avoiding its intentional direct bypass for literal private addresses.
             target = "127.1"
             target_port = echo.server_address[1]
+
+            # Bypass environment proxies: this test only talks to local processes.
+            metrics_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            def sessions_return_to_mux_only():
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    with metrics_http.open(f"http://127.0.0.1:{metrics_port}/metrics", timeout=1) as response:
+                        metrics = response.read().decode()
+                    active = int(re.search(r"^bibavpn_active_sessions (\d+)$", metrics, re.M)[1])
+                    busy = int(re.search(r"^bibavpn_sessions_rejected_busy_total (\d+)$", metrics, re.M)[1])
+                    assert busy == 0, "closed fallback sessions exhausted the server limit"
+                    if active == 1:
+                        return
+                    time.sleep(0.05)
+                raise AssertionError(f"closed fallback retained server sessions: {active}")
 
             def connect_socks():
                 sock = stack.enter_context(socket.create_connection(("127.0.0.1", socks_port), 5))
@@ -121,7 +140,8 @@ def main():
             client_log = re.sub(r"\x1b\[[0-9;]*m", "", (logs / "client.log").read_text())
             assert "credit_negotiated=true" in client_log, client_log[-2000:]
             print("64 mux streams held open", flush=True)
-            for kind in ("HTTP CONNECT", "SOCKS"):
+            # More requests than the server limit, with mux kept full throughout.
+            for kind in ("HTTP CONNECT", "SOCKS") * 4:
                 if kind == "SOCKS":
                     sock = connect_socks()
                 else:
@@ -133,12 +153,16 @@ def main():
                     assert b"200" in header.split(b"\r\n")[0]
                 sock.sendall(b"overflow")
                 assert receive(sock, 8) == b"overflow", kind
+                sock.close()
+                sessions_return_to_mux_only()
                 print(f"{kind} overflow request succeeded", flush=True)
             forward = stack.enter_context(socket.create_connection(("127.0.0.1", http_port), 5))
             forward.sendall(f"GET http://{target}:{target_port}/prefetch HTTP/1.1\r\nHost: {target}:{target_port}\r\n\r\n".encode())
             request_line = b"GET /prefetch HTTP/1.1\r\n"
             received = receive(forward, len(request_line))
             assert received == request_line, received
+            forward.close()
+            sessions_return_to_mux_only()
             print("HTTP forward preserved its request prefix", flush=True)
             for sock in held:
                 sock.sendall(b"still alive")
