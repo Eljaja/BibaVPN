@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
@@ -124,10 +125,12 @@ type TcpMuxSlot = TcpMuxClientSlot;
 struct SessionGuard {
     shutdown: watch::Receiver<bool>,
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    stopped: Arc<AtomicBool>,
 }
 
 fn abort_session_tasks_sync(session: &SessionGuard) {
     let mut handles = session.tasks.lock().unwrap_or_else(|e| e.into_inner());
+    session.stopped.store(true, Ordering::SeqCst);
     for h in handles.drain(..) {
         h.abort();
     }
@@ -158,6 +161,7 @@ impl SessionGuard {
         Self {
             shutdown,
             tasks: Arc::new(StdMutex::new(Vec::new())),
+            stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -168,14 +172,25 @@ impl SessionGuard {
     fn push_task(&self, handle: JoinHandle<()>) {
         if let Ok(mut g) = self.tasks.lock() {
             g.retain(|task| !task.is_finished());
-            g.push(handle);
+            if self.stopped.load(Ordering::SeqCst) {
+                handle.abort();
+            } else {
+                g.push(handle);
+            }
         }
     }
 
     fn with_tasks<R>(&self, f: impl FnOnce(&mut Vec<JoinHandle<()>>) -> R) -> R {
         let mut g = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         g.retain(|task| !task.is_finished());
-        f(&mut g)
+        let start = g.len();
+        let result = f(&mut g);
+        if self.stopped.load(Ordering::SeqCst) {
+            for task in g.drain(start..) {
+                task.abort();
+            }
+        }
+        result
     }
 
     async fn abort_all(&self) {
@@ -1199,6 +1214,7 @@ pub async fn run_local_client(
         let tcp_mux_http = tcp_mux_slot.clone();
         let mut shutdown_http = shutdown.clone();
         let sess_http = session.clone();
+        let sess_http_tasks = session.clone();
         static HTTP_ACCEPT_ERR_LOG: crate::log_ratelimit::LogEvery =
             crate::log_ratelimit::LogEvery::new(8, 256);
         session.push_task(tokio::spawn(async move {
@@ -1215,11 +1231,12 @@ pub async fn run_local_client(
                                 let c = cfg_http.clone();
                                 let tms = tcp_mux_http.clone();
                                 let sess = sess_http.clone();
-                                tokio::spawn(async move {
+                                let task = tokio::spawn(async move {
                                     if let Err(e) = handle_http_peer(sock, c, tms, sess).await {
                                         error!("http {peer}: {e:#}");
                                     }
                                 });
+                                sess_http_tasks.push_task(task);
                             }
                             Err(e) => {
                                 log_local_accept_error(e, "http", &HTTP_ACCEPT_ERR_LOG).await;
@@ -1251,7 +1268,7 @@ pub async fn run_local_client(
                         let ums = udp_mux_slot.clone();
                         let tms = tcp_mux_slot.clone();
                         let sess = session.clone();
-                        tokio::spawn(async move {
+                        let task = tokio::spawn(async move {
                             if let Err(e) = handle_socks_peer(sock, c, ums, tms, sess).await {
                                 if socks5::is_benign_handshake_abort(&e) {
                                     debug!("socks {peer}: client closed before SOCKS5 handshake");
@@ -1260,6 +1277,7 @@ pub async fn run_local_client(
                                 }
                             }
                         });
+                        session.push_task(task);
                     }
                     Err(e) => {
                         log_local_accept_error(e, "socks", &SOCKS_ACCEPT_ERR_LOG).await;
@@ -2167,6 +2185,62 @@ mod session_shutdown_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn local_client_test_options(socks_bind: SocketAddr, http_bind: SocketAddr) -> LocalClientOptions {
+        LocalClientOptions {
+            server_host: "127.0.0.1".into(),
+            server_port: 1,
+            sni: "localhost".into(),
+            token: "test".into(),
+            socks_bind: socks_bind.to_string(),
+            socks_auth: None,
+            http_proxy_bind: Some(http_bind.to_string()),
+            insecure_tls: true,
+            max_pad: 0,
+            junk_frames: 0,
+            early_ws_frames: 0,
+            psk: None,
+            decoy_max: 0,
+            ws_host: None,
+            ws_origin: None,
+            ws_user_agent: None,
+            ws_accept_language: None,
+            ws_extra_headers: Arc::new(Vec::new()),
+            max_ws_binary: 65535,
+            ws_ping_secs: 0,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            udp_max_pad: None,
+            udp_max_ws_binary: None,
+            udp_mux_reply_timeout_secs: 1,
+            tls_profile: TlsClientProfile::Default,
+            pinned_certs_pem: None,
+            ws_path: "/ws".into(),
+            use_tcp_mux: false,
+            pad_mode: PadMode::Adaptive,
+            dummy_interval_secs: 0,
+            decoy_gets: false,
+            decoy_gets_interval_secs: 0,
+            decoy_gets_paths: Vec::new(),
+            proto: 3,
+            proto_domain: String::new(),
+            reality_target: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            decoy_mode: DecoyMode::default(),
+            desync_mode: DesyncMode::default(),
+            tcp_fooling: TcpFooling::default(),
+            tls_fragment: false,
+            ws_parallel: 1,
+            mux_window_mib: tcp_mux::MuxWindow::default(),
+            idle_decoy_secs: 0,
+            stealth_profile: None,
+            tls_stack: TlsStack::Rustls,
+        }
+    }
 
     #[tokio::test]
     async fn session_guard_aborts_tracked_tasks() {
@@ -2209,6 +2283,80 @@ mod session_shutdown_tests {
         let after = hits.load(Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits.load(Ordering::Relaxed), after);
+    }
+
+    #[tokio::test]
+    async fn session_guard_does_not_register_tasks_after_abort() {
+        let (_tx, rx) = watch::channel(false);
+        let session = SessionGuard::new(rx);
+        session.abort_all().await;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = hits.clone();
+        session.push_task(tokio::spawn(async move {
+            hits_task.fetch_add(1, Ordering::Relaxed);
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_http_and_socks_peers_abort_on_client_shutdown() {
+        let socks_probe = TcpListener::bind("127.0.0.1:0").await.expect("socks probe bind");
+        let socks_bind = socks_probe.local_addr().expect("socks probe addr");
+        drop(socks_probe);
+        let http_probe = TcpListener::bind("127.0.0.1:0").await.expect("http probe bind");
+        let http_bind = http_probe.local_addr().expect("http probe addr");
+        drop(http_probe);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let client = tokio::spawn(run_local_client(
+            local_client_test_options(socks_bind, http_bind),
+            shutdown_rx,
+            Some(ready_tx),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(1))),
+        )
+        .await
+        .expect("local listeners ready timeout")
+        .expect("ready waiter join")
+        .expect("local listeners ready");
+
+        let mut socks = TcpStream::connect(socks_bind).await.expect("socks connect");
+        socks.write_all(&[5, 1, 0]).await.expect("socks greeting");
+        let mut socks_method = [0u8; 2];
+        timeout(Duration::from_secs(1), socks.read_exact(&mut socks_method))
+            .await
+            .expect("socks handshake timeout")
+            .expect("socks method response");
+        assert_eq!(socks_method, [5, 0]);
+
+        let mut http = TcpStream::connect(http_bind).await.expect("http connect");
+        http.write_all(b"CONNECT").await.expect("partial http request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).expect("shutdown send");
+        timeout(Duration::from_secs(2), client)
+            .await
+            .expect("local client shutdown timeout")
+            .expect("local client join")
+            .expect("local client result");
+
+        let mut buf = [0u8; 1];
+        let socks_read = timeout(Duration::from_secs(1), socks.read(&mut buf))
+            .await
+            .expect("socks peer shutdown timeout")
+            .expect("socks peer read");
+        let http_read = timeout(Duration::from_secs(1), http.read(&mut buf))
+            .await
+            .expect("http peer shutdown timeout")
+            .expect("http peer read");
+        assert_eq!(socks_read, 0, "SOCKS peer remained open after shutdown");
+        assert_eq!(http_read, 0, "HTTP peer remained open after shutdown");
     }
 
     #[tokio::test]
