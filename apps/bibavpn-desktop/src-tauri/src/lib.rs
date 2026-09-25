@@ -179,6 +179,11 @@ struct TunnelStatus {
     connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     vpn_session_uptime_secs: Option<u64>,
+    /// Android: ошибка bootstrap / отказ в разрешении VPN, пока туннель не поднят.
+    /// Без неё UI в «рукопожатии» не видел провал и держал кнопку заблокированной
+    /// до страховочного таймера.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// TCP connect time до `profile.server` (host или host:port). IPv6 — только формат `[addr]:port`.
@@ -252,6 +257,16 @@ fn bump_epoch(inner: &mut Inner) {
     inner.epoch = inner.epoch.wrapping_add(1);
 }
 
+/// Лок состояния, переживающий отравление мьютекса.
+///
+/// Команды раньше делали `lock().map_err(|e| e.to_string())?`: одна паника под
+/// локом — и `get_edit_config`, `save_config_cmd`, импорт и прочие навсегда
+/// возвращали ошибку (настройки «…», сохранить нельзя) до перезапуска приложения.
+/// Остальной код и так восстанавливается через `into_inner`.
+fn lock_inner(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
+    inner.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Fields copied under `Inner` before a lock-free mobile tunnel probe.
 #[derive(Clone)]
 struct SnapshotCopy {
@@ -287,17 +302,12 @@ fn snapshot_copy_from_inner(inner: &Inner) -> SnapshotCopy {
 fn run_tunnel_probe(app: &AppHandle) -> TunnelProbe {
     #[cfg(target_os = "android")]
     {
-        let connected = android_vpn::tunnel_is_active(app).unwrap_or(false);
-        let vpn_session_uptime_secs = if connected {
-            Some(android_vpn::tunnel_session_elapsed_ms(app).unwrap_or(0) / 1000)
-        } else {
-            None
-        };
-        let jni_connect_error = android_vpn::last_connect_error(app).ok().flatten();
+        // Одно JNI-чтение вместо трёх: connected / uptime / ошибка bootstrap одним снимком.
+        let st = android_vpn::tunnel_status(app).unwrap_or_default();
         TunnelProbe {
-            connected,
-            vpn_session_uptime_secs,
-            jni_connect_error,
+            connected: st.active,
+            vpn_session_uptime_secs: st.active.then_some(st.elapsed_ms / 1000),
+            jni_connect_error: st.connect_error,
         }
     }
     #[cfg(target_os = "ios")]
@@ -481,6 +491,22 @@ fn inject_mobile_tunnel_session_json(base_json: &str) -> Result<String, String> 
     serde_json::to_string(&v).map_err(|e| e.to_string())
 }
 
+/// Метка активной мобильной сессии для `tunnelServer`.
+///
+/// UI сравнивает её с `profile.server`, чтобы предупредить «адрес сервера изменился».
+/// Раньше сюда шёл `display_host_line` (SNI или хост без порта), и для ручного профиля
+/// вида `host:port` предупреждение «нажмите Отключить, затем Подключить» горело всю сессию —
+/// подталкивая к лишним переподключениям. Для ручного профиля берём ровно `server`
+/// (на десктопе там тоже `host:port`).
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
+fn mobile_session_label(cfg: &SavedConfig) -> String {
+    cfg.active_profile()
+        .map(|p| p.server.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| display_host_line(cfg))
+}
+
 #[cfg(any(target_os = "android", target_os = "ios"))]
 fn start_json_with_bypass_cache(cfg: &SavedConfig) -> Result<String, String> {
     // Must run before `start_config_json()`: that builds `split_bypass_domains` for the
@@ -490,6 +516,8 @@ fn start_json_with_bypass_cache(cfg: &SavedConfig) -> Result<String, String> {
     cfg.start_config_json()
 }
 
+/// Только десктоп (на Android/iOS трея нет). Вызывать **без** `Inner`: `set_tooltip`
+/// выполняется на главном потоке и ждёт его (`run_on_main_thread` + `recv`).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn sync_tray_tooltip_i18n(app: &AppHandle, connected: bool, cfg: &SavedConfig) {
     let s = tray_strings(resolved_tray_lang(cfg));
@@ -502,9 +530,6 @@ fn sync_tray_tooltip_i18n(app: &AppHandle, connected: bool, cfg: &SavedConfig) {
         let _ = tray.set_tooltip(Some(tip));
     }
 }
-
-#[cfg(any(target_os = "android", target_os = "ios"))]
-fn sync_tray_tooltip_i18n(_app: &AppHandle, _connected: bool, _cfg: &SavedConfig) {}
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn build_tray_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
@@ -1002,13 +1027,11 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
         // JNI/webview без удержания Mutex — иначе ANR/краш при disconnect (глобальный lock + UI-поток).
         let jni_result = android_vpn::request_disconnect(app);
 
-        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Трея на Android нет — обновлять подсказку не нужно.
         if let Err(ref e) = jni_result {
             warn!(target: "bibavpn_desktop", "android VPN stop: {e}");
-            g.last_error = Some(e.clone());
+            lock_inner(&state.inner).last_error = Some(e.clone());
         }
-        sync_tray_tooltip_i18n(app, false, &g.cfg);
-        drop(g);
         // Остановка сервиса асинхронна — tunnel_is_active ещё может быть true в snapshot().
         let force_disconnected = jni_result.is_ok();
         let snap = snapshot_with_probe(state, || run_tunnel_probe(app), force_disconnected);
@@ -1028,13 +1051,10 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
 
         let stop_res = ios_vpn::request_disconnect(app);
 
-        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(ref e) = stop_res {
             warn!(target: "bibavpn_desktop", "ios VPN stop: {e}");
-            g.last_error = Some(e.clone());
+            lock_inner(&state.inner).last_error = Some(e.clone());
         }
-        sync_tray_tooltip_i18n(app, false, &g.cfg);
-        drop(g);
         let force_disconnected = stop_res.is_ok();
         let snap = snapshot_with_probe(state, || run_tunnel_probe(app), force_disconnected);
         let _ = app.emit("vpn-state", &snap);
@@ -1086,14 +1106,20 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             vpn.stop(&state.rt);
         }
 
-        // Фаза 3 (под Mutex): фиксация результата, трей и снапшот.
-        let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(e) = pending_error {
-            g.last_error = Some(e);
-        }
-        g.phase = VpnPhase::Idle;
-        sync_tray_tooltip_i18n(app, false, &g.cfg);
-        drop(g);
+        // Фаза 3 (под Mutex): только фиксация результата.
+        let tray_cfg = {
+            let mut g = lock_inner(&state.inner);
+            if let Some(e) = pending_error {
+                g.last_error = Some(e);
+            }
+            g.phase = VpnPhase::Idle;
+            g.cfg.clone()
+        };
+        // Трей — строго после drop: `set_tooltip` ждёт главный поток
+        // (`run_on_main_thread` + `recv`), а главный поток сам может стоять на этом
+        // Mutex в синхронной IPC-команде. Под локом это был взаимный deadlock —
+        // окно «Не отвечает», трей мёртв, помогал только перезапуск.
+        sync_tray_tooltip_i18n(app, false, &tray_cfg);
         let snap = snapshot_from_state(app, state);
         let _ = app.emit("vpn-state", &snap);
     }
@@ -1172,13 +1198,13 @@ fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> R
     let (token, base_url) = parse_import_deeplink(raw_url)
         .ok_or_else(|| "Неверная ссылка импорта (ожидается bibavpn://import?...).".to_string())?;
     let allowed = {
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let g = lock_inner(&state.inner);
         allowed_origins_for_import(&g.cfg)
     };
     let (origin, payload) = control_plane_client::redeem_import(&base_url, &token, &allowed)?;
     let pending = PendingControlPlaneImport { origin, payload };
     let view = pending_import_view(&pending.origin, &pending.payload);
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = lock_inner(&state.inner);
     g.last_error = None;
     g.pending_import = Some(pending);
     drop(g);
@@ -1188,7 +1214,7 @@ fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> R
 }
 
 fn apply_pending_import(state: &AppState, app: &AppHandle) -> Result<(), String> {
-    let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+    let mut g = lock_inner(&state.inner);
     let pending = g
         .pending_import
         .take()
@@ -1407,11 +1433,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     // создание внутри блока с живым MutexGuard дало бы самоблокировку.
     let mut phase_guard = ConnectingPhaseGuard::new(&state.inner);
 
-    let (cfg, backup) = {
-        let mut g = match state.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+    let (cfg, saved_backup) = {
+        let mut g = lock_inner(&state.inner);
         match g.phase {
             VpnPhase::Connecting => {
                 return Err("Подключение уже выполняется.".into());
@@ -1434,12 +1457,16 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             );
         }
 
-        let backup = if let Some(ref saved) = g.proxy_backup {
-            saved.clone()
-        } else {
-            read_backup().map_err(|e| e.to_string())?
-        };
-        (g.cfg.clone(), backup)
+        (g.cfg.clone(), g.proxy_backup.clone())
+    };
+
+    // Снимок системного прокси — вне Mutex: на macOS это `networksetup` × 4 на каждый
+    // сетевой сервис, на Linux — пачка `gsettings`. Под локом это держало `Inner`
+    // секундами, и главный поток (синхронные команды) замирал вместе с окном.
+    // Фаза уже Connecting, так что второй connect сюда не пройдёт.
+    let backup = match saved_backup {
+        Some(saved) => saved,
+        None => read_backup().map_err(|e| e.to_string())?,
     };
 
     let http_port = cfg.local_http_port;
@@ -1554,23 +1581,24 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         socks = %socks_hp,
         "VPN включён, локальный прокси и системные настройки применены"
     );
-    let mut g = match state.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    let tray_cfg = {
+        let mut g = lock_inner(&state.inner);
+        g.proxy_backup = Some(backup);
+        g.vpn = Some(ActiveVpn {
+            shutdown: shutdown_tx,
+            join,
+        });
+        g.tunnel_server = Some(remote_label);
+        bump_epoch(&mut g);
+        g.phase = VpnPhase::Connected;
+        // Туннель снова живой: авто-восстановление завершено.
+        g.recovery_pending = false;
+        // Фаза доведена до Connected — сбрасывать в Idle на выходе больше не нужно.
+        phase_guard.disarm();
+        g.cfg.clone()
     };
-    g.proxy_backup = Some(backup);
-    g.vpn = Some(ActiveVpn {
-        shutdown: shutdown_tx,
-        join,
-    });
-    g.tunnel_server = Some(remote_label);
-    bump_epoch(&mut g);
-    g.phase = VpnPhase::Connected;
-    // Туннель снова живой: авто-восстановление завершено.
-    g.recovery_pending = false;
-    // Фаза доведена до Connected — сбрасывать в Idle на выходе больше не нужно.
-    phase_guard.disarm();
-    sync_tray_tooltip_i18n(app, true, &g.cfg);
+    // Не под `Inner`: см. фазу 3 в `disconnect_inner` — tray API ждёт главный поток.
+    sync_tray_tooltip_i18n(app, true, &tray_cfg);
     Ok(())
 }
 
@@ -1581,27 +1609,31 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    // Вне мьютекса: это JNI-раундтрип с ожиданием ответа от UI-потока (таймаут 5 с).
-    // Под локом он задерживал бы всех, кто держит опрос состояния раз в секунду.
+    // Вне мьютекса: JNI-вызов в Kotlin.
     let _ = android_vpn::clear_last_connect_error(app);
 
-    let mut g = match state.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    let cfg = {
+        let mut g = lock_inner(&state.inner);
+        g.last_error = None;
+
+        if !g.cfg.can_connect() {
+            warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
+            return Err(
+                "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
+                    .into(),
+            );
+        }
+
+        // Запись на диск остаётся под локом — так она упорядочена с `save_config_cmd`
+        // и более старый снимок не перетрёт свежие настройки.
+        persist_cfg(app, &g.cfg)?;
+        g.cfg.clone()
     };
-    g.last_error = None;
 
-    if !g.cfg.can_connect() {
-        warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
-        return Err(
-            "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
-                .into(),
-        );
-    }
-
-    persist_cfg(app, &g.cfg)?;
-    let json = start_json_with_bypass_cache(&g.cfg)?;
-    let (split_tunnel_enabled, packages, domains, battery) = match g.cfg.active_profile() {
+    // Холодный кэш пресетов уходит в сеть (ureq; DNS без таймаута) — только без `Inner`,
+    // иначе на нём висели бы все команды, включая синхронные на JS-потоке WebView.
+    let json = start_json_with_bypass_cache(&cfg)?;
+    let (split_tunnel_enabled, packages, domains, battery) = match cfg.active_profile() {
         Some(p) => (
             p.split_tunnel_enabled,
             split_tunnel::android_split_packages_for_profile(p),
@@ -1610,8 +1642,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         ),
         None => (false, Vec::new(), Vec::new(), false),
     };
-    let remote_label = display_host_line(&g.cfg);
-    drop(g);
+    let remote_label = mobile_session_label(&cfg);
 
     android_vpn::request_connect(
         app,
@@ -1623,21 +1654,11 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     )
     .map_err(|code| map_android_jni_connect_error(&code))?;
 
-    {
-        let mut g = match state.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.tunnel_server = Some(remote_label);
-        bump_epoch(&mut g);
-    }
-
-    let tray_up = android_vpn::tunnel_is_active(app).unwrap_or(false);
-    let g = match state.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    sync_tray_tooltip_i18n(app, tray_up, &g.cfg);
+    // Трея на Android нет, поэтому и прежний JNI-раундтрип `tunnel_is_active`
+    // ради подсказки трея здесь не нужен.
+    let mut g = lock_inner(&state.inner);
+    g.tunnel_server = Some(remote_label);
+    bump_epoch(&mut g);
     Ok(())
 }
 
@@ -1648,62 +1669,60 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    let mut g = match state.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    let cfg = {
+        let mut g = lock_inner(&state.inner);
+        g.last_error = None;
+
+        if !g.cfg.can_connect() {
+            warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
+            return Err(
+                "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
+                    .into(),
+            );
+        }
+
+        persist_cfg(app, &g.cfg)?;
+        g.cfg.clone()
     };
-    g.last_error = None;
 
-    if !g.cfg.can_connect() {
-        warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
-        return Err(
-            "Укажите сервер и токен или ключ biba:// и passphrase (как в приложении Android)."
-                .into(),
-        );
-    }
-
-    persist_cfg(app, &g.cfg)?;
-    let json = start_json_with_bypass_cache(&g.cfg)?;
+    // Как на Android: возможный сетевой запрос за пресетами — без `Inner`.
+    let json = start_json_with_bypass_cache(&cfg)?;
     let json = inject_mobile_tunnel_session_json(&json)?;
-    let remote_label = display_host_line(&g.cfg);
-    drop(g);
+    let remote_label = mobile_session_label(&cfg);
 
     ios_vpn::request_connect(app, &json)?;
 
-    {
-        let mut g = match state.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.tunnel_server = Some(remote_label);
-        bump_epoch(&mut g);
-    }
-
-    let tray_up = ios_vpn::tunnel_is_active(app).unwrap_or(false);
-    let g = match state.inner.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    sync_tray_tooltip_i18n(app, tray_up, &g.cfg);
+    // Трея на iOS нет: прежний `tunnel_is_active` (таймаут до 18 с) ради подсказки трея убран.
+    let mut g = lock_inner(&state.inner);
+    g.tunnel_server = Some(remote_label);
+    bump_epoch(&mut g);
     Ok(())
 }
 
+// Все команды ниже — `async`. Синхронная `#[tauri::command] fn` исполняется прямо в
+// IPC-обработчике: на десктопе это главный поток (окно и трей), на Android — JavaBridge,
+// на котором стоит синхронный `window.ipc.postMessage` страницы (весь JS WebView ждёт).
+// Любое ожидание `Inner` в такой команде замораживало интерфейс.
+
 #[tauri::command]
 #[cfg(target_os = "android")]
-fn pick_installed_package_cmd(app: AppHandle) -> Result<Option<String>, String> {
-    android_vpn::pick_installed_package(&app)
+async fn pick_installed_package_cmd(app: AppHandle) -> Result<Option<String>, String> {
+    // Ждёт выбор пользователя до 60 с — только на blocking-пуле.
+    tauri::async_runtime::spawn_blocking(move || android_vpn::pick_installed_package(&app))
+        .await
+        .map_err(|e| format!("pick package task: {e}"))?
 }
 
 #[tauri::command]
 #[cfg(not(target_os = "android"))]
-fn pick_installed_package_cmd() -> Result<Option<String>, String> {
+async fn pick_installed_package_cmd() -> Result<Option<String>, String> {
     Err("Выбор приложения доступен только на Android.".into())
 }
 
 #[tauri::command]
 async fn measure_server_rtt_cmd(state: State<'_, AppState>) -> Result<Option<u32>, String> {
     let target = {
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let g = lock_inner(&state.inner);
         let Some(p) = g.cfg.active_profile() else {
             return Ok(None);
         };
@@ -1738,15 +1757,19 @@ async fn get_tunnel_status_cmd(
     {
         let _ = state;
         let status = tauri::async_runtime::spawn_blocking(move || {
-            let connected = android_vpn::tunnel_is_active(&app).unwrap_or(false);
-            let vpn_session_uptime_secs = if connected {
-                Some(android_vpn::tunnel_session_elapsed_ms(&app).unwrap_or(0) / 1000)
-            } else {
+            let st = android_vpn::tunnel_status(&app).unwrap_or_default();
+            let error = if st.active {
                 None
+            } else {
+                st.connect_error
+                    .as_deref()
+                    .map(map_android_jni_connect_error)
+                    .filter(|s| !s.is_empty())
             };
             TunnelStatus {
-                connected,
-                vpn_session_uptime_secs,
+                connected: st.active,
+                vpn_session_uptime_secs: st.active.then_some(st.elapsed_ms / 1000),
+                error,
             }
         })
         .await
@@ -1767,6 +1790,7 @@ async fn get_tunnel_status_cmd(
             TunnelStatus {
                 connected,
                 vpn_session_uptime_secs,
+                error: None,
             }
         })
         .await
@@ -1777,18 +1801,21 @@ async fn get_tunnel_status_cmd(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
-        let g = state.inner.lock().map_err(|e| e.to_string())?;
+        let g = lock_inner(&state.inner);
         Ok(TunnelStatus {
             connected: g.vpn.is_some(),
             vpn_session_uptime_secs: None,
+            error: None,
         })
     }
 }
 
 #[tauri::command]
-fn get_edit_config(state: State<'_, AppState>) -> Result<SavedConfig, String> {
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    Ok(g.cfg.clone())
+async fn get_edit_config(state: State<'_, AppState>) -> Result<SavedConfig, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || lock_inner(&state.inner).cfg.clone())
+        .await
+        .map_err(|e| format!("edit config task: {e}"))
 }
 
 #[tauri::command]
@@ -1800,7 +1827,7 @@ async fn save_config_cmd(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (locale_changed, cfg_for_tray) = {
-            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            let mut g = lock_inner(&state.inner);
             let old_locale = g.cfg.ui_locale.clone();
             g.cfg = merge_saved_config(&g.cfg, &cfg)?;
             normalize_loaded(&mut g.cfg);
@@ -1833,7 +1860,7 @@ async fn connect_cmd(state: State<'_, AppState>, app: AppHandle) -> Result<State
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         if let Err(e) = connect_inner(&state, &app) {
-            let mut g = state.inner.lock().map_err(|e2| e2.to_string())?;
+            let mut g = lock_inner(&state.inner);
             g.last_error = Some(e.clone());
             bump_epoch(&mut g);
             drop(g);
@@ -1873,7 +1900,7 @@ async fn apply_invite_cmd(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let result = {
-            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            let mut g = lock_inner(&state.inner);
             g.last_error = None;
             match apply_invite_to_cfg(&mut g.cfg) {
                 Ok(()) => {
@@ -1903,7 +1930,7 @@ async fn open_control_plane_refresh_cmd(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let url = {
-            let g = state.inner.lock().map_err(|e| e.to_string())?;
+            let g = lock_inner(&state.inner);
             let p = g
                 .cfg
                 .active_profile()
@@ -1993,7 +2020,7 @@ async fn clear_error_cmd(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         {
-            let mut g = state.inner.lock().map_err(|e| e.to_string())?;
+            let mut g = lock_inner(&state.inner);
             g.last_error = None;
         }
         #[cfg(target_os = "android")]
@@ -2007,12 +2034,18 @@ async fn clear_error_cmd(
 }
 
 #[tauri::command]
-fn get_pending_import(state: State<'_, AppState>) -> Result<Option<PendingImportView>, String> {
-    let g = state.inner.lock().map_err(|e| e.to_string())?;
-    Ok(g
-        .pending_import
-        .as_ref()
-        .map(|p| pending_import_view(&p.origin, &p.payload)))
+async fn get_pending_import(
+    state: State<'_, AppState>,
+) -> Result<Option<PendingImportView>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        lock_inner(&state.inner)
+            .pending_import
+            .as_ref()
+            .map(|p| pending_import_view(&p.origin, &p.payload))
+    })
+    .await
+    .map_err(|e| format!("pending import task: {e}"))
 }
 
 #[tauri::command]
@@ -2030,9 +2063,11 @@ async fn confirm_pending_import_cmd(
 }
 
 #[tauri::command]
-fn cancel_pending_import_cmd(state: State<'_, AppState>) -> Result<(), String> {
-    cancel_pending_import_inner(&state);
-    Ok(())
+async fn cancel_pending_import_cmd(state: State<'_, AppState>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cancel_pending_import_inner(&state))
+        .await
+        .map_err(|e| format!("cancel import task: {e}"))
 }
 
 #[derive(Serialize, Clone)]
@@ -2741,6 +2776,115 @@ mod android_connect_error_tests {
             Some("vpn_permission_denied".into()),
         );
         assert_eq!(err, rust_err);
+    }
+}
+
+#[cfg(test)]
+mod main_thread_safety_tests {
+    //! Регрессии фризов, которые лечились только перезапуском приложения.
+
+    use super::{lock_inner, Inner, SavedConfig, VpnPhase};
+    use std::sync::{Arc, Mutex};
+
+    fn source() -> String {
+        include_str!("lib.rs").replace("\r\n", "\n")
+    }
+
+    /// Синхронная `#[tauri::command] fn` исполняется в IPC-обработчике: на десктопе это
+    /// главный поток, на Android — JavaBridge с синхронным `postMessage` страницы.
+    /// Стоило такой команде подождать `Inner`, как вставало окно (или весь JS WebView),
+    /// а вместе с трей-вызовами под локом это давало вечный deadlock.
+    #[test]
+    fn every_ipc_command_is_async() {
+        let src = source();
+        let mut checked = 0;
+        for chunk in src.split("#[tauri::command]\n").skip(1) {
+            let decl = chunk
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.starts_with("#["))
+                .unwrap_or_default();
+            if decl.is_empty() || decl.starts_with("//") {
+                continue;
+            }
+            assert!(
+                decl.starts_with("async fn ") || decl.starts_with("pub async fn "),
+                "IPC command must be async (runs off the main/JavaBridge thread): {decl}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 15,
+            "expected to find the command set, checked {checked}"
+        );
+    }
+
+    /// Tray API (`set_tooltip`, `set_menu`) блокируется до выполнения на главном потоке.
+    /// Под `Inner` это взаимная блокировка с любой командой, ждущей `Inner` на главном потоке.
+    #[test]
+    fn tray_is_never_touched_while_inner_is_locked() {
+        let src = source();
+        for (i, line) in src.lines().enumerate() {
+            let l = line.trim();
+            if l.starts_with("sync_tray_tooltip_i18n(") || l.starts_with("apply_tray_menu_locale(")
+            {
+                assert!(
+                    !l.contains("&g."),
+                    "line {}: tray update must use a copy taken before dropping the Inner guard: {l}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mobile_session_label_matches_manual_profile_server() {
+        use crate::config::TunnelProfile;
+        let mut cfg = SavedConfig::default();
+        cfg.profiles = vec![TunnelProfile {
+            id: "p1".into(),
+            server: " vpn.example.com:8443 ".into(),
+            sni: "cdn.example.com".into(),
+            ..TunnelProfile::default()
+        }];
+        cfg.active_profile_id = "p1".into();
+        // Ровно то, с чем UI сравнивает `tunnelServer` (после trim).
+        assert_eq!(super::mobile_session_label(&cfg), "vpn.example.com:8443");
+
+        cfg.profiles[0].server.clear();
+        cfg.profiles[0].from_invite = "biba://x".into();
+        assert_eq!(
+            super::mobile_session_label(&cfg),
+            super::display_host_line(&cfg),
+            "invite profile keeps the display label"
+        );
+    }
+
+    #[test]
+    fn lock_inner_survives_poisoned_mutex() {
+        let inner = Arc::new(Mutex::new(Inner {
+            cfg: SavedConfig::default(),
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: None,
+            last_error: None,
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 0,
+        }));
+        let poisoner = Arc::clone(&inner);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("lock");
+            panic!("отравляем мьютекс");
+        })
+        .join();
+        assert!(inner.is_poisoned());
+        lock_inner(&inner).last_error = Some("still usable".into());
+        assert_eq!(
+            lock_inner(&inner).last_error.as_deref(),
+            Some("still usable")
+        );
     }
 }
 

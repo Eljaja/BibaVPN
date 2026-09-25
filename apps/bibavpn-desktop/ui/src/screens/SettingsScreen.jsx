@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useT } from "../ThemeContext.jsx";
 import { Btn, Field, CheckRow } from "../ui/primitives.jsx";
@@ -12,6 +12,23 @@ import {
 import { groupBypassPresets, allSplitPresetIds } from "../splitPresets.js";
 import { useBypassPresets, presetLabel } from "../useBypassPresets.js";
 import { SEMANTIC } from "../theme.js";
+
+const U8_MAX = 255;
+const U32_MAX = 4294967295;
+/** Предел для Rust `u64`/`usize`: больше `JSON.stringify` пишет `1e+21`, и serde это не примет. */
+const SAFE_MAX = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Целое в `[min, max]` для числовых полей профиля (в Rust это `u8`/`u32`/`u64`/`usize`).
+ * Раньше уходило `Number(v) || 0`: дробь (`1.5`), минус или `1e30` роняли `save_config_cmd`
+ * ошибкой serde — и из настроек нельзя было уйти, пока не перезапустишь приложение.
+ */
+function intIn(v, min, max, fallback = min) {
+  if (String(v).trim() === "") return fallback;
+  const n = Math.trunc(Number(v));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
 
 /** @param {{ theme: object, title: React.ReactNode, children: React.ReactNode }} p */
 function SettingsSection({ theme, title, children }) {
@@ -42,7 +59,7 @@ function SettingsSection({ theme, title, children }) {
   );
 }
 
-/** @param {{ cfg: import('../vpnTypes').SavedConfig, setCfg: (fn: (c: import('../vpnTypes').SavedConfig) => import('../vpnTypes').SavedConfig) => void, boringAvailable: boolean, onBack?: () => void, onPersist: () => Promise<void>, onSave: () => Promise<void>, onApplyInvite: () => Promise<void>, onRefreshFromControlPlane?: () => Promise<void>, lastError: string | null, onClearError: () => Promise<void> }} props */
+/** @param {{ cfg: import('../vpnTypes').SavedConfig, setCfg: (fn: (c: import('../vpnTypes').SavedConfig) => import('../vpnTypes').SavedConfig) => void, boringAvailable: boolean, onBack?: () => void, onPersist: () => Promise<boolean>, onSave: () => Promise<void>, saveError?: { message: string, at: number } | null, onDiscardChanges?: () => Promise<void>, onApplyInvite: () => Promise<void>, onRefreshFromControlPlane?: () => Promise<void>, lastError: string | null, onClearError: () => Promise<void> }} props */
 export function SettingsScreen({
   cfg,
   setCfg,
@@ -50,6 +67,8 @@ export function SettingsScreen({
   onBack,
   onPersist,
   onSave,
+  saveError,
+  onDiscardChanges,
   onApplyInvite,
   onRefreshFromControlPlane,
   lastError,
@@ -72,6 +91,12 @@ export function SettingsScreen({
     const delta = migrateAndroidSplitFields(prof, bypassPresets);
     if (delta) setCfg((c) => patchActiveProfile(c, delta));
   }, [cfg, isAndroid, setCfg, bypassPresets]);
+
+  /** Уход с вкладки не удался — показываем почему, даже если форма прокручена вниз. */
+  const saveErrorRef = useRef(/** @type {HTMLDivElement | null} */ (null));
+  useEffect(() => {
+    if (saveError) saveErrorRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [saveError]);
 
   if (!p) return null;
 
@@ -149,7 +174,8 @@ export function SettingsScreen({
           android_split_tunnel_packages: mergedAndroidSplitPackages(bypassPresets, cur.split_tunnel_preset_ids, arr),
         });
       });
-      await onPersist();
+      // Не зовём onPersist здесь: его замыкание ещё со старым черновиком (без нового пакета),
+      // и последующая перезагрузка черновика стирала выбор. Сохранится при уходе / «Сохранить».
     } catch (e) {
       console.error(e);
     }
@@ -168,8 +194,7 @@ export function SettingsScreen({
   }
 
   async function handleApplyInvite() {
-    await onPersist();
-    await onApplyInvite();
+    if (await onPersist()) await onApplyInvite();
   }
 
   const boringWarn = p.tls_stack === "boring" && !boringAvailable;
@@ -199,8 +224,7 @@ export function SettingsScreen({
           <Btn
             kind="ghost"
             onClick={async () => {
-              await onPersist();
-              onBack();
+              if (await onPersist()) onBack();
             }}
           >
             ←
@@ -236,6 +260,45 @@ export function SettingsScreen({
           gap: 22,
         }}
       >
+        {saveError && (
+          <div
+            ref={saveErrorRef}
+            role="alert"
+            style={{
+              padding: "10px 12px",
+              borderRadius: 4,
+              border: `1px solid ${SEMANTIC.err}`,
+              background: "rgba(255,90,90,0.08)",
+              color: SEMANTIC.err,
+              fontFamily: "IBM Plex Mono",
+              fontSize: 11,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <span>{t("settings_save_failed", { error: saveError.message })}</span>
+            {onDiscardChanges && (
+              <button
+                type="button"
+                onClick={() => onDiscardChanges()}
+                style={{
+                  alignSelf: "flex-start",
+                  background: "transparent",
+                  border: `1px solid ${SEMANTIC.err}`,
+                  color: SEMANTIC.err,
+                  fontFamily: "IBM Plex Mono",
+                  fontSize: 10,
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                  textTransform: "uppercase",
+                }}
+              >
+                {t("btn_discard_changes")}
+              </button>
+            )}
+          </div>
+        )}
         {lastError && (
           <div
             style={{
@@ -334,7 +397,7 @@ export function SettingsScreen({
             label="ws_ping_secs"
             type="number"
             value={String(p.ws_ping_secs)}
-            onChange={(v) => patchP({ ws_ping_secs: Number(v) || 0 })}
+            onChange={(v) => patchP({ ws_ping_secs: intIn(v, 0, SAFE_MAX) })}
           />
         </SettingsSection>
 
@@ -344,13 +407,13 @@ export function SettingsScreen({
               label="max_pad"
               type="number"
               value={String(p.max_pad)}
-              onChange={(v) => patchP({ max_pad: Math.min(255, Math.max(0, Number(v) || 0)) })}
+              onChange={(v) => patchP({ max_pad: intIn(v, 0, U8_MAX) })}
             />
             <Field
               label="decoy_max"
               type="number"
               value={String(p.decoy_max)}
-              onChange={(v) => patchP({ decoy_max: Math.min(255, Math.max(0, Number(v) || 0)) })}
+              onChange={(v) => patchP({ decoy_max: intIn(v, 0, U8_MAX) })}
             />
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -358,20 +421,20 @@ export function SettingsScreen({
               label="junk_frames"
               type="number"
               value={String(p.junk_frames)}
-              onChange={(v) => patchP({ junk_frames: Number(v) || 0 })}
+              onChange={(v) => patchP({ junk_frames: intIn(v, 0, U32_MAX) })}
             />
             <Field
               label="early_ws_frames"
               type="number"
               value={String(p.early_ws_frames)}
-              onChange={(v) => patchP({ early_ws_frames: Math.min(255, Number(v) || 0) })}
+              onChange={(v) => patchP({ early_ws_frames: intIn(v, 0, U8_MAX) })}
             />
           </div>
           <Field
             label="max_ws_binary"
             type="number"
             value={String(p.max_ws_binary)}
-            onChange={(v) => patchP({ max_ws_binary: Math.max(1024, Number(v) || 0) })}
+            onChange={(v) => patchP({ max_ws_binary: intIn(v, 1024, SAFE_MAX) })}
           />
           <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
             <Field
@@ -379,7 +442,7 @@ export function SettingsScreen({
               type="number"
               value={String(p.ws_ping_jitter_percent)}
               onChange={(v) =>
-                patchP({ ws_ping_jitter_percent: Math.min(50, Math.max(0, Number(v) || 0)) })
+                patchP({ ws_ping_jitter_percent: intIn(v, 0, 50) })
               }
             />
             <Field
@@ -387,14 +450,14 @@ export function SettingsScreen({
               type="number"
               value={String(p.ws_binary_send_jitter_ms)}
               onChange={(v) =>
-                patchP({ ws_binary_send_jitter_ms: Math.min(255, Math.max(0, Number(v) || 0)) })
+                patchP({ ws_binary_send_jitter_ms: intIn(v, 0, U8_MAX) })
               }
             />
             <Field
               label="dummy_interval_secs"
               type="number"
               value={String(p.dummy_interval_secs)}
-              onChange={(v) => patchP({ dummy_interval_secs: Number(v) || 0 })}
+              onChange={(v) => patchP({ dummy_interval_secs: intIn(v, 0, SAFE_MAX) })}
             />
           </div>
           <CheckRow
@@ -409,7 +472,7 @@ export function SettingsScreen({
                 type="number"
                 value={String(p.decoy_gets_interval_secs)}
                 onChange={(v) =>
-                  patchP({ decoy_gets_interval_secs: Math.max(1, Number(v) || 1) })
+                  patchP({ decoy_gets_interval_secs: intIn(v, 1, SAFE_MAX) })
                 }
               />
               <Field
@@ -506,7 +569,7 @@ export function SettingsScreen({
             label={t("proto_label")}
             type="number"
             value={String(p.proto)}
-            onChange={(v) => patchP({ proto: Math.min(255, Math.max(1, Number(v) || 3)) })}
+            onChange={(v) => patchP({ proto: intIn(v, 1, U8_MAX, 3) })}
           />
           <Field
             label={t("proto_domain_label")}
@@ -542,13 +605,13 @@ export function SettingsScreen({
             label={t("ws_parallel_label")}
             type="number"
             value={String(p.ws_parallel)}
-            onChange={(v) => patchP({ ws_parallel: Math.min(4, Math.max(1, Number(v) || 1)) })}
+            onChange={(v) => patchP({ ws_parallel: intIn(v, 1, 4) })}
           />
           <Field
             label={t("idle_decoy_label")}
             type="number"
             value={String(p.idle_decoy_secs)}
-            onChange={(v) => patchP({ idle_decoy_secs: Number(v) || 0 })}
+            onChange={(v) => patchP({ idle_decoy_secs: intIn(v, 0, SAFE_MAX) })}
           />
         </SettingsSection>
 
@@ -585,7 +648,7 @@ export function SettingsScreen({
               type="number"
               value={String(p.ws_jitter_min_ms)}
               onChange={(v) =>
-                patchP({ ws_jitter_min_ms: Math.min(255, Math.max(0, Number(v) || 0)) })
+                patchP({ ws_jitter_min_ms: intIn(v, 0, U8_MAX) })
               }
             />
             <Field
@@ -593,7 +656,7 @@ export function SettingsScreen({
               type="number"
               value={String(p.ws_jitter_max_ms)}
               onChange={(v) =>
-                patchP({ ws_jitter_max_ms: Math.min(255, Math.max(0, Number(v) || 0)) })
+                patchP({ ws_jitter_max_ms: intIn(v, 0, U8_MAX) })
               }
             />
           </div>

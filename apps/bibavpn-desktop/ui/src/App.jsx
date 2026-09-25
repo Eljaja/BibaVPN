@@ -38,47 +38,71 @@ function AppInner() {
   /** @type {[null | { controlPlaneHost: string, vpnHost: string, displayName: string, serverName: string }, (v: null | object) => void]} */
   const [pendingImport, setPendingImport] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
+  /** В черновике настроек есть несохранённые правки (уход с вкладки без правок не ходит в бэкенд). */
+  const [draftDirty, setDraftDirty] = useState(false);
+  /**
+   * Ошибка последнего сохранения — показываем в настройках вместо молчаливой «зависшей» навигации.
+   * `at` меняется на каждой неудаче, чтобы баннер снова прокручивался в зону видимости.
+   */
+  const [saveError, setSaveError] = useState(/** @type {{ message: string, at: number } | null} */ (null));
 
   useEffect(() => {
+    let disposed = false;
     let unlisten = () => {};
     (async () => {
       try {
         const pending = await invoke("get_pending_import");
-        if (pending) setPendingImport(/** @type {typeof pendingImport} */ (pending));
+        if (pending && !disposed) setPendingImport(/** @type {typeof pendingImport} */ (pending));
       } catch (e) {
         console.error(e);
       }
-      unlisten = await listen("control-plane-import-pending", (ev) => {
+      const un = await listen("control-plane-import-pending", (ev) => {
         setPendingImport(/** @type {typeof pendingImport} */ (ev.payload));
       });
+      if (disposed) un();
+      else unlisten = un;
     })();
-    return () => unlisten();
+    return () => {
+      disposed = true;
+      unlisten();
+    };
   }, []);
 
   const loadEditDraft = useCallback(async () => {
     try {
       const c = await getEditConfig();
       setDraft(cloneCfg(c));
+      setDraftDirty(false);
+      setSaveError(null);
     } catch (e) {
       console.error(e);
     }
   }, [getEditConfig]);
 
   useEffect(() => {
-    if (tab === "connect") setDraft(null);
-    else if (tab === "profiles" || tab === "settings") loadEditDraft();
+    if (tab === "connect") {
+      setDraft(null);
+      setDraftDirty(false);
+      setSaveError(null);
+    } else if (tab === "profiles" || tab === "settings") loadEditDraft();
   }, [tab, loadEditDraft]);
 
   useEffect(() => {
+    let disposed = false;
     let unlisten = () => {};
     (async () => {
-      unlisten = await listen("control-plane-import", () => {
+      const un = await listen("control-plane-import", () => {
         setPendingImport(null);
         setTab("profiles");
         loadEditDraft();
       });
+      if (disposed) un();
+      else unlisten = un;
     })();
-    return () => unlisten();
+    return () => {
+      disposed = true;
+      unlisten();
+    };
   }, [loadEditDraft]);
 
   const confirmPendingImport = useCallback(async () => {
@@ -116,7 +140,11 @@ function AppInner() {
     if (snap.error) setTunnelHandshake(false);
   }, [snap?.connected, snap?.error, tunnelHandshake]);
 
-  /** Туннель на Android поднимается после JNI; опрашиваем только лёгкий статус, а полный snapshot берём один раз. */
+  /**
+   * Туннель на Android поднимается после JNI; опрашиваем только лёгкий статус, а полный snapshot
+   * берём один раз — когда туннель поднялся или сервис сообщил ошибку (провал bootstrap, отказ
+   * в разрешении VPN). Раньше ошибку здесь не видели, и кнопка висела заблокированной 2 минуты.
+   */
   useEffect(() => {
     if (!tunnelHandshake) return;
     if (snap?.connected) return;
@@ -125,7 +153,7 @@ function AppInner() {
     async function pollTunnelStatus() {
       const status = await getTunnelStatus();
       if (cancelled) return;
-      if (status?.connected) {
+      if (status?.connected || status?.error) {
         await refresh();
         if (!cancelled) setTunnelHandshake(false);
         return;
@@ -139,52 +167,101 @@ function AppInner() {
     };
   }, [tunnelHandshake, snap?.connected, refresh, getTunnelStatus]);
 
-  /** Снимаем зависший «handshake», если туннель так и не попал в snapshot (ошибка JNI и т.п.). */
+  /** Страховка: nativeStart (20 с) + tun2socks (25 с) ограничены, дальше за туннелем следит опрос ниже. */
   useEffect(() => {
     if (!tunnelHandshake) return;
-    const id = setTimeout(() => setTunnelHandshake(false), 120000);
+    const id = setTimeout(() => setTunnelHandshake(false), 60000);
     return () => clearTimeout(id);
   }, [tunnelHandshake]);
+
+  /**
+   * Сессия запрошена (`tunnelServer`), но туннель сейчас не поднят: Android пересобирает стек
+   * после разблокировки / смены сети (секунды), или ещё открыт диалог разрешения VPN. Раньше в
+   * этот момент оба опроса выключались и UI навсегда оставался на «Не подключено», хотя VPN
+   * через пару секунд снова работал, — а нажатие «Подключить» рвало живой туннель.
+   */
+  const sessionDown = Boolean(snap && !snap.connected && snap.tunnelServer);
+  const snapError = snap?.error ?? null;
+  useEffect(() => {
+    if (!sessionDown || tunnelHandshake || busy) return;
+    let cancelled = false;
+    let timer = 0;
+    async function pollRecovery() {
+      const status = await getTunnelStatus();
+      if (cancelled) return;
+      if (status?.connected || (status?.error && !snapError)) {
+        await refresh();
+        if (cancelled || status?.connected) return;
+      }
+      timer = window.setTimeout(pollRecovery, 2000);
+    }
+    timer = window.setTimeout(pollRecovery, 1500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [sessionDown, snapError, tunnelHandshake, busy, refresh, getTunnelStatus]);
 
   const setCfg = useCallback((updater) => {
     setDraft((d) => {
       if (!d) return null;
       return typeof updater === "function" ? updater(d) : updater;
     });
+    setDraftDirty(true);
   }, []);
 
+  /**
+   * @returns {Promise<boolean>} `true` — сохранено или сохранять нечего.
+   * Ошибку не бросаем: раньше отказ `save_config_cmd` (например, дробь в числовом поле) ронял
+   * `goTab` до `setTab`, и из настроек нельзя было уйти ни вкладками, ни кнопкой «Сохранить».
+   */
   const saveDraft = useCallback(async () => {
-    if (!draft) return;
-    await saveCfg(draft);
-    const full = await getEditConfig();
-    setDraft(cloneCfg(full));
-  }, [draft, saveCfg, getEditConfig]);
+    if (!draft || !draftDirty) return true;
+    try {
+      await saveCfg(draft);
+      const full = await getEditConfig();
+      setDraft(cloneCfg(full));
+      setDraftDirty(false);
+      setSaveError(null);
+      return true;
+    } catch (e) {
+      console.error(e);
+      setSaveError({ message: String(e), at: Date.now() });
+      return false;
+    }
+  }, [draft, draftDirty, saveCfg, getEditConfig]);
 
   const goTab = useCallback(
     async (/** @type {"connect" | "profiles" | "settings"} */ next) => {
       if (next === tab) return;
-      if (tab === "settings") {
-        await saveDraft();
-      }
+      // Не сохранилось — остаёмся: ошибка и «Отменить изменения» видны в настройках.
+      if (tab === "settings" && !(await saveDraft())) return;
       setTab(next);
     },
     [tab, saveDraft]
   );
 
   const saveSettingsAndGoConnect = useCallback(async () => {
-    await saveDraft();
-    setTab("connect");
+    if (await saveDraft()) setTab("connect");
   }, [saveDraft]);
 
+  /**
+   * Сессия поднимается или пересобирается — кнопка работает как «Отменить/Отключить», а не
+   * заблокирована. Блокируем её только пока идёт сам invoke (`busy`).
+   */
+  const sessionPending = tunnelHandshake || Boolean(sessionDown && !snapError);
   /** Показываем «рукопожатие»: пока invoke идёт (busy), или пока ждём появление туннеля после диалога VPN. */
-  const connectPhasePending =
-    tunnelHandshake || Boolean(busy && snap && !snap.connected);
+  const connectPhasePending = sessionPending || Boolean(busy && snap && !snap.connected);
 
   async function handleToggleConnect() {
-    if (!snap) return;
-    if (snap.connected) {
+    if (!snap || busy) return;
+    if (snap.connected || sessionPending) {
       setTunnelHandshake(false);
-      await disconnect();
+      try {
+        await disconnect();
+      } catch (e) {
+        console.error(e);
+      }
       return;
     }
     setTunnelHandshake(true);
@@ -214,9 +291,13 @@ function AppInner() {
         cfg={cfg}
         onSave={async (c) => {
           setDraft(c);
-          await saveCfg(c);
-          const full = await getEditConfig();
-          setDraft(cloneCfg(full));
+          try {
+            await saveCfg(c);
+          } catch (e) {
+            console.error(e);
+          }
+          // И после ошибки: экран должен показывать то, что реально сохранено.
+          await loadEditDraft();
         }}
       />
     );
@@ -228,23 +309,26 @@ function AppInner() {
         boringAvailable={boringAvailable}
         onPersist={saveDraft}
         onSave={saveSettingsAndGoConnect}
+        saveError={saveError}
+        onDiscardChanges={loadEditDraft}
         lastError={snap.error}
         onClearError={clearError}
         onApplyInvite={async () => {
           try {
             await applyInvite();
-          } finally {
-            const full = await getEditConfig();
-            setDraft(cloneCfg(full));
+          } catch (e) {
+            // Текст ошибки приходит в `snap.error` через vpn-state.
+            console.error(e);
           }
+          await loadEditDraft();
         }}
         onRefreshFromControlPlane={async () => {
           try {
             await refreshFromControlPlane();
-          } finally {
-            const full = await getEditConfig();
-            setDraft(cloneCfg(full));
+          } catch (e) {
+            console.error(e);
           }
+          await loadEditDraft();
         }}
       />
     );
@@ -257,6 +341,9 @@ function AppInner() {
       <ConnectScreen
         snap={snap}
         connectPending={connectPhasePending}
+        busy={busy}
+        cancelable={sessionPending}
+        reconnecting={sessionPending && !tunnelHandshake}
         refresh={refresh}
         getTunnelStatus={getTunnelStatus}
         onSettings={() => goTab("settings")}

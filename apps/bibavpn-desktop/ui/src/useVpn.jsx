@@ -40,12 +40,15 @@ export function useVpn() {
     let unlisten = () => {};
     (async () => {
       await refresh();
-      unlisten = await listen("vpn-state", (ev) => {
+      const un = await listen("vpn-state", (ev) => {
         const p = /** @type {StateSnapshot} */ (ev.payload);
         if (!alive) return;
         setSnap(p);
         if (p?.cfg) setLanguageFromCfg(p.cfg);
       });
+      // Эффект мог размонтироваться, пока ждали `listen` — не оставляем лишний слушатель.
+      if (alive) unlisten = un;
+      else un();
     })();
     return () => {
       alive = false;

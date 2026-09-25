@@ -17,10 +17,13 @@ function formatSessionUptime(elapsedMs) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-/** @param {{ snap: import('../vpnTypes').StateSnapshot, connectPending: boolean, refresh: () => Promise<void>, getTunnelStatus: () => Promise<{ connected?: boolean, vpnSessionUptimeSecs?: number } | null>, onSettings: () => void, onToggleConnect: () => void, onClearError: () => void }} props */
+/** @param {{ snap: import('../vpnTypes').StateSnapshot, connectPending: boolean, busy: boolean, cancelable: boolean, reconnecting: boolean, refresh: () => Promise<void>, getTunnelStatus: () => Promise<{ connected?: boolean, vpnSessionUptimeSecs?: number, error?: string } | null>, onSettings: () => void, onToggleConnect: () => void, onClearError: () => void }} props */
 export function ConnectScreen({
   snap,
   connectPending,
+  busy,
+  cancelable,
+  reconnecting,
   refresh,
   getTunnelStatus,
   onSettings,
@@ -155,17 +158,25 @@ export function ConnectScreen({
           ? "rgba(255,90,90,0.35)"
           : "transparent";
 
+  const connectingLabel = reconnecting ? t("status_reconnecting") : t("status_handshaking");
   const stateLabel =
     cs === "connected"
       ? t("status_connected")
       : cs === "connecting"
-        ? t("status_handshaking")
+        ? connectingLabel
         : cs === "error"
           ? t("status_disconnected") + " · !"
           : t("status_disconnected");
 
-  const btnLabel = snap.connected ? t("cta_disconnect") : t("cta_connect");
-  const canTap = snap.connected || snap.canConnect;
+  // Пока туннель поднимается/пересобирается, кнопка — «Отменить», а не заблокированный круг:
+  // блокируем её только на время самого invoke.
+  const btnLabel = snap.connected
+    ? t("cta_disconnect")
+    : cancelable
+      ? t("cta_cancel")
+      : t("cta_connect");
+  const canTap = snap.connected || cancelable || snap.canConnect;
+  const tapDisabled = !canTap || busy;
 
   const subtitle = snap.connected ? snap.displayHost : t("status_sub_disconnected");
 
@@ -181,7 +192,7 @@ export function ConnectScreen({
     cs === "connected"
       ? t("status_connected")
       : cs === "connecting"
-        ? t("status_handshaking")
+        ? connectingLabel
         : cs === "error"
           ? "!"
           : t("status_disconnected");
@@ -287,7 +298,7 @@ export function ConnectScreen({
         <div style={{ display: "flex", justifyContent: "center", padding: "8px 0 4px" }}>
           <button
             type="button"
-            disabled={!canTap || connectPending}
+            disabled={tapDisabled}
             onClick={onToggleConnect}
             style={{
               width: 220,
@@ -295,7 +306,7 @@ export function ConnectScreen({
               borderRadius: "50%",
               background: "transparent",
               border: `1.5px solid ${ringColor}`,
-              cursor: !canTap || connectPending ? "not-allowed" : "pointer",
+              cursor: tapDisabled ? "not-allowed" : "pointer",
               padding: 0,
               position: "relative",
               transition: "border-color 200ms ease, opacity 160ms ease, transform 160ms ease",
