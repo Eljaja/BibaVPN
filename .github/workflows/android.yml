@@ -51,7 +51,9 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: tools platform-tools platforms;android-34 build-tools;34.0.0
+          # No legacy `tools` (SDK Tools 26.x, deprecated since 2017): the cmdline-tools the
+          # action now downloads (16.0) cannot resolve it — `sdkmanager tools` exits 1.
+          packages: platform-tools platforms;android-34 build-tools;34.0.0
 
       - name: Install NDK (Rust JNI)
         id: ndk
