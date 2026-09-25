@@ -199,6 +199,18 @@ class BibaVpnService : VpnService() {
 
     override fun onBind(intent: Intent?) = null
 
+    /**
+     * Система отозвала VPN (включили другое VPN-приложение, выключили в настройках).
+     * Стандартная реализация — `stopSelf()`, после чего `onDestroy` разбирал стек синхронно
+     * на главном потоке: join tun2socks до 8 с + `nativeStop` до 5 с — ANR. Разбираем в воркере.
+     */
+    override fun onRevoke() {
+        Log.i(TAG, "onRevoke: VPN revoked by the system")
+        networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
+        networkRestartRunnable = null
+        enqueueTeardownWorker("onRevoke") { stopServiceUnlessRestarted("onRevoke") }
+    }
+
     override fun onCreate() {
         super.onCreate()
         VpnProtect.vpn = this
@@ -428,6 +440,8 @@ class BibaVpnService : VpnService() {
                                 "(nativeStop_ms=$nativeStopMs nativeStart_ms=$nativeStartMs)",
                         )
                         allowScreenOnStackRestart = true
+                        // Без этого UI видел лишь «туннель пропал» и не знал почему.
+                        setLastConnectError(err)
                         mainHandler.post {
                             setTunnelActive(false)
                             android.widget.Toast.makeText(
@@ -448,6 +462,7 @@ class BibaVpnService : VpnService() {
                     )
                     if (!tunOk) {
                         setTunnelActive(false)
+                        setLastConnectError("vpn_tunnel_start_failed")
                         synchronized(nativeLifecycleLock) {
                             BibaNative.nativeStop()
                         }
@@ -490,10 +505,7 @@ class BibaVpnService : VpnService() {
                 networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
                 networkRestartRunnable = null
                 stopRequested = true
-                enqueueTeardownWorker("ACTION_STOP") {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
+                enqueueTeardownWorker("ACTION_STOP") { stopServiceUnlessRestarted("ACTION_STOP") }
                 return START_NOT_STICKY
             }
             ACTION_SYNC_WAKE_LOCK -> {
@@ -590,11 +602,29 @@ class BibaVpnService : VpnService() {
     /** nativeStart ждёт bind SOCKS в Rust — не блокируем main thread (ANR). */
     private fun enqueueBootstrapWorker(sessionJson: String) {
         clearLastConnectError()
+        // «Отключить → сразу подключить»: разбор прошлой сессии (ACTION_STOP) может ещё идти.
+        // Параллельный старт либо получал "already running" и молча ничего не поднимал, либо
+        // его свежего клиента убивал `nativeStop` того разбора (он берёт nativeLifecycleLock
+        // уже после tun2socks). Поэтому сначала дожидаемся разбора.
+        val priorTeardown = teardownThread
+        // Новая сессия: если её потом снесёт система, onDestroy обязан разобрать стек сам.
+        tunnelTeardownDoneBeforeDestroy = false
         val worker =
             Thread(
                 {
                     val self = Thread.currentThread()
                     try {
+                        if (priorTeardown != null && priorTeardown.isAlive) {
+                            Log.i(TAG, "worker: waiting for previous teardown before nativeStart")
+                            try {
+                                priorTeardown.join(TEARDOWN_WAIT_BEFORE_START_MS)
+                            } catch (_: InterruptedException) {
+                            }
+                        }
+                        if (stopRequested) {
+                            Log.i(TAG, "worker: stop requested before nativeStart — skip bootstrap")
+                            return@Thread
+                        }
                         Log.i(TAG, "worker: nativeStart begin ${configFingerprint(sessionJson)}")
                         val err = try {
                             synchronized(nativeLifecycleLock) {
@@ -623,6 +653,15 @@ class BibaVpnService : VpnService() {
                             return@Thread
                         }
 
+                        // «Отмена» во время nativeStart (до 20 с): не поднимаем TUN поверх
+                        // уже запрошенной остановки — иначе туннель «оживал» после ACTION_STOP.
+                        if (stopRequested) {
+                            Log.i(TAG, "worker: stop requested during nativeStart — undo")
+                            synchronized(nativeLifecycleLock) {
+                                BibaNative.nativeStop()
+                            }
+                            return@Thread
+                        }
                         Log.i(TAG, "worker: nativeStart OK — startVpnTunnel")
                         if (!startVpnTunnel(tun2socksProxyFromSessionJson(sessionJson))) {
                             Log.e(TAG, "startVpnTunnel returned false — nativeStop + stopSelf")
@@ -636,6 +675,10 @@ class BibaVpnService : VpnService() {
                                 stopSelf()
                             }
                             return@Thread
+                        }
+                        if (stopRequested) {
+                            Log.i(TAG, "worker: stop requested during TUN start — undo")
+                            stopTunnelAndNative()
                         }
                     } catch (e: Throwable) {
                         setLastConnectError(e.message ?: e.javaClass.simpleName)
@@ -888,11 +931,27 @@ class BibaVpnService : VpnService() {
                 )
             android.widget.Toast.makeText(applicationContext, msg, android.widget.Toast.LENGTH_LONG)
                 .show()
-            enqueueTeardownWorker("abort") {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
+            enqueueTeardownWorker("abort") { stopServiceUnlessRestarted("abort") }
         }
+    }
+
+    /**
+     * Завершение сервиса после разбора стека — только если за это время не пришёл новый старт.
+     *
+     * Разбор идёт секундами (join tun2socks, `nativeStop`). «Отключить → сразу подключить»
+     * (или `connect_inner` в Rust, который сам делает disconnect + 300 мс + connect) успевает
+     * прислать новый `onStartCommand`, и безусловный `stopSelf()` уничтожал сервис прямо под
+     * новой сессией: `onDestroy` обнулял [VpnProtect.vpn], снималось FGS-уведомление, а
+     * bootstrap-воркер продолжал на мёртвом сервисе. Новый старт сбрасывает [stopRequested];
+     * оба колбэка идут на главном потоке, поэтому проверка без гонки.
+     */
+    private fun stopServiceUnlessRestarted(reason: String) {
+        if (!stopRequested) {
+            Log.i(TAG, "$reason: teardown done, newer start pending — keep service running")
+            return
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     /**
@@ -1238,6 +1297,12 @@ class BibaVpnService : VpnService() {
         }
 
         private const val ERR_ALREADY_RUNNING = "already running"
+
+        /**
+         * Сколько bootstrap ждёт незавершённый разбор прошлой сессии: join tun2socks (до 8 с)
+         * + `nativeStop` (до 5 с в JNI) с запасом.
+         */
+        private const val TEARDOWN_WAIT_BEFORE_START_MS = 20_000L
 
         private const val TAG = "BibaVpnService"
         private const val CHANNEL_ID = "bibavpn_proxy"
