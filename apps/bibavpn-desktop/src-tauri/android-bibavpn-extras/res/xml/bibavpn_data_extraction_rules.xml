@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    BibaVPN: android:allowBackup="false" (set in merge_bibavpn_manifest.py) already blocks Auto
+    Backup to the cloud AND Android 12+ device-to-device transfer, on every API level; that is
+    the master switch and it is what actually keeps VPN config/credentials on-device.
+
+    This file is the API 31+ replacement for the old fullBackupContent format, referenced via
+    android:dataExtractionRules. It is inert while allowBackup="false" (extraction never runs at
+    all), but is wired in anyway as a belt-and-suspenders rule set: it explicitly excludes
+    everything from both cloud backup and device transfer, so nothing leaks even if allowBackup is
+    ever accidentally flipped back to true by a future template regen or dependency bump.
+-->
+<data-extraction-rules>
+    <cloud-backup disableIfNoEncryptionCapability="false">
+        <exclude domain="root" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+    </device-transfer>
+</data-extraction-rules>

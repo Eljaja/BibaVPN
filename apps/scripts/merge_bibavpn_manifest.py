@@ -110,12 +110,44 @@ def _ensure_biba_application(text: str) -> str:
     )
 
 
+def _patch_application_tag_no_backup(tag: str) -> str:
+    """allowBackup=false is the master switch: it blocks Auto Backup (cloud) *and* Android 12+
+    device-to-device transfer, on every API level, which is what actually keeps VPN config and
+    credentials from leaving the device. dataExtractionRules (API 31+) is the newer, more
+    granular replacement for fullBackupContent; it has no effect while allowBackup=false, but is
+    wired in too, pointing at a rule set that excludes everything, so nothing leaks even if
+    allowBackup is ever flipped back to true later.
+    """
+    self_closing = tag.endswith("/>")
+    inner = tag[: -2 if self_closing else -1]
+
+    if "android:allowBackup=" in inner:
+        inner = re.sub(r'android:allowBackup="[^"]*"', 'android:allowBackup="false"', inner, count=1)
+    else:
+        inner += ' android:allowBackup="false"'
+
+    if "android:dataExtractionRules=" not in inner:
+        inner += ' android:dataExtractionRules="@xml/bibavpn_data_extraction_rules"'
+
+    return inner + ("/>" if self_closing else ">")
+
+
+def _ensure_no_backup(text: str) -> str:
+    return re.sub(
+        r"<application\b[^>]*/?>",
+        lambda m: _patch_application_tag_no_backup(m.group(0)),
+        text,
+        count=1,
+    )
+
+
 def patch_manifest(text: str) -> tuple[str, bool]:
     original = text
     text = _insert_after_internet_perm(text, PERMS)
     text = _ensure_tv_features(text)
     text = _ensure_tv_banner(text)
     text = _ensure_biba_application(text)
+    text = _ensure_no_backup(text)
 
     if "AppLocalesMetadataHolderService" not in text:
         text = re.sub(

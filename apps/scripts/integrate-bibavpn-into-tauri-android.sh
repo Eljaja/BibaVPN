@@ -30,12 +30,20 @@ EXR="$EXTRAS/res"
 mkdir -p "$GEN/app/src/main/res/values"
 cp -f "$EXR/values/bibavpn_vpn_strings.xml" "$GEN/app/src/main/res/values/"
 
+# android:dataExtractionRules target for merge_bibavpn_manifest.py's allowBackup=false patch below.
+mkdir -p "$GEN/app/src/main/res/xml"
+cp -f "$EXR/xml/bibavpn_data_extraction_rules.xml" "$GEN/app/src/main/res/xml/"
+
 python3 "$SCRIPT_DIR/merge_bibavpn_manifest.py" "$GEN/app/src/main/AndroidManifest.xml"
 
 # Зависимости tun2socks — Groovy-фрагмент (apply(from) для .kts не даёт scope на implementation).
-EXTRAS="$GEN/app/bibavpn-vpn-extras.gradle"
+# Own variable name (not EXTRAS): EXTRAS must keep meaning the android-bibavpn-extras SOURCE
+# directory below (~line 89 checks "$EXTRAS/libs/tun2socks.aar" there) — reusing EXTRAS for this
+# generated-gradle-file path previously shadowed that check, so it always missed the bundled aar
+# and silently fell back to the unpinned Maven coordinate.
+VPN_GRADLE_FILE="$GEN/app/bibavpn-vpn-extras.gradle"
 rm -f "$GEN/app/bibavpn-vpn-extras.gradle.kts"
-cat > "$EXTRAS" << 'EOF'
+cat > "$VPN_GRADLE_FILE" << 'EOF'
 dependencies {
     def tun2socksAar = file("${project.projectDir}/libs/tun2socks.aar")
     if (tun2socksAar.exists()) {
