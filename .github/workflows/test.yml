@@ -187,3 +187,37 @@ jobs:
 
       - name: cargo test -p bibavpn-jni -p bibavpn-ffi
         run: cargo test -p bibavpn-jni -p bibavpn-ffi --locked
+
+  lint:
+    name: fmt · clippy · audit
+    # Unconditional, like agent-validation: the workflow-level `paths:` filters
+    # above already scope this to Rust-relevant pushes/PRs, so it doesn't need
+    # its own needs: changes gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        # ~120 pre-existing warnings across the workspace as of this PR; kept
+        # non-blocking for now so the gate can land without a separate cleanup
+        # pass. Drop continue-on-error once the backlog is cleared so clippy
+        # actually gates merges.
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
