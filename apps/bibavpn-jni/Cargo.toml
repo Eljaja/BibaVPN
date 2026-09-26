@@ -26,5 +26,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.14"
+android_logger = "0.15"
 log = "0.4"
