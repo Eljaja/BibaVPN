@@ -68,4 +68,6 @@ united-design-new/
 
 # Local cross-compilation output (e.g. Windows GNU from Linux)
 dist-windows-gnu/
+.idea/
+apps/.idea/
 apps/.idea/caches/deviceStreaming.xml
