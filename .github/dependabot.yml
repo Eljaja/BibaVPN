@@ -1,4 +1,9 @@
 version: 2
+
+# Minor/patch updates are grouped into one PR per ecosystem: the first run of the
+# ungrouped config opened 16 PRs at once, which is noise nobody reviews properly.
+# Major bumps are deliberately left ungrouped — they break things (actions/checkout
+# 4 -> 7, react 18 -> 19) and each deserves its own red or green CI run.
 updates:
   # Root Cargo workspace: bibavpn, biba, apps/bibavpn-jni, apps/bibavpn-ffi,
   # apps/bibavpn-desktop/src-tauri.
@@ -6,20 +11,44 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # Tauri desktop shell (package.json alongside src-tauri).
   - package-ecosystem: "npm"
     directory: "/apps/bibavpn-desktop"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm-shell-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # Desktop frontend UI.
   - package-ecosystem: "npm"
     directory: "/apps/bibavpn-desktop/ui"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm-ui-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
