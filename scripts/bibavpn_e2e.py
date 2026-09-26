@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import os
 import random
 import secrets
@@ -345,10 +346,10 @@ def ws_client_over_tcp(sock: socket.socket, messages: int) -> None:
 
 
 def test_tcp_bulk(
-    proxy: Tuple[str, int], echo_port: int, nbytes: int
+    proxy: Tuple[str, int], target: str, echo_port: int, nbytes: int
 ) -> None:
-    _log(f"TCP bulk: {nbytes} bytes via SOCKS ->127.0.0.1:{echo_port}")
-    s = socks5_tcp_connect(proxy[0], proxy[1], "127.0.0.1", echo_port)
+    _log(f"TCP bulk: {nbytes} bytes via SOCKS -> {target}:{echo_port}")
+    s = socks5_tcp_connect(proxy[0], proxy[1], target, echo_port)
     try:
         s.settimeout(60.0)
         data = os.urandom(nbytes)
@@ -367,10 +368,10 @@ def test_tcp_bulk(
 
 
 def test_tcp_idle(
-    proxy: Tuple[str, int], echo_port: int, idle_secs: float
+    proxy: Tuple[str, int], target: str, echo_port: int, idle_secs: float
 ) -> None:
     _log(f"TCP long idle: {idle_secs}s then echo byte")
-    s = socks5_tcp_connect(proxy[0], proxy[1], "127.0.0.1", echo_port)
+    s = socks5_tcp_connect(proxy[0], proxy[1], target, echo_port)
     try:
         s.settimeout(idle_secs + 30.0)
         time.sleep(idle_secs)
@@ -381,10 +382,12 @@ def test_tcp_idle(
     _log("TCP idle OK")
 
 
-def test_tcp_many_short(proxy: Tuple[str, int], echo_port: int, n: int) -> None:
+def test_tcp_many_short(
+    proxy: Tuple[str, int], target: str, echo_port: int, n: int
+) -> None:
     _log(f"TCP many short round-trips: {n}")
     for i in range(n):
-        s = socks5_tcp_connect(proxy[0], proxy[1], "127.0.0.1", echo_port, timeout=15.0)
+        s = socks5_tcp_connect(proxy[0], proxy[1], target, echo_port, timeout=15.0)
         try:
             s.settimeout(15.0)
             p = struct.pack("!I", i)
@@ -396,16 +399,16 @@ def test_tcp_many_short(proxy: Tuple[str, int], echo_port: int, n: int) -> None:
 
 
 def test_udp_echo(
-    proxy: Tuple[str, int], echo_port: int, payloads: int
+    proxy: Tuple[str, int], target: str, echo_port: int, payloads: int
 ) -> None:
-    _log(f"UDP echo: {payloads} datagrams -> 127.0.0.1:{echo_port}")
+    _log(f"UDP echo: {payloads} datagrams -> {target}:{echo_port}")
     ctrl, relay = socks5_udp_associate(proxy[0], proxy[1])
     try:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp.settimeout(30.0)
         for _ in range(payloads):
             pl = os.urandom(random.randint(32, 1400))
-            pkt = _pack_socks_udp_header("127.0.0.1", echo_port, pl)
+            pkt = _pack_socks_udp_header(target, echo_port, pl)
             udp.sendto(pkt, relay)
             raw, _ = udp.recvfrom(65535)
             _, _, body = parse_socks_udp_reply(raw)
@@ -423,15 +426,45 @@ def test_udp_echo(
     _log("UDP echo OK")
 
 
-def test_ws_chat(proxy: Tuple[str, int], ws_port: int, rounds: int) -> None:
+def test_ws_chat(
+    proxy: Tuple[str, int], target: str, ws_port: int, rounds: int
+) -> None:
     _log(f"WebSocket chat-like: {rounds} messages via SOCKS")
-    s = socks5_tcp_connect(proxy[0], proxy[1], "127.0.0.1", ws_port)
+    s = socks5_tcp_connect(proxy[0], proxy[1], target, ws_port)
     try:
         s.settimeout(60.0)
         ws_client_over_tcp(s, rounds)
     finally:
         s.close()
     _log("WebSocket OK")
+
+
+def resolve_loopback_target(host: str) -> str:
+    """Return `host` once every address it resolves to is loopback, else abort.
+
+    The echo servers below only listen on 127.0.0.1, so a target that resolved
+    anywhere else would mean this test is spraying random bytes at a stranger --
+    `localtest.me` is third-party DNS and could change or be hijacked. Fail loudly
+    instead of sending the traffic.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise SystemExit(
+            f"[e2e] target host {host!r} does not resolve ({e}).\n"
+            f"[e2e] Set BIBAVPN_E2E_TARGET_HOST to a name that resolves to 127.0.0.1,\n"
+            f"[e2e] or add one to /etc/hosts. It must NOT be 'localhost' or an IP\n"
+            f"[e2e] literal: the client bypasses those, so the tunnel is never used."
+        )
+    addrs = sorted({i[4][0] for i in infos})
+    bad = [a for a in addrs if not ipaddress.ip_address(a).is_loopback]
+    if bad:
+        raise SystemExit(
+            f"[e2e] refusing to run: target host {host!r} resolves to {bad}, "
+            f"which is not loopback. The echo servers are local only."
+        )
+    _log(f"target host {host} -> {addrs} (loopback, traffic will cross the tunnel)")
+    return host
 
 
 def pick_port() -> int:
@@ -446,6 +479,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="BibaVPN SOCKS e2e tests")
     ap.add_argument("--socks-host", default=os.environ.get("BIBAVPN_SOCKS_HOST", "127.0.0.1"))
     ap.add_argument("--socks-port", type=int, default=int(os.environ.get("BIBAVPN_SOCKS_PORT", "11080")))
+    # NOT 127.0.0.1 and NOT "localhost": domain_route::host_is_local_or_private()
+    # makes the client route those direct, so the tunnel is never exercised and the
+    # TCP/WS tests pass without proving anything. Any name resolving to 127.0.0.1
+    # works; override for an offline run with an /etc/hosts entry.
+    ap.add_argument(
+        "--target-host",
+        default=os.environ.get("BIBAVPN_E2E_TARGET_HOST", "localtest.me"),
+    )
     ap.add_argument("--tcp-bytes", type=int, default=512 * 1024)
     ap.add_argument("--idle-secs", type=float, default=12.0)
     ap.add_argument("--short-count", type=int, default=40)
@@ -454,6 +495,7 @@ def main() -> int:
     ap.add_argument("--skip-ws", action="store_true")
     args = ap.parse_args()
     proxy = (args.socks_host, args.socks_port)
+    target = resolve_loopback_target(args.target_host)
 
     stop = threading.Event()
     tcp_port = pick_port()
@@ -477,12 +519,12 @@ def main() -> int:
     time.sleep(0.2)
 
     try:
-        test_tcp_bulk(proxy, tcp_port, args.tcp_bytes)
-        test_tcp_idle(proxy, tcp_port, args.idle_secs)
-        test_tcp_many_short(proxy, tcp_port, args.short_count)
-        test_udp_echo(proxy, udp_port, args.udp_datagrams)
+        test_tcp_bulk(proxy, target, tcp_port, args.tcp_bytes)
+        test_tcp_idle(proxy, target, tcp_port, args.idle_secs)
+        test_tcp_many_short(proxy, target, tcp_port, args.short_count)
+        test_udp_echo(proxy, target, udp_port, args.udp_datagrams)
         if not args.skip_ws:
-            test_ws_chat(proxy, ws_port, args.ws_rounds)
+            test_ws_chat(proxy, target, ws_port, args.ws_rounds)
         _log("ALL TESTS PASSED")
         return 0
     except Exception as e:

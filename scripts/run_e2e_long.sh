@@ -30,6 +30,9 @@ fi
 VPN_PORT="${BIBAVPN_LOCAL_PORT:-$((38443 + RANDOM % 2000))}"
 SOCKS_PORT="${BIBAVPN_SOCKS_PORT:-$((11080 + RANDOM % 2000))}"
 TOKEN="${BIBAVPN_TOKEN:-e2e-local-token}"
+# A PSK is mandatory unless REALITY is fully configured (see startup_secrets::require_psk).
+# This is a throwaway loopback value, not a secret: override with BIBAVPN_PSK.
+PSK="${BIBAVPN_PSK:-e2e-local-psk}"
 
 cleanup() {
   [[ -n "${CLIENT_PID:-}" ]] && kill "$CLIENT_PID" 2>/dev/null || true
@@ -43,6 +46,7 @@ if [[ "${BIBAVPN_SKIP_STACK:-}" != "1" ]]; then
     --listen "127.0.0.1:${VPN_PORT}" \
     --self-signed-san localhost \
     --token "$TOKEN" \
+    --psk "$PSK" \
     --ws-path /ws \
     --ws-ping-secs 15 \
  &
@@ -54,6 +58,7 @@ if [[ "${BIBAVPN_SKIP_STACK:-}" != "1" ]]; then
     --server "127.0.0.1:${VPN_PORT}" \
     --sni localhost \
     --token "$TOKEN" \
+    --psk "$PSK" \
     --insecure \
     --socks5 "127.0.0.1:${SOCKS_PORT}" \
     --ws-ping-secs 15 \

@@ -40,6 +40,9 @@ if ($env:BIBAVPN_SERVER_EXE -and $env:BIBAVPN_CLIENT_EXE) {
 $vpnPort = if ($env:BIBAVPN_LOCAL_PORT) { [int]$env:BIBAVPN_LOCAL_PORT } else {38443 + (Get-Random -Maximum 2000) }
 $socksPort = if ($env:BIBAVPN_SOCKS_PORT) { [int]$env:BIBAVPN_SOCKS_PORT } else { 11080 + (Get-Random -Maximum 2000) }
 $token = if ($env:BIBAVPN_TOKEN) { $env:BIBAVPN_TOKEN } else { "e2e-local-token" }
+# Mandatory unless REALITY is fully configured (startup_secrets::require_psk).
+# Throwaway loopback value, not a secret: override with $env:BIBAVPN_PSK.
+$psk = if ($env:BIBAVPN_PSK) { $env:BIBAVPN_PSK } else { "e2e-local-psk" }
 
 $serverProc = $null
 $clientProc = $null
@@ -70,6 +73,7 @@ try {
             "--listen", "127.0.0.1:$vpnPort",
             "--self-signed-san", "localhost",
             "--token", $token,
+            "--psk", $psk,
             "--ws-path", "/ws",
             "--ws-ping-secs", "10"
         )
@@ -81,6 +85,7 @@ try {
             "--server", "127.0.0.1:$vpnPort",
             "--sni", "localhost",
             "--token", $token,
+            "--psk", $psk,
             "--insecure",
             "--socks5", "127.0.0.1:$socksPort",
             "--ws-ping-secs", "10"
