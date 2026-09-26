@@ -53,9 +53,10 @@ env:
   # Standard tiers only — not grok-4.6-fast / composer-2.5-fast.
   SMART_MODEL: grok-4.6
   CHEAP_MODEL: composer-2.5
-  CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-  # Optional PAT so the PR is opened as the repo user, not github-actions[bot].
-  GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+  # CURSOR_API_KEY and GH_TOKEN are deliberately NOT set at job level. Each is
+  # exported only on the specific steps that need it (see below), so neither
+  # secret is present in the environment of the implement/test-changes step,
+  # which runs cargo over code an untrusted-input-derived agent just wrote.
 
 jobs:
   fix:
@@ -76,6 +77,8 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Mask secrets
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           set +x
           if [ -z "$CURSOR_API_KEY" ]; then
@@ -88,6 +91,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           token: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+          persist-credentials: false
 
       - name: Resolve issue
         id: issue
@@ -95,6 +99,7 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
           LABEL: ${{ github.event.label.name }}
           FORCE_IMPLEMENT: ${{ inputs.force_implement }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           meta="$(gh issue view "$ISSUE_NUMBER" --json number,title,body,state)"
@@ -123,8 +128,12 @@ jobs:
             if [ "$approved" = true ]; then
               echo
               echo "<<<UNTRUSTED_ISSUE_COMMENTS>>>"
+              # gh api's --jq only takes a single expression string (no --arg
+              # pass-through), so pipe raw JSON into real jq to bind $owner
+              # safely instead of interpolating it into the filter text.
               gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" \
-                --jq '.[] | "### comment by \(.user.login)\n\(.body)\n"'
+                | jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" \
+                    '.[] | select(.user.login == $owner) | "### comment by \(.user.login)\n\(.body)\n"'
               echo "<<<END_UNTRUSTED_ISSUE_COMMENTS>>>"
             fi
           } > .github/agent/work/ISSUE.md
@@ -139,6 +148,8 @@ jobs:
 
       - name: Comment run started
         if: steps.issue.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
         run: |
           gh issue comment "${{ steps.issue.outputs.number }}" --body "Agent run started: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
@@ -152,6 +163,7 @@ jobs:
         if: steps.issue.outputs.skip != 'true'
         env:
           APPROVED: ${{ steps.issue.outputs.approved }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           set -euo pipefail
           if [ "${APPROVED}" = "true" ]; then
@@ -191,6 +203,7 @@ jobs:
         if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large == 'true'
         env:
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           n="$ISSUE_NUMBER"
@@ -216,6 +229,12 @@ jobs:
 
       - name: Implement / review loop
         if: steps.issue.outputs.skip != 'true' && steps.size.outputs.large != 'true'
+        env:
+          # Needed for the cursor-agent implement/review calls below. Explicitly
+          # stripped (along with GH_TOKEN, which is never set on this step) for
+          # the test-changes.sh invocation, which runs cargo over code the
+          # implementer agent just wrote.
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           set -euo pipefail
           # Keep runner-owned validation outside the implementer's working tree.
@@ -241,7 +260,9 @@ jobs:
 
             echo "::group::Validate changed components"
             set +e
-            bash "${RUNNER_TEMP}/test-changes.sh"
+            # -u strips CURSOR_API_KEY (and GH_TOKEN, already absent here) so
+            # neither secret is present while cargo runs over agent-written code.
+            env -u CURSOR_API_KEY -u GH_TOKEN bash "${RUNNER_TEMP}/test-changes.sh"
             test_ec=$?
             set -e
             if [ "$test_ec" -ne 0 ]; then
@@ -274,12 +295,18 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
           n="$ISSUE_NUMBER"
           title="$ISSUE_TITLE"
           git config user.name "${GITHUB_ACTOR}"
           git config user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
+          # checkout ran with persist-credentials: false, so the origin remote
+          # has no stored auth; point it at a token-authenticated URL before
+          # pushing. GH_TOKEN is a secrets-sourced value, so Actions masks it
+          # in logs wherever it appears, including in any git error output.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git checkout -B "agent/issue-${n}"
           git add -A
           git reset -q -- .github/agent/work/ 2>/dev/null || true

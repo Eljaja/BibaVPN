@@ -27,7 +27,14 @@
       "Write(.env*)",
       "Write(**/*.pem)",
       "Write(**/*.key)",
-      "Write(.git/**)"
+      "Write(.git/**)",
+      "Write(build.rs)",
+      "Write(**/build.rs)",
+      "Write(Cargo.toml)",
+      "Write(**/Cargo.toml)",
+      "Write(.cargo/**)",
+      "Write(**/.cargo/**)",
+      "Read(.git/**)"
     ]
   }
 }
