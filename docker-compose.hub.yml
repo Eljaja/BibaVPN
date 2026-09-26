@@ -6,12 +6,13 @@
 #   - eljaja/bibavpn-server
 #   - eljaja/bibavpn-client
 #
-# Exposes on the host:
+# Exposes on the host (loopback-only — not reachable from the network):
 #   SOCKS5        127.0.0.1:11080
 #   HTTP CONNECT  127.0.0.1:11880
 #
-# The PSK / token below are example values. Change them before trusting this
-# with anything real (both server and client must agree).
+# BIBA_VPN_TOKEN and BIBA_VPN_PSK have no defaults — compose refuses to start
+# until you set them (both server and client must use the same values):
+#   BIBA_VPN_TOKEN=... BIBA_VPN_PSK=... docker compose -f docker-compose.hub.yml up -d
 
 services:
   biba-server:
@@ -24,9 +25,9 @@ services:
       - --self-signed-san
       - biba-server
       - --token
-      - ${BIBA_VPN_TOKEN:-docker-compose-biba}
+      - ${BIBA_VPN_TOKEN:?set BIBA_VPN_TOKEN}
       - --psk
-      - ${BIBA_VPN_PSK:-ComposePSK_ChangeMe}
+      - ${BIBA_VPN_PSK:?set BIBA_VPN_PSK}
       - --decoy-max
       - "24"
       - --max-pad
@@ -52,9 +53,9 @@ services:
       - --sni
       - biba-server
       - --token
-      - ${BIBA_VPN_TOKEN:-docker-compose-biba}
+      - ${BIBA_VPN_TOKEN:?set BIBA_VPN_TOKEN}
       - --psk
-      - ${BIBA_VPN_PSK:-ComposePSK_ChangeMe}
+      - ${BIBA_VPN_PSK:?set BIBA_VPN_PSK}
       - --insecure
       - --socks5
       - 0.0.0.0:11080
@@ -71,8 +72,8 @@ services:
       - --early-ws-frames
       - "1"
     ports:
-      - "11080:11080"
-      - "11880:18080"
+      - "127.0.0.1:11080:11080"
+      - "127.0.0.1:11880:18080"
     networks:
       - bibanet
 

@@ -11,3 +11,11 @@ bibavpn-desktop/ui/node_modules
 naiveproxy
 wstunnel
 third_party
+
+# Secrets and local artifacts — must never enter the build context
+.env*
+*.pem
+*.key
+.biba-start.env
+server.txt
+rust_out

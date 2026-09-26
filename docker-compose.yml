@@ -47,14 +47,14 @@ services:
       - --sni
       - biba-server
       - --token
-      - docker-compose-biba
+      - "${BIBA_TOKEN:?run bash start.sh or set BIBA_TOKEN}"
       - --insecure
       - --socks5
       - 0.0.0.0:11080
       - --http-proxy
       - 0.0.0.0:18080
       - --psk
-      - ComposePSK_ChangeMe
+      - "${BIBA_PSK:?run bash start.sh or set BIBA_PSK}"
       - --decoy-max
       - "24"
       - --max-pad
