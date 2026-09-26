@@ -6,6 +6,8 @@ Thumbs.db
 
 # Local release build artifacts
 *.exe
+rust_out
+*.apk
 release-staging/
 # Secrets and local overrides — NEVER commit
 server.txt
@@ -15,8 +17,6 @@ server.txt
 *.key
 docker-compose.override.yml
 .biba-start.env
-scripts/*.sh
-/scripts/*
 # Local deploy helpers created by one-off runs
 scripts/.deploy-run-once.sh
 scripts/.invite_local_test.uri
