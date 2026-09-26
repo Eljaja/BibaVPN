@@ -32,7 +32,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Rust (host + iOS device)
         uses: dtolnay/rust-toolchain@stable
