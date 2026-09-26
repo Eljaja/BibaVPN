@@ -98,7 +98,7 @@ export type PublicSavedConfig = {
 };
 
 export type ClientCapabilities = {
-  boring_tls_available: boolean;
+  boringTlsAvailable: boolean;
 };
 
 export type StateSnapshot = {

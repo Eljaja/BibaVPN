@@ -44,7 +44,8 @@ pub fn open_in_file_manager(path: &Path) {
     }
 }
 
-/// Включает `tracing`: ежедневная ротация `bibavpn-desktop.log.YYYY-MM-DD` в `…\BibaVPN\logs\`.
+/// Включает `tracing`: ежедневная ротация `bibavpn-desktop.log.YYYY-MM-DD` в `…\BibaVPN\logs\`,
+/// хранится не более 7 файлов (старые удаляются автоматически).
 /// Повторный вызов безопасен (игнорируется, если subscriber уже стоит).
 pub fn init() -> Option<PathBuf> {
     let filter = env_filter();
@@ -60,11 +61,17 @@ pub fn init() -> Option<PathBuf> {
     }
     let _ = LOG_DIR.set(log_dir.clone());
 
-    let file_appender = tracing_appender::rolling::RollingFileAppender::new(
-        tracing_appender::rolling::Rotation::DAILY,
-        &log_dir,
-        "bibavpn-desktop",
-    );
+    // `max_log_files` caps retention so logs can't grow unbounded (oldest rotated
+    // files are pruned automatically once the cap is exceeded).
+    let Ok(file_appender) = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("bibavpn-desktop")
+        .max_log_files(7)
+        .build(&log_dir)
+    else {
+        try_init_stderr_only(filter);
+        return None;
+    };
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
     std::mem::forget(guard);
 

@@ -279,7 +279,7 @@ function AppInner() {
     );
   }
 
-  const boringAvailable = Boolean(snap.capabilities?.boring_tls_available);
+  const boringAvailable = Boolean(snap.capabilities?.boringTlsAvailable);
   const cfg = draft;
   const cpHost = pendingImport?.controlPlaneHost ?? "";
   const vpnHost = pendingImport?.vpnHost ?? "";
