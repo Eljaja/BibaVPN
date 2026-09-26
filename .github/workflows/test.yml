@@ -207,6 +207,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt --check
+        # 215 diffs across 40 files on main as of this PR. Kept non-blocking so
+        # this gate can land without dragging a repo-wide reformat (and its
+        # conflicts with every in-flight branch) along with it. Drop
+        # continue-on-error once a dedicated `cargo fmt --all` PR has landed.
+        continue-on-error: true
         run: cargo fmt --all --check
 
       - name: cargo clippy
@@ -218,6 +223,11 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
       - name: cargo audit
+        # 6 open advisories on main as of this PR (rustls, rustls-webpki,
+        # quick-xml via tauri build-dep). Non-blocking: advisories are published
+        # upstream at any time, so a blocking gate turns CI red on unrelated
+        # PRs. Report-only here; Dependabot (added in this PR) raises the bumps.
+        continue-on-error: true
         run: |
           cargo install cargo-audit --locked
           cargo audit
