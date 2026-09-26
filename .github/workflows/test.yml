@@ -30,6 +30,8 @@ on:
       - "!apps/bibavpn-jni/**/*.md"
       - "apps/bibavpn-ffi/**"
       - "!apps/bibavpn-ffi/**/*.md"
+      - "scripts/**"
+      - "!scripts/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -50,6 +52,8 @@ on:
       - "!apps/bibavpn-jni/**/*.md"
       - "apps/bibavpn-ffi/**"
       - "!apps/bibavpn-ffi/**/*.md"
+      - "scripts/**"
+      - "!scripts/**/*.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -75,6 +79,7 @@ jobs:
       core: ${{ steps.plan.outputs.core }}
       desktop: ${{ steps.plan.outputs.desktop }}
       mobile: ${{ steps.plan.outputs.mobile }}
+      e2e: ${{ steps.plan.outputs.e2e }}
     steps:
       - uses: actions/checkout@v4
 
@@ -94,6 +99,9 @@ jobs:
             mobile:
               - '{apps/bibavpn-jni/**,apps/bibavpn-ffi/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
               - '!**/*.md'
+            e2e:
+              - '{bibavpn/**,biba/**,scripts/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '!**/*.md'
 
       - name: Plan which test jobs to run
         id: plan
@@ -101,16 +109,19 @@ jobs:
           FILTER_CORE: ${{ steps.filter.outputs.core }}
           FILTER_DESKTOP: ${{ steps.filter.outputs.desktop }}
           FILTER_MOBILE: ${{ steps.filter.outputs.mobile }}
+          FILTER_E2E: ${{ steps.filter.outputs.e2e }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
             echo "core=true" >> "$GITHUB_OUTPUT"
             echo "desktop=true" >> "$GITHUB_OUTPUT"
             echo "mobile=true" >> "$GITHUB_OUTPUT"
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
           else
             echo "core=${FILTER_CORE:-false}" >> "$GITHUB_OUTPUT"
             echo "desktop=${FILTER_DESKTOP:-false}" >> "$GITHUB_OUTPUT"
             echo "mobile=${FILTER_MOBILE:-false}" >> "$GITHUB_OUTPUT"
+            echo "e2e=${FILTER_E2E:-false}" >> "$GITHUB_OUTPUT"
           fi
 
   core:
@@ -138,6 +149,50 @@ jobs:
 
       - name: Mux capacity and fallback session cleanup
         run: python3 bibavpn/tests/mux_capacity.py target/debug
+
+  e2e:
+    name: e2e (SOCKS tunnel smoke test)
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-latest
+    # Sane upper bound so a hung tunnel/client can't burn the whole runner
+    # budget: a clean run takes well under a minute once the binaries are built.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check prerequisites (python3, nc)
+        run: |
+          set -euo pipefail
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 not found on this runner image" >&2
+            exit 1
+          fi
+          if ! command -v nc >/dev/null 2>&1; then
+            echo "nc not found; installing netcat-openbsd"
+            sudo apt-get update -y
+            sudo apt-get install -y netcat-openbsd
+          fi
+
+      # run_e2e.sh's own bypass check (see the script) needs a --target-host
+      # that only *resolves* to loopback rather than "localhost" or an IP
+      # literal, both of which domain_route::host_is_local_or_private() routes
+      # direct instead of through the tunnel. The script's default,
+      # localtest.me, depends on third-party DNS being reachable from the
+      # runner, so CI uses its own dedicated /etc/hosts entry instead.
+      - name: Add e2e.bibavpn.test hosts entry
+        run: echo "127.0.0.1 e2e.bibavpn.test" | sudo tee -a /etc/hosts
+
+      - name: Run e2e SOCKS tunnel suite
+        env:
+          BIBAVPN_E2E_TARGET_HOST: e2e.bibavpn.test
+        run: ./scripts/run_e2e.sh
 
   desktop:
     name: cargo test (bibavpn-desktop)
