@@ -197,7 +197,13 @@ class BibaVpnService : VpnService() {
         }
     }
 
-    override fun onBind(intent: Intent?) = null
+    // No onBind() override here: VpnService's own onBind(Intent) is how the system framework
+    // binds to this service to manage and revoke the VPN. Returning null (as this used to do)
+    // suppressed that bind, so onRevoke() below never fired on revocation/hand-off to another
+    // VPN app — a fail-open leak for a censorship-circumvention tool. Nothing in this app binds
+    // to BibaVpnService (only startService/startForegroundService via the companion object), so
+    // there is no custom-binder use case to preserve; the inherited VpnService.onBind() is used
+    // as-is.
 
     /**
      * Система отозвала VPN (включили другое VPN-приложение, выключили в настройках).
