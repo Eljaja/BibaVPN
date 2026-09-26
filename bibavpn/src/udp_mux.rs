@@ -448,8 +448,31 @@ async fn run_udp_mux_driver_forever(
         if *shutdown.borrow() {
             return Ok(());
         }
-        let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg, &mut shutdown).await?;
-        let stop = run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await?;
+        let (ws, crypto) = match connect_udp_mux_ws_resilient(&cfg, &mut shutdown).await {
+            Ok(x) => x,
+            Err(e) => {
+                // `connect_udp_mux_ws_resilient` only returns `Err` on shutdown (it retries
+                // connect failures internally), but stay resilient rather than assume that.
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                warn!("udp mux driver: connect error, reconnecting: {e:#}");
+                continue;
+            }
+        };
+        // A session ending in `Err` (WS read error, or too many bad frames) must not kill
+        // the driver forever: the client would show "connected" while UDP/DNS stayed dead.
+        // Only a clean shutdown (watch flag, or the cmd channel closing) ends the loop.
+        let stop = match run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await {
+            Ok(stop) => stop,
+            Err(e) => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                warn!("udp mux driver: session error, reconnecting: {e:#}");
+                continue;
+            }
+        };
         if stop {
             return Ok(());
         }
@@ -1595,6 +1618,40 @@ mod tests {
         drop(cmd_tx);
         drop(receivers);
         let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+    }
+
+    /// 24 consecutive undecryptable "binary" frames from the peer must end the session with
+    /// `Err` (the documented `run_udp_mux_driver_forever` reconnect trigger), instead of the
+    /// session sitting there indefinitely. This is the precondition that used to kill the
+    /// client's UDP mux driver permanently: any `Err` here used to propagate via `?` out of
+    /// `run_udp_mux_driver_forever` and end the driver task for good, even though the driver
+    /// keeps running and the UI still shows "connected".
+    #[tokio::test]
+    async fn client_session_errors_after_too_many_bad_frames() {
+        let _guard = test_hooks::server_stress_lock().await;
+        let (mut peer_ws, server_ws) = ws_duplex_pair().await;
+        let crypto = test_session_crypto();
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(UDP_MUX_CMD_QUEUE_CAP);
+        let cfg = test_udp_mux_cfg(0);
+        let session = tokio::spawn(async move {
+            run_udp_mux_one_session(server_ws, crypto, &cfg, &mut cmd_rx).await
+        });
+
+        // Matches `unpack_tunnel_rejects_garbage_ciphertext`: 32 zero bytes fail decryption,
+        // so every one of these increments `bad_frames` instead of resetting it.
+        for _ in 0..24 {
+            peer_ws
+                .send(Message::Binary(Bytes::from(vec![0u8; 32])))
+                .await
+                .unwrap();
+        }
+
+        let err = timeout(Duration::from_secs(3), session)
+            .await
+            .expect("session must return promptly, not hang")
+            .unwrap()
+            .expect_err("too many bad frames must end the session with Err so the driver can reconnect");
+        assert!(format!("{err:#}").contains("too many bad frames"));
     }
 
     #[tokio::test]
