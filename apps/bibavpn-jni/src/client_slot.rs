@@ -87,7 +87,7 @@ impl ClientSlotManager {
     }
 
     /// Prepare for a new client: wait out a stopping slot or join a dead live thread.
-    /// Returns `Err("already running")` if a thread is still alive after the bounded wait.
+    /// Returns `Err("client stopping")` while a prior stopped thread remains alive.
     pub fn try_prepare_start(&mut self, clear_hook: impl Fn()) -> Result<(), &'static str> {
         loop {
             let Some(slot) = self.slot.take() else {
@@ -117,7 +117,7 @@ impl ClientSlotManager {
                         JoinWait::Joined => clear_hook(),
                         JoinWait::Timeout(stopping) => {
                             self.slot = Some(stopping);
-                            return Err("already running");
+                            return Err("client stopping");
                         }
                     }
                 }
@@ -225,7 +225,7 @@ mod tests {
         assert!(!mgr.is_idle());
 
         let err = mgr.try_prepare_start(|| {}).unwrap_err();
-        assert_eq!(err, "already running");
+        assert_eq!(err, "client stopping");
         assert_eq!(mgr.live_thread_count_for_test(), 1);
         assert!(!hook_cleared.load(Ordering::SeqCst));
     }
