@@ -33,7 +33,7 @@ use bibavpn::ServerWsOutTiming;
 use bibavpn::{read_padded_frame_into, write_padded_frame_with_mode_state};
 use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
 use bibavpn::ws_bridge::TunnelEnd;
-use bibavpn::reality::{extract_sni, server_handshake_reality, RealityServerConfig};
+use bibavpn::reality::{extract_sni, server_handshake_reality, RealityReplayCache, RealityServerConfig};
 use base64::Engine;
 use bytes::Bytes;
 use clap::Parser;
@@ -283,6 +283,10 @@ struct Args {
     /// Default: host from `--reality-target`. An empty list accepts any name (startup WARN).
     #[arg(long)]
     reality_server_names: Option<String>,
+
+    /// REALITY mode: max allowed HELLO timestamp skew in seconds (default 90; 1..=3600).
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    reality_max_time_diff_secs: u64,
 }
 
 type SharedCrypto = Arc<SessionCrypto>;
@@ -605,8 +609,14 @@ async fn main() -> anyhow::Result<()> {
             short_ids,
             min_client_ver: None,
             max_client_ver: None,
-            max_time_diff: 0,
+            max_time_diff: args.reality_max_time_diff_secs,
         })
+    } else {
+        None
+    };
+
+    let reality_replay_cache: Option<Arc<RealityReplayCache>> = if reality_config.is_some() {
+        Some(Arc::new(RealityReplayCache::new()))
     } else {
         None
     };
@@ -745,6 +755,7 @@ async fn main() -> anyhow::Result<()> {
         let psk_conn = psk.clone();
         let proto_domain = args.proto_domain.clone();
         let reality_cfg = reality_config.clone();
+        let reality_replay = reality_replay_cache.clone();
         let server_ws_out = server_ws_out;
         let auth = Arc::clone(&auth);
         let stats = Arc::clone(&stats);
@@ -828,6 +839,7 @@ async fn main() -> anyhow::Result<()> {
                 camo,
                 proto_domain,
                 reality_cfg,
+                reality_replay,
                 params,
             )
             .await
@@ -1142,6 +1154,7 @@ async fn handle_one(
     camo: CamouflageServeConfig,
     proto_domain: String,
     reality_config: Option<RealityServerConfig>,
+    reality_replay_cache: Option<Arc<RealityReplayCache>>,
     params: ServerConnParams,
 ) -> anyhow::Result<()> {
     let span = tracing::info_span!(
@@ -1223,6 +1236,9 @@ async fn handle_one(
                 &token,
                 tls_sni.as_deref(),
                 http_host.as_deref(),
+                reality_replay_cache
+                    .as_ref()
+                    .expect("REALITY replay cache"),
             ),
         )
         .await

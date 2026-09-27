@@ -195,9 +195,12 @@ Start with the defaults, then adjust only what your network needs. Run either bi
 | Adjust server timing | `--ack-profile`, `--server-ack-delay-min-ms`, `--server-ack-delay-max-ms`, `--rtt-mask-jitter-ms` |
 | Pin the server certificate | Client `--pin-cert`; supported by both TLS engines |
 
+
 The server and client must agree on token, PSK, WebSocket path and protocol domain (`--proto-domain`, default `default`). The default path is `/ws`; authentication credentials are carried inside the encrypted tunnel, not in the URL.
 
 Optional **REALITY mode** is BibaVPN's own WSS handshake, not Xray REALITY compatibility. See [protocol details](PROTOCOL.md#reality-wss-path). Browser-like profiles and desync controls have implementation limits; consult the [current capabilities and roadmap](AGENTS.md#stealth-dpi-and-roadmap) before relying on them.
+
+REALITY handshake v3 rejects repeated nonces and timestamps outside `--reality-max-time-diff-secs` (default 90 seconds). Update both client and server together: older REALITY peers cannot connect. Keep clocks synchronized. The nonce cache is held in memory per server process; it does not survive restarts or coordinate multiple server processes.
 
 ## Build from source
 
