@@ -14,18 +14,13 @@ use tokio::sync::watch;
 mod client_slot;
 use client_slot::{ClientSlotManager, PRODUCTION_JOIN_TIMEOUT};
 
-
 const PANIC_ERR: &str = "internal panic";
 
-/// Signal shutdown and wait for the client thread, but never longer than
-/// [`STOP_JOIN_TIMEOUT`].
-///
-/// On Android this runs on the service teardown path, which reaches the main
-/// thread: an unbounded `join()` there is an ANR. Dropping the runtime waits for
-/// outstanding `spawn_blocking` work (e.g. `lookup_host`/getaddrinfo on a dead
-/// mobile network), so the wait has to be bounded. The shutdown signal has
-/// already been sent, so a detached thread still winds down on its own.
-static STATE: LazyLock<Mutex<ClientSlotManager>> = LazyLock::new(|| Mutex::new(ClientSlotManager::new(PRODUCTION_JOIN_TIMEOUT)));
+/// The client slot retains a stopping thread after the bounded join timeout.
+/// A later start can proceed only after that thread has joined.
+static STATE: LazyLock<Mutex<ClientSlotManager>> = LazyLock::new(|| {
+    Mutex::new(ClientSlotManager::new(PRODUCTION_JOIN_TIMEOUT))
+});
 
 static RING_ONCE: OnceLock<()> = OnceLock::new();
 static TRACING_ONCE: OnceLock<()> = OnceLock::new();
