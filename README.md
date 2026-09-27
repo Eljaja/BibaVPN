@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="branding/biba-vpn-logo.png" alt="BibaVPN — green wordmark with a ghost" width="433">
+  <img src="branding/repo-banner.png" alt="BIBA:// — a self-hosted tunnel, with the monochrome wordmark and app icon" width="924">
 </p>
 
 <h1 align="center">BibaVPN</h1>
