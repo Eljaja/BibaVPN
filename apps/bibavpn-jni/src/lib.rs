@@ -1,7 +1,7 @@
 //! Android JNI: start/stop the embedded SOCKS5 → BibaVPN client (same protocol as `bibavpn-client`).
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use bibavpn::start_json_config::local_client_options_from_json_str;
 use bibavpn::tls_util::install_ring_crypto;
@@ -11,61 +11,16 @@ use jni::JNIEnv;
 use serde_json::json;
 use tokio::sync::watch;
 
-struct NativeState {
-    shutdown_tx: Option<watch::Sender<bool>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    /// Closed by the client thread's own sender when its body (and therefore the
-    /// tokio runtime drop) has finished. Gives [`stop_client_bounded`] the timed
-    /// join that `JoinHandle` does not offer.
-    done_rx: Option<std::sync::mpsc::Receiver<()>>,
-}
-
-/// How long a stop waits for the client thread before detaching it.
-/// Mirrors the desktop bound in `ActiveVpn::stop` (`timeout(5s, handle)`).
-const STOP_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+mod client_slot;
+use client_slot::{ClientSlotManager, PRODUCTION_JOIN_TIMEOUT};
 
 const PANIC_ERR: &str = "internal panic";
 
-/// Signal shutdown and wait for the client thread, but never longer than
-/// [`STOP_JOIN_TIMEOUT`].
-///
-/// On Android this runs on the service teardown path, which reaches the main
-/// thread: an unbounded `join()` there is an ANR. Dropping the runtime waits for
-/// outstanding `spawn_blocking` work (e.g. `lookup_host`/getaddrinfo on a dead
-/// mobile network), so the wait has to be bounded. The shutdown signal has
-/// already been sent, so a detached thread still winds down on its own.
-fn stop_client_bounded(s: &mut NativeState) {
-    if let Some(tx) = s.shutdown_tx.take() {
-        let _ = tx.send(true);
-    }
-    let handle = s.thread.take();
-    let Some(rx) = s.done_rx.take() else {
-        // No completion channel (older state): fall back to a plain join.
-        if let Some(h) = handle {
-            let _ = h.join();
-        }
-        return;
-    };
-    match rx.recv_timeout(STOP_JOIN_TIMEOUT) {
-        // Sender dropped: the thread body returned, so `join` is immediate.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            if let Some(h) = handle {
-                let _ = h.join();
-            }
-        }
-        // Nobody ever sends on this channel; treat anything else as "still
-        // running" and detach rather than risk blocking the caller.
-        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            tracing::warn!(
-                "stop: client thread still running after {:?}; detaching (shutdown already signalled)",
-                STOP_JOIN_TIMEOUT
-            );
-            drop(handle);
-        }
-    }
-}
-
-static STATE: Mutex<Option<NativeState>> = Mutex::new(None);
+/// The client slot retains a stopping thread after the bounded join timeout.
+/// A later start can proceed only after that thread has joined.
+static STATE: LazyLock<Mutex<ClientSlotManager>> = LazyLock::new(|| {
+    Mutex::new(ClientSlotManager::new(PRODUCTION_JOIN_TIMEOUT))
+});
 
 static RING_ONCE: OnceLock<()> = OnceLock::new();
 static TRACING_ONCE: OnceLock<()> = OnceLock::new();
@@ -75,7 +30,7 @@ static TRACING_ONCE: OnceLock<()> = OnceLock::new();
 #[cfg(target_os = "android")]
 static VPN_PROTECT_CLASS: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
 
-fn lock_state() -> MutexGuard<'static, Option<NativeState>> {
+fn lock_state() -> MutexGuard<'static, ClientSlotManager> {
     STATE.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -327,23 +282,12 @@ fn native_start_impl(env: &mut JNIEnv, _class: JClass, config_json: JString) -> 
 
     let mut guard = lock_state();
 
-    if guard.is_some() {
-        let thread_done = guard
-            .as_ref()
-            .and_then(|s| s.thread.as_ref().map(|t| t.is_finished()))
-            .unwrap_or(true);
-        if thread_done {
-            #[cfg(target_os = "android")]
-            {
-                bibavpn::outbound_protect::set_hook(None);
-            }
-            if let Some(mut s) = guard.take() {
-                stop_client_bounded(&mut s);
-            }
-        } else {
-            tracing::warn!("nativeStart: already running");
-            return jni_err(env, "already running");
-        }
+    if let Err(msg) = guard.try_prepare_start(|| {
+        #[cfg(target_os = "android")]
+        bibavpn::outbound_protect::set_hook(None);
+    }) {
+        tracing::warn!("nativeStart: {msg}");
+        return jni_err(env, msg);
     }
 
     let opts = match local_client_options_from_json_str(&json) {
@@ -401,11 +345,7 @@ fn native_start_impl(env: &mut JNIEnv, _class: JClass, config_json: JString) -> 
         }
     });
 
-    *guard = Some(NativeState {
-        shutdown_tx: Some(shutdown_tx),
-        thread: Some(thread),
-        done_rx: Some(done_rx),
-    });
+    guard.install_live(shutdown_tx, thread, done_rx);
     drop(guard);
 
     tracing::info!("nativeStart: waiting SOCKS bind (20s timeout)");
@@ -423,13 +363,10 @@ fn native_start_impl(env: &mut JNIEnv, _class: JClass, config_json: JString) -> 
             };
             tracing::error!("nativeStart: SOCKS not ready: {msg}");
             let mut guard = lock_state();
-            if let Some(mut s) = guard.take() {
-                stop_client_bounded(&mut s);
-            }
-            #[cfg(target_os = "android")]
-            {
+            guard.abort_pending_start(|| {
+                #[cfg(target_os = "android")]
                 bibavpn::outbound_protect::set_hook(None);
-            }
+            });
             jni_err(env, msg)
         }
     }
@@ -454,20 +391,14 @@ fn native_stop_impl(_env: &mut JNIEnv, _class: JClass) -> jstring {
     tracing::info!("nativeStop: enter");
     let mut guard = lock_state();
 
-    let mut s = match guard.take() {
-        Some(s) => s,
-        None => {
-            tracing::info!("nativeStop: idle (no client)");
-            return std::ptr::null_mut();
-        }
-    };
-
-    stop_client_bounded(&mut s);
-
-    #[cfg(target_os = "android")]
-    {
-        bibavpn::outbound_protect::set_hook(None);
+    if guard.is_idle() {
+        tracing::info!("nativeStop: idle (no client)");
+        return std::ptr::null_mut();
     }
+    guard.stop(|| {
+        #[cfg(target_os = "android")]
+        bibavpn::outbound_protect::set_hook(None);
+    });
 
     tracing::info!("nativeStop: done");
     std::ptr::null_mut()
