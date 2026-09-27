@@ -39,6 +39,8 @@ BibaVPN carries your apps' **SOCKS5 and HTTP CONNECT traffic over TLS + WebSocke
 
 **Already have an invitation?** Install a client, import your `biba://` URI, enter the passphrase, and connect. You need access to a BibaVPN server; the app does not include a hosted VPN subscription.
 
+Newly minted invitations use Argon2id (invite format v2). Update clients before importing them; updated clients still accept existing v1 invitations.
+
 | Platform | Download | Package |
 | --- | --- | --- |
 | Android | [Download APK](https://github.com/Eljaja/BibaVPN/releases/latest/download/BibaVPN-android-debug.apk) | ARM64 debug build; sideload |
