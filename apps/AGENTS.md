@@ -25,6 +25,8 @@ Workspace mobile bridges: `**bibavpn-jni**` (Android JNI) and `**bibavpn-ffi**` 
 
 **Desktop**
 
+The Vite 8 frontend requires Node.js 20.19+ or 22.12+ (supported newer releases also work).
+
 ```bash
 cd apps/bibavpn-desktop/ui && npm install && npm run build
 cd .. && cargo tauri dev    # or from repo root: cargo build -p bibavpn-desktop --release
