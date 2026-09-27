@@ -1936,10 +1936,11 @@ mod tests {
         client_ws: &mut WebSocketStream<DuplexStream>,
         crypto: &SessionCrypto,
         count: usize,
+        port: u16,
     ) {
         // Local discard port: send succeeds, recv blocks until session/worker cancel.
         for i in 0..count {
-            let inner = encode_udp_req(i as u64, "127.0.0.1", 59999, b"q").unwrap();
+            let inner = encode_udp_req(i as u64, "127.0.0.1", port, b"q").unwrap();
             let sealed = seal_c2s(crypto, &inner);
             client_ws
                 .send(Message::Binary(Bytes::from(sealed)))
@@ -2015,6 +2016,11 @@ mod tests {
     async fn server_session_abort_drains_inflight_during_recv() {
         let _guard = test_hooks::server_stress_lock().await;
         for _ in 0..2 {
+            // Keep a test-owned discard destination bound; otherwise the relay
+            // socket can be assigned the same ephemeral port and receive its
+            // own datagram before the flood reaches the intended steady state.
+            let discard = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let discard_port = discard.local_addr().unwrap().port();
             let (mut client_ws, server_ws) = ws_duplex_pair().await;
             let crypto = test_session_crypto();
             let crypto_srv = crypto.clone();
@@ -2023,7 +2029,7 @@ mod tests {
             });
             let sem = wait_for_server_sem().await;
 
-            flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
+            flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT, discard_port)
                 .await;
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
@@ -2055,7 +2061,7 @@ mod tests {
             });
             let sem = wait_for_server_sem().await;
 
-            flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
+            flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT, 59999)
                 .await;
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
@@ -2098,7 +2104,7 @@ mod tests {
             });
             let sem = wait_for_server_sem().await;
 
-            flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
+            flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT, 59999)
                 .await;
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
