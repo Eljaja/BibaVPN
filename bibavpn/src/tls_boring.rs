@@ -156,7 +156,7 @@ mod tests {
         let ck =
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()])
                 .expect("rcgen cert");
-        (ck.cert.pem().into_bytes(), ck.key_pair.serialize_pem().into_bytes())
+        (ck.cert.pem().into_bytes(), ck.signing_key.serialize_pem().into_bytes())
     }
 
     #[tokio::test]

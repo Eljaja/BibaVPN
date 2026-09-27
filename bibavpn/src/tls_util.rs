@@ -1,4 +1,3 @@
-use std::io::{BufReader, Cursor};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -27,7 +26,7 @@ use anyhow::Context;
 use biba::ClientHelloId;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{client::danger::ServerCertVerifier, crypto::CryptoProvider, SupportedCipherSuite};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 
@@ -106,8 +105,7 @@ impl TlsClientProfile {
 }
 
 fn read_certs(pem: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(Cursor::new(pem));
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .context("parse certs")?;
     Ok(certs)
@@ -123,16 +121,15 @@ pub fn parse_pem_certificates(pem: &[u8]) -> anyhow::Result<Vec<CertificateDer<'
 }
 
 fn read_key(pem: &[u8]) -> anyhow::Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(Cursor::new(pem));
-    let items = rustls_pemfile::read_all(&mut reader)
+    let keys = PrivateKeyDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .context("read pem")?;
-    for item in items {
-        if let rustls_pemfile::Item::Pkcs8Key(k) = item {
-            return Ok(PrivatePkcs8KeyDer::from(k).into());
-        }
-    }
-    anyhow::bail!("no PKCS8 private key in pem")
+    keys.into_iter()
+        .find_map(|key| match key {
+            PrivateKeyDer::Pkcs8(key) => Some(PrivateKeyDer::Pkcs8(key)),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("no PKCS8 private key in pem"))
 }
 
 pub fn server_config_from_pem(
@@ -151,7 +148,7 @@ pub fn server_config_from_pem(
 pub fn server_self_signed(san: &str) -> anyhow::Result<Arc<ServerConfig>> {
     let ck = rcgen::generate_simple_self_signed([san.to_string()]).context("rcgen")?;
     let cert_der = ck.cert.der().clone();
-    let key_der = ck.key_pair.serialize_der();
+    let key_der = ck.signing_key.serialize_der();
     let cert_chain = vec![cert_der];
     let key = PrivatePkcs8KeyDer::from(key_der).into();
     let cfg = ServerConfig::builder()
@@ -489,5 +486,30 @@ mod tests {
     fn fingerprint_str_matches_profile_parse() {
         let p = TlsClientProfile::from_fingerprint_str("safari-18").unwrap();
         assert_eq!(p, TlsClientProfile::Safari18);
+    }
+
+    #[test]
+    fn private_key_parser_preserves_pkcs8_selection_and_errors() {
+        let generated = rcgen::generate_simple_self_signed(["key.test".into()]).unwrap();
+        let key = generated.signing_key.serialize_pem();
+        assert!(matches!(read_key(key.as_bytes()).unwrap(), PrivateKeyDer::Pkcs8(_)));
+        let mixed = format!("{key}-----BEGIN PRIVATE KEY-----\nnot-base64!\n-----END PRIVATE KEY-----\n");
+        assert!(read_key(mixed.as_bytes()).is_err());
+        assert!(read_key(b"-----BEGIN RSA PRIVATE KEY-----\nAA==\n-----END RSA PRIVATE KEY-----").is_err());
+    }
+
+    #[test]
+    fn certificate_parser_preserves_chain_and_errors_on_non_pem() {
+        let first = rcgen::generate_simple_self_signed(["first.test".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let second = rcgen::generate_simple_self_signed(["second.test".into()])
+            .unwrap()
+            .cert
+            .pem();
+        let pem = format!("{first}{second}");
+        assert_eq!(read_certs(pem.as_bytes()).unwrap().len(), 2);
+        assert!(parse_pem_certificates(b"not a certificate").is_err());
     }
 }
