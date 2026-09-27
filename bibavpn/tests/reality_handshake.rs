@@ -53,6 +53,7 @@ async fn spawn_reality_server(
             &token,
             CamouflageServeConfig::default(),
             None,
+            bibavpn::frame::DEFAULT_MAX_WS_BINARY,
         )
         .await
         .expect("ws")
@@ -219,6 +220,7 @@ async fn reality_handshake_rejects_forged_server() {
             &token_s,
             CamouflageServeConfig::default(),
             None,
+            bibavpn::frame::DEFAULT_MAX_WS_BINARY,
         )
         .await
         .expect("ws")

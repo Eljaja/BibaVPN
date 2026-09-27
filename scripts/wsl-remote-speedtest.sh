@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start 64 MiB file + python http on VPS (BIBA_HOST), then bench from WSL through bibavpn-client.
-# Usage: BIBA_HOST=202.181.159.79 bash scripts/wsl-remote-speedtest.sh
+# Usage: BIBA_HOST=203.0.113.10 bash scripts/wsl-remote-speedtest.sh
 set -euo pipefail
 : "${BIBA_HOST:?BIBA_HOST}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

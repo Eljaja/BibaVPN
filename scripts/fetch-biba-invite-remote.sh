@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-off: print biba:// line for /opt/bibavpn (same secrets; RUST_LOG=off).
-# Args: public_ip host_port  e.g.  94.176.232.23 19843
+# Args: public_ip host_port  e.g.  203.0.113.11 19843
 set -euo pipefail
 : "${1:?usage: $0 <DEPLOY_VPS_IP> <DEPLOY_PORT>}"
 : "${2:?usage: $0 <DEPLOY_VPS_IP> <DEPLOY_PORT>}"

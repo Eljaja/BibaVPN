@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # From WSL (or Linux): build docker image, push to VPS via ssh, run install-bibavpn-docker-secure.sh.
 # Usage:
-#   export DEPLOY_VPS_IP=94.176.232.23
+#   export DEPLOY_VPS_IP=203.0.113.11
 #   export DEPLOY_PORT=19843
 #   export SSH_IDENTITY=~/.ssh/id_rsa   # optional (default: RSA, then ed25519)
 #   ./scripts/deploy-secure-bibavpn-docker-remote.sh

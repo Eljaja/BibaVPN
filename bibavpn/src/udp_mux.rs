@@ -439,17 +439,76 @@ pub fn spawn_udp_mux_driver(
     UdpMuxHandle { tx }
 }
 
+/// A session that stayed up at least this long was doing real work, so the failure that
+/// ended it starts a fresh backoff streak rather than inheriting the previous one.
+const UDP_MUX_HEALTHY_SESSION: Duration = Duration::from_secs(30);
+
+/// Waits before the driver's next reconnect and advances `streak`. Returns `true` if
+/// shutdown was requested during the wait, in which case the caller must stop.
+///
+/// `connect_udp_mux_ws_resilient` backs off only between *connect* attempts and returns
+/// immediately once one succeeds, so without this a peer that accepts the connection and
+/// then instantly fails the session (e.g. enough bad frames to trip the limit straight
+/// away) would spin the driver through a full TLS + WS + handshake per iteration.
+async fn udp_mux_reconnect_backoff(shutdown: &mut watch::Receiver<bool>, streak: &mut u32) -> bool {
+    tokio::select! {
+        _ = shutdown.changed() => {
+            if *shutdown.borrow() {
+                return true;
+            }
+        }
+        _ = sleep_outbound_backoff((*streak).min(10)) => {}
+    }
+    *streak = streak.saturating_add(1);
+    false
+}
+
 async fn run_udp_mux_driver_forever(
     cfg: UdpMuxConfig,
     mut cmd_rx: mpsc::Receiver<ClientUdpCmd>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let mut fail_streak = 0u32;
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
-        let (ws, crypto) = connect_udp_mux_ws_resilient(&cfg, &mut shutdown).await?;
-        let stop = run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await?;
+        let (ws, crypto) = match connect_udp_mux_ws_resilient(&cfg, &mut shutdown).await {
+            Ok(x) => x,
+            Err(e) => {
+                // `connect_udp_mux_ws_resilient` only returns `Err` on shutdown (it retries
+                // connect failures internally), but stay resilient rather than assume that.
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                warn!("udp mux driver: connect error, reconnecting: {e:#}");
+                if udp_mux_reconnect_backoff(&mut shutdown, &mut fail_streak).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        // A session ending in `Err` (WS read error, or too many bad frames) must not kill
+        // the driver forever: the client would show "connected" while UDP/DNS stayed dead.
+        // Only a clean shutdown (watch flag, or the cmd channel closing) ends the loop.
+        let started = tokio::time::Instant::now();
+        let stop = match run_udp_mux_one_session(ws, crypto, &cfg, &mut cmd_rx).await {
+            Ok(stop) => stop,
+            Err(e) => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                warn!("udp mux driver: session error, reconnecting: {e:#}");
+                if started.elapsed() >= UDP_MUX_HEALTHY_SESSION {
+                    fail_streak = 0;
+                }
+                if udp_mux_reconnect_backoff(&mut shutdown, &mut fail_streak).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        fail_streak = 0;
         if stop {
             return Ok(());
         }
@@ -1597,6 +1656,42 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
     }
 
+    /// 24 consecutive undecryptable "binary" frames from the peer must end the session with
+    /// `Err` (the documented `run_udp_mux_driver_forever` reconnect trigger), instead of the
+    /// session sitting there indefinitely. This is the precondition that used to kill the
+    /// client's UDP mux driver permanently: any `Err` here used to propagate via `?` out of
+    /// `run_udp_mux_driver_forever` and end the driver task for good, even though the driver
+    /// keeps running and the UI still shows "connected".
+    #[tokio::test]
+    async fn client_session_errors_after_too_many_bad_frames() {
+        let _guard = test_hooks::server_stress_lock().await;
+        let (mut peer_ws, server_ws) = ws_duplex_pair().await;
+        let crypto = test_session_crypto();
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(UDP_MUX_CMD_QUEUE_CAP);
+        let cfg = test_udp_mux_cfg(0);
+        let session = tokio::spawn(async move {
+            run_udp_mux_one_session(server_ws, crypto, &cfg, &mut cmd_rx).await
+        });
+
+        // Matches `unpack_tunnel_rejects_garbage_ciphertext`: 32 zero bytes fail decryption,
+        // so every one of these increments `bad_frames` instead of resetting it.
+        for _ in 0..24 {
+            peer_ws
+                .send(Message::Binary(Bytes::from(vec![0u8; 32])))
+                .await
+                .unwrap();
+        }
+
+        let err = timeout(Duration::from_secs(3), session)
+            .await
+            .expect("session must return promptly, not hang")
+            .unwrap()
+            .expect_err(
+                "too many bad frames must end the session with Err so the driver can reconnect",
+            );
+        assert!(format!("{err:#}").contains("too many bad frames"));
+    }
+
     #[tokio::test]
     async fn client_session_xid_collision_through_driver() {
         let _guard = test_hooks::server_stress_lock().await;
@@ -2143,5 +2238,51 @@ mod tests {
         let body = crate::protocol::build_socks5_udp_datagram("8.8.8.8", 53, b"a").unwrap();
         entry.reply.send(Ok(body.clone())).unwrap();
         assert_eq!(rx_new.try_recv().unwrap().unwrap(), body);
+    }
+
+    /// The driver must pause between reconnects, and pause longer the more it fails.
+    /// `connect_udp_mux_ws_resilient` returns as soon as a connect succeeds, so a peer that
+    /// accepts the connection and then instantly fails the session would otherwise spin the
+    /// driver through a full TLS + WS + handshake per iteration.
+    /// Asserted as lower bounds only (a sleep may overshoot under load, never undershoot),
+    /// so this cannot flake on a busy CI runner.
+    #[tokio::test]
+    async fn reconnect_backoff_waits_and_grows_with_the_streak() {
+        let (_tx, mut shutdown) = watch::channel(false);
+        let mut streak = 0u32;
+
+        let t0 = tokio::time::Instant::now();
+        assert!(!udp_mux_reconnect_backoff(&mut shutdown, &mut streak).await);
+        let first = t0.elapsed();
+        assert_eq!(streak, 1);
+        assert!(
+            first >= Duration::from_millis(200),
+            "first reconnect must wait, waited {first:?}"
+        );
+
+        let t1 = tokio::time::Instant::now();
+        assert!(!udp_mux_reconnect_backoff(&mut shutdown, &mut streak).await);
+        let second = t1.elapsed();
+        assert_eq!(streak, 2);
+        assert!(
+            second >= Duration::from_millis(400),
+            "backoff must grow with the streak, second wait was {second:?}"
+        );
+    }
+
+    /// Shutdown during the wait must end the driver, not sleep the delay out and reconnect
+    /// one more time. Streak 3 would otherwise wait 1.6s+.
+    #[tokio::test]
+    async fn reconnect_backoff_returns_on_shutdown() {
+        let (tx, mut shutdown) = watch::channel(false);
+        tx.send(true).unwrap();
+        let mut streak = 3u32;
+
+        let t0 = tokio::time::Instant::now();
+        assert!(udp_mux_reconnect_backoff(&mut shutdown, &mut streak).await);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "shutdown must not wait out the backoff"
+        );
     }
 }

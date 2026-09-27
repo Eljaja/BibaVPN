@@ -756,6 +756,21 @@ async fn main() -> anyhow::Result<()> {
         let session_id = rand::random::<u64>();
 
         tokio::spawn(async move {
+            // Check the per-IP ban/allow list *before* taking a global concurrency permit: a
+            // banned (or otherwise disallowed) IP must be rejected without ever occupying one of
+            // the limited global permits, so it can't starve every other peer out of the
+            // semaphore while it is itself guaranteed to be turned away.
+            if let Err(e) = auth.check_allowed(peer.ip()).await {
+                stats.inc_auth_rejected_banned();
+                debug!(
+                    target: "bibavpn_security",
+                    %peer,
+                    session_id,
+                    "rejected: {e:#}"
+                );
+                return;
+            }
+
             let permit = match &conn_sem {
                 Some(sem) => {
                     match timeout(Duration::from_secs(5), sem.clone().acquire_owned()).await {
@@ -774,18 +789,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 None => None,
             };
-
-            if let Err(e) = auth.check_allowed(peer.ip()).await {
-                stats.inc_auth_rejected_banned();
-                debug!(
-                    target: "bibavpn_security",
-                    %peer,
-                    session_id,
-                    "rejected: {e:#}"
-                );
-                drop(permit);
-                return;
-            }
 
             let _sess = stats.session_guard();
 
@@ -1176,6 +1179,7 @@ async fn handle_one(
             &token,
             camo,
             Some(params.peer),
+            max_ws_binary.max(udp_mux_max_ws_binary),
         ),
     )
     .await?

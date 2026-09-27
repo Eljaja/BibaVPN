@@ -122,7 +122,10 @@ pub async fn http_proxy_handshake(stream: &mut TcpStream) -> anyhow::Result<Http
 async fn read_header_block<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<()> {
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).await.context("read header")?;
+        let n = reader.read_line(&mut line).await.context("read header")?;
+        if n == 0 {
+            bail!("unexpected eof in http headers");
+        }
         if line.len() > 8192 {
             bail!("header line too long");
         }
@@ -139,7 +142,10 @@ async fn read_header_lines_into<R: AsyncBufReadExt + Unpin>(
 ) -> anyhow::Result<()> {
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).await.context("read header")?;
+        let n = reader.read_line(&mut line).await.context("read header")?;
+        if n == 0 {
+            bail!("unexpected eof in http headers");
+        }
         if line.len() > 8192 {
             bail!("header line too long");
         }
@@ -208,8 +214,10 @@ pub async fn reply_connect_error(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_authority;
+    use super::{parse_authority, read_header_block, read_header_lines_into};
     use http::Uri;
+    use std::time::Duration;
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     #[test]
     fn authority_host_port() {
@@ -272,5 +280,37 @@ mod tests {
     fn benign_abort_detects_empty_request_line() {
         let err = anyhow::anyhow!("empty request line");
         assert!(super::is_benign_handshake_abort(&err));
+    }
+
+    /// A half-closed client (EOF mid-headers, no terminating blank line) must error out
+    /// promptly instead of looping forever on `read_line` returning `Ok(0)`.
+    #[tokio::test]
+    async fn read_header_block_errors_on_eof_instead_of_spinning() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"Host: example.com\r\n").await.unwrap();
+        drop(client); // EOF before the blank-line terminator.
+        let mut reader = BufReader::new(server);
+        let res = tokio::time::timeout(Duration::from_secs(2), read_header_block(&mut reader))
+            .await
+            .expect("must return promptly on EOF, not busy-loop");
+        let err = res.expect_err("EOF before the terminating blank line is an error");
+        assert!(format!("{err:#}").contains("unexpected eof"));
+    }
+
+    #[tokio::test]
+    async fn read_header_lines_into_errors_on_eof_instead_of_spinning() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"Host: example.com\r\n").await.unwrap();
+        drop(client);
+        let mut reader = BufReader::new(server);
+        let mut out = Vec::new();
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_header_lines_into(&mut reader, &mut out),
+        )
+        .await
+        .expect("must return promptly on EOF, not busy-loop");
+        let err = res.expect_err("EOF before the terminating blank line is an error");
+        assert!(format!("{err:#}").contains("unexpected eof"));
     }
 }

@@ -44,6 +44,7 @@ pub async fn accept_websocket_or_camouflage<S>(
     token: &str,
     camo: CamouflageServeConfig,
     peer: Option<SocketAddr>,
+    max_ws_binary_cap: usize,
 ) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind, Option<String>)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -110,6 +111,21 @@ Sec-WebSocket-Accept: {accept}\r\n\
         let mut ws_cfg = WebSocketConfig::default();
         ws_cfg.write_buffer_size = 256 * 1024;
         ws_cfg.max_write_buffer_size = 1024 * 1024;
+        // Pre-auth (and, since this config governs the WebSocketStream's whole lifetime,
+        // post-auth too) frame/message caps. Without these, tungstenite's defaults (64 MiB
+        // message / 16 MiB frame) apply to a not-yet-authenticated peer, letting it force huge
+        // buffer allocations before a single byte of the mux protocol is validated. Legitimate
+        // mux traffic on this connection tops out around `max_ws_binary_cap`; the receivers in
+        // ws_bridge.rs / udp_mux.rs / tcp_mux_flow.rs already tolerate a peer sending up to 4x
+        // their local `max_ws_binary` (see their "oversized WS binary" checks, for a peer with a
+        // larger configured value), so mirror that same 4x bound here plus a little slack, while
+        // staying far below tungstenite's 64 MiB default.
+        let max_frame = max_ws_binary_cap
+            .saturating_mul(4)
+            .saturating_add(64 * 1024);
+        let max_message = max_frame.saturating_mul(2);
+        ws_cfg.max_frame_size = Some(max_frame);
+        ws_cfg.max_message_size = Some(max_message);
         let ws =
             WebSocketStream::from_partially_read(stream, remainder, Role::Server, Some(ws_cfg))
                 .await;
@@ -862,6 +878,7 @@ Connection: close\r\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::fs;
     use std::time::Duration;
 
@@ -892,6 +909,7 @@ mod tests {
                 "tok",
                 CamouflageServeConfig::default(),
                 None,
+                crate::frame::DEFAULT_MAX_WS_BINARY,
             ),
         )
         .await;
@@ -915,6 +933,7 @@ mod tests {
                 "tok",
                 CamouflageServeConfig::default(),
                 None,
+                crate::frame::DEFAULT_MAX_WS_BINARY,
             )
             .await
         });
@@ -1666,5 +1685,76 @@ mod tests {
         assert!(res.is_err(), "stall must time out");
         assert!(start.elapsed() < Duration::from_secs(2));
         drop(client);
+    }
+
+    /// A pre-auth peer must not be able to force a huge frame/message allocation: the cap
+    /// applied to the returned `WebSocketStream` must be the caller-supplied
+    /// `max_ws_binary_cap`, not tungstenite's 64 MiB message / 16 MiB frame defaults.
+    #[tokio::test]
+    async fn websocket_upgrade_enforces_configured_frame_cap() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            accept_websocket_or_camouflage(
+                server,
+                "/ws",
+                false,
+                "tok",
+                CamouflageServeConfig::default(),
+                None,
+                crate::frame::DEFAULT_MAX_WS_BINARY,
+            )
+            .await
+        });
+
+        client
+            .write_all(
+                b"GET /ws HTTP/1.1\r\n\
+Host: example.org\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut resp = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut resp))
+            .await
+            .expect("handshake response must arrive")
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp[..n]);
+        assert!(
+            text.starts_with("HTTP/1.1 101"),
+            "expected a completed websocket upgrade, got: {text}"
+        );
+
+        // A frame header alone (no payload bytes needed -- tungstenite enforces the size cap
+        // as soon as it parses the header's declared length, before buffering the payload)
+        // declaring 5,000,000 bytes: well under tungstenite's built-in 16 MiB max_frame_size
+        // default, but over our configured cap for `DEFAULT_MAX_WS_BINARY` (~1.06 MiB) --
+        // proving it's OUR cap being enforced here, not just tungstenite's own default ceiling.
+        let mut oversized_frame_header = vec![0x82u8, 0xFF]; // FIN+Binary, MASK+len127-marker
+        oversized_frame_header.extend_from_slice(&5_000_000u64.to_be_bytes());
+        oversized_frame_header.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]); // mask key
+        client.write_all(&oversized_frame_header).await.unwrap();
+
+        let (mut ws, _kind, _host) = tokio::time::timeout(Duration::from_secs(5), srv)
+            .await
+            .expect("accept must not hang")
+            .expect("join")
+            .expect("accept_websocket_or_camouflage must succeed")
+            .expect("a valid upgrade must return a WebSocketStream");
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the oversized frame must be rejected promptly, not hang");
+        let err = msg
+            .expect("stream must yield an item, not end silently")
+            .expect_err("an oversized frame from an unauthenticated peer must be rejected");
+        assert!(
+            format!("{err}").contains("too long"),
+            "expected a capacity/too-long error, got: {err}"
+        );
     }
 }

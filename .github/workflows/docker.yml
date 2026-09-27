@@ -60,12 +60,12 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Detect changed paths
         id: filter
         if: github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             server:
@@ -137,10 +137,10 @@ jobs:
         include: ${{ fromJson(needs.changes.outputs.matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -177,7 +177,7 @@ jobs:
             type=raw,value=manual-${{ github.run_id }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push ${{ matrix.name }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}

@@ -128,6 +128,7 @@ def run_chunked_stream_server(
 
 def streaming_client_via_socks(
     proxy: Tuple[str, int],
+    target: str,
     stream_port: int,
     duration_sec: int,
     chunk_interval: float,
@@ -138,7 +139,7 @@ def streaming_client_via_socks(
         f"(expect >= {min_chunks} chunks)"
     )
     s = b.socks5_tcp_connect(
-        proxy[0], proxy[1], "127.0.0.1", stream_port, timeout=float(duration_sec) + 60.0
+        proxy[0], proxy[1], target, stream_port, timeout=float(duration_sec) + 60.0
     )
     try:
         s.settimeout(float(duration_sec) + 90.0)
@@ -287,6 +288,7 @@ def _ws_read_frame(sock: socket.socket) -> Tuple[int, bytes]:
 
 def slack_ws_client_via_socks(
     proxy: Tuple[str, int],
+    target: str,
     ws_port: int,
     duration_sec: int,
     push_interval: float,
@@ -297,7 +299,7 @@ def slack_ws_client_via_socks(
         f"(expect >= {min_events} messages)"
     )
     s = b.socks5_tcp_connect(
-        proxy[0], proxy[1], "127.0.0.1", ws_port, timeout=float(duration_sec) + 60.0
+        proxy[0], proxy[1], target, ws_port, timeout=float(duration_sec) + 60.0
     )
     try:
         key = base64.b64encode(secrets.token_bytes(16)).decode()
@@ -340,6 +342,7 @@ def slack_ws_client_via_socks(
 
 def telegram_voip_udp_via_socks(
     proxy: Tuple[str, int],
+    target: str,
     echo_port: int,
     duration_sec: int,
     pps: float,
@@ -362,7 +365,7 @@ def telegram_voip_udp_via_socks(
             pl = struct.pack("!IIH", seq, int(time.time() * 1000) & 0xFFFFFFFF, seq & 0xFFFF) + os.urandom(
                 max(0, 120 - 10)
             )
-            pkt = b._pack_socks_udp_header("127.0.0.1", echo_port, pl)
+            pkt = b._pack_socks_udp_header(target, echo_port, pl)
             udp.sendto(pkt, relay)
             try:
                 raw, _ = udp.recvfrom(65535)
@@ -403,6 +406,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Real-world-ish BibaVPN stress tests")
     ap.add_argument("--socks-host", default=os.environ.get("BIBAVPN_SOCKS_HOST", "127.0.0.1"))
     ap.add_argument("--socks-port", type=int, default=int(os.environ.get("BIBAVPN_SOCKS_PORT", "11080")))
+    # See bibavpn_e2e.resolve_loopback_target: 127.0.0.1 and "localhost" are
+    # routed direct by the client, so they never exercise the tunnel.
+    ap.add_argument(
+        "--target-host",
+        default=os.environ.get("BIBAVPN_E2E_TARGET_HOST", "localtest.me"),
+    )
     ap.add_argument("--duration-sec", type=int, default=int(os.environ.get("BIBAVPN_LONG_SECS", "300")))
     ap.add_argument("--chunk-interval", type=float, default=0.25, help="Chunked HTTP: seconds between chunks")
     ap.add_argument("--slack-interval", type=float, default=4.0, help="Seconds between server WS pushes")
@@ -417,6 +426,7 @@ def main() -> int:
     ap.add_argument("--only", action="append", choices=("stream", "slack", "voip"), help="Repeatable")
     args = ap.parse_args()
     proxy = (args.socks_host, args.socks_port)
+    target = b.resolve_loopback_target(args.target_host)
     duration = max(5, args.duration_sec)
 
     only: Optional[List[str]] = args.only if args.only else None
@@ -454,16 +464,20 @@ def main() -> int:
 
         def run_stream() -> None:
             if want("stream"):
-                streaming_client_via_socks(proxy, stream_port, duration, args.chunk_interval)
+                streaming_client_via_socks(
+                    proxy, target, stream_port, duration, args.chunk_interval
+                )
 
         def run_slack() -> None:
             if want("slack"):
-                slack_ws_client_via_socks(proxy, ws_port, duration, args.slack_interval)
+                slack_ws_client_via_socks(
+                    proxy, target, ws_port, duration, args.slack_interval
+                )
 
         def run_voip() -> None:
             if want("voip"):
                 telegram_voip_udp_via_socks(
-                    proxy, udp_port, duration, args.voip_pps, args.max_udp_loss
+                    proxy, target, udp_port, duration, args.voip_pps, args.max_udp_loss
                 )
 
         def record_exc(e: BaseException) -> None:

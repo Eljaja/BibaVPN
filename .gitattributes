@@ -1,0 +1,5 @@
+# Shell scripts are run by bash on Linux/WSL. A CR at the end of each line
+# turns `set -euo pipefail` into `set: pipefail: invalid option name` and makes
+# every argument carry a trailing \r, so the script fails immediately. Keep LF
+# regardless of the checkout platform.
+*.sh text eol=lf
