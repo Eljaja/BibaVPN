@@ -11,12 +11,12 @@ pub fn resolved_tray_lang(cfg: &SavedConfig) -> &'static str {
         return "ru";
     }
     if sys_locale::get_locale()
-        .map(|loc| loc.to_lowercase().starts_with("en"))
+        .map(|loc| loc.to_lowercase().starts_with("ru"))
         .unwrap_or(false)
     {
-        "en"
-    } else {
         "ru"
+    } else {
+        "en"
     }
 }
 

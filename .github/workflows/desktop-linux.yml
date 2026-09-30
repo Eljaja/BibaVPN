@@ -70,7 +70,7 @@ jobs:
 
       - name: Install UI deps & build frontend
         working-directory: apps/bibavpn-desktop/ui
-        run: npm install --no-audit --no-fund && npm run build
+        run: npm install --no-audit --no-fund && node --test src/i18n.test.js && npm run build
 
       - name: Fetch split-tunnel list for compile-time embed
         env:
@@ -89,6 +89,9 @@ jobs:
 
       - name: Smoke-test AppImage on Ubuntu 22.04
         working-directory: target/release/bundle/appimage
+        env:
+          LANG: C
+          LC_ALL: C
         run: |
           ./*.AppImage --appimage-extract > /dev/null
           status=0

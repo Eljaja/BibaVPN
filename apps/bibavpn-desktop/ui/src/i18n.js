@@ -324,7 +324,7 @@ export function tlsProfileSpecs() {
 }
 
 /** @type {Lang} */
-let currentLang = "ru";
+let currentLang = resolveLang();
 
 /** @param {unknown} cfg */
 export function resolveLang(cfg) {
@@ -332,7 +332,7 @@ export function resolveLang(cfg) {
   if (v === "en") return "en";
   if (v === "ru") return "ru";
   const nav = (typeof navigator !== "undefined" && navigator.language) || "";
-  return nav.toLowerCase().startsWith("en") ? "en" : "ru";
+  return nav.toLowerCase().startsWith("ru") ? "ru" : "en";
 }
 
 /** @param {unknown} cfg */
