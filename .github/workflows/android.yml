@@ -107,7 +107,7 @@ jobs:
             build -p bibavpn-jni --release
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           build-root-directory: apps/bibavpn-desktop/src-tauri/gen/android
 
