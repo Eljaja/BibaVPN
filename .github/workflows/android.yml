@@ -49,7 +49,7 @@ jobs:
           java-version: 17
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           # No legacy `tools` (SDK Tools 26.x, deprecated since 2017): the cmdline-tools the
           # action now downloads (16.0) cannot resolve it — `sdkmanager tools` exits 1.
