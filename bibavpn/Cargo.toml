@@ -46,7 +46,7 @@ tokio = { version = "1.43", features = [
     "fs",
 ] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tokio-tungstenite = { version = "0.26", default-features = false, features = [
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "handshake",
     "connect",
     "rustls-native-certs",
