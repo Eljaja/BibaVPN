@@ -105,7 +105,10 @@ fn embed_bypass_domains_json() {
     println!("cargo:rerun-if-changed={}", src.display());
     println!(
         "cargo:rerun-if-changed={}",
-        manifest.join("embedded").join("bypass_domains.json").display()
+        manifest
+            .join("embedded")
+            .join("bypass_domains.json")
+            .display()
     );
     println!(
         "cargo:rerun-if-changed={}",

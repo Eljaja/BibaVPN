@@ -76,6 +76,35 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+/// `Runtime::block_on` panics when called from an async context (a runtime worker
+/// thread). The callers below normally run on plain or `spawn_blocking` threads, but
+/// tray/exit paths are invoked from arbitrary threads; if a runtime context is
+/// present we hop to a scratch thread so we can neither panic nor park a worker.
+fn block_on_rt<F, T>(rt: &tokio::runtime::Runtime, fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let handle = rt.handle().clone();
+        std::thread::spawn(move || handle.block_on(fut))
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    } else {
+        rt.block_on(fut)
+    }
+}
+
+/// Serializes config mutations that also persist to disk. Lock order is
+/// `CONFIG_IO` → `Inner`; no code may take `Inner` first and then this lock.
+/// The lock is held across the write but **not** across `Inner` (so a slow disk
+/// never blocks `get_state` / `get_tunnel_status`).
+static CONFIG_IO: Mutex<()> = Mutex::new(());
+
+fn config_io_guard() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_IO.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 struct ActiveVpn {
     shutdown: watch::Sender<bool>,
     join: JoinHandle<anyhow::Result<()>>,
@@ -86,7 +115,9 @@ impl ActiveVpn {
         let _ = self.shutdown.send(true);
         let handle = self.join;
         let abort = handle.abort_handle();
-        match rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), handle).await }) {
+        match block_on_rt(rt, async {
+            tokio::time::timeout(Duration::from_secs(5), handle).await
+        }) {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => error!(target: "bibavpn_desktop", "VPN-клиент: {e:#}"),
             Ok(Err(e)) => error!(target: "bibavpn_desktop", "join VPN-клиента: {e}"),
@@ -143,6 +174,10 @@ pub(crate) struct Inner {
     /// Generation counter for snapshot assembly; not persisted. Bumped when tunnel
     /// identity, cfg, or connect errors change so a late mobile probe cannot revive stale state.
     epoch: u64,
+    /// Identifies the in-flight connect attempt. A later connect (or an explicit
+    /// disconnect that flips the phase) invalidates it, so a slow connect cannot
+    /// install its tunnel on top of a newer user action.
+    connect_token: u64,
 }
 
 #[derive(Clone)]
@@ -212,8 +247,19 @@ fn parse_server_tcp_target(server_trimmed: &str) -> Option<(String, u16)> {
     Some((s.to_string(), 443))
 }
 
+/// `host:port` suitable for `ToSocketAddrs`, bracketing raw IPv6 literals (an
+/// unbracketed `::1:443` is not parseable and made the RTT probe silently fail).
+fn tcp_target_addr_string(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn measure_tcp_connect_rtt_ms(host: &str, port: u16) -> Option<u32> {
-    let addr_str = format!("{host}:{port}");
+    let addr_str = tcp_target_addr_string(host, port);
     let addr = addr_str.to_socket_addrs().ok()?.next()?;
     let start = Instant::now();
     TcpStream::connect_timeout(&addr, Duration::from_secs(4)).ok()?;
@@ -255,6 +301,20 @@ fn android_snapshot_error(
 
 fn bump_epoch(inner: &mut Inner) {
     inner.epoch = inner.epoch.wrapping_add(1);
+}
+
+/// A slow connect may only install its tunnel while it still owns the phase and no
+/// newer connect/disconnect superseded it. Compared under `Inner`, right before the
+/// `vpn` handle is published.
+fn can_install_connection(phase: VpnPhase, current_token: u64, my_token: u64) -> bool {
+    phase == VpnPhase::Connecting && current_token == my_token
+}
+
+/// The watchdog re-checks this under `Inner` after its lock-free health probes, so a
+/// user disconnect that landed meanwhile cancels the recovery instead of being undone.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn should_start_watchdog_recovery(phase: VpnPhase, has_vpn: bool) -> bool {
+    phase == VpnPhase::Connected && has_vpn
 }
 
 /// Лок состояния, переживающий отравление мьютекса.
@@ -396,9 +456,7 @@ pub(crate) fn assemble_state_snapshot(
     let jni_connect_error = if stale {
         None
     } else {
-        probe
-            .as_ref()
-            .and_then(|p| p.jni_connect_error.clone())
+        probe.as_ref().and_then(|p| p.jni_connect_error.clone())
     };
     #[cfg(not(target_os = "android"))]
     let jni_connect_error: Option<String> = None;
@@ -420,20 +478,16 @@ pub(crate) fn assemble_state_snapshot(
     }
 }
 
-fn snapshot_with_probe<F>(
-    state: &AppState,
-    probe_fn: F,
-    force_disconnected: bool,
-) -> StateSnapshot
+fn snapshot_with_probe<F>(state: &AppState, probe_fn: F, force_disconnected: bool) -> StateSnapshot
 where
     F: FnOnce() -> TunnelProbe,
 {
     let copy = {
-        let g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let g = lock_inner(&state.inner);
         snapshot_copy_from_inner(&g)
     };
     let probe = probe_fn();
-    let g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+    let g = lock_inner(&state.inner);
     assemble_state_snapshot(&copy, &g, Some(probe), force_disconnected)
 }
 
@@ -739,149 +793,171 @@ fn spawn_tunnel_recovery_watch(app: AppHandle, state: AppState) {
     std::thread::spawn(move || {
         let mut retry_backoff = Duration::from_secs(0);
         loop {
-        let tick_started = Instant::now();
-        std::thread::sleep(Duration::from_secs(12));
-        let slept = tick_started.elapsed();
-        let likely_wake = slept > Duration::from_secs(20);
+            let tick_started = Instant::now();
+            std::thread::sleep(Duration::from_secs(12));
+            let slept = tick_started.elapsed();
+            let likely_wake = slept > Duration::from_secs(20);
 
-        // Two cases matter: a live session to health-check, and a recovery that
-        // has not succeeded yet. The latter used to be dropped entirely — after a
-        // failed post-wake reconnect the phase is Idle, so the watchdog skipped
-        // every later tick and never tried again, leaving the system proxy
-        // pointing at a local port with nothing behind it (no traffic at all).
-        enum Tick {
-            Check { http_port: u16, client_dead: bool },
-            Retry,
-        }
-        let tick = {
-            let g = match state.inner.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
+            // Two cases matter: a live session to health-check, and a recovery that
+            // has not succeeded yet. The latter used to be dropped entirely — after a
+            // failed post-wake reconnect the phase is Idle, so the watchdog skipped
+            // every later tick and never tried again, leaving the system proxy
+            // pointing at a local port with nothing behind it (no traffic at all).
+            enum Tick {
+                Check { http_port: u16, client_dead: bool },
+                Retry,
+            }
+            let tick = {
+                let g = match state.inner.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                match g.phase {
+                    VpnPhase::Connected => g.vpn.as_ref().map(|vpn| Tick::Check {
+                        http_port: g.cfg.local_http_port,
+                        client_dead: vpn.join.is_finished(),
+                    }),
+                    VpnPhase::Idle if g.recovery_pending => Some(Tick::Retry),
+                    _ => None,
+                }
             };
-            match g.phase {
-                VpnPhase::Connected => g.vpn.as_ref().map(|vpn| Tick::Check {
-                    http_port: g.cfg.local_http_port,
-                    client_dead: vpn.join.is_finished(),
-                }),
-                VpnPhase::Idle if g.recovery_pending => Some(Tick::Retry),
-                _ => None,
-            }
-        };
-        let Some(tick) = tick else {
-            retry_backoff = Duration::from_secs(0);
-            continue;
-        };
+            let Some(tick) = tick else {
+                retry_backoff = Duration::from_secs(0);
+                continue;
+            };
 
-        if let Tick::Retry = tick {
-            // Keep trying to restore the tunnel; the proxy stays applied
-            // (fail-closed) so nothing leaks around the VPN meanwhile.
-            if retry_backoff > Duration::from_secs(0) {
-                std::thread::sleep(retry_backoff);
-            }
-            match connect_inner(&state, &app) {
-                Ok(()) => {
+            if let Tick::Retry = tick {
+                // Keep trying to restore the tunnel; the proxy stays applied
+                // (fail-closed) so nothing leaks around the VPN meanwhile.
+                if retry_backoff > Duration::from_secs(0) {
+                    std::thread::sleep(retry_backoff);
+                }
+                // An explicit user disconnect clears recovery_pending while we slept:
+                // never resurrect the tunnel against that decision.
+                if !lock_inner(&state.inner).recovery_pending {
                     retry_backoff = Duration::from_secs(0);
-                    info!(
-                        target: "bibavpn_desktop",
-                        "туннель восстановлен после сна/смены сети"
-                    );
+                    continue;
                 }
-                Err(e) => {
-                    if is_fd_exhaustion_message(&e) {
-                        fail_fd_exhaustion_recovery(&state, &app, &e);
+                match connect_inner(&state, &app) {
+                    Ok(()) => {
                         retry_backoff = Duration::from_secs(0);
-                        continue;
+                        info!(
+                            target: "bibavpn_desktop",
+                            "туннель восстановлен после сна/смены сети"
+                        );
                     }
-                    retry_backoff = next_recovery_backoff(retry_backoff);
-                    warn!(
-                        target: "bibavpn_desktop",
-                        backoff_secs = retry_backoff.as_secs(),
-                        "автовосстановление VPN не удалось: {e}"
-                    );
-                    let mut g = match state.inner.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    g.last_error =
-                        Some(format!("Нет связи с сервером, переподключение… ({e})"));
-                    bump_epoch(&mut g);
-                    drop(g);
-                    let snap = snapshot_from_state(&app, &state);
-                    let _ = app.emit("vpn-state", &snap);
+                    Err(e) => {
+                        if is_fd_exhaustion_message(&e) {
+                            fail_fd_exhaustion_recovery(&state, &app, &e);
+                            retry_backoff = Duration::from_secs(0);
+                            continue;
+                        }
+                        retry_backoff = next_recovery_backoff(retry_backoff);
+                        warn!(
+                            target: "bibavpn_desktop",
+                            backoff_secs = retry_backoff.as_secs(),
+                            "автовосстановление VPN не удалось: {e}"
+                        );
+                        let mut g = match state.inner.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        g.last_error =
+                            Some(format!("Нет связи с сервером, переподключение… ({e})"));
+                        bump_epoch(&mut g);
+                        drop(g);
+                        let snap = snapshot_from_state(&app, &state);
+                        let _ = app.emit("vpn-state", &snap);
+                    }
+                }
+                continue;
+            }
+
+            let Tick::Check {
+                http_port,
+                client_dead,
+            } = tick
+            else {
+                continue;
+            };
+            if client_dead {
+                warn!(
+                    target: "bibavpn_desktop",
+                    "VPN-клиент завершился неожиданно — переподключение"
+                );
+            } else if !likely_wake && tunnel_is_healthy(http_port) {
+                continue;
+            } else if !likely_wake {
+                std::thread::sleep(Duration::from_secs(2));
+                if tunnel_is_healthy(http_port) {
+                    continue;
+                }
+                warn!(
+                    target: "bibavpn_desktop",
+                    "туннель недоступен после сна или сбоя — переподключение VPN"
+                );
+            } else {
+                warn!(
+                    target: "bibavpn_desktop",
+                    "пробуждение системы — проверка туннеля и прокси"
+                );
+                if tunnel_is_healthy(http_port) {
+                    continue;
                 }
             }
-            continue;
-        }
-
-        let Tick::Check {
-            http_port,
-            client_dead,
-        } = tick
-        else {
-            continue;
-        };
-        if client_dead {
-            warn!(
-                target: "bibavpn_desktop",
-                "VPN-клиент завершился неожиданно — переподключение"
-            );
-        } else if !likely_wake && tunnel_is_healthy(http_port) {
-            continue;
-        } else if !likely_wake {
-            std::thread::sleep(Duration::from_secs(2));
-            if tunnel_is_healthy(http_port) {
-                continue;
-            }
-            warn!(
-                target: "bibavpn_desktop",
-                "туннель недоступен после сна или сбоя — переподключение VPN"
-            );
-        } else {
-            warn!(
-                target: "bibavpn_desktop",
-                "пробуждение системы — проверка туннеля и прокси"
-            );
-            if tunnel_is_healthy(http_port) {
-                continue;
-            }
-        }
-        // Mark the recovery *before* tearing the tunnel down: if the reconnect
-        // below fails, later ticks must keep retrying (the system proxy stays
-        // applied, so without a retry the user is left with no traffic at all).
-        {
-            let mut g = match state.inner.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
+            // Mark the recovery *before* tearing the tunnel down: if the reconnect
+            // below fails, later ticks must keep retrying (the system proxy stays
+            // applied, so without a retry the user is left with no traffic at all).
+            //
+            // Re-check under the lock: the health probes above run without `Inner`, so
+            // the user may have disconnected (or reconnected) meanwhile. Without this
+            // the watchdog resurrected a tunnel the user had just switched off.
+            let began = {
+                let mut g = lock_inner(&state.inner);
+                if should_start_watchdog_recovery(g.phase, g.vpn.is_some()) {
+                    g.recovery_pending = true;
+                    true
+                } else {
+                    false
+                }
             };
-            g.recovery_pending = true;
-        }
-        disconnect_inner(&state, &app, false);
-        if let Err(e) = connect_inner(&state, &app) {
-            if is_fd_exhaustion_message(&e) {
-                fail_fd_exhaustion_recovery(&state, &app, &e);
+            if !began {
                 retry_backoff = Duration::from_secs(0);
                 continue;
             }
-            retry_backoff = next_recovery_backoff(retry_backoff);
-            warn!(
-                target: "bibavpn_desktop",
-                backoff_secs = retry_backoff.as_secs(),
-                "автовосстановление VPN: {e}"
-            );
-            let mut g = match state.inner.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            g.last_error = Some(format!("Нет связи с сервером, переподключение… ({e})"));
-            bump_epoch(&mut g);
-            drop(g);
-            let snap = snapshot_from_state(&app, &state);
-            let _ = app.emit("vpn-state", &snap);
-        } else {
-            retry_backoff = Duration::from_secs(0);
-            let snap = snapshot_from_state(&app, &state);
-            let _ = app.emit("vpn-state", &snap);
-        }
+            disconnect_inner(&state, &app, false);
+            // disconnect_inner only keeps recovery_pending for the watchdog path
+            // (`restore_system_proxy == false`); a racing explicit disconnect clears it.
+            if !lock_inner(&state.inner).recovery_pending {
+                retry_backoff = Duration::from_secs(0);
+                continue;
+            }
+            if let Err(e) = connect_inner(&state, &app) {
+                if is_fd_exhaustion_message(&e) {
+                    fail_fd_exhaustion_recovery(&state, &app, &e);
+                    retry_backoff = Duration::from_secs(0);
+                    continue;
+                }
+                retry_backoff = next_recovery_backoff(retry_backoff);
+                warn!(
+                    target: "bibavpn_desktop",
+                    backoff_secs = retry_backoff.as_secs(),
+                    "автовосстановление VPN: {e}"
+                );
+                let mut g = match state.inner.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                g.last_error = Some(format!("Нет связи с сервером, переподключение… ({e})"));
+                bump_epoch(&mut g);
+                drop(g);
+                let snap = snapshot_from_state(&app, &state);
+                let _ = app.emit("vpn-state", &snap);
+            } else {
+                retry_backoff = Duration::from_secs(0);
+                let snap = snapshot_from_state(&app, &state);
+                let _ = app.emit("vpn-state", &snap);
+            }
         }
     });
 }
@@ -1015,10 +1091,13 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
     #[cfg(target_os = "android")]
     {
         {
-            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut g = lock_inner(&state.inner);
             info!(target: "bibavpn_desktop", "отключение VPN");
             g.last_error = None;
             g.tunnel_server = None;
+            g.phase = VpnPhase::Idle;
+            // A slow connect may still be in flight after this point: leave the phase
+            // Idle and let its install check abort instead of reviving the tunnel.
             bump_epoch(&mut g);
         }
 
@@ -1030,7 +1109,9 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
         // Трея на Android нет — обновлять подсказку не нужно.
         if let Err(ref e) = jni_result {
             warn!(target: "bibavpn_desktop", "android VPN stop: {e}");
-            lock_inner(&state.inner).last_error = Some(e.clone());
+            let mut g = lock_inner(&state.inner);
+            g.last_error = Some(e.clone());
+            bump_epoch(&mut g);
         }
         // Остановка сервиса асинхронна — tunnel_is_active ещё может быть true в snapshot().
         let force_disconnected = jni_result.is_ok();
@@ -1042,10 +1123,11 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
     #[cfg(target_os = "ios")]
     {
         {
-            let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut g = lock_inner(&state.inner);
             info!(target: "bibavpn_desktop", "отключение VPN (iOS)");
             g.last_error = None;
             g.tunnel_server = None;
+            g.phase = VpnPhase::Idle;
             bump_epoch(&mut g);
         }
 
@@ -1053,7 +1135,9 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
 
         if let Err(ref e) = stop_res {
             warn!(target: "bibavpn_desktop", "ios VPN stop: {e}");
-            lock_inner(&state.inner).last_error = Some(e.clone());
+            let mut g = lock_inner(&state.inner);
+            g.last_error = Some(e.clone());
+            bump_epoch(&mut g);
         }
         let force_disconnected = stop_res.is_ok();
         let snap = snapshot_with_probe(state, || run_tunnel_probe(app), force_disconnected);
@@ -1174,7 +1258,10 @@ fn parse_import_deeplink(raw: &str) -> Option<(String, String)> {
     Some((token?, base_url?))
 }
 
-fn pending_import_view(origin: &str, payload: &control_plane_client::ImportPayload) -> PendingImportView {
+fn pending_import_view(
+    origin: &str,
+    payload: &control_plane_client::ImportPayload,
+) -> PendingImportView {
     let control_plane_host = url::Url::parse(origin)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
@@ -1207,6 +1294,7 @@ fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> R
     let mut g = lock_inner(&state.inner);
     g.last_error = None;
     g.pending_import = Some(pending);
+    bump_epoch(&mut g);
     drop(g);
     show_main_window(app);
     let _ = app.emit("control-plane-import-pending", &view);
@@ -1214,22 +1302,38 @@ fn handle_import_deeplink(state: &AppState, app: &AppHandle, raw_url: &str) -> R
 }
 
 fn apply_pending_import(state: &AppState, app: &AppHandle) -> Result<(), String> {
-    let mut g = lock_inner(&state.inner);
-    let pending = g
-        .pending_import
-        .take()
-        .ok_or_else(|| "Нет ожидающего импорта.".to_string())?;
-    g.last_error = None;
-    import_control_plane_payload(&mut g.cfg, &pending.payload, &pending.origin)?;
-    persist_cfg(app, &g.cfg)?;
+    // Invite decoding (passphrase KDF) and the disk write happen on a clone, never
+    // under `Inner`: the UI polls `get_state` and must not wait for them.
+    // The IO lock keeps this transaction ordered with `save_config_cmd`.
+    let _io = config_io_guard();
+    let (pending, mut cfg) = {
+        let mut g = lock_inner(&state.inner);
+        let pending = g
+            .pending_import
+            .take()
+            .ok_or_else(|| "Нет ожидающего импорта.".to_string())?;
+        g.last_error = None;
+        (pending, g.cfg.clone())
+    };
+    if let Err(e) = import_control_plane_payload(&mut cfg, &pending.payload, &pending.origin)
+        .and_then(|()| persist_cfg(app, &cfg))
+    {
+        // Failed import/persist: keep the pending payload so the user can retry.
+        lock_inner(&state.inner).pending_import = Some(pending);
+        return Err(e);
+    }
+    {
+        let mut g = lock_inner(&state.inner);
+        g.cfg = cfg;
+        bump_epoch(&mut g);
+    }
     info!(
         target: "bibavpn_desktop",
         instance_id = pending.payload.instance_id,
         config_version = %pending.payload.config_version,
         "control plane import ok"
     );
-    bump_epoch(&mut g);
-    drop(g);
+    drop(_io);
     let snap = snapshot_from_state(app, state);
     let _ = app.emit("vpn-state", &snap);
     let _ = app.emit("control-plane-import", ());
@@ -1237,7 +1341,7 @@ fn apply_pending_import(state: &AppState, app: &AppHandle) -> Result<(), String>
 }
 
 fn cancel_pending_import_inner(state: &AppState) {
-    let mut g = state.inner.lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = lock_inner(&state.inner);
     g.pending_import = None;
 }
 
@@ -1245,13 +1349,11 @@ fn cancel_pending_import_inner(state: &AppState) {
 /// уже после того, как фаза стала [`VpnPhase::Connecting`], фаза возвращается в
 /// [`VpnPhase::Idle`]. Без этого любой ранний `return`/`?` навсегда оставлял бы
 /// приложение в состоянии «Подключение уже выполняется.» — до перезапуска процесса.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct ConnectingPhaseGuard {
     inner: Arc<Mutex<Inner>>,
     armed: bool,
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl ConnectingPhaseGuard {
     /// Создаётся невооружённой: пока не вызван [`Self::arm`], `Drop` ничего не делает
     /// (фаза ещё не наша — например, подключение уже выполняет другой поток).
@@ -1273,7 +1375,6 @@ impl ConnectingPhaseGuard {
     }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Drop for ConnectingPhaseGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -1333,6 +1434,55 @@ mod recovery_backoff_tests {
 }
 
 #[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod connect_install_tests {
+    use super::{
+        can_install_connection, should_start_watchdog_recovery, tcp_target_addr_string, VpnPhase,
+    };
+
+    #[test]
+    fn install_requires_connecting_phase_and_matching_token() {
+        assert!(can_install_connection(VpnPhase::Connecting, 7, 7));
+        assert!(!can_install_connection(VpnPhase::Connecting, 8, 7));
+        assert!(!can_install_connection(VpnPhase::Idle, 7, 7));
+        assert!(!can_install_connection(VpnPhase::Disconnecting, 7, 7));
+        assert!(!can_install_connection(VpnPhase::Connected, 7, 7));
+    }
+
+    #[test]
+    fn a_late_connect_cannot_install_after_disconnect() {
+        // User pressed Disconnect while connect_inner was still waiting for TLS.
+        let phase_after_disconnect = VpnPhase::Idle;
+        assert!(!can_install_connection(phase_after_disconnect, 1, 1));
+    }
+
+    #[test]
+    fn only_a_live_connected_tunnel_starts_recovery() {
+        assert!(should_start_watchdog_recovery(VpnPhase::Connected, true));
+        // User disconnected while the health probe ran without the lock.
+        assert!(!should_start_watchdog_recovery(VpnPhase::Idle, false));
+        assert!(!should_start_watchdog_recovery(
+            VpnPhase::Disconnecting,
+            false
+        ));
+        assert!(!should_start_watchdog_recovery(VpnPhase::Connected, false));
+    }
+
+    #[test]
+    fn ipv6_rtt_target_is_bracketed() {
+        assert_eq!(tcp_target_addr_string("::1", 443), "[::1]:443");
+        assert_eq!(tcp_target_addr_string("[::1]", 443), "[::1]:443");
+        assert_eq!(
+            tcp_target_addr_string("vpn.example.com", 8443),
+            "vpn.example.com:8443"
+        );
+        assert_eq!(
+            tcp_target_addr_string(" 127.0.0.1 ", 1080),
+            "127.0.0.1:1080"
+        );
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
 mod connecting_phase_guard_tests {
     use super::{ConnectingPhaseGuard, Inner, SavedConfig, VpnPhase};
     use std::sync::{Arc, Mutex};
@@ -1348,6 +1498,7 @@ mod connecting_phase_guard_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         }))
     }
 
@@ -1418,10 +1569,7 @@ mod connecting_phase_guard_tests {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     {
-        let g = match state.inner.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let g = lock_inner(&state.inner);
         if g.vpn.is_some() && g.phase == VpnPhase::Connected {
             drop(g);
             disconnect_inner(state, app, true);
@@ -1433,7 +1581,10 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     // создание внутри блока с живым MutexGuard дало бы самоблокировку.
     let mut phase_guard = ConnectingPhaseGuard::new(&state.inner);
 
-    let (cfg, saved_backup) = {
+    let (cfg, saved_backup, connect_token) = {
+        // Serialize with `save_config_cmd` / imports, but never hold `Inner` across
+        // the disk write: the UI polls state on every tick.
+        let _io = config_io_guard();
         let mut g = lock_inner(&state.inner);
         match g.phase {
             VpnPhase::Connecting => {
@@ -1445,9 +1596,16 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             _ => {}
         }
         g.phase = VpnPhase::Connecting;
+        g.connect_token = g.connect_token.wrapping_add(1);
+        let connect_token = g.connect_token;
         // Дальше любой выход с ошибкой обязан вернуть фазу в Idle — это делает Drop охраны.
         phase_guard.arm();
         g.last_error = None;
+        // Stale identity from a tunnel that died while phase was already Idle.
+        if g.vpn.is_none() {
+            g.tunnel_server = None;
+        }
+        bump_epoch(&mut g);
 
         if !g.cfg.can_connect() {
             warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
@@ -1457,7 +1615,11 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             );
         }
 
-        (g.cfg.clone(), g.proxy_backup.clone())
+        let cfg = g.cfg.clone();
+        let saved_backup = g.proxy_backup.clone();
+        drop(g);
+        persist_cfg(app, &cfg)?;
+        (cfg, saved_backup, connect_token)
     };
 
     // Снимок системного прокси — вне Mutex: на macOS это `networksetup` × 4 на каждый
@@ -1484,7 +1646,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     let http_bind = format!("127.0.0.1:{http_port}");
     let socks_bind = format!("127.0.0.1:{socks_port}");
 
-    persist_cfg(app, &cfg)?;
     // Same contract as Android: `start_config_json` / system-proxy ignore-hosts read the
     // in-memory preset cache. Prefetch is racy; a cold cache silently disables split-tunnel.
     let _ = bypass_domains::ensure_loaded(false);
@@ -1519,7 +1680,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
                 "таймаут 45 с: локальный прокси или удалённый туннель не поднялись, отмена подключения"
             );
             let _ = shutdown_tx.send(true);
-            match state.rt.block_on(join) {
+            match block_on_rt(&state.rt, join) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => error!(target: "bibavpn_desktop", "клиент после таймаута: {e:#}"),
                 Err(e) => error!(target: "bibavpn_desktop", "join клиента: {e}"),
@@ -1529,7 +1690,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             );
         }
         Err(RecvTimeoutError::Disconnected) => {
-            let msg = match state.rt.block_on(join) {
+            let msg = match block_on_rt(&state.rt, join) {
                 Ok(Ok(())) => {
                     "Клиент завершился до готовности прокси (проверьте TLS pin, SNI, token, PSK)."
                         .to_string()
@@ -1570,7 +1731,7 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     if let Err(e) = proxy_res {
         warn!(target: "bibavpn_desktop", "системный прокси: {e}");
         let _ = shutdown_tx.send(true);
-        let _ = state.rt.block_on(join);
+        let _ = block_on_rt(&state.rt, join);
         return Err(format!("Системный прокси: {e}"));
     }
 
@@ -1581,22 +1742,51 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         socks = %socks_hp,
         "VPN включён, локальный прокси и системные настройки применены"
     );
-    let tray_cfg = {
+    // A user disconnect (or a newer connect) can land while the client was starting
+    // and the proxy was being applied. Publish the tunnel only if this attempt still
+    // owns the phase; otherwise undo the proxy instead of reviving a cancelled session.
+    let mut pending_vpn = Some(ActiveVpn {
+        shutdown: shutdown_tx,
+        join,
+    });
+    let mut backup = Some(backup);
+    let installed = {
         let mut g = lock_inner(&state.inner);
-        g.proxy_backup = Some(backup);
-        g.vpn = Some(ActiveVpn {
-            shutdown: shutdown_tx,
-            join,
-        });
-        g.tunnel_server = Some(remote_label);
-        bump_epoch(&mut g);
-        g.phase = VpnPhase::Connected;
-        // Туннель снова живой: авто-восстановление завершено.
-        g.recovery_pending = false;
-        // Фаза доведена до Connected — сбрасывать в Idle на выходе больше не нужно.
-        phase_guard.disarm();
-        g.cfg.clone()
+        if can_install_connection(g.phase, g.connect_token, connect_token) {
+            g.proxy_backup = backup.take();
+            g.vpn = pending_vpn.take();
+            g.tunnel_server = Some(remote_label);
+            bump_epoch(&mut g);
+            g.phase = VpnPhase::Connected;
+            // Туннель снова живой: авто-восстановление завершено.
+            g.recovery_pending = false;
+            // Фаза доведена до Connected — сбрасывать в Idle на выходе больше не нужно.
+            phase_guard.disarm();
+            true
+        } else {
+            false
+        }
     };
+    if !installed {
+        // Another connect owns the state now (phase = Connecting): leave the system
+        // proxy to it. Only an explicit disconnect (Idle/Disconnecting/Connected)
+        // means our proxy must be rolled back.
+        let user_cancelled = lock_inner(&state.inner).phase != VpnPhase::Connecting;
+        warn!(
+            target: "bibavpn_desktop",
+            "подключение отменено более новым действием пользователя — останавливаем клиент"
+        );
+        if let Some(vpn) = pending_vpn.take() {
+            vpn.stop(&state.rt);
+        }
+        if user_cancelled {
+            if let Some(e) = restore_proxy_blocking(backup) {
+                warn!(target: "bibavpn_desktop", "{e}");
+            }
+        }
+        return Err("Подключение отменено: VPN отключён пользователем.".into());
+    }
+    let tray_cfg = lock_inner(&state.inner).cfg.clone();
     // Не под `Inner`: см. фазу 3 в `disconnect_inner` — tray API ждёт главный поток.
     sync_tray_tooltip_i18n(app, true, &tray_cfg);
     Ok(())
@@ -1612,9 +1802,29 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     // Вне мьютекса: JNI-вызов в Kotlin.
     let _ = android_vpn::clear_last_connect_error(app);
 
-    let cfg = {
+    let mut phase_guard = ConnectingPhaseGuard::new(&state.inner);
+    let (cfg, connect_token) = {
+        // Serialize with `save_config_cmd`, but keep `Inner` free while writing:
+        // on Android the same lock feeds state polling and the connect JNI wait.
+        let _io = config_io_guard();
         let mut g = lock_inner(&state.inner);
+        match g.phase {
+            VpnPhase::Connecting => {
+                return Err("Подключение уже выполняется.".into());
+            }
+            VpnPhase::Disconnecting => {
+                return Err("Дождитесь завершения отключения.".into());
+            }
+            _ => {}
+        }
+        g.phase = VpnPhase::Connecting;
+        g.connect_token = g.connect_token.wrapping_add(1);
+        let connect_token = g.connect_token;
+        phase_guard.arm();
         g.last_error = None;
+        // Не оставляем метку прошлой (уже упавшей) сессии, пока новый connect не готов.
+        g.tunnel_server = None;
+        bump_epoch(&mut g);
 
         if !g.cfg.can_connect() {
             warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
@@ -1624,10 +1834,10 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             );
         }
 
-        // Запись на диск остаётся под локом — так она упорядочена с `save_config_cmd`
-        // и более старый снимок не перетрёт свежие настройки.
-        persist_cfg(app, &g.cfg)?;
-        g.cfg.clone()
+        let cfg = g.cfg.clone();
+        drop(g);
+        persist_cfg(app, &cfg)?;
+        (cfg, connect_token)
     };
 
     // Холодный кэш пресетов уходит в сеть (ureq; DNS без таймаута) — только без `Inner`,
@@ -1657,8 +1867,21 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     // Трея на Android нет, поэтому и прежний JNI-раундтрип `tunnel_is_active`
     // ради подсказки трея здесь не нужен.
     let mut g = lock_inner(&state.inner);
+    if !can_install_connection(g.phase, g.connect_token, connect_token) {
+        // A disconnect may have run while the service was starting (and found
+        // nothing to stop yet). Stop what we just started, unless a newer connect
+        // has already taken over.
+        let user_cancelled = g.phase != VpnPhase::Connecting;
+        drop(g);
+        if user_cancelled {
+            let _ = android_vpn::request_disconnect(app);
+        }
+        return Err("Подключение отменено: VPN отключён пользователем.".into());
+    }
     g.tunnel_server = Some(remote_label);
+    g.phase = VpnPhase::Connected;
     bump_epoch(&mut g);
+    phase_guard.disarm();
     Ok(())
 }
 
@@ -1669,9 +1892,26 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    let cfg = {
+    let mut phase_guard = ConnectingPhaseGuard::new(&state.inner);
+    let (cfg, connect_token) = {
+        let _io = config_io_guard();
         let mut g = lock_inner(&state.inner);
+        match g.phase {
+            VpnPhase::Connecting => {
+                return Err("Подключение уже выполняется.".into());
+            }
+            VpnPhase::Disconnecting => {
+                return Err("Дождитесь завершения отключения.".into());
+            }
+            _ => {}
+        }
+        g.phase = VpnPhase::Connecting;
+        g.connect_token = g.connect_token.wrapping_add(1);
+        let connect_token = g.connect_token;
+        phase_guard.arm();
         g.last_error = None;
+        g.tunnel_server = None;
+        bump_epoch(&mut g);
 
         if !g.cfg.can_connect() {
             warn!(target: "bibavpn_desktop", "подключение: не заполнены сервер/токен или biba://");
@@ -1681,8 +1921,10 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
             );
         }
 
-        persist_cfg(app, &g.cfg)?;
-        g.cfg.clone()
+        let cfg = g.cfg.clone();
+        drop(g);
+        persist_cfg(app, &cfg)?;
+        (cfg, connect_token)
     };
 
     // Как на Android: возможный сетевой запрос за пресетами — без `Inner`.
@@ -1694,8 +1936,20 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 
     // Трея на iOS нет: прежний `tunnel_is_active` (таймаут до 18 с) ради подсказки трея убран.
     let mut g = lock_inner(&state.inner);
+    if !can_install_connection(g.phase, g.connect_token, connect_token) {
+        // Disconnect raced the NetworkExtension start: stop what we just started
+        // unless a newer connect owns the phase.
+        let user_cancelled = g.phase != VpnPhase::Connecting;
+        drop(g);
+        if user_cancelled {
+            let _ = ios_vpn::request_disconnect(app);
+        }
+        return Err("Подключение отменено: VPN отключён пользователем.".into());
+    }
     g.tunnel_server = Some(remote_label);
+    g.phase = VpnPhase::Connected;
     bump_epoch(&mut g);
+    phase_guard.disarm();
     Ok(())
 }
 
@@ -1801,12 +2055,17 @@ async fn get_tunnel_status_cmd(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
-        let g = lock_inner(&state.inner);
-        Ok(TunnelStatus {
-            connected: g.vpn.is_some(),
-            vpn_session_uptime_secs: None,
-            error: None,
+        let state = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let g = lock_inner(&state.inner);
+            TunnelStatus {
+                connected: g.vpn.is_some(),
+                vpn_session_uptime_secs: None,
+                error: None,
+            }
         })
+        .await
+        .map_err(|e| format!("tunnel status task: {e}"))
     }
 }
 
@@ -1827,15 +2086,21 @@ async fn save_config_cmd(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (locale_changed, cfg_for_tray) = {
-            let mut g = lock_inner(&state.inner);
-            let old_locale = g.cfg.ui_locale.clone();
-            g.cfg = merge_saved_config(&g.cfg, &cfg)?;
-            normalize_loaded(&mut g.cfg);
-            let locale_changed = old_locale != g.cfg.ui_locale;
-            persist_cfg(&app, &g.cfg)?;
-            bump_epoch(&mut g);
+            let _io = config_io_guard();
+            let (locale_changed, cfg_to_persist) = {
+                let mut g = lock_inner(&state.inner);
+                let old_locale = g.cfg.ui_locale.clone();
+                g.cfg = merge_saved_config(&g.cfg, &cfg)?;
+                normalize_loaded(&mut g.cfg);
+                let locale_changed = old_locale != g.cfg.ui_locale;
+                bump_epoch(&mut g);
+                (locale_changed, g.cfg.clone())
+            };
+            // Disk write outside `Inner` (under the IO lock, so it stays ordered
+            // with connect/import/reconnect writes).
+            persist_cfg(&app, &cfg_to_persist)?;
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let cfg_for_tray = g.cfg.clone();
+            let cfg_for_tray = cfg_to_persist;
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let cfg_for_tray = SavedConfig::default();
             (locale_changed, cfg_for_tray)
@@ -1900,16 +2165,23 @@ async fn apply_invite_cmd(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let result = {
-            let mut g = lock_inner(&state.inner);
-            g.last_error = None;
-            match apply_invite_to_cfg(&mut g.cfg) {
+            // Decode the invite (passphrase KDF) and write the file outside `Inner`;
+            // the IO lock keeps this ordered with `save_config_cmd`.
+            let _io = config_io_guard();
+            let mut cfg = lock_inner(&state.inner).cfg.clone();
+            match apply_invite_to_cfg(&mut cfg) {
                 Ok(()) => {
-                    persist_cfg(&app, &g.cfg)?;
+                    persist_cfg(&app, &cfg)?;
+                    let mut g = lock_inner(&state.inner);
+                    g.cfg = cfg;
+                    g.last_error = None;
                     bump_epoch(&mut g);
                     Ok(())
                 }
                 Err(e) => {
+                    let mut g = lock_inner(&state.inner);
                     g.last_error = Some(e.clone());
+                    bump_epoch(&mut g);
                     Err(e)
                 }
             }
@@ -1939,8 +2211,7 @@ async fn open_control_plane_refresh_cmd(
             let inst = p.control_plane_instance_id;
             if base.is_empty() || inst == 0 {
                 return Err(
-                    "Профиль не привязан к control plane. Откройте конфиг из веб-кабинета."
-                        .into(),
+                    "Профиль не привязан к control plane. Откройте конфиг из веб-кабинета.".into(),
                 );
             }
             format!("{base}/me/instances/{inst}/open")
@@ -1975,16 +2246,12 @@ fn open_portal_url(url: &str) -> Result<(), String> {
         use tauri::Manager;
         // Android: rely on VIEW intent via plugin when available; fallback to log.
         let _ = url;
-        return Err(
-            "Откройте веб-кабинет в браузере и нажмите «Открыть в BibaVPN».".into(),
-        );
+        return Err("Откройте веб-кабинет в браузере и нажмите «Открыть в BibaVPN».".into());
     }
     #[cfg(target_os = "ios")]
     {
         let _ = url;
-        return Err(
-            "Откройте веб-кабинет в браузере и нажмите «Open in BibaVPN».".into(),
-        );
+        return Err("Откройте веб-кабинет в браузере и нажмите «Open in BibaVPN».".into());
     }
     #[cfg(windows)]
     {
@@ -2002,7 +2269,10 @@ fn open_portal_url(url: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
-    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "android", target_os = "ios", target_os = "macos"))
+    ))]
     {
         std::process::Command::new("xdg-open")
             .arg(url)
@@ -2022,6 +2292,7 @@ async fn clear_error_cmd(
         {
             let mut g = lock_inner(&state.inner);
             g.last_error = None;
+            bump_epoch(&mut g);
         }
         #[cfg(target_os = "android")]
         let _ = android_vpn::clear_last_connect_error(&app);
@@ -2080,17 +2351,14 @@ struct BypassPresetsResponse {
 
 #[tauri::command]
 async fn get_bypass_presets_cmd(refresh: bool) -> BypassPresetsResponse {
-    const FETCH_TIMEOUT: Duration =
-        Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
+    const FETCH_TIMEOUT: Duration = Duration::from_secs(bypass_domains::HTTP_TIMEOUT_SECS + 1);
 
     let task = tauri::async_runtime::spawn_blocking(move || {
         let configured = bypass_domains::bypass_source_configured();
         match bypass_domains::ensure_loaded(refresh) {
             Ok(presets) => {
                 let error = if configured && presets.is_empty() {
-                    Some(
-                        "Списки обхода недоступны (таймаут 2 с или ошибка сети)".into(),
-                    )
+                    Some("Списки обхода недоступны (таймаут 2 с или ошибка сети)".into())
                 } else {
                     None
                 };
@@ -2187,6 +2455,7 @@ pub fn run() -> anyhow::Result<()> {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         })),
     };
 
@@ -2201,9 +2470,7 @@ pub fn run() -> anyhow::Result<()> {
         }));
     }
 
-    builder = builder
-        .plugin(tauri_plugin_deep_link::init())
-        .manage(state);
+    builder = builder.plugin(tauri_plugin_deep_link::init()).manage(state);
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -2304,15 +2571,19 @@ pub fn run() -> anyhow::Result<()> {
                 Ok(path) => {
                     let mut cfg = load_config_from_path(&path);
                     normalize_loaded(&mut cfg);
-                    let state = app.state::<AppState>();
-                    let mut inner = match state.inner.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    inner.cfg = cfg;
-                    drop(inner);
-                    let snap = snapshot_from_state(&handle, &*state);
-                    let _ = handle.emit("vpn-state", &snap);
+                    let state = Clone::clone(&*app.state::<AppState>());
+                    {
+                        let mut inner = lock_inner(&state.inner);
+                        inner.cfg = cfg;
+                    }
+                    // Never run the mobile JNI probe from `setup`: on Android the first
+                    // bridge lookup hops to the main looper, i.e. the thread currently
+                    // running setup, stalling window creation. Emit from a helper.
+                    let emit_handle = handle.clone();
+                    std::thread::spawn(move || {
+                        let snap = snapshot_from_state(&emit_handle, &state);
+                        let _ = emit_handle.emit("vpn-state", &snap);
+                    });
                 }
                 Err(e) => {
                     warn!(target: "bibavpn_desktop", "mobile config path: {e}");
@@ -2352,6 +2623,17 @@ pub fn run() -> anyhow::Result<()> {
             // до 5 с на остановку клиента), поэтому дублировать её из трея
             // нельзя.
             let st = app_handle.state::<AppState>();
+            #[cfg(target_os = "android")]
+            {
+                // `disconnect_inner` → `request_disconnect` posts to the Android main
+                // looper and waits. This callback already runs on that looper, so a
+                // synchronous call would block the only thread able to run it (a 30 s
+                // ANR on exit). Hand it to a helper instead.
+                let state = Clone::clone(&*st);
+                let app = app_handle.clone();
+                std::thread::spawn(move || disconnect_inner(&state, &app, true));
+            }
+            #[cfg(not(target_os = "android"))]
             disconnect_inner(&*st, app_handle, true);
         }
     });
@@ -2387,9 +2669,11 @@ mod deeplink_tests {
     #[test]
     fn pending_import_not_persisted_until_confirm() {
         let allowed = vec!["https://cp.example.com".to_string()];
-        let origin =
-            control_plane_client::validate_control_plane_base_url("https://cp.example.com", &allowed)
-                .unwrap();
+        let origin = control_plane_client::validate_control_plane_base_url(
+            "https://cp.example.com",
+            &allowed,
+        )
+        .unwrap();
         let payload = ImportPayload {
             invite_uri: "biba://x".into(),
             invite_passphrase: "pw".into(),
@@ -2416,10 +2700,13 @@ mod deeplink_tests {
                     payload: payload.clone(),
                 }),
                 epoch: 0,
+                connect_token: 0,
             })),
         };
         let cfg_before = state.inner.lock().unwrap().cfg.clone();
-        assert!(cfg_before.active_profile().is_none_or(|p| p.server.is_empty()));
+        assert!(cfg_before
+            .active_profile()
+            .is_none_or(|p| p.server.is_empty()));
         cancel_pending_import_inner(&state);
         assert!(state.inner.lock().unwrap().pending_import.is_none());
         let view = pending_import_view(&origin, &payload);
@@ -2484,20 +2771,25 @@ mod snapshot_assemble_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         });
         let probe_started = Arc::new(AtomicBool::new(false));
         let ps = Arc::clone(&probe_started);
         let state2 = state.clone();
         let worker = std::thread::spawn(move || {
-            snapshot_with_probe(&state, move || {
-                ps.store(true, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(200));
-                TunnelProbe {
-                    connected: true,
-                    vpn_session_uptime_secs: Some(99),
-                    ..TunnelProbe::default()
-                }
-            }, false)
+            snapshot_with_probe(
+                &state,
+                move || {
+                    ps.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    TunnelProbe {
+                        connected: true,
+                        vpn_session_uptime_secs: Some(99),
+                        ..TunnelProbe::default()
+                    }
+                },
+                false,
+            )
         });
         while !probe_started.load(Ordering::SeqCst) {
             std::thread::yield_now();
@@ -2541,6 +2833,7 @@ mod snapshot_assemble_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 1,
+            connect_token: 0,
         };
         let snap = assemble_state_snapshot(&copy, &current, Some(stale_probe), false);
         assert!(!snap.connected);
@@ -2548,11 +2841,16 @@ mod snapshot_assemble_tests {
         assert!(snap.tunnel_server.is_none());
         assert_eq!(snap.error.as_deref(), Some("disconnect err"));
         current.last_error = None;
-        let snap2 = assemble_state_snapshot(&copy, &current, Some(TunnelProbe {
-            connected: true,
-            vpn_session_uptime_secs: Some(42),
-            ..TunnelProbe::default()
-        }), false);
+        let snap2 = assemble_state_snapshot(
+            &copy,
+            &current,
+            Some(TunnelProbe {
+                connected: true,
+                vpn_session_uptime_secs: Some(42),
+                ..TunnelProbe::default()
+            }),
+            false,
+        );
         assert!(!snap2.connected);
         assert!(snap2.vpn_session_uptime_secs.is_none());
     }
@@ -2576,6 +2874,7 @@ mod snapshot_assemble_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         });
         let mut new_cfg = SavedConfig::default();
         new_cfg.profiles = vec![TunnelProfile {
@@ -2594,6 +2893,7 @@ mod snapshot_assemble_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 1,
+            connect_token: 0,
         };
         let snap = assemble_state_snapshot(
             &copy,
@@ -2625,6 +2925,7 @@ mod snapshot_assemble_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         };
         let copy = snapshot_copy_from_inner(&inner);
         let snap = assemble_state_snapshot(&copy, &inner, None, false);
@@ -2669,6 +2970,7 @@ mod snapshot_assemble_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         };
         let copy = snapshot_copy_from_inner(&inner);
         let snap = assemble_state_snapshot(
@@ -2680,17 +2982,16 @@ mod snapshot_assemble_tests {
             }),
             false,
         );
-        assert!(snap.connected, "desktop must ignore mobile probe and use vpn.is_some()");
+        assert!(
+            snap.connected,
+            "desktop must ignore mobile probe and use vpn.is_some()"
+        );
     }
 
     #[test]
     fn android_snapshot_error_timeout_is_not_success() {
         use super::android_snapshot_error;
-        let err = android_snapshot_error(
-            &None,
-            false,
-            Some("connect_ui_thread_timeout".into()),
-        );
+        let err = android_snapshot_error(&None, false, Some("connect_ui_thread_timeout".into()));
         assert!(err.is_some());
         assert!(err.as_ref().unwrap().contains("Таймаут"));
         assert!(android_snapshot_error(&None, false, Some("".into())).is_none());
@@ -2709,6 +3010,7 @@ mod snapshot_assemble_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         };
         bump_epoch(&mut inner);
         assert_eq!(inner.epoch, 1);
@@ -2728,10 +3030,7 @@ mod android_connect_error_tests {
         ] {
             let msg = map_android_jni_connect_error(code);
             assert!(!msg.is_empty(), "code {code}");
-            assert!(
-                msg.contains(expect_substr),
-                "code {code}: {msg}"
-            );
+            assert!(msg.contains(expect_substr), "code {code}: {msg}");
         }
     }
 
@@ -2749,32 +3048,20 @@ mod android_connect_error_tests {
 
     #[test]
     fn android_snapshot_error_overlay_inactive_tunnel() {
-        let err = android_snapshot_error(
-            &None,
-            false,
-            Some("vpn_permission_denied".into()),
-        );
+        let err = android_snapshot_error(&None, false, Some("vpn_permission_denied".into()));
         assert_eq!(err.as_deref(), Some("Разрешение VPN отклонено"));
     }
 
     #[test]
     fn android_snapshot_error_active_tunnel_ignores_jni() {
-        let err = android_snapshot_error(
-            &None,
-            true,
-            Some("vpn_tunnel_start_failed".into()),
-        );
+        let err = android_snapshot_error(&None, true, Some("vpn_tunnel_start_failed".into()));
         assert!(err.is_none());
     }
 
     #[test]
     fn android_snapshot_error_last_error_wins_over_jni() {
         let rust_err = Some("Rust ошибка".into());
-        let err = android_snapshot_error(
-            &rust_err,
-            false,
-            Some("vpn_permission_denied".into()),
-        );
+        let err = android_snapshot_error(&rust_err, false, Some("vpn_permission_denied".into()));
         assert_eq!(err, rust_err);
     }
 }
@@ -2872,6 +3159,7 @@ mod main_thread_safety_tests {
             recovery_pending: false,
             pending_import: None,
             epoch: 0,
+            connect_token: 0,
         }));
         let poisoner = Arc::clone(&inner);
         let _ = std::thread::spawn(move || {

@@ -78,23 +78,31 @@ object TauriVpnBridge {
         // возврата, который [startConnectOnMain] отдаёт не блокируясь.
         val holder = arrayOfNulls<String?>(1)
         val latch = CountDownLatch(1)
-        activity.runOnUiThread {
-            try {
-                holder[0] =
-                    startConnectOnMain(
-                        activity,
-                        json,
-                        splitTunnelEnabled,
-                        splitPackages,
-                        splitDomains,
-                        screenOffBatterySaver,
-                    )
-            } catch (t: Throwable) {
-                Log.e(TAG, "requestConnect", t)
-                holder[0] = t.message ?: "requestConnect_exception"
-            } finally {
-                latch.countDown()
+        try {
+            activity.runOnUiThread {
+                try {
+                    holder[0] =
+                        startConnectOnMain(
+                            activity,
+                            json,
+                            splitTunnelEnabled,
+                            splitPackages,
+                            splitDomains,
+                            screenOffBatterySaver,
+                        )
+                } catch (t: Throwable) {
+                    Log.e(TAG, "requestConnect", t)
+                    holder[0] = t.message ?: "requestConnect_exception"
+                } finally {
+                    latch.countDown()
+                }
             }
+        } catch (t: Throwable) {
+            // e.g. activity gone / looper shut down: never wait the full timeout for a runnable
+            // that will never run.
+            Log.e(TAG, "requestConnect: runOnUiThread", t)
+            holder[0] = t.message ?: "requestConnect_exception"
+            latch.countDown()
         }
         return try {
             if (!latch.await(30, TimeUnit.SECONDS)) {
@@ -103,6 +111,7 @@ object TauriVpnBridge {
                 holder[0]
             }
         } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
             "connect_interrupted"
         }
     }
@@ -246,66 +255,72 @@ object TauriVpnBridge {
             }
         }
 
-        activity.runOnUiThread {
-            try {
-                val pm = getTauriPluginManager(activity)
-                if (pm == null) {
-                    finish("ERROR:no_plugin_manager")
-                    return@runOnUiThread
-                }
-                val cbClass = Class.forName("app.tauri.plugin.PluginManager\$ActivityResultCallback")
-                val proxy =
-                    java.lang.reflect.Proxy.newProxyInstance(
-                        cbClass.classLoader,
-                        arrayOf(cbClass),
-                    ) { _, method, args ->
-                        if (method.name != "onResult") {
-                            return@newProxyInstance null
-                        }
-                        try {
-                            val result = args?.firstOrNull()
-                            val out =
-                                if (result == null) {
-                                    "CANCEL"
-                                } else {
-                                    val code =
-                                        try {
-                                            result.javaClass.getMethod("getResultCode").invoke(result) as Int
-                                        } catch (_: Throwable) {
-                                            Activity.RESULT_CANCELED
-                                        }
-                                    if (code != Activity.RESULT_OK) {
+        try {
+            activity.runOnUiThread {
+                try {
+                    val pm = getTauriPluginManager(activity)
+                    if (pm == null) {
+                        finish("ERROR:no_plugin_manager")
+                        return@runOnUiThread
+                    }
+                    val cbClass = Class.forName("app.tauri.plugin.PluginManager\$ActivityResultCallback")
+                    val proxy =
+                        java.lang.reflect.Proxy.newProxyInstance(
+                            cbClass.classLoader,
+                            arrayOf(cbClass),
+                        ) { _, method, args ->
+                            if (method.name != "onResult") {
+                                return@newProxyInstance null
+                            }
+                            try {
+                                val result = args?.firstOrNull()
+                                val out =
+                                    if (result == null) {
                                         "CANCEL"
                                     } else {
-                                        val data = extractResultIntent(result)
-                                        val pkg =
-                                            data?.getStringExtra(PickInstalledPackageActivity.EXTRA_PACKAGE_NAME)?.trim().orEmpty()
-                                        if (pkg.isEmpty()) {
+                                        val code =
+                                            try {
+                                                result.javaClass.getMethod("getResultCode").invoke(result) as Int
+                                            } catch (_: Throwable) {
+                                                Activity.RESULT_CANCELED
+                                            }
+                                        if (code != Activity.RESULT_OK) {
                                             "CANCEL"
                                         } else {
-                                            "PACKAGE:$pkg"
+                                            val data = extractResultIntent(result)
+                                            val pkg =
+                                                data?.getStringExtra(PickInstalledPackageActivity.EXTRA_PACKAGE_NAME)?.trim().orEmpty()
+                                            if (pkg.isEmpty()) {
+                                                "CANCEL"
+                                            } else {
+                                                "PACKAGE:$pkg"
+                                            }
                                         }
                                     }
-                                }
-                            finish(out)
-                        } catch (t: Throwable) {
-                            Log.e(TAG, "pick onResult", t)
-                            finish("ERROR:${t.message ?: t.javaClass.simpleName}")
+                                finish(out)
+                            } catch (t: Throwable) {
+                                Log.e(TAG, "pick onResult", t)
+                                finish("ERROR:${t.message ?: t.javaClass.simpleName}")
+                            }
+                            null
                         }
-                        null
-                    }
-                val intent = Intent(activity, PickInstalledPackageActivity::class.java)
-                val m =
-                    pm.javaClass.getMethod(
-                        "startActivityForResult",
-                        Intent::class.java,
-                        cbClass,
-                    )
-                m.invoke(pm, intent, proxy)
-            } catch (e: Throwable) {
-                Log.e(TAG, "pickInstalledLauncherPackageWorker", e)
-                finish("ERROR:${e.message ?: e.javaClass.simpleName}")
+                    val intent = Intent(activity, PickInstalledPackageActivity::class.java)
+                    val m =
+                        pm.javaClass.getMethod(
+                            "startActivityForResult",
+                            Intent::class.java,
+                            cbClass,
+                        )
+                    m.invoke(pm, intent, proxy)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "pickInstalledLauncherPackageWorker", e)
+                    finish("ERROR:${e.message ?: e.javaClass.simpleName}")
+                }
             }
+        } catch (t: Throwable) {
+            // Activity gone / looper shut down: release the worker instead of waiting 60 s.
+            Log.e(TAG, "pickInstalledLauncherPackageWorker: runOnUiThread", t)
+            finish("ERROR:${t.message ?: t.javaClass.simpleName}")
         }
         return try {
             if (!latch.await(60, TimeUnit.SECONDS)) {
@@ -314,6 +329,7 @@ object TauriVpnBridge {
                 holder[0] ?: "ERROR:null_result"
             }
         } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
             "ERROR:interrupted"
         }
     }

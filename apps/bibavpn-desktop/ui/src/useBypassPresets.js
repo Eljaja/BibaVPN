@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /**
@@ -25,20 +25,33 @@ export function useBypassPresets() {
   const [loading, setLoading] = useState(true);
   const [configured, setConfigured] = useState(false);
   const [error, setError] = useState(/** @type {string | null} */ (null));
+  const mountedRef = useRef(true);
+  const requestRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const load = useCallback(async (refresh = false) => {
-    setLoading(true);
+    const request = ++requestRef.current;
+    if (mountedRef.current) setLoading(true);
     try {
       /** @type {{ presets: BypassPreset[], configured: boolean, error?: string | null }} */
       const res = await invoke("get_bypass_presets_cmd", { refresh });
+      // Более новый запрос (или размонтирование) — этот ответ уже неактуален.
+      if (!mountedRef.current || request !== requestRef.current) return;
       setPresets(Array.isArray(res.presets) ? res.presets : []);
       setConfigured(Boolean(res.configured));
       setError(res.error || null);
     } catch (e) {
+      if (!mountedRef.current || request !== requestRef.current) return;
       setPresets([]);
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (mountedRef.current && request === requestRef.current) setLoading(false);
     }
   }, []);
 
@@ -46,12 +59,14 @@ export function useBypassPresets() {
     void load(false);
   }, [load]);
 
+  const refresh = useCallback(() => load(true), [load]);
+
   return {
     presets,
     loading,
     configured,
     error,
-    refresh: () => load(true),
+    refresh,
   };
 }
 

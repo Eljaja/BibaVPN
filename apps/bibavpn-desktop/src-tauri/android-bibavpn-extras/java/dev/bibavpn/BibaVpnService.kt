@@ -415,29 +415,37 @@ class BibaVpnService : VpnService() {
         reason: String,
         json: String,
     ) {
-        val sessionJson = configJsonWithSessionSocksAuth(json)
         Thread(
             {
                 try {
+                    // configJsonWithSessionSocksAuth may decode an invite through JNI and build
+                    // session SOCKS credentials. Keep it off the caller thread (broadcast receiver /
+                    // main handler / onStartCommand) so the UI looper never waits on JNI or crypto.
+                    val sessionJson = configJsonWithSessionSocksAuth(json)
                     Log.i(TAG, "$reason: begin full stack restart")
                     val stopBegin = SystemClock.elapsedRealtime()
                     val nativeStopMs: Long
                     val nativeStartMs: Long
                     val err =
-                        synchronized(nativeLifecycleLock) {
-                            stopTunnelAndNative()
-                            allowScreenOnStackRestart = false
-                            nativeStopMs = SystemClock.elapsedRealtime() - stopBegin
-                            val nativeStartBegin = SystemClock.elapsedRealtime()
-                            val startErr =
-                                try {
-                                    BibaNative.nativeStart(sessionJson)
-                                } catch (e: Throwable) {
-                                    Log.e(TAG, "$reason: nativeStart", e)
-                                    e.message ?: e.javaClass.simpleName
-                                }
-                            nativeStartMs = SystemClock.elapsedRealtime() - nativeStartBegin
-                            startErr
+                        synchronized(tunLock) {
+                            // Consistent order everywhere: tunLock -> nativeLifecycleLock
+                            // (stopTunnelAndNative uses the same order). The reverse order used to
+                            // deadlock when a STOP teardown raced a SCREEN_ON/network restart.
+                            synchronized(nativeLifecycleLock) {
+                                stopTunnelAndNative()
+                                allowScreenOnStackRestart = false
+                                nativeStopMs = SystemClock.elapsedRealtime() - stopBegin
+                                val nativeStartBegin = SystemClock.elapsedRealtime()
+                                val startErr =
+                                    try {
+                                        BibaNative.nativeStart(sessionJson)
+                                    } catch (e: Throwable) {
+                                        Log.e(TAG, "$reason: nativeStart", e)
+                                        e.message ?: e.javaClass.simpleName
+                                    }
+                                nativeStartMs = SystemClock.elapsedRealtime() - nativeStartBegin
+                                startErr
+                            }
                         }
                     if (err != null) {
                         Log.e(
@@ -478,6 +486,7 @@ class BibaVpnService : VpnService() {
                 } catch (e: Throwable) {
                     allowScreenOnStackRestart = true
                     Log.e(TAG, "$reason: full restart", e)
+                    setLastConnectError(e.message ?: e.javaClass.simpleName)
                 } finally {
                     val rerun =
                         synchronized(restartLock) {
@@ -538,14 +547,15 @@ class BibaVpnService : VpnService() {
 
         stopRequested = false
 
-        val sessionJson = configJsonWithSessionSocksAuth(json)
+        // Only a cheap parse here: onStartCommand runs on the main looper. Invite decode (JNI) and
+        // per-session SOCKS credentials are built in the bootstrap worker / restart thread.
         val socks = runCatching {
-            JSONObject(sessionJson).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
+            JSONObject(json).optString("socks_bind", SOCKS_LOCAL).ifBlank { SOCKS_LOCAL }
         }.getOrDefault(SOCKS_LOCAL)
 
         Log.i(
             TAG,
-            "bootstrap ${configFingerprint(sessionJson)} socks=$socks fromIntentExtra=" +
+            "bootstrap ${configFingerprint(json)} socks=$socks fromIntentExtra=" +
                 "${fromExtra != null && intent?.action != ACTION_ENABLE} action=${intent?.action}",
         )
 
@@ -563,7 +573,7 @@ class BibaVpnService : VpnService() {
                 requestFullStackRestart("ACTION_ENABLE", json)
                 return START_STICKY
             }
-            enqueueBootstrapWorker(sessionJson)
+            enqueueBootstrapWorker(json)
             return START_STICKY
         }
 
@@ -574,7 +584,7 @@ class BibaVpnService : VpnService() {
             }
         }
 
-        enqueueBootstrapWorker(sessionJson)
+        enqueueBootstrapWorker(json)
         return START_STICKY
     }
 
@@ -606,7 +616,7 @@ class BibaVpnService : VpnService() {
     }
 
     /** nativeStart ждёт bind SOCKS в Rust — не блокируем main thread (ANR). */
-    private fun enqueueBootstrapWorker(sessionJson: String) {
+    private fun enqueueBootstrapWorker(baseJson: String) {
         clearLastConnectError()
         // «Отключить → сразу подключить»: разбор прошлой сессии (ACTION_STOP) может ещё идти.
         // Параллельный старт либо получал "already running" и молча ничего не поднимал, либо
@@ -631,6 +641,8 @@ class BibaVpnService : VpnService() {
                             Log.i(TAG, "worker: stop requested before nativeStart — skip bootstrap")
                             return@Thread
                         }
+                        // Invite decode + session SOCKS auth may go through JNI; never on main.
+                        val sessionJson = configJsonWithSessionSocksAuth(baseJson)
                         Log.i(TAG, "worker: nativeStart begin ${configFingerprint(sessionJson)}")
                         val err = try {
                             synchronized(nativeLifecycleLock) {
@@ -713,6 +725,9 @@ class BibaVpnService : VpnService() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onDestroy() {
+        // Tell any in-flight bootstrap/restart worker not to bring a new session up on a
+        // destroyed service (it would otherwise start TUN after our teardown below).
+        stopRequested = true
         networkRestartRunnable?.let { networkRestartHandler.removeCallbacks(it) }
         networkRestartRunnable = null
         runCatching { connectivityManager?.unregisterNetworkCallback(physicalNetworkCallback) }
@@ -722,17 +737,18 @@ class BibaVpnService : VpnService() {
         }
         if (!tunnelTeardownDoneBeforeDestroy) {
             // Страховка: разбор не начинали (сервис снят системой, а не через STOP).
-            // Уносить в воркер поздно — процесс может умереть сразу после onDestroy;
-            // сверху время здесь ограничивает STOP_JOIN_TIMEOUT в JNI.
-            stopTunnelAndNative()
-        } else {
-            // Разбор уже идёт в воркере: ждём его недолго, иначе daemon-поток убьют
-            // вместе с процессом на середине nativeStop.
-            teardownThread?.let { t ->
-                try {
-                    t.join(3000)
-                } catch (_: InterruptedException) {
-                }
+            // Раньше здесь синхронно звали stopTunnelAndNative: join tun2socks (до 8 с) +
+            // nativeStop (до 5 с) на главном потоке — ANR при отключении. Запускаем тот же
+            // воркер и ждём его лишь ограниченно; если процесс переживёт onDestroy, daemon-поток
+            // доведёт nativeStop сам.
+            enqueueTeardownWorker("onDestroy")
+        }
+        // Разбор идёт в воркере: ждём его недолго, иначе daemon-поток убьют вместе с
+        // процессом на середине nativeStop.
+        teardownThread?.let { t ->
+            try {
+                t.join(DESTROY_TEARDOWN_WAIT_MS)
+            } catch (_: InterruptedException) {
             }
         }
         super.onDestroy()
@@ -796,8 +812,12 @@ class BibaVpnService : VpnService() {
             val proxy = proxyUrl.trim()
             val startLatch = CountDownLatch(1)
             val startErr = AtomicReference<String?>(null)
+            val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
             tun2socksThread = Thread(
                 {
+                    // The raw fd was detached from a ParcelFileDescriptor and is owned by the
+                    // engine only once Engine.start() returns. If start fails first, close it here.
+                    var engineOwnsFd = false
                     try {
                         val key = Key()
                         key.setDevice("fd://$fd")
@@ -808,6 +828,12 @@ class BibaVpnService : VpnService() {
                         Log.i(TAG, "tun2socks Key.logLevel=${key.logLevel}")
                         Engine.insert(key)
                         Engine.start()
+                        engineOwnsFd = true
+                        if (cancelled.get()) {
+                            Log.w(TAG, "tun2socks: start finished after timeout — stopping engine")
+                            runCatching { Engine.stop() }
+                            return@Thread
+                        }
                         acquireTunnelWakeLock()
                         setTunnelActive(true)
                         allowScreenOnStackRestart = true
@@ -824,6 +850,10 @@ class BibaVpnService : VpnService() {
                     } catch (e: Throwable) {
                         Log.e(TAG, "tun2socks", e)
                         startErr.set(e.message ?: e.javaClass.simpleName)
+                        if (!engineOwnsFd) {
+                            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+                                .onFailure { ce -> Log.w(TAG, "close unowned tun fd: ${ce.message}") }
+                        }
                         mainHandler.post { abortVpnFromWorker(e.message) }
                     } finally {
                         startLatch.countDown()
@@ -832,9 +862,17 @@ class BibaVpnService : VpnService() {
                 "biba-tun2socks",
             ).also { it.start() }
 
-            val ok = startLatch.await(25, TimeUnit.SECONDS)
+            val ok =
+                try {
+                    startLatch.await(25, TimeUnit.SECONDS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    Log.w(TAG, "tun2socks: await interrupted — останавливаем")
+                    false
+                }
             if (!ok) {
                 Log.e(TAG, "tun2socks: Engine.start timeout (${25}s) — останавливаем")
+                cancelled.set(true)
                 tun2socksThread?.interrupt()
                 stopTun2socksOnly()
                 return false
@@ -1310,6 +1348,9 @@ class BibaVpnService : VpnService() {
          */
         private const val TEARDOWN_WAIT_BEFORE_START_MS = 20_000L
 
+        /** Верхняя граница ожидания разбора в [onDestroy] — ниже порога ANR (~5 с). */
+        private const val DESTROY_TEARDOWN_WAIT_MS = 4_000L
+
         private const val TAG = "BibaVpnService"
         private const val CHANNEL_ID = "bibavpn_proxy"
         private const val NOTIFICATION_ID = 42
@@ -1319,9 +1360,14 @@ class BibaVpnService : VpnService() {
 
         /** После выключения «экономии при блокировке» восстановить wake lock, если туннель ещё активен. */
         fun requestSyncWakeLock(ctx: Context) {
-            ctx.startService(
-                Intent(ctx, BibaVpnService::class.java).setAction(ACTION_SYNC_WAKE_LOCK),
-            )
+            try {
+                ctx.startService(
+                    Intent(ctx, BibaVpnService::class.java).setAction(ACTION_SYNC_WAKE_LOCK),
+                )
+            } catch (e: Throwable) {
+                // Background start restrictions: the service may already be running/foreground.
+                Log.w(TAG, "requestSyncWakeLock: ${e.message}")
+            }
         }
         const val EXTRA_CONFIG_JSON = "config_json"
         private const val PREFS = "bibavpn"
@@ -1430,17 +1476,28 @@ class BibaVpnService : VpnService() {
             Log.i(TAG, "startWithJson ${configFingerprint(json)}")
             saveConfig(ctx, json)
             val i = Intent(ctx, BibaVpnService::class.java).putExtra(EXTRA_CONFIG_JSON, json)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                ctx.startForegroundService(i)
-            } else {
-                ctx.startService(i)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    ctx.startForegroundService(i)
+                } else {
+                    ctx.startService(i)
+                }
+            } catch (e: Throwable) {
+                // e.g. BackgroundServiceStartNotAllowedException; surface it instead of crashing
+                // through the JNI/reflection callback.
+                Log.e(TAG, "startWithJson: ${e.message}")
+                setLastConnectError(e.message ?: "start_service_failed")
             }
         }
 
         fun stop(ctx: Context) {
-            ctx.startService(
-                Intent(ctx, BibaVpnService::class.java).setAction(ACTION_STOP),
-            )
+            try {
+                ctx.startService(
+                    Intent(ctx, BibaVpnService::class.java).setAction(ACTION_STOP),
+                )
+            } catch (e: Throwable) {
+                Log.w(TAG, "stop: ${e.message}")
+            }
         }
 
         /** Длина и короткий отпечаток JSON без вывода содержимого в лог. */

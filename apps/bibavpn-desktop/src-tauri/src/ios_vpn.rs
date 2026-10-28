@@ -39,9 +39,8 @@ pub fn request_disconnect(_app: &tauri::AppHandle) -> Result<(), String> {
         }
         let _ = tx.send(());
     });
-    rx.recv_timeout(Duration::from_secs(45)).map_err(|_| {
-        "таймаут VPN disconnect (iOS)".to_string()
-    })?;
+    rx.recv_timeout(Duration::from_secs(45))
+        .map_err(|_| "таймаут VPN disconnect (iOS)".to_string())?;
     Ok(())
 }
 

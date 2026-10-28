@@ -18,9 +18,8 @@ const PANIC_ERR: &str = "internal panic";
 
 /// The client slot retains a stopping thread after the bounded join timeout.
 /// A later start can proceed only after that thread has joined.
-static STATE: LazyLock<Mutex<ClientSlotManager>> = LazyLock::new(|| {
-    Mutex::new(ClientSlotManager::new(PRODUCTION_JOIN_TIMEOUT))
-});
+static STATE: LazyLock<Mutex<ClientSlotManager>> =
+    LazyLock::new(|| Mutex::new(ClientSlotManager::new(PRODUCTION_JOIN_TIMEOUT)));
 
 static RING_ONCE: OnceLock<()> = OnceLock::new();
 static TRACING_ONCE: OnceLock<()> = OnceLock::new();
@@ -129,6 +128,15 @@ fn jni_alloc_failed(env: &mut JNIEnv) -> jstring {
     std::ptr::null_mut()
 }
 
+/// Drop a pending Java exception before returning to Java or making another JNI call:
+/// leaving one attached makes the next JNI call abort the process in ART.
+fn clear_pending_java_exception(env: &mut JNIEnv) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+}
+
 /// Allocate a JNI string or throw `RuntimeException` and return null on failure.
 fn jni_new_string_or_throw(env: &mut JNIEnv, s: &str) -> jstring {
     let created = env.new_string(s);
@@ -143,6 +151,9 @@ fn jni_new_string_or_throw(env: &mut JNIEnv, s: &str) -> jstring {
 
 /// Return a `jstring` for an error message, or throw `RuntimeException` if allocation fails.
 fn jni_err(env: &mut JNIEnv, msg: impl AsRef<str>) -> jstring {
+    // If an earlier JNI call left a Java exception pending, `NewString` would fail. We are
+    // replacing it with our own error string, so clear it first.
+    clear_pending_java_exception(env);
     jni_new_string_or_throw(env, &sanitize_jni_utf8(msg.as_ref()))
 }
 
@@ -175,25 +186,46 @@ fn jni_protect_socket(jvm: &jni::JavaVM, fd: std::os::unix::io::RawFd) -> std::i
                 "VpnProtect class not cached (nativeStart order?)",
             )
         })?;
-        env.new_local_ref(gref.as_obj()).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("VpnProtect local ref: {e}"),
-            )
-        })?
+        match env.new_local_ref(gref.as_obj()) {
+            Ok(local) => local,
+            Err(e) => {
+                clear_pending_java_exception(&mut env);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("VpnProtect local ref: {e}"),
+                ));
+            }
+        }
     };
     let jclass = JClass::from(local);
-    let v = env
-        .call_static_method(
-            &jclass,
-            "protectFd",
-            "(I)Z",
-            &[JValue::Int(fd as jni::sys::jint)],
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("protectFd: {e}")))?;
-    let ok = v
-        .z()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    let call = env.call_static_method(
+        &jclass,
+        "protectFd",
+        "(I)Z",
+        &[JValue::Int(fd as jni::sys::jint)],
+    );
+    // The local ref is only needed for this call.
+    let _ = env.delete_local_ref(jclass);
+    let v = match call {
+        Ok(v) => v,
+        Err(e) => {
+            clear_pending_java_exception(&mut env);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("protectFd: {e}"),
+            ));
+        }
+    };
+    let ok = match v.z() {
+        Ok(ok) => ok,
+        Err(e) => {
+            clear_pending_java_exception(&mut env);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("protectFd result: {e}"),
+            ));
+        }
+    };
     if !ok {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,

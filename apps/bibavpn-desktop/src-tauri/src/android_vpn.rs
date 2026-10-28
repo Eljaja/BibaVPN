@@ -45,10 +45,18 @@ where
         .ok_or_else(|| "нет окна main".to_string())?;
     w.with_webview(move |webview| {
         webview.jni_handle().exec(move |env, activity, _webview| {
-            let activity = env
-                .new_local_ref(activity)
-                .expect("failed to create local Activity reference");
-            run(env, &activity);
+            // Never panic across the FFI boundary: an OOM/pending exception here would abort the
+            // process. Fail closed; the waiting caller hits its recv_timeout instead.
+            let local = match env.new_local_ref(activity) {
+                Ok(local) => local,
+                Err(e) => {
+                    tracing::warn!("with_main_webview_jni: activity local ref: {e}");
+                    clear_pending_exception(env);
+                    return;
+                }
+            };
+            run(env, &local);
+            let _ = env.delete_local_ref(local);
             clear_pending_exception(env);
         });
     })
@@ -65,13 +73,15 @@ fn load_app_class<'local>(
     name: &str,
 ) -> Result<JClass<'local>, String> {
     let j_name = env.new_string(name).map_err(|e| jni_string_err(env, e))?;
-    let cls = env
-        .call_method(
-            activity,
-            "getAppClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[(&j_name).into()],
-        )
+    let res = env.call_method(
+        activity,
+        "getAppClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[(&j_name).into()],
+    );
+    // The argument string is not needed after the call; free it even when the call failed.
+    let _ = env.delete_local_ref(j_name);
+    let cls = res
         .map_err(|e| jni_string_err(env, e))?
         .l()
         .map_err(|e| jni_string_err(env, e))?;
@@ -100,6 +110,8 @@ fn direct_bridge(app: &AppHandle) -> Result<&'static DirectBridge, String> {
             let class = env
                 .new_global_ref(&cls)
                 .map_err(|e| jni_string_err(env, e))?;
+            // The local class ref is only needed to build the GlobalRef.
+            let _ = env.delete_local_ref(cls);
             let vm = env.get_java_vm().map_err(|e| jni_string_err(env, e))?;
             Ok::<DirectBridge, String>(DirectBridge { vm, class })
         })();
@@ -161,59 +173,56 @@ pub fn request_connect(
     with_main_webview_jni(app, move |env, activity| {
         let res = (|| {
             let cls = load_app_class(env, activity, BRIDGE_CLASS)?;
-            let j_json = env
-                .new_string(&json)
-                .map_err(|e| jni_string_err(env, e))?;
+            let j_json = env.new_string(&json).map_err(|e| jni_string_err(env, e))?;
             let str_cls = load_app_class(env, activity, "java.lang.String")?;
             let pkg_arr = env
-                .new_object_array(
-                    packages.len() as jni::sys::jsize,
-                    &str_cls,
-                    JObject::null(),
-                )
+                .new_object_array(packages.len() as jni::sys::jsize, &str_cls, JObject::null())
                 .map_err(|e| jni_string_err(env, e))?;
             for (i, p) in packages.iter().enumerate() {
                 let s = env.new_string(p).map_err(|e| jni_string_err(env, e))?;
-                env.set_object_array_element(&pkg_arr, i as jni::sys::jsize, &s)
-                    .map_err(|e| jni_string_err(env, e))?;
+                let set = env.set_object_array_element(&pkg_arr, i as jni::sys::jsize, &s);
+                // `set_object_array_element` copies the reference; release the per-element local
+                // ref immediately so large split-tunnel lists cannot overflow the local ref table.
+                let _ = env.delete_local_ref(s);
+                set.map_err(|e| jni_string_err(env, e))?;
             }
             let domain_arr = env
-                .new_object_array(
-                    domains.len() as jni::sys::jsize,
-                    &str_cls,
-                    JObject::null(),
-                )
+                .new_object_array(domains.len() as jni::sys::jsize, &str_cls, JObject::null())
                 .map_err(|e| jni_string_err(env, e))?;
             for (i, d) in domains.iter().enumerate() {
                 let s = env.new_string(d).map_err(|e| jni_string_err(env, e))?;
-                env.set_object_array_element(&domain_arr, i as jni::sys::jsize, &s)
-                    .map_err(|e| jni_string_err(env, e))?;
+                let set = env.set_object_array_element(&domain_arr, i as jni::sys::jsize, &s);
+                let _ = env.delete_local_ref(s);
+                set.map_err(|e| jni_string_err(env, e))?;
             }
-            let out = env
-                .call_static_method(
-                    &cls,
-                    "requestConnect",
-                    "(Landroid/app/Activity;Ljava/lang/String;Z[Ljava/lang/String;[Ljava/lang/String;Z)Ljava/lang/String;",
-                    &[
-                        activity.into(),
-                        (&j_json).into(),
-                        (split_tunnel_enabled as jboolean).into(),
-                        (&pkg_arr).into(),
-                        (&domain_arr).into(),
-                        (screen_off_battery_saver as jboolean).into(),
-                    ],
-                )
-                .map_err(|e| jni_string_err(env, e))?;
+            let out = env.call_static_method(
+                &cls,
+                "requestConnect",
+                "(Landroid/app/Activity;Ljava/lang/String;Z[Ljava/lang/String;[Ljava/lang/String;Z)Ljava/lang/String;",
+                &[
+                    activity.into(),
+                    (&j_json).into(),
+                    (split_tunnel_enabled as jboolean).into(),
+                    (&pkg_arr).into(),
+                    (&domain_arr).into(),
+                    (screen_off_battery_saver as jboolean).into(),
+                ],
+            );
+            // Arguments are no longer needed once the call has returned (even with an exception).
+            let _ = env.delete_local_ref(j_json);
+            let _ = env.delete_local_ref(str_cls);
+            let _ = env.delete_local_ref(pkg_arr);
+            let _ = env.delete_local_ref(domain_arr);
+            let _ = env.delete_local_ref(cls);
+            let out = out.map_err(|e| jni_string_err(env, e))?;
             let j_obj = out.l().map_err(|e| jni_string_err(env, e))?;
             if j_obj.is_null() {
                 return Ok(());
             }
             let j_str = jni::objects::JString::from(j_obj);
-            let err: String = env
-                .get_string(&j_str)
-                .map_err(|e| jni_string_err(env, e))?
-                .into();
-            Err(err)
+            let read = env.get_string(&j_str).map(String::from);
+            let _ = env.delete_local_ref(j_str);
+            Err(read.map_err(|e| jni_string_err(env, e))?)
         })();
         let _ = tx.send(res);
     })?;
@@ -234,13 +243,15 @@ pub fn request_disconnect(app: &AppHandle) -> Result<(), String> {
     with_main_webview_jni(app, move |env, activity| {
         let res = (|| {
             let cls = load_app_class(env, activity, BRIDGE_CLASS)?;
-            env.call_static_method(
+            let call = env.call_static_method(
                 &cls,
                 "requestDisconnect",
                 "(Landroid/content/Context;)V",
                 &[activity.into()],
-            )
-            .map_err(|e| jni_string_err(env, e))?;
+            );
+            // The main looper thread stays attached to the JVM; free the class ref explicitly.
+            let _ = env.delete_local_ref(cls);
+            call.map_err(|e| jni_string_err(env, e))?;
             Ok::<(), String>(())
         })();
         let _ = tx.send(res);
