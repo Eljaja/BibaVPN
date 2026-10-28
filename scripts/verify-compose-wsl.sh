@@ -25,28 +25,43 @@ umask 077
 
 echo "=== compose config: 262144 + print-invite-uri ==="
 RESOLVED="$(docker compose --env-file "$ENV_FILE" -f docker-compose.yml config)"
-echo "$RESOLVED" | grep -q '262144' || { echo "FAIL: 262144 not in config" >&2; exit 1; }
-echo "$RESOLVED" | grep -q 'print-invite-uri' || { echo "FAIL: print-invite-uri missing" >&2; exit 1; }
-echo "$RESOLVED" | grep -q 'invite-passphrase' || { echo "FAIL: invite-passphrase missing" >&2; exit 1; }
+case "$RESOLVED" in
+  *262144*) ;;
+  *) echo "FAIL: 262144 not in config" >&2; exit 1 ;;
+esac
+case "$RESOLVED" in
+  *print-invite-uri*) ;;
+  *) echo "FAIL: print-invite-uri missing" >&2; exit 1 ;;
+esac
+case "$RESOLVED" in
+  *invite-passphrase*) ;;
+  *) echo "FAIL: invite-passphrase missing" >&2; exit 1 ;;
+esac
 
 echo "=== build ==="
 docker compose --env-file "$ENV_FILE" -f docker-compose.yml build biba-server
 
 echo "=== up -d ==="
 docker compose --env-file "$ENV_FILE" -f docker-compose.yml up -d biba-server
+trap 'docker compose --env-file "$ENV_FILE" -f docker-compose.yml down >/dev/null 2>&1 || true' EXIT
 sleep 4
 echo "=== logs (expect a biba:// line) ==="
-docker compose --env-file "$ENV_FILE" -f docker-compose.yml logs biba-server 2>&1 | tail -25
-
-if ! docker compose --env-file "$ENV_FILE" -f docker-compose.yml logs biba-server 2>&1 | grep -q 'biba://'; then
+# Capture once: `logs | grep -m1` can SIGPIPE the producer, and with
+# `set -o pipefail` that turns a successful match into a failed pipeline.
+LOGS="$(docker compose --env-file "$ENV_FILE" -f docker-compose.yml logs biba-server 2>&1 || true)"
+printf '%s\n' "$LOGS" | tail -25
+if [[ "$LOGS" =~ (biba://[^[:space:]]+) ]]; then
+  INVITE_LINE="${BASH_REMATCH[1]}"
+else
   echo "FAIL: no biba:// line in logs" >&2
   exit 1
 fi
 
 echo "=== OK ==="
-docker compose --env-file "$ENV_FILE" -f docker-compose.yml logs biba-server 2>&1 | grep 'biba://' | head -n1
+printf '%s\n' "$INVITE_LINE"
 
 echo "=== down ==="
 docker compose --env-file "$ENV_FILE" -f docker-compose.yml down
+trap - EXIT
 
 echo "verify-compose-wsl.sh: all checks passed"

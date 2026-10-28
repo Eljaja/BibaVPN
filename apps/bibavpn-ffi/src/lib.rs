@@ -152,10 +152,7 @@ fn leak_cstring(s: String) -> *mut c_char {
     }
 }
 
-fn bibavpn_ffi_start_impl(
-    config_json_utf8: *const c_char,
-    err_out: *mut *mut c_char,
-) -> c_int {
+fn bibavpn_ffi_start_impl(config_json_utf8: *const c_char, err_out: *mut *mut c_char) -> c_int {
     if !err_out.is_null() {
         unsafe {
             *err_out = std::ptr::null_mut();

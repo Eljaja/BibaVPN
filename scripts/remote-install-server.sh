@@ -25,6 +25,7 @@ fi
 : "${SSHPASS:?export SSHPASS to the SSH password (sshpass), or configure SSH keys}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+q() { printf '%q' "$1"; }
 if [[ ! -f "$ROOT/target/release/bibavpn-server" ]]; then
   (cd "$ROOT" && cargo build --release -p bibavpn --bin bibavpn-server)
 fi
@@ -40,14 +41,14 @@ docker save bibavpn-server:local | gzip > /tmp/bibavpn-server.tgz
 "${SSH[@]}" "docker rm -f bibavpn 2>/dev/null || true; docker run -d --name bibavpn --restart unless-stopped -p 8443:8443 \
   bibavpn-server:local \
   --listen 0.0.0.0:8443 \
-  --self-signed-san ${BIBA_HOST} \
-  --token ${BIBA_VPN_TOKEN} \
-  --psk ${BIBA_VPN_PSK} \
+  --self-signed-san $(q "$BIBA_HOST") \
+  --token $(q "$BIBA_VPN_TOKEN") \
+  --psk $(q "$BIBA_VPN_PSK") \
   --decoy-max 32 \
   --max-pad 64 \
   --max-ws-binary 1400 \
   --ws-ping-secs 25"
 
 echo "Server started. Test from your PC:"
-echo "  export BIBA_VPN_PSK='(same as above)'"
-echo "  ./target/release/bibavpn-client --server $BIBA_HOST:8443 --sni $BIBA_HOST --token $BIBA_VPN_TOKEN --insecure --socks5 127.0.0.1:1080 --psk \"\$BIBA_VPN_PSK\" --decoy-max 32 --max-ws-binary 1400 --ws-ping-secs 25"
+echo "  export BIBA_VPN_TOKEN='<same token as server>'; export BIBA_VPN_PSK='<same PSK as server>'"
+echo "  ./target/release/bibavpn-client --server $BIBA_HOST:8443 --sni $BIBA_HOST --token \"\$BIBA_VPN_TOKEN\" --insecure --socks5 127.0.0.1:1080 --psk \"\$BIBA_VPN_PSK\" --decoy-max 32 --max-ws-binary 1400 --ws-ping-secs 25"

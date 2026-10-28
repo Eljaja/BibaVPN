@@ -261,6 +261,20 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Cheap, tool-free syntax gate for the repo's helper scripts. It only
+      # fails on a real parse error, so it cannot turn an unrelated PR red.
+      - name: Syntax-check shell and Python scripts
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' f; do
+            bash -n "$f" || status=1
+          done < <(find scripts apps/scripts .github/scripts -name '*.sh' -print0)
+          while IFS= read -r -d '' f; do
+            python3 -c 'import sys; compile(open(sys.argv[1], "rb").read(), sys.argv[1], "exec")' "$f" || status=1
+          done < <(find scripts .github/agent/tests -name '*.py' -print0)
+          exit "$status"
+
       - name: cargo fmt --check
         # 215 diffs across 40 files on main as of this PR. Kept non-blocking so
         # this gate can land without dragging a repo-wide reformat (and its

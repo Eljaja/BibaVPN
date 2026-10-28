@@ -21,7 +21,8 @@ echo "=============================================="
 cargo build -p bibavpn --features boring-tls --release
 
 TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"; kill "${SRV_PID:-}" 2>/dev/null || true' EXIT
+BODY="$TMPDIR/body"
+trap 'rm -rf "$TMPDIR"; kill "${CL_PID:-}" "${SRV_PID:-}" 2>/dev/null || true' EXIT
 
 CERT="$TMPDIR/cert.pem"
 KEY="$TMPDIR/key.pem"
@@ -72,7 +73,8 @@ echo "=== Client A: rustls (default) + --pin-cert + strong secrets ==="
   --decoy-max 0 &
 CL_PID=$!
 sleep 2
-curl -fsS --connect-timeout 12 --socks5-hostname "$SOCKS_R" http://example.com/ | head -c 100
+curl -fsS --connect-timeout 12 --max-time 20 --socks5-hostname "$SOCKS_R" http://example.com/ -o "$BODY"
+head -c 100 "$BODY"
 echo
 kill "$CL_PID" 2>/dev/null || true
 wait "$CL_PID" 2>/dev/null || true
@@ -95,7 +97,8 @@ echo "=== Client B: --tls-stack boring + --pin-cert (production path) ==="
   &
 CL_PID=$!
 sleep 2
-curl -fsS --connect-timeout 12 --socks5-hostname "$SOCKS_B" http://example.com/ | head -c 100
+curl -fsS --connect-timeout 12 --max-time 20 --socks5-hostname "$SOCKS_B" http://example.com/ -o "$BODY"
+head -c 100 "$BODY"
 echo
 kill "$CL_PID" 2>/dev/null || true
 wait "$CL_PID" 2>/dev/null || true
@@ -117,7 +120,8 @@ echo "=== Client C: --tls-stack boring + --insecure (lab only) ==="
   &
 CL_PID=$!
 sleep 2
-curl -fsS --connect-timeout 12 --socks5-hostname "127.0.0.1:21082" http://example.com/ | head -c 100
+curl -fsS --connect-timeout 12 --max-time 20 --socks5-hostname "127.0.0.1:21082" http://example.com/ -o "$BODY"
+head -c 100 "$BODY"
 echo
 kill "$CL_PID" 2>/dev/null || true
 wait "$CL_PID" 2>/dev/null || true

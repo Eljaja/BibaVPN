@@ -43,7 +43,7 @@ for p in \
 done
 if [ -z "$APK" ]; then
   echo "APK not found, listing outputs:" >&2
-  find apps/bibavpn-desktop/src-tauri/gen/android -name "*.apk" 2>/dev/null | head -20
+  find apps/bibavpn-desktop/src-tauri/gen/android -name "*.apk" 2>/dev/null | head -20 || true
   exit 1
 fi
 

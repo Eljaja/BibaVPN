@@ -25,4 +25,4 @@ bash apps/scripts/wsl-build-tauri-android-jni.sh
 cd "$ROOT/apps/bibavpn-desktop" && npm run build
 npm run tauri:android:build
 echo "APK (search):"
-find "$ROOT/apps/bibavpn-desktop/src-tauri" -name '*.apk' 2>/dev/null | head -20
+find "$ROOT/apps/bibavpn-desktop/src-tauri" -name '*.apk' 2>/dev/null | head -20 || true
