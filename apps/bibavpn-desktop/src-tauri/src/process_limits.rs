@@ -4,7 +4,11 @@ pub const WANT_NOFILE: u64 = 50_000;
 
 /// Pure helper for unit tests: never lowers `cur`; caps at `min(want, hard)` when hard is finite.
 pub fn desired_nofile_soft(cur: u64, hard: u64, want: u64) -> u64 {
-    let cap = if hard == u64::MAX { want } else { want.min(hard) };
+    let cap = if hard == u64::MAX {
+        want
+    } else {
+        want.min(hard)
+    };
     cap.max(cur)
 }
 
@@ -37,7 +41,10 @@ mod tests {
 
     #[test]
     fn desired_nofile_soft_never_lowers_current() {
-        assert_eq!(desired_nofile_soft(10_000, 100_000, WANT_NOFILE), WANT_NOFILE);
+        assert_eq!(
+            desired_nofile_soft(10_000, 100_000, WANT_NOFILE),
+            WANT_NOFILE
+        );
         assert_eq!(desired_nofile_soft(60_000, 100_000, WANT_NOFILE), 60_000);
     }
 
@@ -53,5 +60,10 @@ mod tests {
             desired_nofile_soft(1024, u64::MAX, WANT_NOFILE),
             WANT_NOFILE
         );
+    }
+
+    #[test]
+    fn desired_nofile_soft_never_raises_above_a_zero_hard_limit() {
+        assert_eq!(desired_nofile_soft(1024, 0, WANT_NOFILE), 1024);
     }
 }

@@ -18,6 +18,9 @@ pub struct ImportPayload {
 }
 
 const HTTP_TIMEOUT_SECS: u64 = 20;
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Keep error bodies out of logs/front-end in full; they are remote-controlled.
+const MAX_ERROR_TEXT: usize = 512;
 
 fn http_agent() -> ureq::Agent {
     use std::time::Duration;
@@ -25,7 +28,52 @@ fn http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_read(timeout)
         .timeout_connect(timeout)
+        // The base origin is allowlisted; do not let a 3xx hop move the
+        // import request to another host.
+        .redirects(0)
         .build()
+}
+
+fn read_body_capped(resp: ureq::Response, url: &str) -> Result<String, String> {
+    use std::io::Read;
+    if let Some(len) = resp
+        .header("Content-Length")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            return Err(format!(
+                "control plane body too large ({len} > {MAX_RESPONSE_BYTES} bytes)"
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("control plane body: {e}"))?;
+    if buf.len() > MAX_RESPONSE_BYTES {
+        return Err("control plane body too large".into());
+    }
+    String::from_utf8(buf).map_err(|e| format!("control plane body ({url}): {e}"))
+}
+
+fn truncate_for_error(text: &str) -> String {
+    let mut end = text.len().min(MAX_ERROR_TEXT);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len() {
+        format!("{}…", &text[..end])
+    } else {
+        text.to_string()
+    }
+}
+
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.len() < 4 {
+        return text.to_string();
+    }
+    text.replace(secret, "<redacted>")
 }
 
 /// Extract `https://host` or `https://host:port` from a service URL (path/query ignored).
@@ -69,9 +117,7 @@ pub fn validate_control_plane_base_url(
         return Err("control plane base_url пуст".into());
     }
     if allowed_origins.is_empty() {
-        return Err(
-            "control plane: импорт недоступен (не задан BIBA_BYPASS_DOMAINS_URL)".into(),
-        );
+        return Err("control plane: импорт недоступен (не задан BIBA_BYPASS_DOMAINS_URL)".into());
     }
     let parsed = Url::parse(trimmed).map_err(|_| "control plane: неверный URL".to_string())?;
     if !parsed.scheme().eq_ignore_ascii_case("https") {
@@ -147,11 +193,12 @@ fn redeem_import_at_origin(base: &str, token: &str) -> Result<ImportPayload, Str
         .send_json(body)
         .map_err(|e| format!("control plane: {e}"))?;
     let status = resp.status();
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("control plane body: {e}"))?;
+    let text = read_body_capped(resp, &url)?;
     if status != 200 {
-        return Err(format!("control plane HTTP {status}: {text}"));
+        return Err(format!(
+            "control plane HTTP {status}: {}",
+            truncate_for_error(&redact_secret(&text, tok))
+        ));
     }
     serde_json::from_str(&text).map_err(|e| format!("control plane JSON: {e}"))
 }
@@ -223,8 +270,7 @@ mod tests {
     #[test]
     fn reject_non_allowlisted_host() {
         let allowed = allow("cp.example.com");
-        let err =
-            validate_control_plane_base_url("https://evil.example", &allowed).unwrap_err();
+        let err = validate_control_plane_base_url("https://evil.example", &allowed).unwrap_err();
         assert!(err.contains("разрешённых"), "{err}");
     }
 
@@ -257,10 +303,7 @@ mod tests {
     #[test]
     fn reject_path_and_query() {
         let allowed = allow("cp.example.com");
-        for url in [
-            "https://cp.example.com/extra",
-            "https://cp.example.com?x=1",
-        ] {
+        for url in ["https://cp.example.com/extra", "https://cp.example.com?x=1"] {
             let err = validate_control_plane_base_url(url, &allowed).unwrap_err();
             assert!(
                 err.contains("путь") || err.contains("query"),
@@ -278,8 +321,7 @@ mod tests {
 
     #[test]
     fn reject_empty_allowlist() {
-        let err =
-            validate_control_plane_base_url("https://cp.example.com", &[]).unwrap_err();
+        let err = validate_control_plane_base_url("https://cp.example.com", &[]).unwrap_err();
         assert!(err.contains("недоступен"), "{err}");
     }
 
@@ -299,14 +341,35 @@ mod tests {
     }
 
     #[test]
+    fn truncate_for_error_respects_utf8_boundaries() {
+        let s = "я".repeat(MAX_ERROR_TEXT);
+        let out = truncate_for_error(&s);
+        assert!(out.len() <= MAX_ERROR_TEXT + '…'.len_utf8());
+        assert!(out.ends_with('…'));
+        assert_eq!(truncate_for_error("short"), "short");
+    }
+
+    #[test]
+    fn redact_secret_hides_tokens_from_error_bodies() {
+        assert_eq!(
+            redact_secret("bad token abcdef123", "abcdef123"),
+            "bad token <redacted>"
+        );
+        assert_eq!(redact_secret("x", ""), "x");
+    }
+
+    #[test]
     fn origin_from_service_url_non_default_port() {
         assert_eq!(
             origin_from_service_url("https://cp.example.com:4443/x").unwrap(),
             "https://cp.example.com:4443"
         );
         let allowed = vec!["https://cp.example.com:4443".to_string()];
-        let err = validate_control_plane_base_url("https://cp.example.com:4443", &allow("cp.example.com"))
-            .unwrap_err();
+        let err = validate_control_plane_base_url(
+            "https://cp.example.com:4443",
+            &allow("cp.example.com"),
+        )
+        .unwrap_err();
         assert!(err.contains("разрешённых"), "{err}");
         assert_eq!(
             validate_control_plane_base_url("https://cp.example.com:4443", &allowed).unwrap(),

@@ -15,7 +15,7 @@ use windows::{
 use winreg::enums::*;
 use winreg::RegKey;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyBackup {
     pub enable: u32,
     pub server: Option<String>,
@@ -25,6 +25,44 @@ pub struct ProxyBackup {
     /// URL сценария настройки прокси (PAC), WinInet `AutoConfigURL`.
     pub auto_config_url: Option<String>,
 }
+
+/// WinInet stores proxy lists in the registry; very long `ProxyOverride`
+/// values are truncated by the stack and can break proxy selection. Keep the
+/// required bypass entries and drop split-tunnel extras first.
+const MAX_PROXY_OVERRIDE_LEN: usize = 2048;
+
+const REQUIRED_OVERRIDE: &[&str] = &[
+    "<-loopback>",
+    "<local>",
+    "localhost",
+    "127.0.0.1",
+    "10.*",
+    "192.168.*",
+    "169.254.*",
+    "100.*",
+    "172.16.*",
+    "172.17.*",
+    "172.18.*",
+    "172.19.*",
+    "172.20.*",
+    "172.21.*",
+    "172.22.*",
+    "172.23.*",
+    "172.24.*",
+    "172.25.*",
+    "172.26.*",
+    "172.27.*",
+    "172.28.*",
+    "172.29.*",
+    "172.30.*",
+    "172.31.*",
+    "tauri.localhost",
+    "steamloopback.host",
+    "*.steamloopback.host",
+    "client-update.steamstatic.com",
+    "client-update.akamai.steamstatic.com",
+    "client-update.fastly.steamstatic.com",
+];
 
 fn internet_settings_key(write: bool) -> io::Result<RegKey> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -65,65 +103,55 @@ pub fn read_backup() -> io::Result<ProxyBackup> {
 }
 
 /// WinInet: prior `ProxyOverride`, обязательный loopback/WebView, плюс split-tunnel домены (прямой выход).
-fn merge_proxy_override(
-    existing: Option<&str>,
-    split_tunnel_hosts: &[String],
-) -> String {
+fn merge_proxy_override(existing: Option<&str>, split_tunnel_hosts: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(e) = existing {
         for p in e.split(';') {
             let t = p.trim();
-            if !t.is_empty() {
+            if !t.is_empty() && !parts.iter().any(|x| x.eq_ignore_ascii_case(t)) {
                 parts.push(t.to_string());
             }
         }
     }
+    // Required entries go before split-tunnel extras so the length cap can drop
+    // only optional domains.
+    for req in REQUIRED_OVERRIDE {
+        if !parts.iter().any(|p| p.eq_ignore_ascii_case(req)) {
+            parts.push((*req).to_string());
+        }
+    }
+    let protected = parts.len();
     for h in split_tunnel_hosts {
         let t = h.trim();
         if !t.is_empty() && !parts.iter().any(|p| p.eq_ignore_ascii_case(t)) {
             parts.push(t.to_string());
         }
     }
-    // Steam: loopback IPC + client bootstrap CDN. WinInet `*.steamstatic.com` often does NOT match
-    // `client-update.fastly.steamstatic.com` (multi-label); without bypass, bootstrap gets http error 0 and
-    // web UI websocket handshakes fail.
-    for req in [
-        "<-loopback>",
-        "<local>",
-        "localhost",
-        "127.0.0.1",
-        "10.*",
-        "192.168.*",
-        "169.254.*",
-        "100.*",
-        "172.16.*",
-        "172.17.*",
-        "172.18.*",
-        "172.19.*",
-        "172.20.*",
-        "172.21.*",
-        "172.22.*",
-        "172.23.*",
-        "172.24.*",
-        "172.25.*",
-        "172.26.*",
-        "172.27.*",
-        "172.28.*",
-        "172.29.*",
-        "172.30.*",
-        "172.31.*",
-        "tauri.localhost",
-        "steamloopback.host",
-        "*.steamloopback.host",
-        "client-update.steamstatic.com",
-        "client-update.akamai.steamstatic.com",
-        "client-update.fastly.steamstatic.com",
-    ] {
-        if !parts.iter().any(|p| p.eq_ignore_ascii_case(req)) {
-            parts.push(req.to_string());
+    trim_proxy_override(parts, protected)
+}
+
+fn trim_proxy_override(mut parts: Vec<String>, protected: usize) -> String {
+    let mut total: usize = parts.iter().map(|p| p.len() + 1).sum();
+    // Drop optional split-tunnel entries from the end until the value fits.
+    while total > MAX_PROXY_OVERRIDE_LEN && parts.len() > protected {
+        if let Some(removed) = parts.pop() {
+            total = total.saturating_sub(removed.len() + 1);
         }
     }
-    parts.join(";")
+    let joined = parts.join(";");
+    if joined.len() <= MAX_PROXY_OVERRIDE_LEN {
+        return joined;
+    }
+    // Pathological pre-existing list: cut at a list boundary (never mid-value).
+    let mut end = MAX_PROXY_OVERRIDE_LEN;
+    while end > 0 && !joined.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &joined[..end];
+    match cut.rfind(';') {
+        Some(i) if i > 0 => cut[..i].to_string(),
+        _ => cut.to_string(),
+    }
 }
 
 /// Уведомляет приложения об изменении WinInet / прокси (часть клиентов игнорирует только `InternetSetOptionW`).
@@ -223,6 +251,25 @@ pub fn apply_proxy(
     prior_proxy_override: Option<&str>,
     split_tunnel_hosts: &[String],
 ) -> Result<(), String> {
+    // The caller stores the pre-connect snapshot separately, but `apply_proxy`
+    // has no access to it here: take our own first so a mid-way registry error
+    // rolls back instead of leaving `ProxyEnable=1` with no tunnel behind it.
+    let snapshot = read_backup().map_err(|e| e.to_string())?;
+    let prior = prior_proxy_override.or(snapshot.override_val.as_deref());
+    match apply_proxy_inner(http_host_port, prior, split_tunnel_hosts) {
+        Ok(()) => Ok(()),
+        Err(e) => match write_backup(&snapshot, true, true) {
+            Ok(()) => Err(e),
+            Err(re) => Err(format!("{e}; откат настроек прокси: {re}")),
+        },
+    }
+}
+
+fn apply_proxy_inner(
+    http_host_port: &str,
+    prior_proxy_override: Option<&str>,
+    split_tunnel_hosts: &[String],
+) -> Result<(), String> {
     let proxy_server = format!("http={http_host_port};https={http_host_port}");
     let key = internet_settings_key(true).map_err(|e| e.to_string())?;
     let merged_override = merge_proxy_override(prior_proxy_override, split_tunnel_hosts);
@@ -239,37 +286,67 @@ pub fn apply_proxy(
     notify_changed()
 }
 
+/// Restore only fields that are still ours (the Biba loopback proxy / the
+/// PAC values we cleared) or already equal to the snapshot. A manual proxy the
+/// user configured while connected is left untouched.
 pub fn restore(backup: &ProxyBackup) -> Result<(), String> {
+    let current = read_backup().map_err(|e| e.to_string())?;
+    let manual_ours =
+        current.enable != 0 && current.server.as_deref().is_some_and(is_biba_manual_proxy);
+    let manual_unchanged = current.enable == backup.enable
+        && current.server == backup.server
+        && current.override_val == backup.override_val;
+    let pac_ours = current.auto_detect == 0 && current.auto_config_url.is_none();
+    let pac_unchanged = current.auto_detect == backup.auto_detect
+        && current.auto_config_url == backup.auto_config_url;
+
+    let restore_manual = manual_ours || manual_unchanged;
+    let restore_pac = pac_ours || pac_unchanged;
+    if !restore_manual && !restore_pac {
+        return Ok(());
+    }
+    write_backup(backup, restore_manual, restore_pac)
+}
+
+fn write_backup(
+    backup: &ProxyBackup,
+    restore_manual: bool,
+    restore_pac: bool,
+) -> Result<(), String> {
     let key = internet_settings_key(true).map_err(|e| e.to_string())?;
-    key.set_value("ProxyEnable", &backup.enable)
-        .map_err(|e| format!("ProxyEnable: {e}"))?;
-    match &backup.server {
-        Some(s) if !s.is_empty() => {
-            key.set_value("ProxyServer", s)
-                .map_err(|e| format!("ProxyServer: {e}"))?;
+    if restore_manual {
+        key.set_value("ProxyEnable", &backup.enable)
+            .map_err(|e| format!("ProxyEnable: {e}"))?;
+        match &backup.server {
+            Some(s) if !s.is_empty() => {
+                key.set_value("ProxyServer", s)
+                    .map_err(|e| format!("ProxyServer: {e}"))?;
+            }
+            _ => {
+                let _ = key.delete_value("ProxyServer");
+            }
         }
-        _ => {
-            let _ = key.delete_value("ProxyServer");
+        match &backup.override_val {
+            Some(o) if !o.is_empty() => {
+                key.set_value("ProxyOverride", o)
+                    .map_err(|e| format!("ProxyOverride: {e}"))?;
+            }
+            _ => {
+                let _ = key.delete_value("ProxyOverride");
+            }
         }
     }
-    match &backup.override_val {
-        Some(o) if !o.is_empty() => {
-            key.set_value("ProxyOverride", o)
-                .map_err(|e| format!("ProxyOverride: {e}"))?;
-        }
-        _ => {
-            let _ = key.delete_value("ProxyOverride");
-        }
-    }
-    key.set_value("AutoDetect", &backup.auto_detect)
-        .map_err(|e| format!("AutoDetect: {e}"))?;
-    match &backup.auto_config_url {
-        Some(s) if !s.is_empty() => {
-            key.set_value("AutoConfigURL", s)
-                .map_err(|e| format!("AutoConfigURL: {e}"))?;
-        }
-        _ => {
-            let _ = key.delete_value("AutoConfigURL");
+    if restore_pac {
+        key.set_value("AutoDetect", &backup.auto_detect)
+            .map_err(|e| format!("AutoDetect: {e}"))?;
+        match &backup.auto_config_url {
+            Some(s) if !s.is_empty() => {
+                key.set_value("AutoConfigURL", s)
+                    .map_err(|e| format!("AutoConfigURL: {e}"))?;
+            }
+            _ => {
+                let _ = key.delete_value("AutoConfigURL");
+            }
         }
     }
     notify_changed()
@@ -287,5 +364,26 @@ mod tests {
         assert!(merged.contains("192.168.*"));
         assert!(merged.contains("172.16.*"));
         assert!(merged.contains("172.31.*"));
+    }
+
+    #[test]
+    fn merge_proxy_override_deduplicates_case_insensitively() {
+        let merged = merge_proxy_override(Some("example.com;EXAMPLE.COM"), &[]);
+        assert_eq!(merged.matches("example.com").count(), 1); // lower-case needle only matches first
+        assert_eq!(
+            merged.to_ascii_lowercase().matches("example.com").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn merge_proxy_override_drops_optional_entries_over_cap() {
+        let split: Vec<String> = (0..500)
+            .map(|i| format!("very-long-split-tunnel-host-{i}.example.com"))
+            .collect();
+        let merged = merge_proxy_override(None, &split);
+        assert!(merged.len() <= MAX_PROXY_OVERRIDE_LEN);
+        assert!(merged.contains("<local>"));
+        assert!(merged.contains("client-update.fastly.steamstatic.com"));
     }
 }
