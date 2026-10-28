@@ -7,7 +7,9 @@
 
 use anyhow::Context;
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
-use bibavpn::local_client::{normalize_ws_path, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS};
+use bibavpn::local_client::{
+    normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
+};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -30,15 +32,22 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Default SNI for an invite: the host part of `host:port` (IPv6-safe), or the
+/// raw value when it cannot be parsed (the caller validates the public address).
+fn default_sni(public: &str) -> String {
+    parse_host_port(public.trim())
+        .map(|(host, _)| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string()
+        })
+        .unwrap_or_else(|_| public.to_string())
+}
+
 fn main() -> anyhow::Result<()> {
-    let public =
-        std::env::var("INVITE_PUBLIC").context("set INVITE_PUBLIC=host:port")?;
-    let sni = std::env::var("INVITE_SNI").unwrap_or_else(|_| {
-        public
-            .split_once(':')
-            .map(|(h, _)| h.to_string())
-            .unwrap_or_else(|| public.clone())
-    });
+    let public = std::env::var("INVITE_PUBLIC").context("set INVITE_PUBLIC=host:port")?;
+    parse_host_port(public.trim()).context("INVITE_PUBLIC must be host:port")?;
+    let sni = std::env::var("INVITE_SNI").unwrap_or_else(|_| default_sni(&public));
     let token = std::env::var("BIBA_VPN_TOKEN").context("set BIBA_VPN_TOKEN")?;
     let psk = std::env::var("BIBA_VPN_PSK").context("set BIBA_VPN_PSK")?;
     let passphrase =
@@ -51,9 +60,13 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
+    anyhow::ensure!(
+        proto == 3,
+        "only Biba protocol v3 is supported (set INVITE_PROTO=3)"
+    );
     let proto_domain = std::env::var("INVITE_PROTO_DOMAIN")
         .ok()
-        .or_else(|| Some("default".to_string()).filter(|_| proto >= 3));
+        .or_else(|| Some("default".to_string()));
 
     let invite = InviteV1 {
         v: 1,
@@ -115,4 +128,17 @@ fn main() -> anyhow::Result<()> {
 
     println!("{}", encode_invite_v1(&invite, &passphrase)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_sni_handles_ipv4_and_ipv6() {
+        assert_eq!(default_sni("vpn.example:443"), "vpn.example");
+        assert_eq!(default_sni("203.0.113.7:8443"), "203.0.113.7");
+        assert_eq!(default_sni("[2001:db8::1]:8443"), "2001:db8::1");
+        assert_eq!(default_sni("vpn.example"), "vpn.example");
+    }
 }

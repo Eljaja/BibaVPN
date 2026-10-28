@@ -1,6 +1,6 @@
 //! First request on a TLS stream: WebSocket upgrade vs plain HTTP (camouflage).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, UNIX_EPOCH};
@@ -179,7 +179,12 @@ fn is_websocket_upgrade(req: &httparse::Request<'_, '_>) -> bool {
     let Some(conn) = conn else {
         return false;
     };
-    if !conn.to_ascii_lowercase().contains("upgrade") {
+    // `Connection` is a comma-separated token list; a substring check would accept
+    // values like `notupgrade` that no HTTP server treats as an upgrade.
+    if !conn
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+    {
         return false;
     }
     key.is_some()
@@ -629,9 +634,10 @@ fn sanitize_camouflage_request_target(target: &str) -> Option<String> {
     {
         return None;
     }
-    if target.bytes().any(|b| {
-        b == b'\\' || b == b'\r' || b == b'\n' || b == 0 || b == b' '
-    }) {
+    if target
+        .bytes()
+        .any(|b| b == b'\\' || b == b'\r' || b == b'\n' || b == 0 || b == b' ')
+    {
         return None;
     }
 
@@ -694,6 +700,11 @@ fn is_blocked_camouflage_ipv4(v4: Ipv4Addr) -> bool {
         return true;
     }
     let o = v4.octets();
+    // 0.0.0.0/8 ("this network"): on several stacks 0.x.y.z routes to loopback,
+    // so an origin like `http://0.0.0.1:8080` must count as private.
+    if o[0] == 0 {
+        return true;
+    }
     if o[0] == 10 {
         return true;
     }
@@ -706,11 +717,27 @@ fn is_blocked_camouflage_ipv4(v4: Ipv4Addr) -> bool {
     if o[0] == 169 && o[1] == 254 {
         return true;
     }
+    // IETF protocol assignments 192.0.0.0/24.
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return true;
+    }
+    // Benchmarking 198.18.0.0/15.
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        return true;
+    }
     // CGNAT 100.64.0.0/10
-    o[0] == 100 && (64..=127).contains(&o[1])
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return true;
+    }
+    // 240.0.0.0/4 reserved (255.255.255.255 is already covered by is_broadcast).
+    o[0] >= 240
 }
 
-async fn camouflage_origin_resolvable(host: &str, port: u16, allow_private: bool) -> anyhow::Result<()> {
+async fn camouflage_origin_resolvable(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+) -> anyhow::Result<()> {
     if allow_private {
         return Ok(());
     }
@@ -721,10 +748,7 @@ async fn camouflage_origin_resolvable(host: &str, port: u16, allow_private: bool
     if addrs.is_empty() {
         anyhow::bail!("camouflage upstream: no addresses");
     }
-    if addrs
-        .iter()
-        .all(|a| is_blocked_camouflage_origin(a.ip()))
-    {
+    if addrs.iter().all(|a| is_blocked_camouflage_origin(a.ip())) {
         tracing::warn!(
             target: "bibavpn_security",
             host = %host,
@@ -800,14 +824,21 @@ async fn forward_http_get_inner<S: AsyncWrite + AsyncRead + Unpin>(
 
     let deadline = tokio::time::Instant::now() + timeout;
     let connect_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut upstream = tokio::time::timeout(connect_remaining, tokio::net::TcpStream::connect((host, port)))
-        .await
-        .context("camouflage upstream connect timeout")?
-        .context("camouflage upstream tcp")?;
+    let mut upstream = tokio::time::timeout(
+        connect_remaining,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .context("camouflage upstream connect timeout")?
+    .context("camouflage upstream tcp")?;
 
-    if let Ok(peer) = upstream.peer_addr() {
-        check_camouflage_peer(peer, allow_private)?;
-    }
+    // Fail closed: the pre-connect DNS check can race a rebinding resolver, so the
+    // address actually connected to is the authoritative SSRF check. If it cannot be
+    // read we must not send the request upstream.
+    let peer = upstream
+        .peer_addr()
+        .context("camouflage upstream peer address")?;
+    check_camouflage_peer(peer, allow_private)?;
 
     let req = format!(
         "{method} {path} HTTP/1.1\r\n\
@@ -863,7 +894,6 @@ Connection: close\r\n\
             let room = CAMOUFLAGE_ORIGIN_MAX_BYTES.saturating_sub(origin_bytes);
             if room > 0 {
                 client_tls.write_all(&buf[..room.min(n)]).await?;
-                client_bytes_written += room.min(n);
             }
             break;
         }
@@ -1327,7 +1357,11 @@ mod tests {
             "/secret\r\nX-Injected: yes",
         ];
         for t in reject {
-            assert_eq!(sanitize_camouflage_request_target(t), None, "expected reject: {t}");
+            assert_eq!(
+                sanitize_camouflage_request_target(t),
+                None,
+                "expected reject: {t}"
+            );
         }
     }
 
@@ -1336,20 +1370,99 @@ mod tests {
         let blocked = [
             "127.0.0.1",
             "10.0.0.1",
+            "172.16.0.1",
             "192.168.1.1",
             "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.1",
+            "0.255.255.255",
+            "192.0.0.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
             "::1",
             "fe80::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "ff02::1",
         ];
         for s in blocked {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_blocked_camouflage_origin(ip), "expected blocked: {s}");
         }
-        let allowed = ["8.8.8.8", "2001:4860:4860::8888"];
+        let allowed = ["8.8.8.8", "1.1.1.1", "198.20.0.1", "2001:4860:4860::8888"];
         for s in allowed {
             let ip: IpAddr = s.parse().unwrap();
             assert!(!is_blocked_camouflage_origin(ip), "expected allowed: {s}");
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_http_head_is_rejected_before_parse() {
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        let srv = tokio::spawn(async move {
+            accept_websocket_or_camouflage(
+                server,
+                "/ws",
+                false,
+                "tok",
+                CamouflageServeConfig::default(),
+                None,
+                crate::frame::DEFAULT_MAX_WS_BINARY,
+            )
+            .await
+        });
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.org\r\n")
+            .await
+            .unwrap();
+        let filler = vec![b'a'; 4096];
+        for _ in 0..20 {
+            if client.write_all(&filler).await.is_err() {
+                break;
+            }
+        }
+        let res = tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("the header cap must reject promptly")
+            .expect("join");
+        let err = match res {
+            Ok(_) => panic!("unterminated oversized head must not be served"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("http headers too large"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_http_headers_is_rejected() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            accept_websocket_or_camouflage(
+                server,
+                "/ws",
+                false,
+                "tok",
+                CamouflageServeConfig::default(),
+                None,
+                crate::frame::DEFAULT_MAX_WS_BINARY,
+            )
+            .await
+        });
+        let mut req = String::from("GET / HTTP/1.1\r\nHost: example.org\r\n");
+        for i in 0..70 {
+            req.push_str(&format!("X-{i}: y\r\n"));
+        }
+        req.push_str("\r\n");
+        client.write_all(req.as_bytes()).await.unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(2), srv)
+            .await
+            .expect("header-count limit must reject promptly")
+            .expect("join");
+        assert!(res.is_err(), "httparse must refuse more than 64 headers");
     }
 
     async fn spawn_camouflage_origin(
@@ -1410,7 +1523,10 @@ mod tests {
             .expect("response within deadline")
             .unwrap();
         let text = String::from_utf8_lossy(&resp[..n]);
-        assert!(text.starts_with("HTTP/1.1 200 OK"), "fallback expected: {text}");
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "fallback expected: {text}"
+        );
         srv.await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let lines = log.lock().await;
@@ -1464,7 +1580,10 @@ mod tests {
             req.contains(&format!("Host: {authority}\r\n")),
             "Host must match origin authority: {req}"
         );
-        assert!(!req.contains("http://"), "must not forward absolute URI: {req}");
+        assert!(
+            !req.contains("http://"),
+            "must not forward absolute URI: {req}"
+        );
     }
 
     #[tokio::test]
@@ -1504,10 +1623,16 @@ mod tests {
             .expect("fallback within deadline")
             .unwrap();
         let text = String::from_utf8_lossy(&resp[..n]);
-        assert!(text.starts_with("HTTP/1.1 200 OK"), "fallback expected: {text}");
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "fallback expected: {text}"
+        );
         srv.await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!*accepted.lock().await, "private origin must not be connected");
+        assert!(
+            !*accepted.lock().await,
+            "private origin must not be connected"
+        );
     }
 
     #[tokio::test]
@@ -1685,6 +1810,43 @@ mod tests {
         assert!(res.is_err(), "stall must time out");
         assert!(start.elapsed() < Duration::from_secs(2));
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn connection_header_must_contain_the_exact_upgrade_token() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let srv = tokio::spawn(async move {
+            accept_websocket_or_camouflage(
+                server,
+                "/ws",
+                false,
+                "tok",
+                CamouflageServeConfig::default(),
+                None,
+                crate::frame::DEFAULT_MAX_WS_BINARY,
+            )
+            .await
+        });
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\n\
+Host: example.org\r\n\
+Upgrade: websocket\r\n\
+Connection: notupgrade\r\n\
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+Sec-WebSocket-Version: 13\r\n\
+\r\n",
+            )
+            .await
+            .unwrap();
+        let mut resp = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut resp))
+            .await
+            .expect("camouflage answer within deadline")
+            .unwrap();
+        let text = String::from_utf8_lossy(&resp[..n]);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        assert!(srv.await.unwrap().unwrap().is_none());
     }
 
     /// A pre-auth peer must not be able to force a huge frame/message allocation: the cap

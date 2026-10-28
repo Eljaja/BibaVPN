@@ -11,7 +11,10 @@ use crate::crypto_layer::secret_eq;
 const SOCKS5_AUTH_NONE: u8 = 0;
 const SOCKS5_AUTH_USERPASS: u8 = 2;
 
-async fn socks5_negotiate_method(local: &mut TcpStream, require_userpass: bool) -> anyhow::Result<()> {
+async fn socks5_negotiate_method(
+    local: &mut TcpStream,
+    require_userpass: bool,
+) -> anyhow::Result<()> {
     let mut buf = [0u8; 2];
     local.read_exact(&mut buf).await.context("socks version")?;
     if buf[0] != 5 {
@@ -124,6 +127,9 @@ async fn socks5_read_connect_request(local: &mut TcpStream) -> anyhow::Result<So
             let mut l = [0u8; 1];
             local.read_exact(&mut l).await?;
             let len = l[0] as usize;
+            if len == 0 {
+                bail!("empty domain name in SOCKS5 request");
+            }
             let mut domain = vec![0u8; len];
             local.read_exact(&mut domain).await?;
             std::str::from_utf8(&domain)?.to_string()
@@ -252,8 +258,36 @@ pub fn is_benign_handshake_abort(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_benign_handshake_abort, socks5_userpass_ok};
+    use super::{is_benign_handshake_abort, socks5_read_command, socks5_userpass_ok};
     use anyhow::Context;
+
+    #[tokio::test]
+    async fn rejects_zero_length_domain() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0u8; 2];
+            s.read_exact(&mut method).await.unwrap();
+            // CONNECT with ATYP=domain but a zero-length name.
+            s.write_all(&[5, 1, 0, 3, 0, 0x01, 0xbb]).await.unwrap();
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            socks5_read_command(&mut server, None),
+        )
+        .await
+        .expect("must not block")
+        .expect_err("empty domain must be rejected");
+        assert!(format!("{err:#}").contains("empty domain"));
+        drop(server);
+        client.await.unwrap();
+    }
 
     #[test]
     fn userpass_ok_only_for_both_correct() {

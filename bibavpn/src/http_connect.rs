@@ -3,11 +3,16 @@
 use std::net::Ipv6Addr;
 
 use anyhow::{bail, Context};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 /// Local-only liveness path for desktop recovery probes (not forwarded to the tunnel).
 pub const LOCAL_HEALTH_PATH: &str = "/bibavpn-health";
+
+/// Largest single request/header line we accept (before the newline).
+const MAX_HEADER_LINE_BYTES: u64 = 8192;
+/// Largest complete request head (request line + headers) we buffer per connection.
+const MAX_HEADER_BLOCK_BYTES: u64 = 64 * 1024;
 
 /// Parsed first client request on the local HTTP proxy port.
 #[derive(Debug)]
@@ -41,13 +46,13 @@ pub async fn try_serve_health_check(stream: &mut TcpStream) -> anyhow::Result<bo
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).await.context("health read line")?;
+    read_header_line(&mut reader, &mut line, MAX_HEADER_BLOCK_BYTES)
+        .await
+        .context("health read line")?;
     read_header_block(&mut reader).await?;
     let stream = reader.into_inner();
     stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-        )
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
         .await
         .context("health write")?;
     stream.flush().await.context("health flush")?;
@@ -57,19 +62,17 @@ pub async fn try_serve_health_check(stream: &mut TcpStream) -> anyhow::Result<bo
 /// True when the peer opened TCP then closed before sending an HTTP request line.
 pub fn is_benign_handshake_abort(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
-    msg.contains("empty request line") || (msg.contains("early eof") && msg.contains("read request line"))
+    msg.contains("empty request line")
+        || (msg.contains("early eof") && msg.contains("read request line"))
 }
 
 /// Read the first HTTP request: either `CONNECT` or proxy-style `METHOD http://authority/path …`.
 pub async fn http_proxy_handshake(stream: &mut TcpStream) -> anyhow::Result<HttpProxyHandshake> {
     let mut reader = BufReader::new(&mut *stream);
     let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .await
-        .context("read request line")?;
-    if request_line.len() > 8192 {
-        bail!("request line too long");
+    let n = read_header_line(&mut reader, &mut request_line, MAX_HEADER_BLOCK_BYTES).await?;
+    if n == 0 {
+        bail!("empty request line");
     }
     let request_line = request_line.trim_end_matches(['\r', '\n']);
     let mut parts = request_line.split_whitespace();
@@ -119,16 +122,47 @@ pub async fn http_proxy_handshake(stream: &mut TcpStream) -> anyhow::Result<Http
     })
 }
 
+/// Read one CRLF/LF-terminated line, refusing to buffer more than the caller's
+/// remaining budget (or one header line). This bounds memory before `String`
+/// growth rather than after the fact.
+async fn read_header_line<R>(
+    reader: &mut R,
+    line: &mut String,
+    remaining: u64,
+) -> anyhow::Result<usize>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    if remaining == 0 {
+        bail!("http headers too large");
+    }
+    // Take one extra byte so an overlong line is detectable instead of silently split.
+    let cap = remaining.min(MAX_HEADER_LINE_BYTES + 1);
+    let n = reader
+        .take(cap)
+        .read_line(line)
+        .await
+        .context("read header")?;
+    if line.len() as u64 > MAX_HEADER_LINE_BYTES {
+        bail!("header line too long");
+    }
+    Ok(n)
+}
+
 async fn read_header_block<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<()> {
+    let mut total = 0u64;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await.context("read header")?;
+        let n = read_header_line(
+            reader,
+            &mut line,
+            MAX_HEADER_BLOCK_BYTES.saturating_sub(total),
+        )
+        .await?;
         if n == 0 {
             bail!("unexpected eof in http headers");
         }
-        if line.len() > 8192 {
-            bail!("header line too long");
-        }
+        total += n as u64;
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -140,15 +174,19 @@ async fn read_header_lines_into<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     out: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
+    let mut total = 0u64;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await.context("read header")?;
+        let n = read_header_line(
+            reader,
+            &mut line,
+            MAX_HEADER_BLOCK_BYTES.saturating_sub(total),
+        )
+        .await?;
         if n == 0 {
             bail!("unexpected eof in http headers");
         }
-        if line.len() > 8192 {
-            bail!("header line too long");
-        }
+        total += n as u64;
         if line == "\r\n" || line == "\n" {
             break;
         }
@@ -168,8 +206,8 @@ fn parse_authority(auth: &str) -> anyhow::Result<(String, u16)> {
         let rest = &auth[end + 1..];
         let port: u16 = if rest.is_empty() {
             443
-        } else if rest.starts_with(':') {
-            rest[1..].parse().context("IPv6 CONNECT port")?
+        } else if let Some(p) = rest.strip_prefix(':') {
+            p.parse().context("IPv6 CONNECT port")?
         } else {
             bail!("IPv6 CONNECT: expected nothing or :port after ]");
         };
@@ -312,5 +350,47 @@ mod tests {
         .expect("must return promptly on EOF, not busy-loop");
         let err = res.expect_err("EOF before the terminating blank line is an error");
         assert!(format!("{err:#}").contains("unexpected eof"));
+    }
+
+    /// A single unterminated header line must be rejected at the line cap instead of
+    /// being buffered without bound.
+    #[tokio::test]
+    async fn overlong_header_line_rejected() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut line = b"X-Long: ".to_vec();
+        line.extend(std::iter::repeat(b'a').take(9 * 1024));
+        line.extend_from_slice(b"\r\n\r\n");
+        client.write_all(&line).await.unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let err = tokio::time::timeout(Duration::from_secs(2), read_header_block(&mut reader))
+            .await
+            .expect("must return promptly")
+            .expect_err("overlong header line must be rejected");
+        assert!(format!("{err:#}").contains("header line too long"));
+    }
+
+    /// Many small headers must hit the total request-head budget.
+    #[tokio::test]
+    async fn header_block_total_size_capped() {
+        let (mut client, server) = tokio::io::duplex(256 * 1024);
+        let mut head = Vec::new();
+        for _ in 0..12_000 {
+            head.extend_from_slice(b"X: a\r\n");
+        }
+        client.write_all(&head).await.unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let err = tokio::time::timeout(Duration::from_secs(2), read_header_block(&mut reader))
+            .await
+            .expect("must return promptly")
+            .expect_err("oversized header block must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("too large") || msg.contains("too long"),
+            "unexpected error: {msg}"
+        );
     }
 }

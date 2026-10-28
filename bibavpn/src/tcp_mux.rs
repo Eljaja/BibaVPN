@@ -288,6 +288,7 @@ pub async fn remove_mux_session(slot: &TcpMuxClientSlot, session_id: u64) {
 }
 
 /// Server: after `MUX_OPEN`, dispatch logical streams.
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_ws_tcp_mux_server<S>(
     ws: WebSocketStream<S>,
     max_pad: u8,
@@ -328,6 +329,7 @@ where
 }
 
 /// Server bridge with an explicitly bounded local receive window.
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_ws_tcp_mux_server_with_window<S>(
     ws: WebSocketStream<S>,
     max_pad: u8,
@@ -457,6 +459,23 @@ mod open_target_tests {
         let mut pl = encode_mux_open_target("h", 1).unwrap();
         pl.push(0);
         assert!(decode_mux_open_target(&pl).is_err());
+    }
+
+    #[test]
+    fn mux_record_rejects_huge_declared_length_without_allocating() {
+        let mut wire = encode_mux_record(1, MUX_FLAG_DATA, b"x");
+        wire[5..9].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_mux_record(&wire).is_err());
+        assert!(decode_mux_record_bytes(wire.into()).is_err());
+    }
+
+    #[test]
+    fn mux_open_target_rejects_malformed_atyp() {
+        assert!(decode_mux_open_target(&[]).is_err());
+        assert!(decode_mux_open_target(&[3, 0xff, 0, 1]).is_err());
+        assert!(decode_mux_open_target(&[1, 1, 2, 3]).is_err());
+        assert!(decode_mux_open_target(&[4, 0, 0]).is_err());
+        assert!(decode_mux_open_target(&[9, 0, 0]).is_err());
     }
 
     #[test]

@@ -5,13 +5,25 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::warn;
 
 use crate::desync::sleep_decoy_rtt_variance;
 use crate::stealth::format_decoy_get_request;
 use crate::stealth_v12::DecoyMode;
 use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile};
+
+/// Upper bound for one decoy TCP+TLS+GET exchange. A stalled or hostile peer must
+/// not pin the decoy task (or the idle-decoy loop, which awaits it) forever.
+const DECOY_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Clamp decoy cadence: a hostile/typo invite must not park the decoy task on a
+/// multi-year sleep.
+const MAX_DECOY_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+fn decoy_base_interval_secs(configured: u64) -> u64 {
+    configured.clamp(5, MAX_DECOY_INTERVAL_SECS)
+}
 
 pub struct DecoyConfig {
     pub server_host: String,
@@ -75,7 +87,7 @@ pub async fn run_decoy_gets_loop(
         if *shutdown.borrow() {
             break;
         }
-        let base = cfg.interval_secs.max(5);
+        let base = decoy_base_interval_secs(cfg.interval_secs);
         let lo = base.saturating_mul(1).saturating_div(2).max(1);
         let hi = base.saturating_mul(3).saturating_div(2).max(lo);
         let wait_secs = rand::thread_rng().gen_range(lo..=hi);
@@ -127,8 +139,10 @@ pub async fn run_decoy_gets_loop(
             let _ = tls.read(&mut buf).await;
             Ok::<_, anyhow::Error>(())
         };
-        if let Err(e) = run.await {
-            warn!("decoy GET: {e:#}");
+        match timeout(DECOY_IO_TIMEOUT, run).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("decoy GET: {e:#}"),
+            Err(_) => warn!("decoy GET: timed out after {}s", DECOY_IO_TIMEOUT.as_secs()),
         }
     }
 }
@@ -161,15 +175,8 @@ pub async fn run_one_decoy_get(cfg: &DecoyConfig) {
     let connector = tokio_rustls::TlsConnector::from(tls);
     let paths: Vec<String> = if cfg.paths.is_empty() {
         match cfg.mode {
-            DecoyMode::Simple => vec![
-                "/favicon.ico".into(),
-                "/robots.txt".into(),
-            ],
-            DecoyMode::Browser => vec![
-                "/".into(),
-                "/favicon.ico".into(),
-                "/robots.txt".into(),
-            ],
+            DecoyMode::Simple => vec!["/favicon.ico".into(), "/robots.txt".into()],
+            DecoyMode::Browser => vec!["/".into(), "/favicon.ico".into(), "/robots.txt".into()],
         }
     } else {
         cfg.paths.clone()
@@ -196,22 +203,39 @@ pub async fn run_one_decoy_get(cfg: &DecoyConfig) {
         cfg.mode,
     );
     let run = async {
-        let tcp = crate::outbound_protect::tcp_connect_host_protected(
-            &cfg.server_host,
-            cfg.server_port,
-        )
-        .await
-        .context("idle decoy tcp")?;
+        let tcp =
+            crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
+                .await
+                .context("idle decoy tcp")?;
         let mut tls = connector
             .connect(domain, tcp)
             .await
             .context("idle decoy tls")?;
-        tls.write_all(req.as_bytes()).await.context("idle decoy write")?;
+        tls.write_all(req.as_bytes())
+            .await
+            .context("idle decoy write")?;
         let mut buf = [0u8; 2048];
         let _ = tls.read(&mut buf).await;
         Ok::<_, anyhow::Error>(())
     };
-    if let Err(e) = run.await {
-        warn!("idle decoy GET: {e:#}");
+    match timeout(DECOY_IO_TIMEOUT, run).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("idle decoy GET: {e:#}"),
+        Err(_) => warn!(
+            "idle decoy GET: timed out after {}s",
+            DECOY_IO_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoy_interval_is_clamped_to_sane_bounds() {
+        assert_eq!(decoy_base_interval_secs(0), 5);
+        assert_eq!(decoy_base_interval_secs(3600), 3600);
+        assert_eq!(decoy_base_interval_secs(u64::MAX), MAX_DECOY_INTERVAL_SECS);
     }
 }

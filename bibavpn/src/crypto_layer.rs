@@ -96,11 +96,23 @@ impl ChaHalf {
         }
     }
 
-    fn next_nonce(&self) -> [u8; 12] {
-        let c = self.ctr.fetch_add(1, Ordering::Relaxed);
+    /// Allocate the next unique nonce. Fails closed (and stops advancing) instead of
+    /// wrapping the counter, which would reuse a ChaCha20-Poly1305 nonce under the
+    /// same key.
+    fn next_nonce(&self) -> anyhow::Result<[u8; 12]> {
+        let c = self
+            .ctr
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                if c == u64::MAX {
+                    None
+                } else {
+                    Some(c + 1)
+                }
+            })
+            .map_err(|_| anyhow::anyhow!("chacha nonce space exhausted"))?;
         let mut n = [0u8; 12];
         n[4..].copy_from_slice(&c.to_be_bytes());
-        n
+        Ok(n)
     }
 
     fn seal(&self, decoy_max: u8, inner: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -118,7 +130,7 @@ impl ChaHalf {
         } else {
             rand::thread_rng().gen_range(0..=decoy_max)
         };
-        let nonce = self.next_nonce();
+        let nonce = self.next_nonce()?;
         // One allocation, including space for the detached tag. Fill decoy directly
         // in its final location rather than allocating temporary random scratch.
         let mut out = Vec::with_capacity(12 + 1 + usize::from(dlen) + inner_len + 16);
@@ -327,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn handshake_parsers_reject_truncation_and_pad_overrun() {
+        let (c, hello) = build_hello_v3();
+        for n in 0..hello.len() {
+            assert!(parse_hello_v3(&hello[..n]).is_err(), "hello trunc {n}");
+        }
+        let mut bad = hello.clone();
+        bad[33] = u8::MAX;
+        assert!(parse_hello_v3(&bad).is_err());
+
+        let (ack, _) = build_ack("psk", "dom", &c).unwrap();
+        for n in 0..ack.len() {
+            assert!(
+                parse_ack("psk", "dom", &ack[..n], &c).is_err(),
+                "ack trunc {n}"
+            );
+        }
+        let mut bad = ack.clone();
+        bad[48] = u8::MAX;
+        assert!(parse_ack("psk", "dom", &bad, &c).is_err());
+    }
+
+    #[test]
     fn secret_eq_accepts_equal_and_rejects_everything_else() {
         assert!(secret_eq("token-abc", "token-abc"));
         assert!(secret_eq(&b"token-abc"[..], "token-abc"));
@@ -503,6 +537,16 @@ mod tests {
         let wire = enc.seal_client_to_server(b"plain").unwrap();
         let plain = enc.open_client_to_server(&wire).unwrap();
         assert_eq!(plain, b"plain");
+    }
+
+    #[test]
+    fn nonce_exhaustion_fails_closed_without_wrapping() {
+        let half = ChaHalf::new(&[3u8; 32]);
+        half.ctr.store(u64::MAX, Ordering::Relaxed);
+        assert!(half.seal(0, b"x").is_err());
+        // A failed seal must not rewind the counter and reuse nonce 0 later.
+        assert!(half.seal(0, b"y").is_err());
+        assert_eq!(half.ctr.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

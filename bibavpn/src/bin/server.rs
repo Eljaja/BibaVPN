@@ -4,43 +4,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
+use base64::Engine;
+use bibavpn::accept::classify_accept_error;
 use bibavpn::crypto_layer::{self, SessionCrypto};
 use bibavpn::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
 use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig, WsHandshakeKind};
-use bibavpn::accept::classify_accept_error;
-use bibavpn::log_ratelimit::LogEvery;
-use bibavpn::logging::{self, LogConfig, LogFormat};
-use bibavpn::server_limits::{
-    account_pre_hello_binary, AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget,
-    PreHelloJunkTracker, ServerStats, MAX_PRE_HELLO_BYTES, MAX_PRE_HELLO_FRAMES,
-};
-use bibavpn::server_metrics::{spawn_metrics_listener, MetricsAuth};
-use bibavpn::transport_capabilities::log_server_listen_caps;
-use bibavpn::startup_secrets::{
-    log_lab_mode_enabled, log_reality_without_psk, require_psk, resolve_cli_token,
-    server_reality_configured,
-};
-use bibavpn::udp_mux::UdpSocketPool;
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
+use bibavpn::log_ratelimit::LogEvery;
+use bibavpn::logging::{self, LogConfig, LogFormat};
 use bibavpn::protocol::{
     classify_v3_first_channel, decode_v3_auth, encode_v3_open_err, encode_v3_open_ok,
     is_v3_mux_open, V3FirstChannelKind, OPEN_FLAG_STATUS,
 };
+use bibavpn::reality::{
+    extract_sni, server_handshake_reality, RealityReplayCache, RealityServerConfig,
+};
+use bibavpn::server_limits::{
+    account_pre_hello_binary, AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget,
+    PreHelloJunkTracker, ServerStats, MAX_PRE_HELLO_BYTES, MAX_PRE_HELLO_FRAMES,
+};
+use bibavpn::server_metrics::{metrics_auth_from_password, spawn_metrics_listener};
+use bibavpn::startup_secrets::{
+    log_lab_mode_enabled, log_reality_without_psk, require_psk, resolve_cli_token,
+    server_reality_configured,
+};
+use bibavpn::stealth_v12::StealthProfile;
+use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
+use bibavpn::transport_capabilities::log_server_listen_caps;
+use bibavpn::udp_mux::UdpSocketPool;
+use bibavpn::ws_bridge::TunnelEnd;
 use bibavpn::ServerWsOutTiming;
 use bibavpn::{read_padded_frame_into, write_padded_frame_with_mode_state};
-use bibavpn::tls_util::{install_ring_crypto, server_config_from_pem, server_self_signed};
-use bibavpn::ws_bridge::TunnelEnd;
-use bibavpn::reality::{extract_sni, server_handshake_reality, RealityReplayCache, RealityServerConfig};
-use base64::Engine;
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
 use std::str::FromStr;
-use bibavpn::stealth_v12::StealthProfile;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -291,6 +293,32 @@ struct Args {
 
 type SharedCrypto = Arc<SessionCrypto>;
 
+/// Parse `--reality-short-ids` (comma-separated 8-byte hex). An empty entry is the
+/// documented "accept any" wildcard; anything else malformed is a startup error
+/// rather than a silently dropped allowlist entry (which would widen access).
+fn parse_reality_short_ids(raw: Option<&str>) -> anyhow::Result<Vec<[u8; 8]>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            out.push([0u8; 8]);
+            continue;
+        }
+        let bytes = hex::decode(part)
+            .with_context(|| format!("--reality-short-ids: {part:?} is not valid hex"))?;
+        if bytes.len() != 8 {
+            anyhow::bail!("--reality-short-ids entries must be 16 hex chars (8 bytes): {part:?}");
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        out.push(arr);
+    }
+    Ok(out)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -396,18 +424,15 @@ async fn main() -> anyhow::Result<()> {
                 let sid = args
                     .reality_short_ids
                     .as_deref()
-                    .and_then(|s| {
-                        s.split(',')
-                            .map(|h| h.trim())
-                            .find(|h| !h.is_empty())
-                    })
+                    .and_then(|s| s.split(',').map(|h| h.trim()).find(|h| !h.is_empty()))
                     .map(|h| h.to_string())
                     .unwrap_or_else(|| hex::encode(&public.to_bytes()[..8]));
                 (Some(t.clone()), Some(pk_b64), Some(sid))
             }
             _ => (None, None, None),
         };
-        let proto_domain = (!args.proto_domain.trim().is_empty()).then_some(args.proto_domain.clone());
+        let proto_domain =
+            (!args.proto_domain.trim().is_empty()).then_some(args.proto_domain.clone());
         let invite = InviteV1 {
             v: 1,
             server: public.clone(),
@@ -493,11 +518,13 @@ async fn main() -> anyhow::Result<()> {
         ack_delay_max_ms: s_ack_hi,
         rtt_mask_jitter_ms: args.rtt_mask_jitter_ms,
     };
-    if s_ack_lo == 0
-        && s_ack_hi == 0
-        && args.rtt_mask_jitter_ms == 0
-    {
-        if let Some(s) = args.ack_profile.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if s_ack_lo == 0 && s_ack_hi == 0 && args.rtt_mask_jitter_ms == 0 {
+        if let Some(s) = args
+            .ack_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let p = StealthProfile::from_str(s).context("--ack-profile")?;
             if let Some(d) = p.server_rtt_defaults() {
                 let mut a = d.ack_delay_min_ms;
@@ -556,27 +583,8 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        let short_ids: Vec<[u8; 8]> = args
-            .reality_short_ids
-            .as_ref()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|hex_str| {
-                        let hex_str = hex_str.trim();
-                        if hex_str.is_empty() {
-                            return Some([0u8; 8]); // empty = allow any
-                        }
-                        let bytes = hex::decode(hex_str).ok()?;
-                        if bytes.len() != 8 {
-                            return None;
-                        }
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(&bytes);
-                        Some(arr)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let short_ids = parse_reality_short_ids(args.reality_short_ids.as_deref())
+            .context("--reality-short-ids")?;
 
         info!(
             "REALITY mode: target={}, server_names={:?}, short_ids={} entries",
@@ -655,7 +663,11 @@ async fn main() -> anyhow::Result<()> {
     let mux_connect_timeout = Duration::from_secs(args.mux_connect_timeout_secs.max(1));
     let mux_window_mib = args.mux_window_mib;
 
-    let psk_present = args.psk.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let psk_present = args
+        .psk
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     log_server_listen_caps(
         args.legacy_path_auth,
         !args.no_auth_rate_limit,
@@ -670,10 +682,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     if let Some(ref metrics_listen) = args.metrics_listen {
-        let metrics_auth = match args.metrics_password.as_deref() {
-            Some(pw) if !pw.is_empty() => MetricsAuth::basic(args.metrics_user.trim(), pw),
-            _ => MetricsAuth::disabled(),
-        };
+        let metrics_auth =
+            metrics_auth_from_password(args.metrics_password.as_deref(), &args.metrics_user)
+                .context("--metrics-password")?;
         spawn_metrics_listener(
             metrics_listen.clone(),
             Arc::clone(&stats),
@@ -857,6 +868,23 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// DNS names are at most 253 bytes; reject obviously invalid OPEN targets before
+/// dialling or logging them (also prevents control characters from reaching logs).
+const MAX_OPEN_HOST_LEN: usize = 255;
+
+fn validate_open_host(host: &str) -> anyhow::Result<()> {
+    if host.is_empty() {
+        anyhow::bail!("OPEN host is empty");
+    }
+    if host.len() > MAX_OPEN_HOST_LEN {
+        anyhow::bail!("OPEN host is too long ({} bytes)", host.len());
+    }
+    if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        anyhow::bail!("OPEN host contains whitespace or control characters");
+    }
+    Ok(())
+}
+
 async fn read_next_binary_after_reality<S>(ws: &mut WebSocketStream<S>) -> anyhow::Result<Bytes>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -870,7 +898,9 @@ where
         match m {
             Message::Binary(b) => return Ok(b),
             Message::Ping(p) => {
-                ws.send(Message::Pong(p)).await.context("pong after REALITY")?;
+                ws.send(Message::Pong(p))
+                    .await
+                    .context("pong after REALITY")?;
             }
             Message::Pong(_) => {}
             Message::Close(_) => anyhow::bail!("closed after REALITY"),
@@ -908,9 +938,8 @@ where
         decoy_max,
     ));
     let auth_c = Arc::clone(auth);
-    let wait = async {
-        server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer_ip, pre_auth).await
-    };
+    let wait =
+        async { server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer_ip, pre_auth).await };
     match timeout(handshake_timeout, wait).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
@@ -971,18 +1000,21 @@ where
             mut ws,
             supports_open_status,
         } => {
-            info!("OPEN {host}:{port}");
+            info!(target: "bibavpn_server", host = %host, port, "OPEN");
             let mut pad_st = AdaptivePadState::default();
             // Bound the dial so a blackholed target cannot tie up the session
             // (and its concurrency permit) until the OS TCP timeout (~minutes).
-            let connect = timeout(mux_connect_timeout, TcpStream::connect((host.as_str(), port)))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "connect timed out",
-                    ))
-                });
+            let connect = timeout(
+                mux_connect_timeout,
+                TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connect timed out",
+                ))
+            });
             let remote = match connect {
                 Ok(remote) => remote,
                 Err(e) => {
@@ -1236,9 +1268,7 @@ async fn handle_one(
                 &token,
                 tls_sni.as_deref(),
                 http_host.as_deref(),
-                reality_replay_cache
-                    .as_ref()
-                    .expect("REALITY replay cache"),
+                reality_replay_cache.as_ref().expect("REALITY replay cache"),
             ),
         )
         .await
@@ -1307,9 +1337,9 @@ async fn handle_one(
         }
 
         if !next.is_empty() && next[0] == crypto_layer::V3_HELLO_TAG {
-            let secret =
-                psk.as_deref()
-                    .context("REALITY + v3 requires server --psk (UDP mux path)")?;
+            let secret = psk
+                .as_deref()
+                .context("REALITY + v3 requires server --psk (UDP mux path)")?;
             let crypto = server_handshake_v3_after_first_hello(
                 &mut ws,
                 next.as_ref(),
@@ -1493,6 +1523,7 @@ where
                 let inner = read_padded_frame_into(raw).context("padded v3 control")?;
                 match classify_v3_first_channel(&inner) {
                     V3FirstChannelKind::TcpOpen { host, port, flags } => {
+                        validate_open_host(&host)?;
                         return Ok(FirstChannel::Tcp {
                             host,
                             port,
@@ -1544,6 +1575,9 @@ where
     let domain = proto_domain.to_string();
     let auth_f = Arc::clone(auth);
     let peer = peer_ip;
+    // The CLI junk budget may tighten (not widen) the hard pre-HELLO caps.
+    let max_pre_hello_frames = pre_auth.max_junk_frames.min(MAX_PRE_HELLO_FRAMES);
+    let max_pre_hello_bytes = pre_auth.max_junk_bytes.min(MAX_PRE_HELLO_BYTES);
     let fut = async {
         let mut pre_hello = PreHelloJunkTracker::default();
         loop {
@@ -1557,11 +1591,15 @@ where
                     let c = match account_pre_hello_binary(
                         b.as_ref(),
                         &mut pre_hello,
-                        MAX_PRE_HELLO_FRAMES,
-                        MAX_PRE_HELLO_BYTES,
-                    )? {
-                        Some(c) => c,
-                        None => continue,
+                        max_pre_hello_frames,
+                        max_pre_hello_bytes,
+                    ) {
+                        Ok(Some(c)) => c,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            auth_f.record_failure(peer).await;
+                            return Err(e);
+                        }
                     };
                     let secret = psk.context("Biba v3 requires server --psk")?;
                     info!("Biba v3 PSK mode, decoy_max={decoy_max}");
@@ -1577,8 +1615,7 @@ where
                         decoy_max,
                     ));
                     let auth_c = Arc::clone(&auth_f);
-                    server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer, pre_auth)
-                        .await?;
+                    server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer, pre_auth).await?;
                     return Ok(crypto);
                 }
                 Message::Ping(p) => {
@@ -1718,9 +1755,7 @@ mod first_channel_wait_tests {
         let (_client, server) = ws_pair().await;
         let crypto = test_crypto();
         let (stats, auth, pre_auth, peer) = wait_ctx();
-        let before = stats
-            .handshake_timeouts_total
-            .load(Ordering::Relaxed);
+        let before = stats.handshake_timeouts_total.load(Ordering::Relaxed);
 
         let err = wait_first_channel_with_timeout(
             server,
@@ -1751,9 +1786,7 @@ mod first_channel_wait_tests {
         let (mut client, server) = ws_pair().await;
         let crypto = test_crypto();
         let (stats, auth, pre_auth, peer) = wait_ctx();
-        let before = stats
-            .handshake_timeouts_total
-            .load(Ordering::Relaxed);
+        let before = stats.handshake_timeouts_total.load(Ordering::Relaxed);
 
         let client_task = tokio::spawn(async move {
             loop {
@@ -1816,10 +1849,7 @@ mod first_channel_wait_tests {
         .unwrap();
 
         assert!(matches!(ch, FirstChannel::Mux { .. }));
-        assert_eq!(
-            stats.handshake_timeouts_total.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(stats.handshake_timeouts_total.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1830,9 +1860,9 @@ mod first_channel_wait_tests {
         let (mut client, server) = ws_pair().await;
         let open = encode_v3_open_with_flags("example.org", 443, OPEN_FLAG_STATUS).unwrap();
         client
-            .send(Message::Binary(Bytes::from(
-                seal_client_frame(&crypto, &open),
-            )))
+            .send(Message::Binary(Bytes::from(seal_client_frame(
+                &crypto, &open,
+            ))))
             .await
             .unwrap();
         let ch = wait_first_channel_with_timeout(
@@ -1881,6 +1911,51 @@ mod first_channel_wait_tests {
     }
 
     #[tokio::test]
+    async fn pre_hello_junk_budget_exceeded_records_auth_failure() {
+        let (mut client, mut server) = ws_pair().await;
+        let stats = ServerStats::new();
+        let auth = AuthRateLimiter::new(AuthRateLimiterConfig {
+            enabled: true,
+            max_failures: 10,
+            window: Duration::from_secs(60),
+            ban: Duration::from_secs(300),
+        });
+        let pre_auth = PreAuthBudget {
+            max_junk_frames: 256,
+            max_junk_bytes: 4,
+            max_decrypt_failures: 64,
+        };
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+        client
+            .send(Message::Binary(Bytes::from_static(b"\x02\x00\x00\x00\x00")))
+            .await
+            .unwrap();
+
+        let err = match server_handshake_v3(
+            &mut server,
+            "tok",
+            Some("test-psk"),
+            8,
+            "test.domain",
+            &auth,
+            &stats,
+            peer,
+            &pre_auth,
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("over-budget junk must fail the handshake"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("too much pre-handshake"),
+            "{err:#}"
+        );
+        assert_eq!(auth.auth_failures_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn wait_first_channel_junk_budget_exceeded_before_timeout() {
         let (mut client, server) = ws_pair().await;
         let crypto = test_crypto();
@@ -1915,13 +1990,11 @@ mod first_channel_wait_tests {
         .unwrap_err();
 
         assert!(
-            err.to_string().contains("too much pre-auth data before v3 AUTH"),
+            err.to_string()
+                .contains("too much pre-auth data before v3 AUTH"),
             "{err:#}"
         );
-        assert_eq!(
-            stats.handshake_timeouts_total.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(stats.handshake_timeouts_total.load(Ordering::Relaxed), 0);
     }
 }
 
@@ -1950,5 +2023,43 @@ mod mux_window_cli_tests {
             ])
             .is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn reality_short_ids_valid_and_wildcard() {
+        assert!(parse_reality_short_ids(None).unwrap().is_empty());
+        assert_eq!(
+            parse_reality_short_ids(Some("")).unwrap(),
+            vec![[0u8; 8]],
+            "empty entry stays the documented wildcard"
+        );
+        let ids = parse_reality_short_ids(Some("0102030405060708, aabbccddeeff0011")).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ids[1], [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11]);
+    }
+
+    #[test]
+    fn reality_short_ids_malformed_fail_closed() {
+        assert!(parse_reality_short_ids(Some("zz")).is_err());
+        assert!(parse_reality_short_ids(Some("deadbeef")).is_err());
+        assert!(parse_reality_short_ids(Some("0102030405060708,zz")).is_err());
+    }
+
+    #[test]
+    fn open_host_validation_rejects_control_and_oversize() {
+        validate_open_host("example.org").unwrap();
+        validate_open_host("::1").unwrap();
+        validate_open_host(&"a".repeat(MAX_OPEN_HOST_LEN)).unwrap();
+        assert!(validate_open_host("").is_err());
+        assert!(validate_open_host(&"a".repeat(MAX_OPEN_HOST_LEN + 1)).is_err());
+        assert!(validate_open_host("bad\nhost").is_err());
+        assert!(validate_open_host("bad host").is_err());
+        assert!(validate_open_host("bad\0host").is_err());
     }
 }

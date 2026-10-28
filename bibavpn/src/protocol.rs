@@ -419,11 +419,7 @@ pub fn is_v3_mux_open(data: &[u8]) -> bool {
 /// Classify a decrypted, unpadded v3 control payload as a first-channel open opcode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V3FirstChannelKind {
-    TcpOpen {
-        host: String,
-        port: u16,
-        flags: u8,
-    },
+    TcpOpen { host: String, port: u16, flags: u8 },
     UdpMux,
     Mux,
     NotChannelOpen,
@@ -431,11 +427,7 @@ pub enum V3FirstChannelKind {
 
 pub fn classify_v3_first_channel(data: &[u8]) -> V3FirstChannelKind {
     if let Ok((host, port, flags)) = decode_v3_open_with_flags(data) {
-        return V3FirstChannelKind::TcpOpen {
-            host,
-            port,
-            flags,
-        };
+        return V3FirstChannelKind::TcpOpen { host, port, flags };
     }
     if is_v3_udp_mux_open(data) {
         return V3FirstChannelKind::UdpMux;
@@ -515,6 +507,22 @@ mod strict_parse_tests {
         let mut b = encode_auth("t").unwrap();
         b.push(9);
         assert!(decode_auth(&b).is_err());
+    }
+
+    #[test]
+    fn malformed_control_frames_error_without_panic() {
+        assert!(decode_v3_auth(&[]).is_err());
+        assert!(decode_v3_auth(&[V3_CTRL_AUTH]).is_err());
+        // Declared token length far exceeds the buffer.
+        assert!(decode_v3_auth(&[V3_CTRL_AUTH, 0xff, 0xff]).is_err());
+        assert!(decode_v3_open_with_flags(&[V3_CTRL_OPEN]).is_err());
+        assert!(decode_v3_open_with_flags(&[V3_CTRL_OPEN, 0xff, 0xff, 0, 0]).is_err());
+        // UDP_REQ with no address bytes, and with an out-of-range domain length.
+        assert!(decode_udp_req(&[V3_CTRL_UDP_REQ, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
+        assert!(decode_udp_req(&[V3_CTRL_UDP_REQ, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0xff, 0, 1]).is_err());
+        assert!(decode_v3_open_err(&[V3_CTRL_OPEN_ERR, 0xff, 0xff]).is_err());
+        assert!(decode_auth(&[0; 12]).is_err());
+        assert!(decode_open_err(&[0; 12]).is_err());
     }
 }
 

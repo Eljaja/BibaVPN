@@ -105,6 +105,7 @@ impl AsyncRead for BridgedTcpRead {
 /// `dummy_interval_secs`: send empty padded frames on idle (0 = off); interval jittered ±50% around this base.
 ///
 /// `server_out_timing`: server-only; extra delay before each WS binary toward the client (ignored for `TunnelEnd::Client`).
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_ws_tcp_padded<S>(
     ws: WebSocketStream<S>,
     prefetched_ws_messages: Vec<WsBridgePrefetch>,

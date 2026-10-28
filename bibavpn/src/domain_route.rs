@@ -457,6 +457,7 @@ pub fn parse_dns_query(msg: &[u8]) -> Option<(u16, String)> {
 /// (lowercased), and the list of `(ip, ttl)` from A / AAAA answer records. Returns
 /// `None` on malformed input. Bounds-checked; name-compression pointers are followed
 /// with a jump cap to prevent loops.
+#[allow(clippy::type_complexity)]
 pub fn parse_dns_answers(msg: &[u8]) -> Option<(u16, String, Vec<(IpAddr, u32)>)> {
     if msg.len() < 12 {
         return None;

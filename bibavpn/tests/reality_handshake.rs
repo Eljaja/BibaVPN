@@ -94,10 +94,7 @@ async fn spawn_reality_server_loop(
     token: &str,
     replay_cache: Arc<RealityReplayCache>,
     connections: usize,
-) -> (
-    SocketAddr,
-    JoinHandle<Vec<anyhow::Result<[u8; 32]>>>,
-) {
+) -> (SocketAddr, JoinHandle<Vec<anyhow::Result<[u8; 32]>>>) {
     let tls_cfg = server_self_signed("127.0.0.1").expect("self-signed");
     let acceptor = TlsAcceptor::from(tls_cfg);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -309,7 +306,9 @@ async fn reality_handshake_rejects_replayed_bytes() {
     let _ = ws1.close(None).await;
 
     let mut ws2 = client_ws(addr, "/ws").await;
-    ws2.send(Message::Binary(hello.into())).await.expect("replay hello");
+    ws2.send(Message::Binary(hello.into()))
+        .await
+        .expect("replay hello");
     let _ = ws2.next().await;
     ws2.send(Message::Binary(auth.into()))
         .await

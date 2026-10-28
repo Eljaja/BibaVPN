@@ -202,6 +202,18 @@ impl UdpSocketPool {
         };
         idle.lock().await.len()
     }
+
+    /// Pre-load an idle socket (test-only) to model a recycled fd that still has
+    /// datagrams queued from its previous destination.
+    #[cfg(test)]
+    async fn seed_idle(&self, v6: bool, sock: UdpSocket) {
+        let idle = if v6 {
+            &self.inner.v6_idle
+        } else {
+            &self.inner.v4_idle
+        };
+        idle.lock().await.push(sock);
+    }
 }
 
 impl UdpLease {
@@ -228,6 +240,19 @@ impl Drop for UdpLease {
         let Some(sock) = self.sock.take() else {
             return;
         };
+        // A pooled socket may still have duplicate/extra datagrams queued for the
+        // destination it just served. If we pool it as-is, the next lease could
+        // read one of those and attribute it to a *different* request. Discard
+        // whatever is already buffered before returning the fd to the idle pool.
+        // Bound the drain: a peer that keeps flooding the old destination must not
+        // spin this drop path forever; leftover datagrams are rare beyond a few.
+        const MAX_STALE_DRAIN: usize = 64;
+        let mut stale = [0u8; 2048];
+        for _ in 0..MAX_STALE_DRAIN {
+            if sock.try_recv_from(&mut stale).is_err() {
+                break;
+            }
+        }
         let inner = self.inner.clone();
         let v6 = self.v6;
         tokio::spawn(async move {
@@ -263,6 +288,12 @@ impl UdpSockHolder {
         if let UdpSockHolder::Pooled(l) = self {
             l.mark_reply_consumed();
         }
+    }
+
+    /// Pooled sockets survive across requests, so replies from a source other than the
+    /// destination we just sent to may be leftovers from an earlier request.
+    fn is_pooled(&self) -> bool {
+        matches!(self, UdpSockHolder::Pooled(_))
     }
 }
 
@@ -427,7 +458,7 @@ impl UdpMuxHandle {
 /// Start background driver; returns handle for submitting UDP requests.
 pub fn spawn_udp_mux_driver(
     cfg: UdpMuxConfig,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     tasks: &mut Vec<JoinHandle<()>>,
 ) -> UdpMuxHandle {
     let (tx, rx) = mpsc::channel(UDP_MUX_CMD_QUEUE_CAP);
@@ -634,7 +665,7 @@ async fn connect_udp_mux_ws(
     if let Some(pk) = cfg.reality_public_key {
         let short_id = cfg
             .reality_short_id
-            .unwrap_or_else(|| rand::random::<[u8; 8]>());
+            .unwrap_or_else(rand::random::<[u8; 8]>);
         crate::reality::reality_client_exchange_verify(&mut ws, &pk, &short_id, &cfg.token)
             .await
             .context("REALITY handshake (udp mux)")?;
@@ -917,6 +948,7 @@ where
 
 /// Server side: UDP over WebSocket after `UDP_MUX_OPEN`. Each request uses a dedicated UDP socket
 /// so replies attach to the correct `xid` (parallel requests to the same host no longer collide).
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_ws_udp_mux_server<S>(
     ws: WebSocketStream<S>,
     max_pad: u8,
@@ -1047,83 +1079,116 @@ where
                             }
                             holder.mark_sent_awaiting_reply();
                             let mut rbuf = vec![0u8; 65535];
-                            match timeout(recv_timeout, holder.sock_mut().recv_from(&mut rbuf))
-                                .await
-                            {
-                                Ok(Ok((n, src))) => {
-                                    holder.mark_reply_consumed();
-                                    let rep_plain = encode_udp_rep(
-                                        xid,
-                                        &src.ip().to_string(),
-                                        src.port(),
-                                        &rbuf[..n],
-                                    )?;
-                                    let mut wire = Vec::new();
-                                    {
-                                        let mut g = udp_ad
-                                            .lock()
-                                            .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
-                                        write_padded_frame_with_mode_state(
-                                            &mut wire,
-                                            &rep_plain,
-                                            max_pad,
-                                            pad_mode,
-                                            Some(&mut *g),
-                                        )
-                                        .context("pad rep")?;
-                                    }
-                                    let blob: Vec<u8> = crypto
-                                        .seal_server_to_client(&wire)
-                                        .context("seal s2c (udp mux)")?;
-                                    if blob.len() > max_ws_binary {
-                                        anyhow::bail!("udp rep ws frame too large");
-                                    }
-                                    maybe_server_ack_and_rtt_mask(server_out).await;
-                                    maybe_ws_send_jitter(wsj).await;
-                                    #[cfg(test)]
-                                    test_hooks::maybe_block_ws_send().await;
-                                    let mut g = ws_tx.lock().await;
-                                    g.send(Message::Binary(Bytes::from(blob)))
-                                        .await
-                                        .context("ws send udp rep")?;
-                                    return Ok::<_, anyhow::Error>(());
+                            // One deadline for the whole wait: dropping a stale reply from a
+                            // different source must not let an attacker extend the timeout.
+                            let deadline = tokio::time::Instant::now() + recv_timeout;
+                            let mut recv_timed_out = false;
+                            let recv_result = loop {
+                                let remaining =
+                                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                                if remaining.is_zero() {
+                                    recv_timed_out = true;
+                                    break None;
                                 }
-                                Ok(Err(e)) => {
-                                    last_err = Some(anyhow::Error::from(e));
+                                match timeout(remaining, holder.sock_mut().recv_from(&mut rbuf)).await
+                                {
+                                    Ok(Ok((n, src))) => {
+                                        if holder.is_pooled() && src != dest {
+                                            // A recycled fd can still hold datagrams for the
+                                            // destination it served before this request.
+                                            trace!(
+                                                target: "bibavpn_udp",
+                                                %dest,
+                                                %src,
+                                                "udp mux server: drop pooled reply from unexpected source"
+                                            );
+                                            continue;
+                                        }
+                                        break Some((n, src));
+                                    }
+                                    Ok(Err(e)) => {
+                                        last_err = Some(anyhow::Error::from(e));
+                                        break None;
+                                    }
+                                    Err(_) => {
+                                        recv_timed_out = true;
+                                        break None;
+                                    }
+                                }
+                            };
+                            let Some((n, src)) = recv_result else {
+                                if !recv_timed_out {
+                                    // Socket error: try the next resolved address.
                                     continue;
                                 }
-                                Err(_) => {
-                                    let rep_plain = encode_udp_rep(xid, "0.0.0.0", 0, &[])?;
-                                    let mut wire = Vec::new();
-                                    {
-                                        let mut g = udp_ad
-                                            .lock()
-                                            .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
-                                        write_padded_frame_with_mode_state(
-                                            &mut wire,
-                                            &rep_plain,
-                                            max_pad,
-                                            pad_mode,
-                                            Some(&mut *g),
-                                        )
-                                        .context("pad rep")?;
-                                    }
-                                    let blob: Vec<u8> = crypto
-                                        .seal_server_to_client(&wire)
-                                        .context("seal s2c (udp mux)")?;
-                                    if blob.len() > max_ws_binary {
-                                        anyhow::bail!("udp rep ws frame too large");
-                                    }
-                                    maybe_server_ack_and_rtt_mask(server_out).await;
-                                    maybe_ws_send_jitter(wsj).await;
-                                    #[cfg(test)]
-                                    test_hooks::maybe_block_ws_send().await;
-                                    let mut g = ws_tx.lock().await;
-                                    g.send(Message::Binary(Bytes::from(blob)))
-                                        .await
-                                        .context("ws send udp rep (timeout)")?;
-                                    return Ok::<_, anyhow::Error>(());
+                                let rep_plain = encode_udp_rep(xid, "0.0.0.0", 0, &[])?;
+                                let mut wire = Vec::new();
+                                {
+                                    let mut g = udp_ad
+                                        .lock()
+                                        .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
+                                    write_padded_frame_with_mode_state(
+                                        &mut wire,
+                                        &rep_plain,
+                                        max_pad,
+                                        pad_mode,
+                                        Some(&mut *g),
+                                    )
+                                    .context("pad rep")?;
                                 }
+                                let blob: Vec<u8> = crypto
+                                    .seal_server_to_client(&wire)
+                                    .context("seal s2c (udp mux)")?;
+                                if blob.len() > max_ws_binary {
+                                    anyhow::bail!("udp rep ws frame too large");
+                                }
+                                maybe_server_ack_and_rtt_mask(server_out).await;
+                                maybe_ws_send_jitter(wsj).await;
+                                #[cfg(test)]
+                                test_hooks::maybe_block_ws_send().await;
+                                let mut g = ws_tx.lock().await;
+                                g.send(Message::Binary(Bytes::from(blob)))
+                                    .await
+                                    .context("ws send udp rep (timeout)")?;
+                                return Ok::<_, anyhow::Error>(());
+                            };
+                            {
+                                holder.mark_reply_consumed();
+                                let rep_plain = encode_udp_rep(
+                                    xid,
+                                    &src.ip().to_string(),
+                                    src.port(),
+                                    &rbuf[..n],
+                                )?;
+                                let mut wire = Vec::new();
+                                {
+                                    let mut g = udp_ad
+                                        .lock()
+                                        .map_err(|e| anyhow::anyhow!("udp adaptive: {e}"))?;
+                                    write_padded_frame_with_mode_state(
+                                        &mut wire,
+                                        &rep_plain,
+                                        max_pad,
+                                        pad_mode,
+                                        Some(&mut *g),
+                                    )
+                                    .context("pad rep")?;
+                                }
+                                let blob: Vec<u8> = crypto
+                                    .seal_server_to_client(&wire)
+                                    .context("seal s2c (udp mux)")?;
+                                if blob.len() > max_ws_binary {
+                                    anyhow::bail!("udp rep ws frame too large");
+                                }
+                                maybe_server_ack_and_rtt_mask(server_out).await;
+                                maybe_ws_send_jitter(wsj).await;
+                                #[cfg(test)]
+                                test_hooks::maybe_block_ws_send().await;
+                                let mut g = ws_tx.lock().await;
+                                g.send(Message::Binary(Bytes::from(blob)))
+                                    .await
+                                    .context("ws send udp rep")?;
+                                return Ok::<_, anyhow::Error>(());
                             }
                         }
                         Err(last_err.unwrap_or_else(|| {
@@ -2027,8 +2092,9 @@ mod tests {
             });
             let sem = wait_for_server_sem().await;
 
-            let _discard = flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
-                .await;
+            let _discard =
+                flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
+                    .await;
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
 
@@ -2059,8 +2125,9 @@ mod tests {
             });
             let sem = wait_for_server_sem().await;
 
-            let _discard = flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
-                .await;
+            let _discard =
+                flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
+                    .await;
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
             wait_for_blocked_send().await;
@@ -2102,8 +2169,9 @@ mod tests {
             });
             let sem = wait_for_server_sem().await;
 
-            let _discard = flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
-                .await;
+            let _discard =
+                flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
+                    .await;
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
             client_ws.close(None).await.ok();
@@ -2213,6 +2281,117 @@ mod tests {
         assert!(res.is_err(), "next lease must not inherit queued reply");
         drop(lease2);
         echo_task.abort();
+    }
+
+    /// A recycled socket can still have extra datagrams queued for its previous
+    /// destination. Reuse must not hand those to the next request.
+    #[tokio::test]
+    async fn recycled_pool_lease_discards_queued_datagrams() {
+        let _guard = test_hooks::server_stress_lock().await;
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pool = UdpSocketPool::new(1);
+
+        let mut lease = pool.lease(false).await.unwrap();
+        let local = lease.sock_mut().local_addr().unwrap();
+        // Model a completed transaction whose duplicate reply is still queued.
+        lease.mark_sent_awaiting_reply();
+        lease.mark_reply_consumed();
+        let reachable = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            local.port(),
+        );
+        attacker.send_to(b"stale", reachable).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let mut lease2 = pool.lease(false).await.unwrap();
+        assert_eq!(
+            lease2.sock_mut().local_addr().unwrap().port(),
+            local.port(),
+            "pool should reuse the same fd"
+        );
+        let mut buf = [0u8; 64];
+        let res = tokio::time::timeout(
+            Duration::from_millis(100),
+            lease2.sock_mut().recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "recycled lease inherited a datagram from its previous destination"
+        );
+        drop(lease2);
+    }
+
+    /// With a pooled socket, a reply arriving from a source other than the
+    /// address we sent to cannot belong to this request and must not complete it.
+    #[tokio::test]
+    async fn server_pooled_reply_from_wrong_source_is_not_delivered() {
+        let _guard = test_hooks::server_stress_lock().await;
+        let dest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+        let dest_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (n, peer) = dest.recv_from(&mut buf).await.unwrap();
+            dest.send_to(&buf[..n], peer).await.unwrap();
+        });
+
+        // Queue a stale datagram on the socket before it is leased.
+        let stale = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let victim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stale
+            .send_to(b"stale", victim.local_addr().unwrap())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let pool = UdpSocketPool::new(1);
+        pool.seed_idle(false, victim).await;
+
+        let (mut client_ws, server_ws) = ws_duplex_pair().await;
+        let crypto = test_session_crypto();
+        let crypto_srv = crypto.clone();
+        let pool_srv = pool.clone();
+        let server = tokio::spawn(async move {
+            run_server_bridge(
+                server_ws,
+                crypto_srv,
+                Duration::from_secs(2),
+                Some(pool_srv),
+                0,
+            )
+            .await
+        });
+
+        let inner = encode_udp_req(7, &dest_addr.ip().to_string(), dest_addr.port(), b"q").unwrap();
+        client_ws
+            .send(Message::Binary(Bytes::from(seal_c2s(
+                crypto.as_ref(),
+                &inner,
+            ))))
+            .await
+            .unwrap();
+
+        let msg = timeout(Duration::from_secs(3), client_ws.next())
+            .await
+            .expect("reply must arrive")
+            .unwrap()
+            .unwrap();
+        let Message::Binary(b) = msg else {
+            panic!("expected UDP_REP binary")
+        };
+        let raw = crypto.open_server_to_client(&b).unwrap();
+        let (xid, host, port, payload) =
+            decode_udp_rep(read_padded_frame_borrow(&raw).unwrap()).unwrap();
+        assert_eq!(xid, 7);
+        assert_eq!(port, dest_addr.port());
+        assert_eq!(host, dest_addr.ip().to_string());
+        assert_eq!(payload, b"q", "stale datagram completed the request");
+
+        client_ws.close(None).await.ok();
+        let _ = timeout(Duration::from_secs(2), server).await;
+        dest_task.abort();
     }
 
     #[test]

@@ -92,6 +92,7 @@ const EFFECTIVE_CONFIG_NOTE: &str =
     "effective config: download throughput is limited by the client advertised receive window; upload by the server advertised receive window";
 
 /// One-line summary when the entry server starts accepting connections.
+#[allow(clippy::too_many_arguments)]
 pub fn log_server_listen_caps(
     legacy_path_auth: bool,
     auth_rate_limit_enabled: bool,

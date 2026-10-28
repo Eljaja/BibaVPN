@@ -10,6 +10,12 @@ pub struct ActivityTracker {
     last: Mutex<Instant>,
 }
 
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ActivityTracker {
     pub fn new() -> Self {
         Self {
