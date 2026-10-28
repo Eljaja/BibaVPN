@@ -1,7 +1,7 @@
 //! Browser presets (`ClientHelloID` → [`ClientHelloSpec`](crate::spec::ClientHelloSpec)).
 
 use crate::constants::*;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::extensions::{Extension, KeyShareEntry, PaddingStyle};
 use crate::spec::ClientHelloSpec;
 

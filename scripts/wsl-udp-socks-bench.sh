@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # UDP over SOCKS5 → bibavpn UDP mux → local echo. Run from WSL, repo root.
-set -u
+set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 cargo build -p bibavpn --release -q
 BIN=target/release

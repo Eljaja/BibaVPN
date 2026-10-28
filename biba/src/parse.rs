@@ -55,7 +55,7 @@ fn parse_client_hello_handshake(data: &[u8], blunt: bool) -> Result<ClientHelloS
 
     let cs_len = u16::from_be_bytes([ch[o], ch[o + 1]]) as usize;
     o += 2;
-    if cs_len % 2 != 0 {
+    if !cs_len.is_multiple_of(2) {
         // Must be a whole number of u16 cipher suites; an odd length would read
         // past the list (into the compression byte, or out of bounds → panic).
         return Err(Error::InvalidClientHello("odd cipher-suite length"));

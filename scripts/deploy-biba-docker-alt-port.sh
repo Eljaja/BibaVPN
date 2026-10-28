@@ -132,7 +132,14 @@ echo "Done. Connect clients to ${PUBLIC_ADDR} (SNI: ${SAN})."
 if [[ -n "${BIBA_INVITE_PASSPHRASE:-}" ]]; then
   sleep 1
   echo "--- biba:// invite (from container stdout) ---"
-  run "docker logs '$CONTAINER' 2>&1" | grep '^biba://' | head -n1 || {
+  # Capture first: `... | head` can SIGPIPE the ssh/docker side, and with
+  # `set -o pipefail` that triggers the "(no biba:// line)" warning even when a
+  # line was printed.
+  LOGS="$(run "docker logs '$CONTAINER' 2>&1" || true)"
+  INVITE_LINE="$(printf '%s\n' "$LOGS" | grep -m1 '^biba://' || true)"
+  if [[ -n "$INVITE_LINE" ]]; then
+    printf '%s\n' "$INVITE_LINE"
+  else
     echo "(no biba:// line in logs yet; try: ssh $USER_@$HOST 'docker logs $CONTAINER')" >&2
-  }
+  fi
 fi

@@ -10,6 +10,7 @@ CERT_DIR="/tmp/biba_capture_certs"
 CERT="${CERT_DIR}/localhost-${PORT}.crt"
 KEY="${CERT_DIR}/localhost-${PORT}.key"
 HTTP_PORT=$((PORT + 10000))
+PSK="${BIBAVPN_PSK:-wsl-lab-psk}"
 
 fuser -k "${PORT}/tcp" 2>/dev/null || true
 fuser -k "${SOCK}/tcp" 2>/dev/null || true
@@ -34,12 +35,12 @@ trap cleanup EXIT
 sleep 0.3
 
 RUST_LOG=warn "${ROOT}/target/release/bibavpn-server" \
-  --listen "127.0.0.1:${PORT}" --cert "$CERT" --key "$KEY" --token t --ws-path /ws --ws-ping-secs 0 &
+  --listen "127.0.0.1:${PORT}" --cert "$CERT" --key "$KEY" --token t --psk "$PSK" --ws-path /ws --ws-ping-secs 0 &
 SP=$!
 sleep 0.8
 
 RUST_LOG=warn "${ROOT}/target/release/bibavpn-client" \
-  --server "127.0.0.1:${PORT}" --sni localhost --token t --socks5 "127.0.0.1:${SOCK}" \
+  --server "127.0.0.1:${PORT}" --sni localhost --token t --psk "$PSK" --socks5 "127.0.0.1:${SOCK}" \
   --ws-path /ws --tls-profile chrome70 --pin-cert "$CERT" &
 CP=$!
 sleep 1

@@ -59,7 +59,8 @@ if [ -z "$URL" ]; then
   exit 0
 fi
 
-TMP="${OUT}.tmp"
+TMP="$(mktemp "${OUT}.XXXXXX")"
+trap 'rm -f "$TMP"' EXIT
 echo "ci-fetch-bypass-domains: GET $URL"
 if ! curl -fsSL --max-time 90 -A "bibavpn-ci/1.0" "$URL" -o "$TMP"; then
   echo "::error::Failed to fetch BIBA_BYPASS_DOMAINS_URL" >&2

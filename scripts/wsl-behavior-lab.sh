@@ -20,6 +20,8 @@ CL="${ROOT}/target/release/bibavpn-client"
 MET="${ROOT}/scripts/wsl-pcap-behavior-metrics.py"
 CERT_DIR="/tmp/biba_capture_certs"
 TOKEN="t"
+# PSK is mandatory for proto 3; throwaway loopback value.
+PSK="${BIBAVPN_PSK:-wsl-lab-psk}"
 
 if [[ ! -x "$SRV" || ! -x "$CL" ]]; then
   echo "build first: cargo build --release -p bibavpn" >&2
@@ -71,12 +73,12 @@ run_scenario() {
   trap cleanup INT TERM
   sleep 0.3
 
-  RUST_LOG=warn "$SRV" --listen "127.0.0.1:${port}" --cert "$crt" --key "$key" --token "$TOKEN" \
+  RUST_LOG=warn "$SRV" --listen "127.0.0.1:${port}" --cert "$crt" --key "$key" --token "$TOKEN" --psk "$PSK" \
     --ws-path /ws "${SRV_EXTRA[@]}" &
   sp=$!
   sleep 0.8
 
-  RUST_LOG=warn "$CL" --server "127.0.0.1:${port}" --sni localhost --token "$TOKEN" --socks5 "127.0.0.1:${sock}" \
+  RUST_LOG=warn "$CL" --server "127.0.0.1:${port}" --sni localhost --token "$TOKEN" --psk "$PSK" --socks5 "127.0.0.1:${sock}" \
     --ws-path /ws --tls-profile chrome70 --pin-cert "$crt" "${CL_EXTRA[@]}" &
   cp=$!
   sleep 1

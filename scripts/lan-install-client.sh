@@ -36,6 +36,7 @@ set -euo pipefail
 : "${BIBA_HTTP_PORT:=11880}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+q() { printf '%q' "$1"; }
 SSH=(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${BIBA_LAN_USER}@${BIBA_LAN_HOST}")
 SCP=(sshpass -e scp -o StrictHostKeyChecking=accept-new)
 
@@ -60,18 +61,18 @@ docker save bibavpn-client:local | gzip > /tmp/bibavpn-client.tgz
   -p ${BIBA_SOCKS_PORT}:${BIBA_SOCKS_PORT} \
   -p ${BIBA_HTTP_PORT}:18080 \
   bibavpn-client:local \
-  --server ${BIBA_REMOTE} \
-  --sni ${BIBA_SNI} \
-  --token ${BIBA_VPN_TOKEN} \
+  --server $(q "$BIBA_REMOTE") \
+  --sni $(q "$BIBA_SNI") \
+  --token $(q "$BIBA_VPN_TOKEN") \
   --insecure \
   --socks5 0.0.0.0:${BIBA_SOCKS_PORT} \
   --http-proxy 0.0.0.0:18080 \
-  --psk ${BIBA_VPN_PSK} \
-  --decoy-max ${BIBA_DECOY_MAX} \
-  --max-pad ${BIBA_MAX_PAD} \
-  --max-ws-binary ${BIBA_MAX_WS_BINARY} \
-  --ws-ping-secs ${BIBA_WS_PING_SECS} \
-  --early-ws-frames ${BIBA_EARLY_WS_FRAMES}"
+  --psk $(q "$BIBA_VPN_PSK") \
+  --decoy-max $(q "$BIBA_DECOY_MAX") \
+  --max-pad $(q "$BIBA_MAX_PAD") \
+  --max-ws-binary $(q "$BIBA_MAX_WS_BINARY") \
+  --ws-ping-secs $(q "$BIBA_WS_PING_SECS") \
+  --early-ws-frames $(q "$BIBA_EARLY_WS_FRAMES")"
 
 echo "OK: bibavpn-client on ${BIBA_LAN_HOST}"
 echo "  SOCKS5: ${BIBA_LAN_HOST}:${BIBA_SOCKS_PORT}"
