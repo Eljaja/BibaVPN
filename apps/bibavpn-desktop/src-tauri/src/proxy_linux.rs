@@ -116,7 +116,9 @@ fn parse_gvariant_string(raw: &str) -> String {
     if t == "''" || t == "\"\"" {
         return String::new();
     }
-    if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')) {
+    if t.len() >= 2
+        && ((t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')))
+    {
         return t[1..t.len() - 1].replace("\\'", "'").replace("\\\"", "\"");
     }
     t.to_string()
@@ -339,10 +341,7 @@ fn set_systemd_user_environment(vars: &[(String, String)]) -> Result<(), String>
         .map_err(|e| format!("systemctl --user set-environment: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "systemctl --user set-environment: {}",
-            err.trim()
-        ));
+        return Err(format!("systemctl --user set-environment: {}", err.trim()));
     }
     Ok(())
 }
@@ -404,8 +403,13 @@ fn apply_session_env(
     socks_port: i32,
     split_tunnel_hosts: &[String],
 ) {
-    let vars =
-        proxy_env_assignments(http_host, http_port, socks_host, socks_port, split_tunnel_hosts);
+    let vars = proxy_env_assignments(
+        http_host,
+        http_port,
+        socks_host,
+        socks_port,
+        split_tunnel_hosts,
+    );
     let _ = set_systemd_user_environment(&vars);
     let _ = dbus_update_activation_environment(&vars);
 }
@@ -577,8 +581,10 @@ pub fn read_backup() -> io::Result<ProxyBackup> {
     let ignore_hosts = gsettings_get(SCHEMA, "ignore-hosts")
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let http = read_http_slot().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let https = read_host_port(SCHEMA_HTTPS).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let socks = read_host_port(SCHEMA_SOCKS).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let https =
+        read_host_port(SCHEMA_HTTPS).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let socks =
+        read_host_port(SCHEMA_SOCKS).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let ftp = read_host_port(SCHEMA_FTP).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     Ok(ProxyBackup {
         mode,
@@ -618,11 +624,29 @@ pub fn apply_proxy(
         );
     }
 
+    // `apply_proxy` only gets the target values, not the snapshot: take one here
+    // so a failure halfway through gsettings writes can be rolled back. Without
+    // this the caller returns an error, never stores a backup, and the user is
+    // left with `mode=manual` pointing at a listener that just shut down.
+    let backup = read_backup().map_err(|e| e.to_string())?;
+    match apply_proxy_inner(http_host_port, socks_host_port, split_tunnel_hosts, &backup) {
+        Ok(()) => Ok(()),
+        Err(e) => match restore(&backup) {
+            Ok(()) => Err(e),
+            Err(re) => Err(format!("{e}; откат настроек прокси: {re}")),
+        },
+    }
+}
+
+fn apply_proxy_inner(
+    http_host_port: &str,
+    socks_host_port: &str,
+    split_tunnel_hosts: &[String],
+    backup: &ProxyBackup,
+) -> Result<(), String> {
     let (http_host, http_port) = split_host_port(http_host_port)?;
     let (socks_host, socks_port) = split_host_port(socks_host_port)?;
-    let existing_ignore = gsettings_get(SCHEMA, "ignore-hosts")
-        .unwrap_or_else(|_| "['localhost', '127.0.0.0/8', '::1']".to_string());
-    let merged_ignore = merge_ignore_hosts(&existing_ignore, split_tunnel_hosts);
+    let merged_ignore = merge_ignore_hosts(&backup.ignore_hosts, split_tunnel_hosts);
 
     gsettings_set(SCHEMA, "mode", "'manual'")?;
     gsettings_set(SCHEMA, "use-same-proxy", "false")?;
@@ -716,6 +740,13 @@ mod tests {
     fn normalize_star_domains() {
         assert_eq!(normalize_ignore_host("*.example.com"), ".example.com");
         assert_eq!(normalize_ignore_host("example.com"), "example.com");
+    }
+
+    #[test]
+    fn parse_gvariant_string_does_not_panic_on_bare_quote() {
+        assert_eq!(parse_gvariant_string("'"), "'");
+        assert_eq!(parse_gvariant_string("\""), "\"");
+        assert_eq!(parse_gvariant_string("'value'"), "value");
     }
 
     #[test]
