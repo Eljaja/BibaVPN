@@ -27,8 +27,16 @@ enum JoinWait {
 }
 
 fn wait_join(stopping: ClientSlot, timeout: Duration) -> JoinWait {
-    let ClientSlot::Stopping { thread, done_rx } = stopping else {
-        panic!("wait_join expects Stopping");
+    // Callers only pass `Stopping`, but never panic across the JNI boundary if that invariant is
+    // ever broken: degrade to the same bounded wait.
+    let (thread, done_rx) = match stopping {
+        ClientSlot::Stopping { thread, done_rx } => (thread, done_rx),
+        ClientSlot::Live {
+            thread, done_rx, ..
+        } => {
+            tracing::error!("wait_join called with a Live slot; waiting anyway");
+            (thread, done_rx)
+        }
     };
     match done_rx.recv_timeout(timeout) {
         // Sender dropped: thread body returned.
@@ -112,8 +120,7 @@ impl ClientSlotManager {
                     clear_hook();
                 }
                 ClientSlot::Stopping { thread, done_rx } => {
-                    match wait_join(ClientSlot::Stopping { thread, done_rx }, self.join_timeout)
-                    {
+                    match wait_join(ClientSlot::Stopping { thread, done_rx }, self.join_timeout) {
                         JoinWait::Joined => clear_hook(),
                         JoinWait::Timeout(stopping) => {
                             self.slot = Some(stopping);
@@ -177,7 +184,10 @@ mod tests {
 
     const TEST_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
-    fn spawn_dummy(sleep: Duration, shutdown: watch::Receiver<bool>) -> (JoinHandle<()>, Receiver<()>) {
+    fn spawn_dummy(
+        sleep: Duration,
+        shutdown: watch::Receiver<bool>,
+    ) -> (JoinHandle<()>, Receiver<()>) {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let handle = thread::spawn(move || {
             let _done_tx = done_tx;
@@ -250,10 +260,9 @@ mod tests {
         assert!(!mgr.is_idle());
 
         exit.store(true, Ordering::SeqCst);
-        assert!(
-            mgr.try_prepare_start(|| hook_flag.store(true, Ordering::SeqCst))
-                .is_ok()
-        );
+        assert!(mgr
+            .try_prepare_start(|| hook_flag.store(true, Ordering::SeqCst))
+            .is_ok());
         assert!(hook_cleared.load(Ordering::SeqCst));
 
         let (shutdown_tx2, _) = watch::channel(false);

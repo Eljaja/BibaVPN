@@ -104,6 +104,9 @@ const MESSAGES = {
     btn_save: "Сохранить",
     btn_clear: "Скрыть",
     settings_save_failed: "Настройки не сохранены: {error}",
+    settings_changed_while_saving:
+      "пока сохраняли, вы изменили настройки — сохраните ещё раз",
+    profile_save_failed: "Профили не сохранены: {error}",
     btn_discard_changes: "Отменить изменения",
     settings_group_profile: "Профиль / инвайт",
     settings_group_endpoint: "Узел и доступ",
@@ -257,6 +260,9 @@ const MESSAGES = {
     btn_save: "Save",
     btn_clear: "Dismiss",
     settings_save_failed: "Settings not saved: {error}",
+    settings_changed_while_saving:
+      "settings changed while saving — please save again",
+    profile_save_failed: "Profiles not saved: {error}",
     btn_discard_changes: "Discard changes",
     settings_group_profile: "Profile / invite",
     settings_group_endpoint: "Endpoint & auth",

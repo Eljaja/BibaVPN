@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ThemeProvider, useT } from "./ThemeContext.jsx";
@@ -9,6 +9,7 @@ import { SettingsScreen } from "./screens/SettingsScreen.jsx";
 import { BottomNav } from "./components/BottomNav.jsx";
 import { Btn } from "./ui/primitives.jsx";
 import { t } from "./i18n.js";
+import { isDocumentHidden } from "./visibility.js";
 import { MONO, SANS } from "./theme.js";
 
 function cloneCfg(c) {
@@ -45,6 +46,10 @@ function AppInner() {
    * `at` меняется на каждой неудаче, чтобы баннер снова прокручивался в зону видимости.
    */
   const [saveError, setSaveError] = useState(/** @type {{ message: string, at: number } | null} */ (null));
+  /** Отсекает устаревшие ответы `get_edit_config` после быстрого переключения вкладок. */
+  const draftReqRef = useRef(0);
+  /** Номер правки черновика: ответ сохранения не должен затереть более новый ввод. */
+  const draftRevRef = useRef(0);
 
   useEffect(() => {
     let disposed = false;
@@ -56,11 +61,15 @@ function AppInner() {
       } catch (e) {
         console.error(e);
       }
-      const un = await listen("control-plane-import-pending", (ev) => {
-        setPendingImport(/** @type {typeof pendingImport} */ (ev.payload));
-      });
-      if (disposed) un();
-      else unlisten = un;
+      try {
+        const un = await listen("control-plane-import-pending", (ev) => {
+          setPendingImport(/** @type {typeof pendingImport} */ (ev.payload));
+        });
+        if (disposed) un();
+        else unlisten = un;
+      } catch (e) {
+        console.error(e);
+      }
     })();
     return () => {
       disposed = true;
@@ -69,8 +78,11 @@ function AppInner() {
   }, []);
 
   const loadEditDraft = useCallback(async () => {
+    const req = ++draftReqRef.current;
     try {
       const c = await getEditConfig();
+      if (req !== draftReqRef.current) return;
+      draftRevRef.current += 1;
       setDraft(cloneCfg(c));
       setDraftDirty(false);
       setSaveError(null);
@@ -80,6 +92,8 @@ function AppInner() {
   }, [getEditConfig]);
 
   useEffect(() => {
+    // Любая загрузка черновика для предыдущей вкладки становится неактуальной.
+    draftReqRef.current += 1;
     if (tab === "connect") {
       setDraft(null);
       setDraftDirty(false);
@@ -91,13 +105,17 @@ function AppInner() {
     let disposed = false;
     let unlisten = () => {};
     (async () => {
-      const un = await listen("control-plane-import", () => {
-        setPendingImport(null);
-        setTab("profiles");
-        loadEditDraft();
-      });
-      if (disposed) un();
-      else unlisten = un;
+      try {
+        const un = await listen("control-plane-import", () => {
+          setPendingImport(null);
+          setTab("profiles");
+          loadEditDraft();
+        });
+        if (disposed) un();
+        else unlisten = un;
+      } catch (e) {
+        console.error(e);
+      }
     })();
     return () => {
       disposed = true;
@@ -151,6 +169,11 @@ function AppInner() {
     let cancelled = false;
     let timer = 0;
     async function pollTunnelStatus() {
+      // В фоне не дёргаем IPC: Android WebView всё равно троттлит таймеры.
+      if (isDocumentHidden()) {
+        timer = window.setTimeout(pollTunnelStatus, 1500);
+        return;
+      }
       const status = await getTunnelStatus();
       if (cancelled) return;
       if (status?.connected || status?.error) {
@@ -187,6 +210,10 @@ function AppInner() {
     let cancelled = false;
     let timer = 0;
     async function pollRecovery() {
+      if (isDocumentHidden()) {
+        timer = window.setTimeout(pollRecovery, 2500);
+        return;
+      }
       const status = await getTunnelStatus();
       if (cancelled) return;
       if (status?.connected || (status?.error && !snapError)) {
@@ -203,6 +230,7 @@ function AppInner() {
   }, [sessionDown, snapError, tunnelHandshake, busy, refresh, getTunnelStatus]);
 
   const setCfg = useCallback((updater) => {
+    draftRevRef.current += 1;
     setDraft((d) => {
       if (!d) return null;
       return typeof updater === "function" ? updater(d) : updater;
@@ -217,9 +245,16 @@ function AppInner() {
    */
   const saveDraft = useCallback(async () => {
     if (!draft || !draftDirty) return true;
+    const rev = draftRevRef.current;
     try {
       await saveCfg(draft);
       const full = await getEditConfig();
+      // Пока шло сохранение, пользователь продолжил печатать — не затираем ввод
+      // устаревшим снимком и просим сохранить ещё раз.
+      if (draftRevRef.current !== rev) {
+        setSaveError({ message: t("settings_changed_while_saving"), at: Date.now() });
+        return false;
+      }
       setDraft(cloneCfg(full));
       setDraftDirty(false);
       setSaveError(null);
@@ -261,6 +296,8 @@ function AppInner() {
         await disconnect();
       } catch (e) {
         console.error(e);
+        // Бэкенд уже мог записать ошибку — подтягиваем её в баннер.
+        await refresh();
       }
       return;
     }
@@ -268,8 +305,11 @@ function AppInner() {
     try {
       const s = await connect();
       if (s?.connected) setTunnelHandshake(false);
-    } catch {
+    } catch (e) {
+      console.error(e);
       setTunnelHandshake(false);
+      // Если событие `vpn-state` с ошибкой не успело прийти, забираем его из снимка.
+      await refresh();
     }
   }
 
@@ -289,15 +329,19 @@ function AppInner() {
     main = (
       <ProfilesScreen
         cfg={cfg}
+        saveError={saveError}
         onSave={async (c) => {
           setDraft(c);
+          let failure = null;
           try {
             await saveCfg(c);
           } catch (e) {
             console.error(e);
+            failure = e;
           }
           // И после ошибки: экран должен показывать то, что реально сохранено.
           await loadEditDraft();
+          setSaveError(failure ? { message: String(failure), at: Date.now() } : null);
         }}
       />
     );

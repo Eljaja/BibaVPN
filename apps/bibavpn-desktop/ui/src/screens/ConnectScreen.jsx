@@ -5,6 +5,7 @@ import { SEMANTIC, MONO, SANS } from "../theme.js";
 import { StatusDot } from "../ui/primitives.jsx";
 import { t } from "../i18n.js";
 import { getActiveProfile } from "../profileUtils.js";
+import { isDocumentHidden } from "../visibility.js";
 
 /** Длительность сессии с момента перехода в connected (локальные часы). */
 function formatSessionUptime(elapsedMs) {
@@ -15,6 +16,179 @@ function formatSessionUptime(elapsedMs) {
   const s = totalSec % 60;
   if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
+ * ПиНГ и аптайм живут в отдельном компоненте: их секундные тики и опрос статуса
+ * не должны перерисовывать весь экран подключения (на Android WebView это
+ * заметно как «подвисание» интерфейса).
+ */
+function ConnectStats({ snap, getTunnelStatus, refresh }) {
+  const { theme } = useT();
+  const [backendUptimeSecs, setBackendUptimeSecs] = useState(
+    typeof snap?.vpnSessionUptimeSecs === "number" ? snap.vpnSessionUptimeSecs : null,
+  );
+  const [sessionStartedAt, setSessionStartedAt] = useState(null);
+  /** Ререндер только этого компонента раз в секунду для локального аптайма. */
+  const [, setTick] = useState(0);
+  const [rttMs, setRttMs] = useState(null);
+
+  const connected = Boolean(snap?.connected);
+  const backendUptime = typeof snap?.vpnSessionUptimeSecs === "number";
+
+  useEffect(() => {
+    if (!connected) {
+      setBackendUptimeSecs(null);
+      setSessionStartedAt(null);
+      setRttMs(null);
+      return;
+    }
+    if (backendUptime) {
+      setSessionStartedAt(null);
+      setBackendUptimeSecs(snap.vpnSessionUptimeSecs);
+      return;
+    }
+    setBackendUptimeSecs(null);
+    setSessionStartedAt((prev) => (prev == null ? Date.now() : prev));
+  }, [connected, backendUptime, snap?.vpnSessionUptimeSecs]);
+
+  /** Android/iOS: обновляем только лёгкий статус туннеля, не весь snapshot с конфигом. */
+  useEffect(() => {
+    if (!connected || !backendUptime) return;
+    let cancelled = false;
+    let inFlight = false;
+    async function refreshUptime() {
+      if (cancelled || inFlight || isDocumentHidden()) return;
+      inFlight = true;
+      try {
+        const status = await getTunnelStatus();
+        if (cancelled) return;
+        if (status?.connected) {
+          if (typeof status.vpnSessionUptimeSecs === "number") {
+            setBackendUptimeSecs(status.vpnSessionUptimeSecs);
+          }
+        } else if (status && status.connected === false) {
+          // Туннель действительно упал — синхронизируем полный snapshot один раз.
+          // `null` означает ошибку IPC: не дёргаем `get_state` каждую секунду.
+          setBackendUptimeSecs(null);
+          await refresh();
+        }
+      } finally {
+        inFlight = false;
+      }
+    }
+    refreshUptime();
+    const id = window.setInterval(refreshUptime, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [connected, backendUptime, refresh, getTunnelStatus]);
+
+  useEffect(() => {
+    if (!connected || sessionStartedAt == null) return;
+    const id = window.setInterval(() => {
+      // В фоне не тикаем: после возврата elapsed всё равно считается от Date.now().
+      if (isDocumentHidden()) return;
+      setTick((x) => x + 1);
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [connected, sessionStartedAt]);
+
+  useEffect(() => {
+    if (!connected) return;
+    let cancelled = false;
+    let inFlight = false;
+    async function probe() {
+      if (cancelled || inFlight || isDocumentHidden()) return;
+      inFlight = true;
+      try {
+        const v = await invoke("measure_server_rtt_cmd");
+        if (!cancelled) setRttMs(typeof v === "number" ? v : null);
+      } catch {
+        if (!cancelled) setRttMs(null);
+      } finally {
+        inFlight = false;
+      }
+    }
+    probe();
+    const id = window.setInterval(probe, 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [connected]);
+
+  const effectiveBackendUptimeSecs =
+    typeof backendUptimeSecs === "number"
+      ? backendUptimeSecs
+      : typeof snap?.vpnSessionUptimeSecs === "number"
+        ? snap.vpnSessionUptimeSecs
+        : null;
+
+  const uptimeStr =
+    connected && typeof effectiveBackendUptimeSecs === "number"
+      ? formatSessionUptime(effectiveBackendUptimeSecs * 1000)
+      : connected && sessionStartedAt != null
+        ? formatSessionUptime(Date.now() - sessionStartedAt)
+        : "—";
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(3, 1fr)",
+        borderTop: `1px solid ${theme.line}`,
+        borderBottom: `1px solid ${theme.line}`,
+      }}
+    >
+      {[
+        {
+          l: t("connect_stat_latency"),
+          v: connected && typeof rttMs === "number" ? String(rttMs) : "—",
+          u: connected && typeof rttMs === "number" ? "ms" : "",
+        },
+        {
+          l: t("connect_stat_uptime"),
+          v: uptimeStr,
+          u: "",
+        },
+        {
+          l: t("connect_stat_down"),
+          v: "—",
+          u: "",
+        },
+      ].map((s, i) => (
+        <div
+          key={s.l}
+          style={{
+            padding: "14px 6px",
+            textAlign: "center",
+            borderLeft: i > 0 ? `1px solid ${theme.line}` : "none",
+          }}
+        >
+          <div
+            style={{
+              fontFamily: SANS,
+              fontSize: 9,
+              color: theme.textDim,
+              letterSpacing: 1.3,
+              textTransform: "uppercase",
+              marginBottom: 6,
+            }}
+          >
+            {s.l}
+          </div>
+          <div style={{ fontFamily: SANS, fontSize: 18, color: theme.text, fontWeight: 500 }}>
+            {s.v}
+            {s.u && (
+              <span style={{ fontSize: 10, color: theme.textDim, marginLeft: 3 }}>{s.u}</span>
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 /** @param {{ snap: import('../vpnTypes').StateSnapshot, connectPending: boolean, busy: boolean, cancelable: boolean, reconnecting: boolean, refresh: () => Promise<void>, getTunnelStatus: () => Promise<{ connected?: boolean, vpnSessionUptimeSecs?: number, error?: string } | null>, onSettings: () => void, onToggleConnect: () => void, onClearError: () => void }} props */
@@ -31,106 +205,8 @@ export function ConnectScreen({
   onClearError,
 }) {
   const { theme, accent } = useT();
-  const [sessionStartedAt, setSessionStartedAt] = useState(null);
-  const [backendUptimeSecs, setBackendUptimeSecs] = useState(null);
-  /** Ререндер раз в секунду для uptime */
-  const [, setTick] = useState(0);
-  const [rttMs, setRttMs] = useState(null);
-
-  useEffect(() => {
-    if (!snap || !snap.connected) {
-      setSessionStartedAt(null);
-      setBackendUptimeSecs(null);
-      setRttMs(null);
-      return;
-    }
-    if (typeof snap.vpnSessionUptimeSecs === "number") {
-      setSessionStartedAt(null);
-      setBackendUptimeSecs(snap.vpnSessionUptimeSecs);
-      return;
-    }
-    setBackendUptimeSecs(null);
-    setSessionStartedAt((prev) => (prev == null ? Date.now() : prev));
-  }, [snap?.connected, snap?.vpnSessionUptimeSecs]);
-
-  /** Android/iOS: обновляем только лёгкий статус туннеля, не весь snapshot с конфигом. */
-  useEffect(() => {
-    const backend =
-      snap?.connected && typeof snap.vpnSessionUptimeSecs === "number";
-    if (!snap?.connected) return;
-    if (backend) {
-      let cancelled = false;
-      let inFlight = false;
-      async function refreshUptime() {
-        if (inFlight) return;
-        inFlight = true;
-        try {
-          const status = await getTunnelStatus();
-          if (cancelled) return;
-          if (status?.connected) {
-            setBackendUptimeSecs(
-              typeof status.vpnSessionUptimeSecs === "number"
-                ? status.vpnSessionUptimeSecs
-                : null
-            );
-          } else {
-            setBackendUptimeSecs(null);
-            await refresh();
-          }
-        } finally {
-          inFlight = false;
-        }
-      }
-      refreshUptime();
-      const id = setInterval(() => {
-        refreshUptime();
-      }, 1000);
-      return () => {
-        cancelled = true;
-        clearInterval(id);
-      };
-    }
-    if (sessionStartedAt != null) {
-      const id = setInterval(() => setTick((x) => x + 1), 1000);
-      return () => clearInterval(id);
-    }
-  }, [snap?.connected, snap?.vpnSessionUptimeSecs, sessionStartedAt, refresh, getTunnelStatus]);
-
-  useEffect(() => {
-    if (!snap?.connected) return;
-    let cancelled = false;
-    async function probe() {
-      try {
-        const v = await invoke("measure_server_rtt_cmd");
-        if (cancelled) return;
-        setRttMs(typeof v === "number" ? v : null);
-      } catch {
-        if (!cancelled) setRttMs(null);
-      }
-    }
-    probe();
-    const id = setInterval(probe, 30000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [snap?.connected]);
 
   if (!snap) return null;
-
-  const effectiveBackendUptimeSecs =
-    typeof backendUptimeSecs === "number"
-      ? backendUptimeSecs
-      : typeof snap.vpnSessionUptimeSecs === "number"
-        ? snap.vpnSessionUptimeSecs
-        : null;
-
-  const uptimeStr =
-    snap.connected && typeof effectiveBackendUptimeSecs === "number"
-      ? formatSessionUptime(effectiveBackendUptimeSecs * 1000)
-      : snap.connected && sessionStartedAt != null
-        ? formatSessionUptime(Date.now() - sessionStartedAt)
-        : "—";
 
   const cs = snap.error
     ? "error"
@@ -425,63 +501,7 @@ export function ConnectScreen({
           </div>
         </button>
 
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(3, 1fr)",
-            borderTop: `1px solid ${theme.line}`,
-            borderBottom: `1px solid ${theme.line}`,
-          }}
-        >
-          {[
-            {
-              l: t("connect_stat_latency"),
-              v:
-                snap.connected && typeof rttMs === "number"
-                  ? String(rttMs)
-                  : "—",
-              u: snap.connected && typeof rttMs === "number" ? "ms" : "",
-            },
-            {
-              l: t("connect_stat_uptime"),
-              v: uptimeStr,
-              u: "",
-            },
-            {
-              l: t("connect_stat_down"),
-              v: snap.connected ? "—" : "—",
-              u: "",
-            },
-          ].map((s, i) => (
-            <div
-              key={s.l}
-              style={{
-                padding: "14px 6px",
-                textAlign: "center",
-                borderLeft: i > 0 ? `1px solid ${theme.line}` : "none",
-              }}
-            >
-              <div
-                style={{
-                  fontFamily: SANS,
-                  fontSize: 9,
-                  color: theme.textDim,
-                  letterSpacing: 1.3,
-                  textTransform: "uppercase",
-                  marginBottom: 6,
-                }}
-              >
-                {s.l}
-              </div>
-              <div style={{ fontFamily: SANS, fontSize: 18, color: theme.text, fontWeight: 500 }}>
-                {s.v}
-                {s.u && (
-                  <span style={{ fontSize: 10, color: theme.textDim, marginLeft: 3 }}>{s.u}</span>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
+        <ConnectStats snap={snap} getTunnelStatus={getTunnelStatus} refresh={refresh} />
 
         <p
           style={{

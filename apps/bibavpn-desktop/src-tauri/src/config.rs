@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bibavpn::local_client::DEFAULT_CLIENT_MAX_WS_BINARY;
 use bibavpn::invite_uri::InviteV1;
+use bibavpn::local_client::DEFAULT_CLIENT_MAX_WS_BINARY;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_VERSION: u32 = 2;
@@ -206,7 +206,18 @@ fn merge_profile_secrets(
 }
 
 /// Merge UI `save_config_cmd` payload into stored config: omitted secret keys keep disk values.
-pub fn merge_saved_config(stored: &SavedConfig, incoming: &serde_json::Value) -> Result<SavedConfig, String> {
+///
+/// The payload is a full config in practice, but a partial update (e.g. only
+/// `ui_locale`) must not wipe profiles, ports, or the active selection. Fields
+/// that are absent from the object keep the stored value; explicitly present
+/// fields (including an explicit `profiles: []`) win.
+pub fn merge_saved_config(
+    stored: &SavedConfig,
+    incoming: &serde_json::Value,
+) -> Result<SavedConfig, String> {
+    let obj = incoming
+        .as_object()
+        .ok_or_else(|| "конфиг должен быть JSON-объектом".to_string())?;
     let incoming_cfg: SavedConfig =
         serde_json::from_value(incoming.clone()).map_err(|e| e.to_string())?;
     let profiles_raw = incoming
@@ -215,8 +226,29 @@ pub fn merge_saved_config(stored: &SavedConfig, incoming: &serde_json::Value) ->
         .cloned()
         .unwrap_or_default();
     let mut merged = incoming_cfg;
+    if !obj.contains_key("profiles") {
+        merged.profiles = stored.profiles.clone();
+    }
+    if !obj.contains_key("active_profile_id") {
+        merged.active_profile_id = stored.active_profile_id.clone();
+    }
+    if !obj.contains_key("version") {
+        merged.version = stored.version;
+    }
+    if !obj.contains_key("ui_locale") {
+        merged.ui_locale = stored.ui_locale.clone();
+    }
+    if !obj.contains_key("local_http_port") {
+        merged.local_http_port = stored.local_http_port;
+    }
+    if !obj.contains_key("local_socks_port") {
+        merged.local_socks_port = stored.local_socks_port;
+    }
     for (i, profile) in merged.profiles.iter_mut().enumerate() {
-        let raw = profiles_raw.get(i).cloned().unwrap_or(serde_json::Value::Null);
+        let raw = profiles_raw
+            .get(i)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let stored_profile = stored.profiles.iter().find(|p| p.id == profile.id);
         merge_profile_secrets(stored_profile, profile, &raw);
     }
@@ -422,7 +454,7 @@ pub fn apply_invite_fields(p: &mut TunnelProfile, inv: &InviteV1) {
     p.desync_mode = inv.desync_mode.clone().unwrap_or_default();
     p.tcp_fooling = inv.tcp_fooling.clone().unwrap_or_default();
     p.tls_fragment = inv.tls_fragment;
-    p.ws_parallel = inv.ws_parallel.max(1).min(4);
+    p.ws_parallel = inv.ws_parallel.clamp(1, 4);
     p.idle_decoy_secs = inv.idle_decoy_secs.unwrap_or(0);
     p.tls_stack = inv.tls_stack.clone();
     p.reality_target = inv.reality_target.clone().unwrap_or_default();
@@ -706,7 +738,7 @@ impl TunnelProfile {
         o.insert("socks_bind".to_string(), json!(socks_bind));
         o.insert("insecure".to_string(), json!(self.insecure));
         o.insert("max_pad".to_string(), json!(self.max_pad));
-        o.insert("decoy_max".to_string(), json!(self.decoy_max.min(255)));
+        o.insert("decoy_max".to_string(), json!(self.decoy_max));
         o.insert("junk_frames".to_string(), json!(self.junk_frames));
         o.insert("early_ws_frames".to_string(), json!(self.early_ws_frames));
         o.insert("max_ws_binary".to_string(), json!(self.max_ws_binary));
@@ -724,15 +756,15 @@ impl TunnelProfile {
         if j_ping > 0 {
             o.insert("ws_ping_jitter_percent".to_string(), json!(j_ping));
         }
-        let j_bin = self.ws_binary_send_jitter_ms.min(255);
+        let j_bin = self.ws_binary_send_jitter_ms;
         if j_bin > 0 {
             o.insert("ws_binary_send_jitter_ms".to_string(), json!(j_bin));
         }
-        let jmin = self.ws_jitter_min_ms.min(255);
+        let jmin = self.ws_jitter_min_ms;
         if jmin > 0 {
             o.insert("ws_jitter_min_ms".to_string(), json!(jmin));
         }
-        let jmax = self.ws_jitter_max_ms.min(255);
+        let jmax = self.ws_jitter_max_ms;
         if jmax > 0 {
             o.insert("ws_jitter_max_ms".to_string(), json!(jmax));
         }
@@ -741,7 +773,7 @@ impl TunnelProfile {
             let v: u8 = udp_pad
                 .parse()
                 .map_err(|_| "udp_max_pad: нужно число 0–255".to_string())?;
-            o.insert("udp_max_pad".to_string(), json!(v.min(255)));
+            o.insert("udp_max_pad".to_string(), json!(v));
         }
         let udp_bin = self.udp_max_ws_binary.trim();
         if !udp_bin.is_empty() {
@@ -794,7 +826,7 @@ impl TunnelProfile {
             o.insert("ws_headers".to_string(), json!(lines));
         }
 
-        let pr = self.proto.max(1).min(255);
+        let pr = self.proto.max(1);
         if pr != 3 {
             o.insert("proto".to_string(), json!(pr));
         }
@@ -828,7 +860,7 @@ impl TunnelProfile {
         if self.tls_fragment {
             o.insert("tls_fragment".to_string(), json!(true));
         }
-        let wsp = self.ws_parallel.max(1).min(4);
+        let wsp = self.ws_parallel.clamp(1, 4);
         o.insert("ws_parallel".to_string(), json!(wsp));
         if self.idle_decoy_secs > 0 {
             o.insert("idle_decoy_secs".to_string(), json!(self.idle_decoy_secs));
@@ -1067,6 +1099,11 @@ pub fn normalize_loaded(cfg: &mut SavedConfig) {
     if cfg.local_http_port == 0 {
         cfg.local_http_port = default_http_port();
     }
+    // A SOCKS port equal to HTTP is rejected at connect time; treat it as "auto"
+    // (HTTP + 1) so a saved/damaged config cannot leave the app unable to connect.
+    if cfg.local_socks_port != 0 && cfg.local_socks_port == cfg.local_http_port {
+        cfg.local_socks_port = 0;
+    }
     if cfg.profiles.is_empty() {
         let id = new_profile_id();
         cfg.active_profile_id = id.clone();
@@ -1076,11 +1113,7 @@ pub fn normalize_loaded(cfg: &mut SavedConfig) {
             ..TunnelProfile::default()
         });
     }
-    if !cfg
-        .profiles
-        .iter()
-        .any(|p| p.id == cfg.active_profile_id)
-    {
+    if !cfg.profiles.iter().any(|p| p.id == cfg.active_profile_id) {
         cfg.active_profile_id = cfg.profiles[0].id.clone();
     }
     for p in &mut cfg.profiles {
@@ -1270,7 +1303,13 @@ mod public_snapshot_tests {
         let public = to_public_saved_config(&cfg);
         let val = serde_json::to_value(&public).expect("serialize public cfg");
         let text = serde_json::to_string(&val).expect("stringify");
-        for key in ["token", "psk", "from_invite", "invite_passphrase", "pin_cert_pem"] {
+        for key in [
+            "token",
+            "psk",
+            "from_invite",
+            "invite_passphrase",
+            "pin_cert_pem",
+        ] {
             assert!(
                 !val.get("profiles")
                     .and_then(|a| a.as_array())
@@ -1408,5 +1447,104 @@ mod public_snapshot_tests {
         assert_eq!(new_p.from_invite, "");
         assert_eq!(new_p.invite_passphrase, "");
         assert_eq!(new_p.pin_cert_pem, "");
+    }
+}
+
+#[cfg(test)]
+mod merge_and_normalize_tests {
+    use super::{merge_saved_config, normalize_loaded, SavedConfig, TunnelProfile};
+    use serde_json::json;
+
+    fn stored_with_secret() -> SavedConfig {
+        let mut stored = SavedConfig::default();
+        stored.version = 7;
+        stored.ui_locale = "ru".into();
+        stored.local_http_port = 18080;
+        stored.local_socks_port = 18081;
+        stored.profiles = vec![TunnelProfile {
+            id: "p1".into(),
+            name: "Main".into(),
+            server: "vpn.example.com:8443".into(),
+            token: "token-secret".into(),
+            psk: "psk-secret".into(),
+            ..TunnelProfile::default()
+        }];
+        stored.active_profile_id = "p1".into();
+        stored
+    }
+
+    /// A locale-only save must not reset profiles, ports, or the active id to defaults.
+    #[test]
+    fn partial_update_keeps_profiles_and_ports() {
+        let stored = stored_with_secret();
+        let merged = merge_saved_config(&stored, &json!({ "ui_locale": "en" })).expect("merge");
+        assert_eq!(merged.ui_locale, "en");
+        assert_eq!(merged.profiles.len(), 1);
+        assert_eq!(merged.profiles[0].id, "p1");
+        assert_eq!(merged.profiles[0].token, "token-secret");
+        assert_eq!(merged.profiles[0].psk, "psk-secret");
+        assert_eq!(merged.local_http_port, 18080);
+        assert_eq!(merged.local_socks_port, 18081);
+        assert_eq!(merged.active_profile_id, "p1");
+        assert_eq!(merged.version, 7);
+    }
+
+    #[test]
+    fn explicit_profiles_update_replaces_profiles() {
+        let stored = stored_with_secret();
+        let incoming = json!({
+            "ui_locale": "en",
+            "active_profile_id": "p2",
+            "profiles": [{
+                "id": "p2",
+                "name": "New",
+                "server": "new.example.com:9443",
+                "sni": "",
+                "insecure": false
+            }]
+        });
+        let merged = merge_saved_config(&stored, &incoming).expect("merge");
+        assert_eq!(merged.profiles.len(), 1);
+        assert_eq!(merged.profiles[0].id, "p2");
+        assert_eq!(merged.active_profile_id, "p2");
+        // Secrets belong to the new profile and must not be copied from p1.
+        assert!(merged.profiles[0].token.is_empty());
+        assert!(merged.profiles[0].psk.is_empty());
+    }
+
+    #[test]
+    fn merge_rejects_non_object_payload() {
+        let stored = stored_with_secret();
+        assert!(merge_saved_config(&stored, &json!([1, 2, 3])).is_err());
+    }
+
+    #[test]
+    fn normalize_moves_socks_off_http_port() {
+        let mut cfg = SavedConfig::default();
+        cfg.local_http_port = 18080;
+        cfg.local_socks_port = 18080;
+        normalize_loaded(&mut cfg);
+        assert_eq!(cfg.local_socks_port, 0, "auto => HTTP + 1");
+    }
+
+    #[test]
+    fn normalize_keeps_distinct_socks_port() {
+        let mut cfg = SavedConfig::default();
+        cfg.local_http_port = 18080;
+        cfg.local_socks_port = 18081;
+        normalize_loaded(&mut cfg);
+        assert_eq!(cfg.local_socks_port, 18081);
+    }
+
+    #[test]
+    fn normalize_repoints_missing_active_profile() {
+        let mut cfg = SavedConfig::default();
+        cfg.profiles = vec![TunnelProfile {
+            id: "kept".into(),
+            ..TunnelProfile::default()
+        }];
+        cfg.active_profile_id = "does-not-exist".into();
+        normalize_loaded(&mut cfg);
+        assert_eq!(cfg.active_profile_id, "kept");
     }
 }

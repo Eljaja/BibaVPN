@@ -84,13 +84,20 @@ export function SettingsScreen({
     [],
   );
 
+  // Миграция нужна только при изменении полей split-tunnel (а не на каждый ввод
+  // в любом поле): иначе Android пересчитывает пакеты пресетов при каждом символе.
+  const splitPresetIds = p?.split_tunnel_preset_ids;
+  const splitPkgs = p?.android_split_tunnel_packages;
+  const manualPkgs = p?.android_manual_split_packages;
+  const profileId = p?.id;
+  const splitMigration = useMemo(() => {
+    if (!isAndroid || !p) return null;
+    return migrateAndroidSplitFields(p, bypassPresets);
+  }, [isAndroid, profileId, splitPresetIds, splitPkgs, manualPkgs, bypassPresets]);
   useEffect(() => {
-    if (!isAndroid || !cfg) return;
-    const prof = getActiveProfile(cfg);
-    if (!prof) return;
-    const delta = migrateAndroidSplitFields(prof, bypassPresets);
-    if (delta) setCfg((c) => patchActiveProfile(c, delta));
-  }, [cfg, isAndroid, setCfg, bypassPresets]);
+    if (!splitMigration) return;
+    setCfg((c) => patchActiveProfile(c, splitMigration));
+  }, [splitMigration, setCfg]);
 
   /** Уход с вкладки не удался — показываем почему, даже если форма прокручена вниз. */
   const saveErrorRef = useRef(/** @type {HTMLDivElement | null} */ (null));
