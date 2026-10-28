@@ -2,6 +2,7 @@
 //! combine with reverse proxy + real site certs in production like naiveproxy + Caddy).
 //! BibaV2.1: customizable Host / Origin / extra headers; `TlsClientProfile` drives default UA / Sec-CH-UA.
 
+use http::header::{HeaderName, HeaderValue};
 use http::{Request, Uri};
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 
@@ -74,28 +75,108 @@ pub struct WsHandshakeParams<'a> {
     pub tls_profile: TlsClientProfile,
 }
 
+/// Percent-encode bytes that cannot appear verbatim in an HTTP request target.
+fn sanitize_uri_path(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        let allowed = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'/'
+                    | b'?'
+                    | b'&'
+                    | b'='
+                    | b'%'
+                    | b':'
+                    | b'@'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'!'
+                    | b'$'
+                    | b'*'
+                    | b'['
+                    | b']'
+            );
+        if allowed {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Parse the outbound WSS URI without panicking on hostile `--ws-path` / invite input.
+fn websocket_uri(host: &str, port: u16, path: &str) -> Uri {
+    if let Ok(uri) = format!("wss://{host}:{port}{path}").parse::<Uri>() {
+        return uri;
+    }
+    if let Ok(uri) = format!("wss://{host}:{port}{}", sanitize_uri_path(path)).parse::<Uri>() {
+        tracing::warn!(
+            target: "bibavpn_stealth",
+            path,
+            "WebSocket path has invalid URI characters; percent-encoded"
+        );
+        return uri;
+    }
+    tracing::warn!(
+        target: "bibavpn_stealth",
+        host,
+        path,
+        "invalid WebSocket URI; falling back to wss://invalid/"
+    );
+    Uri::from_static("wss://invalid/")
+}
+
+/// Return `value` when it is a legal header value, otherwise a valid fallback.
+fn safe_header_value<'a>(value: &'a str, fallback: &'static str) -> &'a str {
+    if HeaderValue::from_str(value).is_ok() {
+        value
+    } else {
+        tracing::warn!(
+            target: "bibavpn_stealth",
+            "invalid WebSocket header value; using default"
+        );
+        fallback
+    }
+}
+
 /// Build WebSocket GET with optional header overrides (BibaV2.1).
+///
+/// Config and invite fields feed this function, so it must never panic: invalid
+/// URIs/header values degrade to safe defaults instead.
 pub fn build_websocket_request(p: WsHandshakeParams<'_>) -> Request<()> {
     let key = generate_key();
-    let scheme = "wss";
-    let uri_s = format!("{scheme}://{}:{}{}", p.host_for_tcp, p.port, p.path);
-    let uri: Uri = uri_s.parse().expect("uri");
+    let uri = websocket_uri(p.host_for_tcp, p.port, p.path);
 
     let default_host: String = if p.port == 443 {
         p.sni.to_string()
     } else {
         format!("{}:{}", p.sni, p.port)
     };
-    let host_h = p.host_header.unwrap_or(default_host.as_str());
+    let host_h = safe_header_value(p.host_header.unwrap_or(default_host.as_str()), "localhost");
 
-    let ua = p
-        .user_agent
-        .unwrap_or_else(|| default_user_agent_for_profile(p.tls_profile));
-    let origin = p
+    let ua = safe_header_value(
+        p.user_agent
+            .unwrap_or_else(|| default_user_agent_for_profile(p.tls_profile)),
+        DEFAULT_UA,
+    );
+    let origin_owned = p
         .origin
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("https://{}", p.sni));
-    let al = p.accept_language.unwrap_or(DEFAULT_AL);
+    let origin = safe_header_value(&origin_owned, "https://localhost");
+    let al = safe_header_value(p.accept_language.unwrap_or(DEFAULT_AL), DEFAULT_AL);
 
     let mut req = if is_firefox_profile(p.tls_profile) {
         Request::builder()
@@ -162,10 +243,28 @@ pub fn build_websocket_request(p: WsHandshakeParams<'_>) -> Request<()> {
     };
 
     for (k, v) in p.extra_headers {
-        req = req.header(k, v);
+        match (
+            HeaderName::from_bytes(k.trim().as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
+            (Ok(name), Ok(value)) => req = req.header(name, value),
+            _ => {
+                tracing::warn!(
+                    target: "bibavpn_stealth",
+                    header = k.as_str(),
+                    "skipping invalid WebSocket header"
+                );
+            }
+        }
     }
 
-    req.body(()).expect("request")
+    req.body(()).unwrap_or_else(|_| {
+        tracing::warn!(
+            target: "bibavpn_stealth",
+            "invalid WebSocket handshake request; using minimal fallback"
+        );
+        Request::new(())
+    })
 }
 
 /// Plain HTTP/1.1 GET for decoy traffic (aligns with [`build_websocket_request`] per TLS profile).
@@ -307,9 +406,61 @@ mod tests {
             tls_profile: TlsClientProfile::Default,
         });
         assert_eq!(
-            req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()),
+            req.headers()
+                .get(header::COOKIE)
+                .and_then(|v| v.to_str().ok()),
             Some("a=b")
         );
+    }
+
+    #[test]
+    fn invalid_path_and_headers_do_not_panic() {
+        let extras = [
+            ("bad name".to_string(), "v".to_string()),
+            ("X-Ok".to_string(), "a\nb".to_string()),
+            ("X-Good".to_string(), "ok".to_string()),
+        ];
+        let req = build_websocket_request(WsHandshakeParams {
+            host_for_tcp: "127.0.0.1",
+            port: 8443,
+            path: "/bad path?x=1&y=2",
+            sni: "vpn.example.com",
+            host_header: Some("bad host\n"),
+            origin: Some("https://vpn.example.com\r\nX: y"),
+            user_agent: Some("bad\nua"),
+            accept_language: Some("ru\n"),
+            extra_headers: &extras,
+            tls_profile: TlsClientProfile::Default,
+        });
+        assert_eq!(req.uri().path(), "/bad%20path");
+        assert_eq!(
+            req.headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok()),
+            Some("localhost")
+        );
+        assert!(req.headers().get("X-Ok").is_none());
+        assert_eq!(
+            req.headers().get("X-Good").and_then(|v| v.to_str().ok()),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn invalid_host_falls_back_instead_of_panicking() {
+        let req = build_websocket_request(WsHandshakeParams {
+            host_for_tcp: "bad host",
+            port: 443,
+            path: "/ws",
+            sni: "h",
+            host_header: None,
+            origin: None,
+            user_agent: None,
+            accept_language: None,
+            extra_headers: &[],
+            tls_profile: TlsClientProfile::Default,
+        });
+        assert_eq!(req.uri().to_string(), "wss://invalid/");
     }
 
     #[test]

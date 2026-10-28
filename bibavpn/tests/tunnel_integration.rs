@@ -1,12 +1,14 @@
 //! Cross-module wire checks (no live server).
 
 use bibavpn::crypto_layer::{build_ack, build_hello_v3, SessionCrypto};
-use bibavpn::frame::{PadMode, AdaptivePadState};
+use bibavpn::frame::{AdaptivePadState, PadMode};
 use bibavpn::protocol::{
     decode_v3_auth, encode_v3_auth, encode_v3_mux_open, encode_v3_udp_mux_open, is_v3_mux_open,
     is_v3_udp_mux_open,
 };
-use bibavpn::tcp_mux::{decode_mux_record, encode_mux_open, encode_mux_record, is_mux_open, MUX_FLAG_DATA};
+use bibavpn::tcp_mux::{
+    decode_mux_record, encode_mux_open, encode_mux_record, is_mux_open, MUX_FLAG_DATA,
+};
 use bibavpn::{read_padded_frame_borrow, write_padded_frame, write_padded_frame_with_mode_state};
 use std::sync::Arc;
 
@@ -44,14 +46,8 @@ fn mux_data_record_survives_pad_and_aead() {
     let rec = encode_mux_record(5, MUX_FLAG_DATA, b"chunk");
     let mut wire = Vec::new();
     let mut adaptive = AdaptivePadState::default();
-    write_padded_frame_with_mode_state(
-        &mut wire,
-        &rec,
-        24,
-        PadMode::Adaptive,
-        Some(&mut adaptive),
-    )
-    .unwrap();
+    write_padded_frame_with_mode_state(&mut wire, &rec, 24, PadMode::Adaptive, Some(&mut adaptive))
+        .unwrap();
     let sealed = crypto.seal_client_to_server(&wire).unwrap();
     let opened = crypto.open_client_to_server(&sealed).unwrap();
     let inner = read_padded_frame_borrow(&opened).unwrap();
@@ -63,7 +59,9 @@ fn mux_data_record_survives_pad_and_aead() {
 
 #[test]
 fn v3_open_host_port_through_aead() {
-    use bibavpn::protocol::{decode_v3_open_with_flags, encode_v3_open_with_flags, OPEN_FLAG_STATUS};
+    use bibavpn::protocol::{
+        decode_v3_open_with_flags, encode_v3_open_with_flags, OPEN_FLAG_STATUS,
+    };
 
     let crypto = session();
     let open = encode_v3_open_with_flags("example.org", 443, OPEN_FLAG_STATUS).unwrap();

@@ -6,24 +6,24 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
+use base64::Engine;
+use bibavpn::client_policy::tls_profile_from_invite;
 use bibavpn::frame::PadMode;
 use bibavpn::invite_uri::decode_invite_v1;
 use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, parse_ws_header, LocalClientOptions,
     DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
-use bibavpn::stealth_v12::{
-    apply_preset_ws_jitter, merge_idle_decoy_secs, DecoyMode, DesyncMode, StealthProfile, TcpFooling,
-    preset,
-};
-use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile, TlsStack};
 use bibavpn::startup_secrets::{
     client_reality_configured, log_lab_mode_enabled, log_reality_without_psk, require_psk,
     resolve_cli_token, validate_resolved_token,
 };
-use bibavpn::client_policy::tls_profile_from_invite;
+use bibavpn::stealth_v12::{
+    apply_preset_ws_jitter, merge_idle_decoy_secs, preset, DecoyMode, DesyncMode, StealthProfile,
+    TcpFooling,
+};
+use bibavpn::tls_util::{install_ring_crypto, TlsClientProfile, TlsStack};
 use clap::{CommandFactory, FromArgMatches, Parser};
-use base64::Engine;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::info;
@@ -392,10 +392,7 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
             },
             args.insecure || inv.insecure,
             inv.proto,
-            inv
-                .proto_domain
-                .clone()
-                .unwrap_or_default(),
+            inv.proto_domain.clone().unwrap_or_default(),
         )
     } else {
         let server = args.server.as_ref().expect("server or from-invite");
@@ -426,6 +423,13 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         )
     };
 
+    // Only proto 3 exists on the wire. The invite field (or `--proto`) must say so,
+    // otherwise the client would silently connect with a mismatched framing.
+    anyhow::ensure!(
+        proto == 3,
+        "only Biba protocol v3 is supported (got proto {proto}; use --proto 3 or an invite with proto 3)"
+    );
+
     let token = if inv_opt.is_some() {
         if args.lab {
             token
@@ -437,32 +441,33 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         token
     };
 
-    let stealth_for_merge: Option<StealthProfile> = (|| -> anyhow::Result<Option<StealthProfile>> {
-        let a = args
-            .stealth_profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(s) = a {
-            return Ok(Some(
-                StealthProfile::from_str(s).context("--stealth-profile")?,
-            ));
-        }
-        if let Some(ref inv) = inv_opt {
-            if let Some(s) = inv
+    let stealth_for_merge: Option<StealthProfile> =
+        (|| -> anyhow::Result<Option<StealthProfile>> {
+            let a = args
                 .stealth_profile
                 .as_deref()
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
+                .filter(|s| !s.is_empty());
+            if let Some(s) = a {
                 return Ok(Some(
-                    StealthProfile::from_str(s).context("invite stealth_profile")?,
+                    StealthProfile::from_str(s).context("--stealth-profile")?,
                 ));
             }
-        }
-        Ok(None)
-    })()
-    .context("stealth profile")?;
+            if let Some(ref inv) = inv_opt {
+                if let Some(s) = inv
+                    .stealth_profile
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Ok(Some(
+                        StealthProfile::from_str(s).context("invite stealth_profile")?,
+                    ));
+                }
+            }
+            Ok(None)
+        })()
+        .context("stealth profile")?;
     let pr_opt = stealth_for_merge.map(preset);
     let explicit_jitter = explicit("ws_jitter_min_ms")
         || explicit("ws_jitter_max_ms")
@@ -500,10 +505,7 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
     let use_tcp_mux = if args.no_mux {
         false
     } else {
-        inv_opt
-            .as_ref()
-            .map(|i| i.use_tcp_mux)
-            .unwrap_or(true)
+        inv_opt.as_ref().map(|i| i.use_tcp_mux).unwrap_or(true)
     };
 
     let pad_mode: PadMode = match args
@@ -518,10 +520,7 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
                 if let Some(ref ps) = inv.pad_mode {
                     PadMode::from_str(ps).context("invite pad_mode")?
                 } else {
-                    pr_opt
-                        .as_ref()
-                        .map(|p| p.pad_mode)
-                        .unwrap_or_default()
+                    pr_opt.as_ref().map(|p| p.pad_mode).unwrap_or_default()
                 }
             } else {
                 pr_opt.as_ref().map(|p| p.pad_mode).unwrap_or_default()
@@ -573,31 +572,33 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         }
         Some(buf)
     } else {
-        inv_opt
-            .as_ref()
-            .and_then(|i| {
-                i.pin_cert_pem
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.as_bytes().to_vec())
-            })
+        inv_opt.as_ref().and_then(|i| {
+            i.pin_cert_pem
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_bytes().to_vec())
+        })
     };
 
-    let reality_public_key: Option<[u8; 32]> = if let Some(pubkey_b64) = args.reality_public_key.as_ref() {
-        let pubkey_bytes = base64::engine::general_purpose::STANDARD
-            .decode(pubkey_b64.trim())
-            .context("decode --reality-public-key (base64)")?;
-        anyhow::ensure!(pubkey_bytes.len() == 32, "reality public key must be 32 bytes");
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&pubkey_bytes);
-        Some(arr)
-    } else if let Some(ref inv) = inv_opt {
-        inv.reality_public_key_parsed()
-            .context("invite reality_public_key")?
-    } else {
-        None
-    };
+    let reality_public_key: Option<[u8; 32]> =
+        if let Some(pubkey_b64) = args.reality_public_key.as_ref() {
+            let pubkey_bytes = base64::engine::general_purpose::STANDARD
+                .decode(pubkey_b64.trim())
+                .context("decode --reality-public-key (base64)")?;
+            anyhow::ensure!(
+                pubkey_bytes.len() == 32,
+                "reality public key must be 32 bytes"
+            );
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&pubkey_bytes);
+            Some(arr)
+        } else if let Some(ref inv) = inv_opt {
+            inv.reality_public_key_parsed()
+                .context("invite reality_public_key")?
+        } else {
+            None
+        };
 
     let reality_short_id: Option<[u8; 8]> = if let Some(s) = args.reality_short_id.as_ref() {
         let bytes = hex::decode(s.trim()).context("decode --reality-short-id (hex)")?;
@@ -617,7 +618,8 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         .clone()
         .or_else(|| inv_opt.as_ref().and_then(|i| i.reality_target.clone()));
     {
-        let reality_any = reality_target.is_some() || reality_public_key.is_some() || reality_short_id.is_some();
+        let reality_any =
+            reality_target.is_some() || reality_public_key.is_some() || reality_short_id.is_some();
         if reality_any {
             anyhow::ensure!(
                 reality_target.is_some() && reality_public_key.is_some(),
@@ -712,17 +714,24 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         }
         Ok(TcpFooling::default())
     })()?;
-    let tls_stack: TlsStack = if let Some(ref inv) = inv_opt {
-        inv.tls_stack
-            .parse()
-            .context("invite tls_stack")?
+    // An explicit CLI value must win over the invite, matching the rest of the merge
+    // table (`ws_path`, `pad_mode`, jitter, ...). Otherwise `--tls-stack boring` on a
+    // command line that also carries an invite is silently ignored.
+    let tls_stack: TlsStack = if explicit("tls_stack") {
+        args.tls_stack.parse().context("--tls-stack")?
+    } else if let Some(ref inv) = inv_opt {
+        inv.tls_stack.parse().context("invite tls_stack")?
     } else {
         args.tls_stack.parse().context("--tls-stack")?
     };
-    let tls_fragment = inv_opt
-        .as_ref()
-        .map(|i| i.tls_fragment)
-        .unwrap_or(args.tls_fragment);
+    let tls_fragment = if explicit("tls_fragment") {
+        args.tls_fragment
+    } else {
+        inv_opt
+            .as_ref()
+            .map(|i| i.tls_fragment)
+            .unwrap_or(args.tls_fragment)
+    };
     let ws_parallel = if explicit("ws_parallel") {
         args.ws_parallel
     } else {
@@ -746,7 +755,9 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         match (u, p) {
             (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
             (None, None) => None,
-            _ => anyhow::bail!("invite: set both socks_auth_user and socks_auth_password, or neither"),
+            _ => anyhow::bail!(
+                "invite: set both socks_auth_user and socks_auth_password, or neither"
+            ),
         }
     } else {
         None
@@ -755,10 +766,8 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
     let mut extra = Vec::new();
     if let Some(ref inv) = inv_opt {
         for line in &inv.ws_headers {
-            extra.push(
-                parse_ws_header(line)
-                    .with_context(|| format!("invite ws header {line:?}"))?,
-            );
+            extra
+                .push(parse_ws_header(line).with_context(|| format!("invite ws header {line:?}"))?);
         }
     }
     for line in &args.ws_headers {
@@ -800,8 +809,7 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         .or(inv_opt.as_ref().and_then(|i| i.idle_decoy_secs));
     let idle_decoy_secs = merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
 
-    let sni_owned =
-        bibavpn::reality::effective_tls_sni(&sni_owned, reality_target.as_deref());
+    let sni_owned = bibavpn::reality::effective_tls_sni(&sni_owned, reality_target.as_deref());
 
     Ok(LocalClientOptions {
         server_host,
@@ -904,7 +912,9 @@ mod performance_precedence_tests {
                 "0",
                 "--ws-parallel",
                 "1",
-                "--decoy-gets-interval-secs", "30", "--no-mux",
+                "--decoy-gets-interval-secs",
+                "30",
+                "--no-mux",
             ])
             .unwrap();
         let o = options_from_args(Args::from_arg_matches(&matches).unwrap(), &matches).unwrap();
@@ -1045,5 +1055,110 @@ mod mux_window_cli_tests {
                 .bytes(),
             1048576
         );
+    }
+}
+
+#[cfg(test)]
+mod protocol_and_tls_precedence_tests {
+    use super::*;
+    use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
+
+    fn invite(extra: serde_json::Value) -> InviteV1 {
+        let mut base = serde_json::json!({
+            "v": 1,
+            "server": "vpn.example:443",
+            "sni": "vpn.example",
+            "token": "strong-token",
+            "psk": "0123456789abcdef0123456789abcdef",
+            "insecure": false,
+            "decoy_max": 0,
+            "max_pad": 64,
+            "max_ws_binary": 1408,
+            "ws_ping_secs": 25,
+            "udp_mux_reply_timeout_secs": 130
+        });
+        if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn options_for(argv: &[&str]) -> anyhow::Result<LocalClientOptions> {
+        let matches = Args::command()
+            .try_get_matches_from(argv.iter().copied())
+            .unwrap();
+        options_from_args(Args::from_arg_matches(&matches).unwrap(), &matches)
+    }
+
+    #[test]
+    fn non_v3_proto_from_cli_is_rejected() {
+        let err = options_for(&[
+            "client",
+            "--server",
+            "vpn.example:443",
+            "--token",
+            "strong-token",
+            "--psk",
+            "0123456789abcdef0123456789abcdef",
+            "--proto",
+            "4",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("v3"), "{err:#}");
+    }
+
+    #[test]
+    fn non_v3_proto_from_invite_is_rejected() {
+        let uri = encode_invite_v1(&invite(serde_json::json!({ "proto": 4 })), "pass").unwrap();
+        let err = options_for(&[
+            "client",
+            "--from-invite",
+            &uri,
+            "--invite-passphrase",
+            "pass",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("v3"), "{err:#}");
+    }
+
+    #[test]
+    fn explicit_tls_stack_overrides_invite() {
+        let uri = encode_invite_v1(
+            &invite(serde_json::json!({ "tls_stack": "rustls" })),
+            "pass",
+        )
+        .unwrap();
+        let o = options_for(&[
+            "client",
+            "--from-invite",
+            &uri,
+            "--invite-passphrase",
+            "pass",
+            "--tls-stack",
+            "boring",
+        ])
+        .unwrap();
+        assert_eq!(o.tls_stack, TlsStack::Boring);
+    }
+
+    #[test]
+    fn explicit_tls_fragment_overrides_invite() {
+        let uri = encode_invite_v1(
+            &invite(serde_json::json!({ "tls_fragment": false })),
+            "pass",
+        )
+        .unwrap();
+        let o = options_for(&[
+            "client",
+            "--from-invite",
+            &uri,
+            "--invite-passphrase",
+            "pass",
+            "--tls-fragment",
+        ])
+        .unwrap();
+        assert!(o.tls_fragment);
     }
 }

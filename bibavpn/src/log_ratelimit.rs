@@ -20,6 +20,6 @@ impl LogEvery {
 
     pub fn should_emit(&self) -> bool {
         let c = self.n.fetch_add(1, Ordering::Relaxed);
-        c < self.warmup || c % self.every == 0
+        c < self.warmup || c.is_multiple_of(self.every)
     }
 }

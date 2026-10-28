@@ -1,8 +1,8 @@
 //! Shared SOCKS5 / HTTP CONNECT front-end for desktop binary and Android JNI.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::Context;
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
@@ -12,8 +12,8 @@ use rand::RngCore;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch, Mutex, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::accept::classify_accept_error;
 use crate::transport_capabilities::log_client_transport_caps;
 
+use crate::activity::ActivityTracker;
 use crate::client_tls_stream::ClientTlsStream;
 use crate::crypto_layer::{self, SessionCrypto};
 use crate::decoy_traffic::{run_one_decoy_get, spawn_decoy_gets, DecoyConfig};
@@ -33,23 +34,20 @@ use crate::protocol::{
     is_v3_open_ok, OPEN_FLAG_STATUS,
 };
 use crate::retry::{sleep_outbound_backoff, OUTBOUND_CONNECT_ATTEMPTS};
-use crate::ServerWsOutTiming;
 use crate::stealth::{
     build_websocket_request, default_user_agent_for_profile, WsHandshakeParams,
     DEFAULT_ACCEPT_LANGUAGE,
 };
-use crate::activity::ActivityTracker;
 use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
 use crate::tcp_mux::{
-    self, MuxClientConfig, MuxOpenStreamDropped, TcpMuxClientSlot,
-    TcpMuxSessionPool,
+    self, MuxClientConfig, MuxOpenStreamDropped, TcpMuxClientSlot, TcpMuxSessionPool,
 };
 use crate::tls_util::{client_tls_config, ClientTlsParams, TlsClientProfile, TlsStack};
 use crate::udp_mux::{spawn_udp_mux_driver, UdpMuxConfig, UdpMuxHandle};
 use crate::ws_bridge::{self, TunnelEnd, WsBridgePrefetch};
+use crate::ServerWsOutTiming;
 use crate::{
-    read_padded_frame_into, write_padded_frame_with_mode_state, socks5,
-    socks5::SocksCommand,
+    read_padded_frame_into, socks5, socks5::SocksCommand, write_padded_frame_with_mode_state,
 };
 use bytes::Bytes;
 
@@ -113,9 +111,10 @@ async fn sleep_mux_slot_retry(attempt: u32) {
 }
 
 fn tcp_mux_writer_gone(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.downcast_ref::<crate::tcp_mux::MuxWriterStopped>().is_some())
-        || format!("{e:#}").contains("tcp mux writer stopped")
+    e.chain().any(|c| {
+        c.downcast_ref::<crate::tcp_mux::MuxWriterStopped>()
+            .is_some()
+    }) || format!("{e:#}").contains("tcp mux writer stopped")
 }
 
 type TcpMuxSlot = TcpMuxClientSlot;
@@ -205,7 +204,11 @@ fn local_accept_error_is_transient(e: &std::io::Error) -> bool {
     true
 }
 
-async fn log_local_accept_error(e: std::io::Error, label: &str, log: &crate::log_ratelimit::LogEvery) {
+async fn log_local_accept_error(
+    e: std::io::Error,
+    label: &str,
+    log: &crate::log_ratelimit::LogEvery,
+) {
     let recovery = classify_accept_error(&e);
     let backoff = recovery.backoff();
     if log.should_emit() {
@@ -489,7 +492,9 @@ where
         .reality_public_key
         .ok_or_else(|| anyhow::anyhow!("REALITY: no server public key configured"))?;
 
-    let short_id = cfg.reality_short_id.unwrap_or_else(|| rand::random::<[u8; 8]>());
+    let short_id = cfg
+        .reality_short_id
+        .unwrap_or_else(rand::random::<[u8; 8]>);
 
     let session_key = crate::reality::reality_client_exchange_verify(
         ws,
@@ -561,14 +566,11 @@ async fn dial_outer_wss(cfg: &ClientCfg, log_context: &str) -> anyhow::Result<Cl
     let _ = tcp.set_nodelay(true);
     let tls = upgrade_client_tls(cfg, tcp).await?;
 
-    let ws_host = cfg
-        .ws_host
-        .as_deref()
-        .or(if cfg.reality_target.is_some() {
-            Some(cfg.sni.as_str())
-        } else {
-            None
-        });
+    let ws_host = cfg.ws_host.as_deref().or(if cfg.reality_target.is_some() {
+        Some(cfg.sni.as_str())
+    } else {
+        None
+    });
     let ws_origin = cfg.ws_origin.as_deref();
     let ws_ua = cfg.ws_user_agent.as_deref();
     let ws_al = cfg.ws_accept_language.as_deref();
@@ -605,7 +607,10 @@ async fn dial_outer_wss(cfg: &ClientCfg, log_context: &str) -> anyhow::Result<Cl
 
 /// One attempt: TCP + TLS + WS + noise + v3 hello + sealed AUTH.
 async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, SharedCrypto)> {
-    anyhow::ensure!(cfg.proto >= 3, "only Biba protocol v3 is supported (use --proto 3)");
+    anyhow::ensure!(
+        cfg.proto == 3,
+        "only Biba protocol v3 is supported (use --proto 3)"
+    );
     anyhow::ensure!(cfg.psk.is_some(), "Biba v3 requires --psk (or invite psk)");
 
     let mut ws = dial_outer_wss(cfg, "v3 tunnel").await?;
@@ -631,8 +636,7 @@ async fn one_try_wss_session(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Share
         let m = ws.next().await.context("eof before ACK")??;
         match m {
             Message::Binary(b) => {
-                let s_rand =
-                    crypto_layer::parse_ack(secret, dom.as_str(), b.as_ref(), &c_rand)?;
+                let s_rand = crypto_layer::parse_ack(secret, dom.as_str(), b.as_ref(), &c_rand)?;
                 let crypto = Arc::new(SessionCrypto::new(
                     secret,
                     dom.as_str(),
@@ -834,8 +838,16 @@ async fn connect_tcp_mux_handle_attempts(
                     let _serial = serial;
                     loop {
                         let Some((ready, current)) = next_pool_mux_ready(
-                            &mut pending, &mut shutdown, &mut ended, &slot, &expected,
-                        ).await else { break };
+                            &mut pending,
+                            &mut shutdown,
+                            &mut ended,
+                            &slot,
+                            &expected,
+                        )
+                        .await
+                        else {
+                            break;
+                        };
                         let pool = current.as_ref().expect("validated current pool");
                         publish_mux_connection(ready, &cfg, &slot, &session_task, pool).await;
                     }
@@ -877,7 +889,10 @@ where
                 debug!(target: "bibavpn_client", "TCP mux connection attempt failed: {error:#}");
                 last_error = Some(error);
             }
-            None => return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("tcp mux: no pending connections"))),
+            None => {
+                return Err(last_error
+                    .unwrap_or_else(|| anyhow::anyhow!("tcp mux: no pending connections")))
+            }
         }
     }
 }
@@ -906,25 +921,37 @@ where
     Some((ready, current))
 }
 
-async fn prepare_mux_connection(cfg: &ClientCfg) -> anyhow::Result<(ClientWs, Option<SharedCrypto>)> {
+async fn prepare_mux_connection(
+    cfg: &ClientCfg,
+) -> anyhow::Result<(ClientWs, Option<SharedCrypto>)> {
     if cfg.reality_target.is_some() {
         let mut ws = dial_outer_wss(cfg, "REALITY mux").await?;
         reality_client_handshake(&mut ws, cfg).await?;
         ws.send(Message::Binary(Bytes::from(encode_v3_mux_open())))
-            .await.context("send MUX_OPEN v3 (REALITY)")?;
+            .await
+            .context("send MUX_OPEN v3 (REALITY)")?;
         Ok((ws, None))
     } else {
         let (mut ws, crypto) = one_try_wss_session(cfg).await?;
         let mut wire = Vec::new();
         let mut pad_st = AdaptivePadState::default();
         write_padded_frame_with_mode_state(
-            &mut wire, &encode_v3_mux_open(), cfg.max_pad, cfg.pad_mode, Some(&mut pad_st),
-        ).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let blob = crypto.seal_client_to_server(&wire).context("seal MUX_OPEN v3")?;
+            &mut wire,
+            &encode_v3_mux_open(),
+            cfg.max_pad,
+            cfg.pad_mode,
+            Some(&mut pad_st),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let blob = crypto
+            .seal_client_to_server(&wire)
+            .context("seal MUX_OPEN v3")?;
         if blob.len() > cfg.max_ws_binary {
             anyhow::bail!("sealed MUX_OPEN exceeds --max-ws-binary");
         }
-        ws.send(Message::Binary(Bytes::from(blob))).await.context("send MUX_OPEN v3")?;
+        ws.send(Message::Binary(Bytes::from(blob)))
+            .await
+            .context("send MUX_OPEN v3")?;
         Ok((ws, Some(crypto)))
     }
 }
@@ -988,7 +1015,7 @@ pub async fn run_local_client(
         );
     }
 
-    let ws_parallel = opts.ws_parallel.max(1).min(4);
+    let ws_parallel = opts.ws_parallel.clamp(1, 4);
     log_client_transport_caps(&opts, ws_parallel);
     let activity = if opts.use_tcp_mux && opts.idle_decoy_secs > 0 {
         Some(Arc::new(ActivityTracker::new()))
@@ -1293,9 +1320,18 @@ pub fn parse_host_port(s: &str) -> anyhow::Result<(String, u16)> {
     if let Some(i) = s.rfind(':') {
         let (h, p) = s.split_at(i);
         let p = p.trim_start_matches(':').parse::<u16>()?;
+        // Bracketed IPv6 (`[::1]:443`) keeps the brackets for URL formatting but
+        // resolvers/`SocketAddr` expect the bare literal.
+        let h = h
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .unwrap_or(h);
+        if h.is_empty() {
+            anyhow::bail!("empty host in host:port, got {s}");
+        }
         return Ok((h.to_string(), p));
     }
-    anyhow::bail!("expected host:port, got {s}");
+    anyhow::bail!("expected host:port, got {s}")
 }
 
 pub fn parse_ws_header(line: &str) -> anyhow::Result<(String, String)> {
@@ -1413,10 +1449,7 @@ async fn resolve_domain_split_route(
 ///
 /// Uses incremental `read` so a timeout never drops bytes already consumed from the
 /// socket; partial data is returned as prefetch for the tunnel or direct relay.
-async fn peek_tls_client_hello_record(
-    local: &mut TcpStream,
-    prefix: Vec<u8>,
-) -> Vec<u8> {
+async fn peek_tls_client_hello_record(local: &mut TcpStream, prefix: Vec<u8>) -> Vec<u8> {
     let mut buf = prefix;
     let deadline = tokio::time::Instant::now() + TLS_SNI_PEEK_TIMEOUT;
     let mut scratch = [0u8; 4096];
@@ -1427,9 +1460,7 @@ async fn peek_tls_client_hello_record(
                 break;
             }
             let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-            let total = 5usize
-                .saturating_add(rec_len)
-                .min(TLS_RECORD_PEEK_MAX);
+            let total = 5usize.saturating_add(rec_len).min(TLS_RECORD_PEEK_MAX);
             if buf.len() >= total {
                 buf.truncate(total);
                 break;
@@ -1464,8 +1495,8 @@ async fn handle_socks_peer(
 ) -> anyhow::Result<()> {
     match socks5::socks5_read_command(&mut local, cfg.socks_auth.as_ref()).await? {
         SocksCommand::Connect { host, port } => {
-            let bypass = resolve_domain_split_route(&host, port, &mut local, Vec::new(), false)
-                .await;
+            let bypass =
+                resolve_domain_split_route(&host, port, &mut local, Vec::new(), false).await;
             if bypass.direct {
                 socks5::socks5_reply_ok(&mut local).await?;
                 return direct_bypass_relay(local, &host, port, &bypass.prefetch).await;
@@ -1623,19 +1654,6 @@ async fn run_socks_udp_assoc(
     static UDP_SRC_DROP: LogEvery = LogEvery::new(4, 512);
 
     let ctrl_peer = ctrl.peer_addr().context("socks ctrl peer_addr")?;
-    let (close_tx, mut close_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 64];
-        loop {
-            match ctrl.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        let _ = close_tx.send(());
-    });
-
     let handle = {
         let mut g = mux_slot.lock().await;
         if g.is_none() {
@@ -1647,8 +1665,10 @@ async fn run_socks_udp_assoc(
     };
 
     let workers = Arc::new(Semaphore::new(SOCKS_UDP_WORKERS));
+    let mut worker_tasks: JoinSet<()> = JoinSet::new();
     let udp = Arc::new(udp);
     let mut mbuf = vec![0u8; 65535];
+    let mut ctrl_buf = [0u8; 64];
     let reply_timeout_secs = if cfg.udp_mux_reply_timeout_secs == 0 {
         DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS
     } else {
@@ -1659,10 +1679,18 @@ async fn run_socks_udp_assoc(
     let mut client_port: Option<u16> = None;
 
     loop {
+        while worker_tasks.try_join_next().is_some() {}
         tokio::select! {
             biased;
-            _ = close_rx.recv() => {
-                break;
+            // The UDP association lives only as long as its TCP control connection
+            // (RFC 1928). Reading here instead of a detached task guarantees the
+            // control socket is dropped (and the peer sees EOF) when this task is
+            // aborted on shutdown.
+            r = ctrl.read(&mut ctrl_buf) => {
+                match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
             }
             r = udp.recv_from(&mut mbuf) => {
                 let (n, peer) = r.context("socks udp recv")?;
@@ -1684,7 +1712,7 @@ async fn run_socks_udp_assoc(
                     Ok(p) => p,
                     Err(_) => break,
                 };
-                tokio::spawn(async move {
+                worker_tasks.spawn(async move {
                     let _permit = permit;
                     let res: anyhow::Result<()> = async {
                         let (dst_host, dst_port, payload) =
@@ -1731,6 +1759,11 @@ async fn run_socks_udp_assoc(
             }
         }
     }
+
+    // No replies may be emitted after the control connection is gone, and in-flight
+    // requests must not outlive the association.
+    worker_tasks.abort_all();
+    while worker_tasks.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -1765,14 +1798,9 @@ async fn handle_http_peer(
                 && host.parse::<IpAddr>().is_ok();
             let (split, connect_replied) = if needs_sni_peek {
                 http_connect::reply_connect_ok(&mut local).await?;
-                let split = resolve_domain_split_route(
-                    &host,
-                    port,
-                    &mut local,
-                    bypass.prefetch,
-                    true,
-                )
-                .await;
+                let split =
+                    resolve_domain_split_route(&host, port, &mut local, bypass.prefetch, true)
+                        .await;
                 (split, true)
             } else {
                 (
@@ -1790,8 +1818,7 @@ async fn handle_http_peer(
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
                     if !connect_replied {
                         let _ =
-                            http_connect::reply_connect_error(&mut local, 502, "Bad Gateway")
-                                .await;
+                            http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
                     }
                     return Err(e);
                 }
@@ -1814,13 +1841,12 @@ async fn handle_http_peer(
                         Ok(x) => x,
                         Err(e) => {
                             if !connect_replied {
-                                let _ =
-                                    http_connect::reply_connect_error(
-                                        &mut local,
-                                        502,
-                                        "Bad Gateway",
-                                    )
-                                    .await;
+                                let _ = http_connect::reply_connect_error(
+                                    &mut local,
+                                    502,
+                                    "Bad Gateway",
+                                )
+                                .await;
                             }
                             return Err(e);
                         }
@@ -1860,12 +1886,19 @@ async fn handle_http_peer(
             }
             if cfg.use_tcp_mux {
                 if let Err(e) = ensure_tcp_mux_ready(&cfg, &tcp_mux_slot, &session).await {
-                    let _ =
-                        http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
+                    let _ = http_connect::reply_connect_error(&mut local, 502, "Bad Gateway").await;
                     return Err(e);
                 }
-                tcp_mux_open_stream_with_retry(local, host, port, to_origin, cfg, tcp_mux_slot, &session)
-                    .await
+                tcp_mux_open_stream_with_retry(
+                    local,
+                    host,
+                    port,
+                    to_origin,
+                    cfg,
+                    tcp_mux_slot,
+                    &session,
+                )
+                .await
             } else {
                 tunnel_to_biba(local, host, port, cfg, to_origin).await
             }
@@ -2051,14 +2084,19 @@ mod parse_tests {
         assert_eq!(h, "203.0.113.7");
         assert_eq!(p, 8443);
         let (h6, p6) = parse_host_port("[2001:db8::1]:443").unwrap();
-        assert_eq!(h6, "[2001:db8::1]");
+        assert_eq!(h6, "2001:db8::1");
         assert_eq!(p6, 443);
+        // Unbracketed IPv6 keeps its last group as the port.
+        let (h6b, p6b) = parse_host_port("2001:db8::1:8443").unwrap();
+        assert_eq!(h6b, "2001:db8::1");
+        assert_eq!(p6b, 8443);
     }
 
     #[test]
     fn parse_host_port_rejects_missing_port() {
         assert!(parse_host_port("example.com").is_err());
         assert!(parse_host_port("").is_err());
+        assert!(parse_host_port(":443").is_err());
     }
 
     #[test]
@@ -2187,7 +2225,10 @@ mod session_shutdown_tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn local_client_test_options(socks_bind: SocketAddr, http_bind: SocketAddr) -> LocalClientOptions {
+    fn local_client_test_options(
+        socks_bind: SocketAddr,
+        http_bind: SocketAddr,
+    ) -> LocalClientOptions {
         LocalClientOptions {
             server_host: "127.0.0.1".into(),
             server_port: 1,
@@ -2303,10 +2344,14 @@ mod session_shutdown_tests {
 
     #[tokio::test]
     async fn accepted_http_and_socks_peers_abort_on_client_shutdown() {
-        let socks_probe = TcpListener::bind("127.0.0.1:0").await.expect("socks probe bind");
+        let socks_probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("socks probe bind");
         let socks_bind = socks_probe.local_addr().expect("socks probe addr");
         drop(socks_probe);
-        let http_probe = TcpListener::bind("127.0.0.1:0").await.expect("http probe bind");
+        let http_probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http probe bind");
         let http_bind = http_probe.local_addr().expect("http probe addr");
         drop(http_probe);
 
@@ -2336,7 +2381,9 @@ mod session_shutdown_tests {
         assert_eq!(socks_method, [5, 0]);
 
         let mut http = TcpStream::connect(http_bind).await.expect("http connect");
-        http.write_all(b"CONNECT").await.expect("partial http request");
+        http.write_all(b"CONNECT")
+            .await
+            .expect("partial http request");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         shutdown_tx.send(true).expect("shutdown send");
@@ -2357,6 +2404,81 @@ mod session_shutdown_tests {
             .expect("http peer read");
         assert_eq!(socks_read, 0, "SOCKS peer remained open after shutdown");
         assert_eq!(http_read, 0, "HTTP peer remained open after shutdown");
+    }
+
+    #[tokio::test]
+    async fn udp_associate_control_closed_on_shutdown() {
+        let socks_probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("socks probe bind");
+        let socks_bind = socks_probe.local_addr().expect("socks probe addr");
+        drop(socks_probe);
+        let http_probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http probe bind");
+        let http_bind = http_probe.local_addr().expect("http probe addr");
+        drop(http_probe);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let client = tokio::spawn(run_local_client(
+            local_client_test_options(socks_bind, http_bind),
+            shutdown_rx,
+            Some(ready_tx),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(1))),
+        )
+        .await
+        .expect("local listeners ready timeout")
+        .expect("ready waiter join")
+        .expect("local listeners ready");
+
+        let mut socks = TcpStream::connect(socks_bind).await.expect("socks connect");
+        socks.write_all(&[5, 1, 0]).await.expect("socks greeting");
+        let mut method = [0u8; 2];
+        socks.read_exact(&mut method).await.expect("method");
+        assert_eq!(method, [5, 0]);
+
+        // UDP ASSOCIATE with an all-zero address; the reply hands us the relay port.
+        socks
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .expect("udp associate");
+        let mut head = [0u8; 4];
+        socks
+            .read_exact(&mut head)
+            .await
+            .expect("associate reply head");
+        assert_eq!(&head[..2], &[5, 0]);
+        let tail_len = match head[3] {
+            1 => 6,
+            4 => 18,
+            other => panic!("unexpected ATYP {other}"),
+        };
+        let mut tail = vec![0u8; tail_len];
+        socks
+            .read_exact(&mut tail)
+            .await
+            .expect("associate reply tail");
+
+        // Let run_socks_udp_assoc take ownership of the control stream.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).expect("shutdown send");
+        timeout(Duration::from_secs(2), client)
+            .await
+            .expect("local client shutdown timeout")
+            .expect("local client join")
+            .expect("local client result");
+
+        let mut buf = [0u8; 1];
+        let n = timeout(Duration::from_secs(1), socks.read(&mut buf))
+            .await
+            .expect("UDP association control connection must close on shutdown")
+            .expect("socks read");
+        assert_eq!(n, 0, "SOCKS control connection outlived shutdown");
     }
 
     #[tokio::test]
@@ -2477,7 +2599,9 @@ mod http_split_bypass_tests {
         });
 
         let client = tokio::spawn(async move {
-            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let mut s = TcpStream::connect(proxy_addr)
+                .await
+                .expect("client connect");
             let req = format!(
                 "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
                 origin_addr.port(),
@@ -2531,7 +2655,9 @@ mod http_split_bypass_tests {
         });
 
         let client = tokio::spawn(async move {
-            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let mut s = TcpStream::connect(proxy_addr)
+                .await
+                .expect("client connect");
             let req = format!(
                 "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
                 origin_addr.port(),
@@ -2588,7 +2714,9 @@ mod http_split_bypass_tests {
         });
 
         let client = tokio::spawn(async move {
-            let mut s = TcpStream::connect(proxy_addr).await.expect("client connect");
+            let mut s = TcpStream::connect(proxy_addr)
+                .await
+                .expect("client connect");
             let req = format!(
                 "GET http://localhost:{}/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 origin_addr.port()
@@ -2626,7 +2754,9 @@ mod mux_startup_tests {
 
     struct Dropped(Arc<AtomicUsize>);
     impl Drop for Dropped {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[tokio::test]
@@ -2637,29 +2767,47 @@ mod mux_startup_tests {
         let task_slot = slot.clone();
         let task = tokio::spawn(async move {
             let mut shutdown = shutdown;
-            wait_for_mux_connect(&task_slot, &mut shutdown).await.unwrap().is_none()
+            wait_for_mux_connect(&task_slot, &mut shutdown)
+                .await
+                .unwrap()
+                .is_none()
         });
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
         let (client, _server) = tokio::io::duplex(4096);
         let ws = WebSocketStream::from_raw_socket(
-            client, tokio_tungstenite::tungstenite::protocol::Role::Client, None,
-        ).await;
+            client,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
         let cfg = MuxClientConfig {
-            mux_window_mib: tcp_mux::MuxWindow::default(), max_pad: 0, decoy_max: 0,
-            max_ws_binary: 65536, ws_ping_secs: 0, ws_ping_jitter_percent: 0,
-            ws_binary_send_jitter_ms: 0, ws_jitter_min_ms: 0, ws_jitter_max_ms: 0,
-            transport_v2: false, pad_mode: PadMode::Random, dummy_interval_secs: 0, activity: None,
+            mux_window_mib: tcp_mux::MuxWindow::default(),
+            max_pad: 0,
+            decoy_max: 0,
+            max_ws_binary: 65536,
+            ws_ping_secs: 0,
+            ws_ping_jitter_percent: 0,
+            ws_binary_send_jitter_ms: 0,
+            ws_jitter_min_ms: 0,
+            ws_jitter_max_ms: 0,
+            transport_v2: false,
+            pad_mode: PadMode::Random,
+            dummy_interval_secs: 0,
+            activity: None,
         };
         let (_session_stop, session_rx) = watch::channel(false);
         let mut tasks = Vec::new();
         let mut current = slot.lock().await;
-        let connected = tcp_mux::spawn_tcp_mux_client(ws, None, cfg, slot.clone(), session_rx, &mut tasks);
+        let connected =
+            tcp_mux::spawn_tcp_mux_client(ws, None, cfg, slot.clone(), session_rx, &mut tasks);
         *current = Some(TcpMuxSessionPool::from_sessions(vec![connected]));
         drop(current);
         tcp_mux_ready_notify().notify_waiters();
         let result = timeout(Duration::from_secs(1), task).await;
-        for task in tasks { task.abort(); }
+        for task in tasks {
+            task.abort();
+        }
         // The secondary connection group still owns the lock throughout this assertion.
         assert!(result.unwrap().unwrap());
         drop(serial);
@@ -2676,9 +2824,16 @@ mod mux_startup_tests {
         let resource = Dropped(drops.clone());
         let mut pending = FuturesUnordered::new();
         pending.push(async move { Ok(resource) });
-        assert!(next_pool_mux_ready(&mut pending, &mut shutdown, &mut ended, &slot, &expected).await.is_none());
+        assert!(
+            next_pool_mux_ready(&mut pending, &mut shutdown, &mut ended, &slot, &expected)
+                .await
+                .is_none()
+        );
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(!Arc::ptr_eq(&slot.lock().await.as_ref().unwrap().sessions, &expected));
+        assert!(!Arc::ptr_eq(
+            &slot.lock().await.as_ref().unwrap().sessions,
+            &expected
+        ));
     }
 
     #[tokio::test]
@@ -2700,12 +2855,23 @@ mod mux_startup_tests {
                 let _resource = resource;
                 std::future::pending::<anyhow::Result<usize>>().await
             });
-            assert!(next_pool_mux_ready(&mut pending, &mut shutdown, &mut ended, &task_slot, &expected).await.is_none());
+            assert!(next_pool_mux_ready(
+                &mut pending,
+                &mut shutdown,
+                &mut ended,
+                &task_slot,
+                &expected
+            )
+            .await
+            .is_none());
         });
         tokio::task::yield_now().await;
         // Real removal/clear path signals the fill task even without another handshake result.
         tcp_mux::remove_mux_session(&slot, 1).await;
-        timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(serial.try_lock().is_ok());
         assert!(slot.lock().await.is_none());
@@ -2720,16 +2886,34 @@ mod mux_startup_tests {
             let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<usize>>();
             senders.push(tx);
             let resource = Dropped(drops.clone());
-            pending.push(async move { let _resource = resource; rx.await.unwrap() });
+            pending.push(async move {
+                let _resource = resource;
+                rx.await.unwrap()
+            });
         }
         let (_stop, mut shutdown) = watch::channel(false);
         // First-created attempt is stalled; later successes must become usable.
         senders.remove(2).send(Ok(2)).unwrap();
-        assert_eq!(timeout(Duration::from_secs(1), next_mux_ready(&mut pending, &mut shutdown)).await.unwrap().unwrap(), 2);
+        assert_eq!(
+            timeout(
+                Duration::from_secs(1),
+                next_mux_ready(&mut pending, &mut shutdown)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            2
+        );
         assert_eq!(pending.len(), 3);
-        senders.remove(0).send(Err(anyhow::anyhow!("failed peer"))).unwrap();
+        senders
+            .remove(0)
+            .send(Err(anyhow::anyhow!("failed peer")))
+            .unwrap();
         senders.remove(1).send(Ok(3)).unwrap();
-        assert_eq!(next_mux_ready(&mut pending, &mut shutdown).await.unwrap(), 3);
+        assert_eq!(
+            next_mux_ready(&mut pending, &mut shutdown).await.unwrap(),
+            3
+        );
         drop(pending);
         assert_eq!(drops.load(Ordering::SeqCst), 4);
         assert!(senders.pop().unwrap().is_closed());
@@ -2752,7 +2936,11 @@ mod mux_startup_tests {
             tokio::task::yield_now().await;
             if shutdown_first {
                 stop.send(true).unwrap();
-                assert!(timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+                assert!(timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err());
             } else {
                 task.abort();
                 assert!(task.await.unwrap_err().is_cancelled());

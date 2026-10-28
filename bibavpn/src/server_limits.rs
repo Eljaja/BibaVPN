@@ -158,7 +158,7 @@ impl AuthRateLimiter {
                 // is not currently banned, rather than grow past the cap.
                 let victim = g
                     .iter()
-                    .filter(|(_, s)| s.banned_until.map_or(true, |u| now >= u))
+                    .filter(|(_, s)| s.banned_until.is_none_or(|u| now >= u))
                     .min_by_key(|(_, s)| s.window_start)
                     .map(|(k, _)| *k);
                 match victim {
@@ -199,17 +199,28 @@ impl AuthRateLimiter {
     }
 
     /// Clear the bucket's failure state after successful AUTH (entry removed).
+    ///
+    /// An *active* ban is not lifted by a later success on an already in-flight
+    /// session: `check_allowed` would have rejected any new connection from that
+    /// bucket anyway, and letting one success un-ban the whole bucket would turn a
+    /// single valid token into a ban-reset primitive. Expired bans are reaped and
+    /// their `bans_active` accounting is released here even if no later request
+    /// calls `check_allowed`.
     pub async fn record_success(self: &Arc<Self>, ip: IpAddr) {
         if !self.cfg.enabled {
             return;
         }
         let key = auth_limit_key(ip);
         let mut g = self.inner.lock().await;
+        let now = Instant::now();
+        if let Some(st) = g.get(&key) {
+            if st.banned_until.is_some_and(|until| now < until) {
+                return;
+            }
+        }
         if let Some(st) = g.remove(&key) {
-            if let Some(until) = st.banned_until {
-                if Instant::now() < until {
-                    let _ = self.bans_active.fetch_sub(1, Ordering::Relaxed);
-                }
+            if st.banned_until.is_some() {
+                let _ = self.bans_active.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -330,19 +341,23 @@ impl ServerStats {
     }
 
     pub fn inc_handshake_timeout(&self) {
-        self.handshake_timeouts_total.fetch_add(1, Ordering::Relaxed);
+        self.handshake_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_auth_rejected_banned(&self) {
-        self.auth_rejected_banned_total.fetch_add(1, Ordering::Relaxed);
+        self.auth_rejected_banned_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_sessions_rejected_busy(&self) {
-        self.sessions_rejected_busy_total.fetch_add(1, Ordering::Relaxed);
+        self.sessions_rejected_busy_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_handshake_success(&self) {
-        self.handshakes_success_total.fetch_add(1, Ordering::Relaxed);
+        self.handshakes_success_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_session_error(&self) {
@@ -407,6 +422,43 @@ mod tests {
         lim.record_failure(ip).await;
         lim.record_success(ip).await;
         lim.record_failure(ip).await;
+        lim.check_allowed(ip).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_success_does_not_lift_an_active_ban() {
+        let lim = AuthRateLimiter::new(AuthRateLimiterConfig {
+            enabled: true,
+            max_failures: 1,
+            window: Duration::from_secs(60),
+            ban: Duration::from_secs(300),
+        });
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        lim.record_failure(ip).await;
+        assert!(lim.check_allowed(ip).await.is_err());
+
+        // A success on an already in-flight session must not reset the bucket.
+        lim.record_success(ip).await;
+        assert!(lim.check_allowed(ip).await.is_err());
+        assert_eq!(lim.bans_active.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn record_success_reaps_expired_ban_and_releases_gauge() {
+        let lim = AuthRateLimiter::new(AuthRateLimiterConfig {
+            enabled: true,
+            max_failures: 1,
+            window: Duration::from_secs(60),
+            ban: Duration::from_millis(20),
+        });
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        lim.record_failure(ip).await;
+        assert_eq!(lim.bans_active.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // No check_allowed here: the success itself must clear the expired ban.
+        lim.record_success(ip).await;
+        assert_eq!(lim.bans_active.load(Ordering::Relaxed), 0);
         lim.check_allowed(ip).await.unwrap();
     }
 
@@ -542,8 +594,7 @@ mod tests {
         let mut tracker = PreHelloJunkTracker::default();
         const CAP: u32 = 3;
         for _ in 0..CAP {
-            account_pre_hello_binary(&malformed_hello_garbage(), &mut tracker, CAP, 1024)
-                .unwrap();
+            account_pre_hello_binary(&malformed_hello_garbage(), &mut tracker, CAP, 1024).unwrap();
         }
         assert_eq!(tracker.junk_frames, CAP);
         let err = account_pre_hello_binary(&malformed_hello_garbage(), &mut tracker, CAP, 1024)
@@ -611,8 +662,13 @@ mod tests {
     #[test]
     fn pre_hello_junk_then_well_formed_hello() {
         let mut tracker = PreHelloJunkTracker::default();
-        account_pre_hello_binary(&[0x04], &mut tracker, MAX_PRE_HELLO_FRAMES, MAX_PRE_HELLO_BYTES)
-            .unwrap();
+        account_pre_hello_binary(
+            &[0x04],
+            &mut tracker,
+            MAX_PRE_HELLO_FRAMES,
+            MAX_PRE_HELLO_BYTES,
+        )
+        .unwrap();
         let (_, hello) = crypto_layer::build_hello_v3();
         let got = account_pre_hello_binary(
             &hello,

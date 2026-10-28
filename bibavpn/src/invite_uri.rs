@@ -40,6 +40,10 @@ const MAX_P_COST: u32 = 4;
 const V1_MIN_WIRE_LEN: usize = 1 + NONCE_LEN + 16;
 const V2_HEADER_LEN: usize = 1 + SALT_LEN + 12 + NONCE_LEN;
 
+/// Reject absurdly long invite strings before base64-decoding them. A real invite
+/// (including an embedded cert PEM) is a few KiB; this only blocks memory abuse.
+const MAX_INVITE_URI_LEN: usize = 256 * 1024;
+
 // --- serde default helpers (backward compatible: old JSON omits these) ---
 
 fn default_u32_0() -> u32 {
@@ -204,9 +208,7 @@ pub struct InviteV1 {
 
 impl InviteV1 {
     /// X25519 public key from `reality_public_key` (Standard base64, 32 bytes), if present.
-    pub fn reality_public_key_parsed(
-        &self,
-    ) -> anyhow::Result<Option<[u8; 32]>> {
+    pub fn reality_public_key_parsed(&self) -> anyhow::Result<Option<[u8; 32]>> {
         use base64::engine::general_purpose::STANDARD;
         use base64::Engine;
         let Some(s) = self
@@ -324,10 +326,12 @@ fn decode_wire_v2(wire: &[u8], passphrase: &str) -> anyhow::Result<InviteV1> {
     }
     let salt = &wire[1..1 + SALT_LEN];
     let m_kib = u32::from_le_bytes(wire[1 + SALT_LEN..1 + SALT_LEN + 4].try_into().unwrap());
-    let t_cost =
-        u32::from_le_bytes(wire[1 + SALT_LEN + 4..1 + SALT_LEN + 8].try_into().unwrap());
-    let p_cost =
-        u32::from_le_bytes(wire[1 + SALT_LEN + 8..1 + SALT_LEN + 12].try_into().unwrap());
+    let t_cost = u32::from_le_bytes(wire[1 + SALT_LEN + 4..1 + SALT_LEN + 8].try_into().unwrap());
+    let p_cost = u32::from_le_bytes(
+        wire[1 + SALT_LEN + 8..1 + SALT_LEN + 12]
+            .try_into()
+            .unwrap(),
+    );
     validate_v2_argon_params(m_kib, t_cost, p_cost)?;
     let nonce = &wire[1 + SALT_LEN + 12..V2_HEADER_LEN];
     let ct = &wire[V2_HEADER_LEN..];
@@ -369,6 +373,9 @@ pub fn encode_invite_v1(invite: &InviteV1, passphrase: &str) -> anyhow::Result<S
 /// Decode `biba://...` or raw base64 payload (outer blob v1 BLAKE3 or v2 Argon2id).
 pub fn decode_invite_v1(uri: &str, passphrase: &str) -> anyhow::Result<InviteV1> {
     let s = uri.trim();
+    if s.len() > MAX_INVITE_URI_LEN {
+        anyhow::bail!("invite: blob too large");
+    }
     let b64 = s
         .strip_prefix(PREFIX)
         .or_else(|| s.strip_prefix("biba:"))
@@ -483,7 +490,8 @@ mod tests {
         let u = encode_invite_v1(&i, "pass").unwrap();
         let err = decode_invite_v1(&u, "wrong").unwrap_err();
         assert!(
-            err.to_string().contains("invite: bad passphrase or corrupted blob"),
+            err.to_string()
+                .contains("invite: bad passphrase or corrupted blob"),
             "unexpected error: {err}"
         );
     }
@@ -532,9 +540,31 @@ mod tests {
         let uri = format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire));
         let err = decode_invite_v1(&uri, "pass").unwrap_err();
         assert!(
-            err.to_string().contains("invite: unsupported argon2 params"),
+            err.to_string()
+                .contains("invite: unsupported argon2 params"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn oversized_uri_is_rejected_before_base64_decode() {
+        let uri = format!("{}{}", PREFIX, "A".repeat(MAX_INVITE_URI_LEN + 1));
+        let err = decode_invite_v1(&uri, "pass").unwrap_err();
+        assert!(err.to_string().contains("too large"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn truncated_v2_blobs_do_not_panic() {
+        for len in 0..V2_HEADER_LEN + 16 {
+            let wire = vec![BLOB_VERSION_V2; len];
+            let uri = format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire));
+            assert!(decode_invite_v1(&uri, "pass").is_err());
+        }
+        for len in 0..V1_MIN_WIRE_LEN {
+            let wire = vec![BLOB_VERSION_V1; len];
+            let uri = format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire));
+            assert!(decode_invite_v1(&uri, "pass").is_err());
+        }
     }
 
     #[test]

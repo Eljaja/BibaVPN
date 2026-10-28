@@ -175,7 +175,11 @@ impl RealityReplayCache {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().expect("REALITY replay cache mutex").entries.len()
+        self.inner
+            .lock()
+            .expect("REALITY replay cache mutex")
+            .entries
+            .len()
     }
 }
 
@@ -190,8 +194,8 @@ pub fn encode_client_auth(mac: &[u8; 32]) -> Vec<u8> {
 
 /// Decode the client AUTH frame `[version][tag][mac:32]` into the MAC.
 pub fn decode_client_auth(data: &[u8]) -> anyhow::Result<[u8; 32]> {
-    if data.len() < REALITY_CLIENT_AUTH_LEN {
-        bail!("short REALITY client AUTH");
+    if data.len() != REALITY_CLIENT_AUTH_LEN {
+        bail!("bad REALITY client AUTH length: {}", data.len());
     }
     if data[0] != REALITY_VERSION {
         bail!("unsupported REALITY version in client AUTH: {}", data[0]);
@@ -302,8 +306,11 @@ pub fn parse_target(target: &str) -> anyhow::Result<(String, u16)> {
         bail!("invalid target format: {}", target);
     }
     let port: u16 = parts[0].parse().context("parse port")?;
-    let host = parts[1].to_string();
-    Ok((host, port))
+    let host = parts[1].trim();
+    if host.is_empty() {
+        bail!("invalid target format: empty host in {}", target);
+    }
+    Ok((host.to_string(), port))
 }
 
 /// Create TLS connector for outbound SpiderX fetches (verification disabled; lab fetch only).
@@ -377,9 +384,13 @@ pub fn server_hello_with_confirm_and_shared(
     client_ephemeral_pub: &[u8; 32],
 ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
     let server_secret = StaticSecret::from(*private_key);
-    let client_public = PublicKey::try_from(*client_ephemeral_pub)
-        .map_err(|_| anyhow::anyhow!("invalid REALITY client public key"))?;
+    let client_public = PublicKey::from(*client_ephemeral_pub);
     let shared = server_secret.diffie_hellman(&client_public);
+    // RFC 7748: reject all-zero outputs (low-order peer public key). Otherwise a
+    // peer could force a known shared secret and attack the client AUTH MAC.
+    if !shared.was_contributory() {
+        bail!("REALITY: non-contributory client public key");
+    }
     let server_pub = RealityServerConfig::public_key_from_private(private_key);
     let mac = reality_confirm_mac(shared.as_bytes(), client_ephemeral_pub, &server_pub);
 
@@ -400,13 +411,24 @@ fn validate_short_id(short_id: &[u8; 8], cfg: &RealityServerConfig) -> anyhow::R
     );
 }
 
-/// Normalize a presented TLS SNI or HTTP `Host` for allowlist comparison: trim and
-/// strip a trailing `:port` when the suffix is decimal digits.
+/// Normalize a presented TLS SNI or HTTP `Host` for allowlist comparison: trim,
+/// drop IPv6 brackets, and strip a trailing `:port` when the suffix is decimal digits.
+///
+/// A bare IPv6 literal (`2001:db8::1`) contains several colons and must not be
+/// mistaken for `host:port` (the last group is often all digits).
 pub fn normalize_server_name(name: &str) -> String {
     let trimmed = name.trim();
-    if let Some((host, port)) = trimmed.rsplit_once(':') {
-        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
-            return host.trim().to_string();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].trim().to_string();
+        }
+    }
+    // Only a single colon can introduce `:port`; more means IPv6.
+    if trimmed.matches(':').count() == 1 {
+        if let Some((host, port)) = trimmed.rsplit_once(':') {
+            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                return host.trim().to_string();
+            }
         }
     }
     trimmed.to_string()
@@ -432,7 +454,9 @@ pub fn is_server_name_allowed(
         .filter(|s| !s.is_empty())
         .collect();
     if normalized_allowed.is_empty() {
-        return true;
+        // A non-empty allowlist made only of blank/unsupported entries must not
+        // silently degrade into "accept anything".
+        return false;
     }
 
     let mut presented = Vec::new();
@@ -635,8 +659,8 @@ pub fn encode_client_hello(
 
 /// Decode REALITY client HELLO v3.
 pub fn decode_client_hello(data: &[u8]) -> anyhow::Result<RealityClientHello> {
-    if data.len() < REALITY_CLIENT_HELLO_LEN {
-        bail!("short REALITY HELLO");
+    if data.len() != REALITY_CLIENT_HELLO_LEN {
+        bail!("bad REALITY HELLO length: {}", data.len());
     }
     if data[0] != REALITY_VERSION {
         bail!("unsupported REALITY version: {}", data[0]);
@@ -676,12 +700,8 @@ where
 
     let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
-    let client_hello = encode_client_hello(
-        short_id,
-        ephemeral_public.as_bytes(),
-        unix_secs,
-        &nonce,
-    );
+    let client_hello =
+        encode_client_hello(short_id, ephemeral_public.as_bytes(), unix_secs, &nonce);
     ws.send(Message::Binary(Bytes::from(client_hello)))
         .await
         .context("send REALITY client hello")?;
@@ -695,6 +715,12 @@ where
     }
     let server_public = PublicKey::from(server_pubkey);
     let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+    // RFC 7748: a low-order pinned server key yields an all-zero secret that any
+    // observer could reproduce, which would expose the client AUTH MAC to offline
+    // token guessing. Refuse it instead of continuing with a known key.
+    if !shared_secret.was_contributory() {
+        bail!("REALITY: non-contributory server public key (pinned key is low-order)");
+    }
 
     // Verify the server proved possession of the private key. A MITM that
     // only knows the pinned public key cannot derive the shared secret and
@@ -731,8 +757,8 @@ where
 /// Decode REALITY SERVER_HELLO `[version][pubkey:32][confirm_mac:32]`.
 /// Returns `(server_pubkey, confirm_mac)`.
 pub fn decode_server_hello(data: &[u8]) -> anyhow::Result<([u8; 32], [u8; 32])> {
-    if data.len() < 1 + 32 + 32 {
-        bail!("short SERVER_HELLO");
+    if data.len() != 1 + 32 + 32 {
+        bail!("bad SERVER_HELLO length: {}", data.len());
     }
     if data[0] != REALITY_VERSION {
         bail!("version mismatch");
@@ -750,7 +776,9 @@ pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u
     let addr = format!("{}:{}", host, port);
 
     let connector = create_tls_connector(&host)?;
-    let tcp = TcpStream::connect(&addr).await.context("connect to target")?;
+    let tcp = TcpStream::connect(&addr)
+        .await
+        .context("connect to target")?;
     let sn = ServerName::try_from(host.clone())?;
     let tls = connector.connect(sn, tcp).await.context("TLS")?;
 
@@ -773,7 +801,10 @@ pub async fn spiderx_fetch(target: &str, paths: &[&str]) -> anyhow::Result<Vec<u
         path, host, accept_language
     );
 
-    write.write_all(request.as_bytes()).await.context("send request")?;
+    write
+        .write_all(request.as_bytes())
+        .await
+        .context("send request")?;
     drop(write);
 
     let mut response = Vec::new();
@@ -839,7 +870,13 @@ pub fn install_ring_crypto() {
 }
 
 pub fn extract_sni(target: &str) -> String {
-    target.split(':').next().unwrap_or(target).to_string()
+    let trimmed = target.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    trimmed.split(':').next().unwrap_or(trimmed).to_string()
 }
 
 pub fn is_short_id_allowed(id: &[u8; 8], allowed: &[[u8; 8]]) -> bool {
@@ -876,7 +913,18 @@ mod tests {
             effective_tls_sni("vps.example.com", Some("vk.com:443")),
             "vk.com"
         );
-        assert_eq!(effective_tls_sni("vps.example.com", None), "vps.example.com");
+        assert_eq!(
+            effective_tls_sni("vps.example.com", None),
+            "vps.example.com"
+        );
+    }
+
+    #[test]
+    fn extract_sni_handles_plain_and_ipv6_targets() {
+        assert_eq!(extract_sni("vk.com:443"), "vk.com");
+        assert_eq!(extract_sni("vk.com"), "vk.com");
+        assert_eq!(extract_sni("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(effective_tls_sni("fallback", Some("[::1]:443")), "::1");
     }
 
     #[test]
@@ -912,7 +960,11 @@ mod tests {
         let allowed = vec!["VK.com".into()];
         assert!(is_server_name_allowed(Some("vk.com"), None, &allowed));
         assert!(is_server_name_allowed(None, Some("VK.COM:443"), &allowed));
-        assert!(is_server_name_allowed(Some("vk.com:443"), Some("vk.com"), &allowed));
+        assert!(is_server_name_allowed(
+            Some("vk.com:443"),
+            Some("vk.com"),
+            &allowed
+        ));
     }
 
     #[test]
@@ -973,8 +1025,11 @@ mod tests {
 
         let real_server_public = PublicKey::from(real_pub);
         let client_shared = client_secret.diffie_hellman(&real_server_public);
-        let expected_mac =
-            reality_confirm_mac(client_shared.as_bytes(), client_public.as_bytes(), &real_pub);
+        let expected_mac = reality_confirm_mac(
+            client_shared.as_bytes(),
+            client_public.as_bytes(),
+            &real_pub,
+        );
 
         assert_ne!(expected_mac, forged_mac);
     }
@@ -1155,7 +1210,10 @@ mod tests {
         assert_eq!(wire[0], REALITY_VERSION);
         assert_eq!(&wire[1..33], &pk);
         assert_eq!(&wire[33..41], &sid);
-        assert_eq!(u64::from_be_bytes(wire[41..49].try_into().unwrap()), unix_secs);
+        assert_eq!(
+            u64::from_be_bytes(wire[41..49].try_into().unwrap()),
+            unix_secs
+        );
         assert_eq!(&wire[49..65], &nonce);
 
         let decoded = decode_client_hello(&wire).unwrap();
@@ -1202,6 +1260,65 @@ mod tests {
     }
 
     #[test]
+    fn handshake_decoders_reject_trailing_bytes() {
+        let hello = encode_client_hello(&[1u8; 8], &[2u8; 32], 42, &[3u8; 16]);
+        assert!(decode_client_hello(&hello).is_ok());
+        let mut extra = hello;
+        extra.push(0);
+        assert!(decode_client_hello(&extra).is_err());
+
+        let (priv_key, _) = RealityServerConfig::generate_keys();
+        let secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let client_pub = PublicKey::from(&secret);
+        let server_hello = server_hello_with_confirm(&priv_key, client_pub.as_bytes()).unwrap();
+        assert!(decode_server_hello(&server_hello).is_ok());
+        let mut extra = server_hello;
+        extra.push(0);
+        assert!(decode_server_hello(&extra).is_err());
+
+        let auth = encode_client_auth(&[4u8; 32]);
+        assert!(decode_client_auth(&auth).is_ok());
+        let mut extra = auth;
+        extra.push(0);
+        assert!(decode_client_auth(&extra).is_err());
+    }
+
+    #[test]
+    fn server_hello_rejects_low_order_client_public_key() {
+        let (priv_key, _) = RealityServerConfig::generate_keys();
+        // All-zero is a low-order X25519 point: the shared secret is all zero.
+        assert!(server_hello_with_confirm_and_shared(&priv_key, &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn normalize_server_name_handles_ipv6_and_ports() {
+        assert_eq!(normalize_server_name("vk.com:443"), "vk.com");
+        assert_eq!(normalize_server_name(" VK.com "), "VK.com");
+        assert_eq!(normalize_server_name("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(normalize_server_name("[2001:db8::1]"), "2001:db8::1");
+        // A bare IPv6 literal must keep its final group instead of losing it as a "port".
+        assert_eq!(normalize_server_name("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_server_name("host:not-a-port"), "host:not-a-port");
+    }
+
+    #[test]
+    fn blank_allowlist_entries_fail_closed() {
+        let allowed = vec!["   ".to_string(), String::new()];
+        assert!(!is_server_name_allowed(Some("vk.com"), None, &allowed));
+        assert!(!is_server_name_allowed(None, None, &allowed));
+        // A real entry still matches.
+        let allowed = vec![" vk.com ".to_string()];
+        assert!(is_server_name_allowed(Some("vk.com"), None, &allowed));
+    }
+
+    #[test]
+    fn parse_target_rejects_empty_host() {
+        assert!(parse_target(":443").is_err());
+        assert!(parse_target("  :443").is_err());
+        assert_eq!(parse_target("vk.com:443").unwrap().0, "vk.com");
+    }
+
+    #[test]
     fn replay_cache_rechecks_freshness_at_authentication() {
         let cache = RealityReplayCache::new();
         assert!(cache.check_and_insert(&[1; 16], 1_000, 1_091, 90).is_err());
@@ -1218,10 +1335,14 @@ mod tests {
             .collect();
         let fresh = (REALITY_REPLAY_CACHE_CAP as u128).to_be_bytes();
         assert!(cache.check_and_insert(&fresh, now, now, 90).is_err());
-        assert!(cache.check_and_insert(&0u128.to_be_bytes(), now, now, 90).is_err());
+        assert!(cache
+            .check_and_insert(&0u128.to_be_bytes(), now, now, 90)
+            .is_err());
         assert_eq!(cache.len(), REALITY_REPLAY_CACHE_CAP);
         // Expired records free capacity; a fresh HELLO can then proceed.
-        assert!(cache.check_and_insert(&fresh, now + 91, now + 91, 90).is_ok());
+        assert!(cache
+            .check_and_insert(&fresh, now + 91, now + 91, 90)
+            .is_ok());
         assert_eq!(cache.len(), 1);
     }
 }

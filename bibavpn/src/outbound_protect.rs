@@ -18,15 +18,18 @@ static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 /// Install or clear the pre-connect hook (e.g. JNI → `VpnService.protect`).
 #[cfg(unix)]
 pub fn set_hook(hook: Option<Hook>) {
-    *HOOK.lock().unwrap() = hook;
+    *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
 }
 
 #[cfg(unix)]
 fn apply_hook(fd: RawFd) -> io::Result<()> {
-    if let Some(f) = HOOK.lock().unwrap().as_ref() {
-        f(fd)
-    } else {
-        Ok(())
+    // Clone the Arc and release the lock before calling into foreign code. A slow
+    // or re-entrant JNI hook must not block every other connect (and a panicking
+    // hook must not poison the global).
+    let hook = HOOK.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    match hook {
+        Some(f) => f(fd),
+        None => Ok(()),
     }
 }
 
@@ -71,4 +74,31 @@ pub async fn tcp_connect_host_protected(
     port: u16,
 ) -> io::Result<tokio::net::TcpStream> {
     tokio::net::TcpStream::connect((host, port)).await
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{apply_hook, set_hook};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The hook runs without the registry lock held, so it may call back into
+    /// `set_hook` (a JNI hook that disables itself) without deadlocking.
+    #[test]
+    fn hook_may_clear_itself_without_deadlock() {
+        set_hook(Some(Arc::new(|_fd| {
+            set_hook(None);
+            Ok(())
+        })));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(apply_hook(0).is_ok());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap_or(false),
+            "hook deadlocked while trying to clear itself"
+        );
+        set_hook(None);
+        assert!(apply_hook(0).is_ok());
+    }
 }

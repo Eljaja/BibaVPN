@@ -1,7 +1,7 @@
 //! Prometheus text exposition and optional HTTP listener for `bibavpn-server`.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use subtle::ConstantTimeEq;
@@ -10,6 +10,27 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use crate::server_limits::{AuthRateLimiter, ServerStats};
+
+/// Upper bound for one metrics HTTP request (read + write). A client that opens
+/// the socket and never finishes the request line must not pin a task forever.
+const METRICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the metrics listener auth from the CLI password flag.
+///
+/// `None` (flag absent) means unauthenticated. An explicitly supplied empty
+/// password is a configuration error, not a silent way to disable auth.
+pub fn metrics_auth_from_password(
+    password: Option<&str>,
+    user: &str,
+) -> anyhow::Result<MetricsAuth> {
+    match password {
+        None => Ok(MetricsAuth::disabled()),
+        Some(pw) if !pw.trim().is_empty() => Ok(MetricsAuth::basic(user.trim(), pw)),
+        Some(_) => {
+            anyhow::bail!("--metrics-password must not be empty; omit it to disable metrics auth")
+        }
+    }
+}
 
 /// Optional HTTP Basic Auth for the metrics listener.
 #[derive(Clone)]
@@ -164,6 +185,15 @@ pub fn spawn_metrics_listener(
                 "Prometheus metrics listening with HTTP Basic Auth (GET /metrics, GET /healthz)"
             );
         } else {
+            if let Ok(local) = listener.local_addr() {
+                if !local.ip().is_loopback() {
+                    warn!(
+                        target: "bibavpn_security",
+                        %local,
+                        "metrics listener is reachable off-host without auth; set --metrics-password or bind loopback"
+                    );
+                }
+            }
             info!(
                 target: "bibavpn_server",
                 %listen,
@@ -178,7 +208,15 @@ pub fn spawn_metrics_listener(
             let auth = Arc::clone(&auth);
             let metrics_auth = metrics_auth.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_one_http(stream, &stats, &auth, &metrics_auth).await {
+                if let Err(e) = serve_one_with_timeout(
+                    stream,
+                    &stats,
+                    &auth,
+                    &metrics_auth,
+                    METRICS_REQUEST_TIMEOUT,
+                )
+                .await
+                {
                     debug!(
                         target: "bibavpn_server",
                         %peer,
@@ -188,6 +226,19 @@ pub fn spawn_metrics_listener(
             });
         }
     })
+}
+
+async fn serve_one_with_timeout(
+    stream: TcpStream,
+    stats: &ServerStats,
+    auth: &AuthRateLimiter,
+    metrics_auth: &MetricsAuth,
+    dur: Duration,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(dur, serve_one_http(stream, stats, auth, metrics_auth)).await {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!("metrics HTTP request timed out"),
+    }
 }
 
 async fn serve_one_http(
@@ -210,8 +261,14 @@ async fn serve_one_http(
     let path = parts.next().unwrap_or("");
 
     if method != "GET" {
-        write_http_response(&mut stream, 405, "text/plain; charset=utf-8", b"method not allowed", &[])
-            .await?;
+        write_http_response(
+            &mut stream,
+            405,
+            "text/plain; charset=utf-8",
+            b"method not allowed",
+            &[],
+        )
+        .await?;
         return Ok(());
     }
 
@@ -243,8 +300,14 @@ async fn serve_one_http(
             write_http_response(&mut stream, 200, "text/plain; charset=utf-8", b"ok", &[]).await?;
         }
         _ => {
-            write_http_response(&mut stream, 404, "text/plain; charset=utf-8", b"not found", &[])
-                .await?;
+            write_http_response(
+                &mut stream,
+                404,
+                "text/plain; charset=utf-8",
+                b"not found",
+                &[],
+            )
+            .await?;
         }
     }
     Ok(())
@@ -326,10 +389,13 @@ mod tests {
             .await
             .unwrap();
         let mut resp = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut resp))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         server.await.unwrap();
         let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.contains("200 OK"));
@@ -360,10 +426,13 @@ mod tests {
             .await
             .unwrap();
         let mut resp = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut resp))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         server.await.unwrap();
         let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.contains("401 Unauthorized"));
@@ -388,14 +457,55 @@ mod tests {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut resp = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_to_end(&mut resp))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         server.await.unwrap();
         let text = std::str::from_utf8(&resp).unwrap();
         assert!(text.contains("200 OK"), "response: {text}");
         assert!(text.contains("bibavpn_active_sessions"), "response: {text}");
+    }
+
+    #[test]
+    fn metrics_password_flag_validation() {
+        assert!(!metrics_auth_from_password(None, "metrics")
+            .unwrap()
+            .is_required());
+        assert!(metrics_auth_from_password(Some("s3cret"), "metrics")
+            .unwrap()
+            .is_required());
+        assert!(metrics_auth_from_password(Some(""), "metrics").is_err());
+        assert!(metrics_auth_from_password(Some("   "), "metrics").is_err());
+    }
+
+    #[tokio::test]
+    async fn silent_metrics_client_times_out() {
+        let stats = ServerStats::new();
+        let auth = AuthRateLimiter::new(AuthRateLimiterConfig::default());
+        let metrics_auth = MetricsAuth::disabled();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_one_with_timeout(
+                stream,
+                &stats,
+                &auth,
+                &metrics_auth,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+        });
+        // Connect but never send a request line.
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let start = std::time::Instant::now();
+        let err = server.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("timed out"), "unexpected: {err:#}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

@@ -7,16 +7,14 @@ use anyhow::Context;
 use serde::Deserialize;
 use tracing::info;
 
+use crate::client_policy::tls_profile_from_invite;
 use crate::local_client::{
     normalize_ws_path, parse_host_port, parse_ws_header, LocalClientOptions,
     DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use crate::logging::{self, LogConfig, LogFormat};
+use crate::startup_secrets::{client_reality_configured, require_psk, validate_resolved_token};
 use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
-use crate::client_policy::tls_profile_from_invite;
-use crate::startup_secrets::{
-    client_reality_configured, require_psk, validate_resolved_token,
-};
 use crate::tls_util::{TlsClientProfile, TlsStack};
 use crate::{decode_invite_v1, InviteV1, PadMode};
 
@@ -239,32 +237,33 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         _ => anyhow::bail!("invite: set both from_invite and invite_passphrase, or neither"),
     };
 
-    let stealth_for_merge: Option<StealthProfile> = (|| -> anyhow::Result<Option<StealthProfile>> {
-        if let Some(s) = j
-            .stealth_profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return Ok(Some(
-                StealthProfile::from_str(s).context("stealth_profile")?,
-            ));
-        }
-        if let Some(ref inv) = invite_pair {
-            if let Some(s) = inv
+    let stealth_for_merge: Option<StealthProfile> =
+        (|| -> anyhow::Result<Option<StealthProfile>> {
+            if let Some(s) = j
                 .stealth_profile
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
                 return Ok(Some(
-                    StealthProfile::from_str(s).context("invite stealth_profile")?,
+                    StealthProfile::from_str(s).context("stealth_profile")?,
                 ));
             }
-        }
-        Ok(None)
-    })()
-    .context("stealth_profile")?;
+            if let Some(ref inv) = invite_pair {
+                if let Some(s) = inv
+                    .stealth_profile
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Ok(Some(
+                        StealthProfile::from_str(s).context("invite stealth_profile")?,
+                    ));
+                }
+            }
+            Ok(None)
+        })()
+        .context("stealth_profile")?;
     let pr_opt: Option<crate::stealth_v12::StealthPreset> =
         stealth_for_merge.map(crate::stealth_v12::preset);
 
@@ -378,10 +377,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     let mut extra = Vec::new();
     if let Some(ref inv) = invite_pair {
         for line in &inv.ws_headers {
-            extra.push(
-                parse_ws_header(line)
-                    .with_context(|| format!("invite ws header {line:?}"))?,
-            );
+            extra
+                .push(parse_ws_header(line).with_context(|| format!("invite ws header {line:?}"))?);
         }
     }
     for line in &j.ws_headers {
@@ -395,15 +392,13 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         .filter(|s| !s.is_empty())
         .map(|s| s.as_bytes().to_vec())
         .or_else(|| {
-            invite_pair
-                .as_ref()
-                .and_then(|i| {
-                    i.pin_cert_pem
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.as_bytes().to_vec())
-                })
+            invite_pair.as_ref().and_then(|i| {
+                i.pin_cert_pem
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.as_bytes().to_vec())
+            })
         });
 
     let base_jmin = j
@@ -452,10 +447,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
                 if let Some(ref ps) = inv.pad_mode {
                     PadMode::from_str(ps).context("invite pad_mode")?
                 } else {
-                    pr_opt
-                        .as_ref()
-                        .map(|p| p.pad_mode)
-                        .unwrap_or_default()
+                    pr_opt.as_ref().map(|p| p.pad_mode).unwrap_or_default()
                 }
             } else {
                 pr_opt.as_ref().map(|p| p.pad_mode).unwrap_or_default()
@@ -500,6 +492,10 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     let proto = j
         .proto
         .unwrap_or_else(|| invite_pair.as_ref().map(|i| i.proto).unwrap_or(3));
+    anyhow::ensure!(
+        proto == 3,
+        "only Biba protocol 3 is supported (got proto {proto})"
+    );
     let proto_domain = json_or_invite_str(
         j.proto_domain.clone(),
         invite_pair.as_ref().and_then(|i| i.proto_domain.clone()),
@@ -517,7 +513,10 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty()),
-        j.tls_profile.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        j.tls_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
         stealth_for_merge,
         invite_tls,
     )
@@ -532,7 +531,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     } else {
         false
     };
-    let decoy_gets_interval_secs = j.decoy_gets_interval_secs
+    let decoy_gets_interval_secs = j
+        .decoy_gets_interval_secs
         .or(invite_pair.as_ref().map(|i| i.decoy_gets_interval_secs))
         .unwrap_or_else(default_decoy_interval);
 
@@ -610,10 +610,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
             return TlsStack::from_str(s);
         }
         if let Some(ref inv) = invite_pair {
-            return inv
-                .tls_stack
-                .parse()
-                .context("invite tls_stack");
+            return inv.tls_stack.parse().context("invite tls_stack");
         }
         Ok(TlsStack::Rustls)
     })()?;
@@ -626,13 +623,12 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     // JSON (Android `nativeStart`, CLI `--config`) must override invite: invite often embeds ws_parallel>1,
     // but the outer JSON may cap it for UDP mux / connection limits.
     let ws_parallel = match j.ws_parallel {
-        Some(jp) => jp.max(1).min(4),
+        Some(jp) => jp.clamp(1, 4),
         None => invite_pair
             .as_ref()
             .map(|i| i.ws_parallel)
             .unwrap_or(1)
-            .max(1)
-            .min(4),
+            .clamp(1, 4),
     };
 
     let socks_auth: Option<(String, String)> = {
@@ -677,9 +673,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         }
     };
 
-    let reality_target: Option<String> = invite_pair
-        .as_ref()
-        .and_then(|i| i.reality_target.clone());
+    let reality_target: Option<String> =
+        invite_pair.as_ref().and_then(|i| i.reality_target.clone());
     let reality_public_key: Option<[u8; 32]> = if let Some(ref inv) = invite_pair {
         inv.reality_public_key_parsed()
             .context("invite reality_public_key")?
@@ -693,9 +688,8 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         None
     };
     {
-        let r_any = reality_target.is_some()
-            || reality_public_key.is_some()
-            || reality_short_id.is_some();
+        let r_any =
+            reality_target.is_some() || reality_public_key.is_some() || reality_short_id.is_some();
         if r_any {
             anyhow::ensure!(
                 reality_target.is_some() && reality_public_key.is_some(),
@@ -739,13 +733,14 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     );
     let ws_accept_language = json_or_invite_str(
         j.ws_accept_language.clone(),
-        invite_pair.as_ref().and_then(|i| i.ws_accept_language.clone()),
+        invite_pair
+            .as_ref()
+            .and_then(|i| i.ws_accept_language.clone()),
     );
     let idle_merged = j
         .idle_decoy_secs
         .or(invite_pair.as_ref().and_then(|i| i.idle_decoy_secs));
-    let idle_decoy_secs =
-        crate::stealth_v12::merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
+    let idle_decoy_secs = crate::stealth_v12::merge_idle_decoy_secs(idle_merged, pr_opt.as_ref());
 
     let effective_proto_domain = proto_domain.trim().to_string();
     info!(
@@ -902,9 +897,7 @@ mod merge_tests {
             ack_profile: None,
         };
         let uri = encode_invite_v1(&inv, "passphrase-test").unwrap();
-        let j = format!(
-            r#"{{"from_invite":"{uri}","invite_passphrase":"passphrase-test"}}"#
-        );
+        let j = format!(r#"{{"from_invite":"{uri}","invite_passphrase":"passphrase-test"}}"#);
         let o = local_client_options_from_json_str(&j).unwrap();
         assert_eq!(o.token, "tok");
     }
@@ -916,12 +909,47 @@ mod merge_tests {
     }
 
     #[test]
+    fn json_rejects_unsupported_proto() {
+        let j: serde_json::Value = serde_json::from_str(BASE).unwrap();
+        for proto in [2u8, 4, 255] {
+            let mut v = j.clone();
+            v["proto"] = proto.into();
+            let err = local_client_options_from_json_str(&v.to_string()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("only Biba protocol 3"),
+                "proto {proto} must be rejected, got {err:#}"
+            );
+        }
+        // Explicit proto 3 keeps working.
+        let mut v = j;
+        v["proto"] = 3.into();
+        assert_eq!(
+            local_client_options_from_json_str(&v.to_string())
+                .unwrap()
+                .proto,
+            3
+        );
+    }
+
+    #[test]
     fn mux_window_json_defaults_and_propagates_valid_values() {
-        assert_eq!(local_client_options_from_json_str(BASE).unwrap().mux_window_mib.bytes(), 1048576);
+        assert_eq!(
+            local_client_options_from_json_str(BASE)
+                .unwrap()
+                .mux_window_mib
+                .bytes(),
+            1048576
+        );
         for (value, bytes) in [(1, 1048576), (2, 2097152), (3, 3145728), (4, 4194304)] {
             let mut json: serde_json::Value = serde_json::from_str(BASE).unwrap();
             json["mux_window_mib"] = value.into();
-            assert_eq!(local_client_options_from_json_str(&json.to_string()).unwrap().mux_window_mib.bytes(), bytes);
+            assert_eq!(
+                local_client_options_from_json_str(&json.to_string())
+                    .unwrap()
+                    .mux_window_mib
+                    .bytes(),
+                bytes
+            );
         }
     }
 
@@ -930,7 +958,10 @@ mod merge_tests {
         for value in [0, 5, 255] {
             let mut json: serde_json::Value = serde_json::from_str(BASE).unwrap();
             json["mux_window_mib"] = value.into();
-            assert!(local_client_options_from_json_str(&json.to_string()).is_err(), "accepted {value}");
+            assert!(
+                local_client_options_from_json_str(&json.to_string()).is_err(),
+                "accepted {value}"
+            );
         }
     }
 
