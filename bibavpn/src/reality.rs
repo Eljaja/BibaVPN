@@ -543,6 +543,28 @@ pub async fn server_handshake_reality<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    server_handshake_reality_with_auth(ws, cfg, tls_sni, http_host, replay_cache,
+        |shared, client_pub, server_pub, unix_secs, nonce, got| {
+            let expected = reality_client_auth_mac(shared, token, client_pub, server_pub, unix_secs, nonce);
+            if !bool::from(got[..].ct_eq(&expected[..])) {
+                bail!("REALITY: client AUTH MAC invalid (unknown token)");
+            }
+            Ok(())
+        }).await.map(|(shared, ())| shared)
+}
+
+/// Authenticate a REALITY transcript using an operator-supplied token lookup.
+pub async fn server_handshake_reality_with_auth<S, T>(
+    ws: &mut WebSocketStream<S>,
+    cfg: &RealityServerConfig,
+    tls_sni: Option<&str>,
+    http_host: Option<&str>,
+    replay_cache: &RealityReplayCache,
+    mut authenticate: impl FnMut(&[u8; 32], &[u8; 32], &[u8; 32], u64, &[u8; 16], &[u8; 32]) -> anyhow::Result<T>,
+) -> anyhow::Result<([u8; 32], T)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     validate_server_names(tls_sni, http_host, cfg)?;
 
     let now = SystemTime::now()
@@ -568,17 +590,7 @@ where
     let server_pub = RealityServerConfig::public_key_from_private(&cfg.private_key);
     let auth = next_handshake_binary(ws, &mut control_frames, "REALITY client AUTH").await?;
     let got = decode_client_auth(auth.as_ref())?;
-    let expected = reality_client_auth_mac(
-        &shared,
-        token,
-        &hello.client_pubkey,
-        &server_pub,
-        hello.unix_secs,
-        &hello.nonce,
-    );
-    if !bool::from(got[..].ct_eq(&expected[..])) {
-        bail!("REALITY: client AUTH MAC invalid (unknown token)");
-    }
+    let identity = authenticate(&shared, &hello.client_pubkey, &server_pub, hello.unix_secs, &hello.nonce, &got)?;
 
     // AUTH may arrive after the HELLO freshness window has elapsed.
     let now = SystemTime::now()
@@ -586,7 +598,7 @@ where
         .context("system clock before REALITY AUTH")?
         .as_secs();
     replay_cache.check_and_insert(&hello.nonce, hello.unix_secs, now, cfg.max_time_diff)?;
-    Ok(shared)
+    Ok((shared, identity))
 }
 
 /// REALITY client connection (standalone helper; main client uses `reality_client_exchange_verify`).

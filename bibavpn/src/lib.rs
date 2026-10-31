@@ -20,6 +20,7 @@ pub mod invite_uri;
 pub mod local_client;
 pub mod outbound_protect;
 pub mod protocol;
+pub mod users;
 mod retry;
 pub use retry::ServerWsOutTiming;
 pub mod socks5;
