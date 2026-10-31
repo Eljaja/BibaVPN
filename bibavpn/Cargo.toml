@@ -22,7 +22,7 @@ path = "src/bin/users.rs"
 
 [dependencies]
 anyhow = "1.0"
-argon2 = "0.5"
+argon2 = "0.6"
 base64 = "0.23"
 biba = { path = "../biba", features = ["rustls"] }
 blake3 = "1.5"
