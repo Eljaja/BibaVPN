@@ -17,7 +17,7 @@
 
 <p align="center">
   <a href="#download"><strong>Download the app</strong></a> ·
-  <a href="#quick-start">Try it locally</a> ·
+  <a href="#quick-start">Quick start</a> ·
   <a href="#self-host-on-a-vps">Self-host</a> ·
   <a href="https://github.com/Eljaja/BibaVPN/discussions">Ask a question</a>
 </p>
@@ -47,11 +47,45 @@ Newly minted invitations use Argon2id (invite format v2). Update clients before 
 | Windows | [Download ZIP](https://github.com/Eljaja/BibaVPN/releases/latest/download/BibaVPN-windows-x64.zip) | x64; extract before launching |
 | macOS | [Download DMG](https://github.com/Eljaja/BibaVPN/releases/latest/download/BibaVPN-macos-aarch64.dmg) | Apple Silicon |
 | Linux | [Choose a package](https://github.com/Eljaja/BibaVPN/releases/latest) | x86_64 AppImage or `.deb` |
-| Server / CLI | [Docker quick start](#quick-start) · [Build from source](#build-from-source) | Self-hosted Rust binaries |
+| Server / CLI | [Quick server setup](#quick-start) · [Build from source](#build-from-source) | Self-hosted Rust binaries |
 
 Windows may need the Microsoft Edge WebView2 Runtime. **iOS is unfinished:** the Packet Tunnel extension does not forward traffic yet. See [app development notes](apps/AGENTS.md) for build details and [release notes](https://github.com/Eljaja/BibaVPN/releases) for changes.
 
 ## Quick start
+
+### Connect with an invitation
+
+1. [Download the app](#download) and install it on your device.
+2. Open **Settings**, paste the `biba://` invitation and its passphrase, then select **Apply to fields** and **Save**.
+3. Select **Connect**. On Android, approve the VPN permission when prompted.
+
+You need an invitation from a server administrator. To run your own server, follow the next section.
+
+### Set up your own server
+
+You need a fresh Debian or Ubuntu VPS with root access and `curl`, a public domain pointing to the VPS, and TCP ports **80 and 443** open in both the VPS and cloud firewall. Those ports must not already be in use. The installer installs Docker and Compose if needed.
+
+Connect to the VPS as root and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Eljaja/BibaVPN/main/scripts/quick-server-setup.sh -o bibavpn-install.sh && bash bibavpn-install.sh
+```
+
+Enter your domain when prompted. The installer starts the VPN and Caddy, obtains a trusted TLS certificate, and prints an invitation and passphrase. Caddy renews the certificate automatically while it is running. Keep the invitation and passphrase secret and send them to users through separate private channels.
+
+The server configuration and credentials are stored in `/opt/bibavpn-quick`, accessible only to root. Re-running the installer resumes an existing quick setup without replacing its credentials. For an existing website, custom certificates, or a different deployment, use [manual VPS setup](#self-host-on-a-vps).
+
+To inspect or stop the quick setup, run as root:
+
+```bash
+cd /opt/bibavpn-quick
+docker compose --env-file server.env -f compose.yaml logs
+docker compose --env-file server.env -f compose.yaml down
+```
+
+If the installer used standalone `docker-compose`, replace `docker compose` with `docker-compose` in these commands. Back up the installation directory securely; it contains the server credentials.
+
+### Try a local Docker lab
 
 Try the complete tunnel locally using prebuilt Docker images — no Rust build or VPS needed.
 
@@ -236,7 +270,7 @@ REALITY handshake v3 rejects repeated nonces and timestamps outside `--reality-m
 
 ## Build from source
 
-Clone the repository as shown in [Quick start](#quick-start). With Rust installed, run these commands from the repository root on Linux or WSL; `rust-toolchain.toml` selects the compiler:
+Clone the repository as shown in the [local Docker lab](#try-a-local-docker-lab). With Rust installed, run these commands from the repository root on Linux or WSL; `rust-toolchain.toml` selects the compiler:
 
 ```bash
 cargo build --release -p bibavpn --bin bibavpn-server --bin bibavpn-client

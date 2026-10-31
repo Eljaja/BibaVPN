@@ -1,0 +1,26 @@
+name: Quick server setup
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'scripts/quick-server-setup.sh'
+      - 'scripts/tests/quick-server-setup-*.sh'
+      - '.github/workflows/quick-server-setup.yml'
+  pull_request:
+    paths:
+      - 'scripts/quick-server-setup.sh'
+      - 'scripts/tests/quick-server-setup-*.sh'
+      - '.github/workflows/quick-server-setup.yml'
+  workflow_dispatch:
+
+jobs:
+  quick-server-setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check configuration and permissions
+        run: bash scripts/tests/quick-server-setup-test.sh
+      - name: Exercise invitation, TLS, and tunnel
+        run: bash scripts/tests/quick-server-setup-e2e.sh
