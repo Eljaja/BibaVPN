@@ -251,6 +251,10 @@ cargo build --release -p bibavpn --features boring-tls --bin bibavpn-client
 
 Then select `--tls-stack boring`. Desktop and mobile build instructions live in [apps/AGENTS.md](apps/AGENTS.md); the repository layout is in [AGENTS.md](AGENTS.md#repository-layout).
 
+## Agent skill
+
+The repository includes [bibavpn-setup](skills/bibavpn-setup/SKILL.md), a reusable Agent Skill for setup and connection troubleshooting. Codex and Claude Code can discover it from the project through the checked-in `.agents/skills/` and `.claude/skills/` links; start a new agent session after updating the repository. Other Agent Skills implementations can load or install the `skills/bibavpn-setup/` directory directly. If your Git checkout does not support symlinks, copy that directory into your agent's project skill directory instead.
+
 ## Security
 
 BibaVPN is experimental software for people comfortable operating their own tunnel. It has **no third-party security audit** and makes no anonymity or universal DPI-bypass guarantee.
