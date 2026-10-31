@@ -529,6 +529,10 @@ require root without explicit opt-in.
 
 ---
 
+## BibaVPN setup skill
+
+For setup, connection checks, invitations, or troubleshooting, read [skills/bibavpn-setup/SKILL.md](skills/bibavpn-setup/SKILL.md). The project skill links enable discovery by Codex and Claude Code; follow the skill's references only when relevant.
+
 ## Guidelines for agents
 
 1. Touch only what the task needs; avoid unrelated refactors.
