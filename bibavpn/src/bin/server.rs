@@ -20,8 +20,9 @@ use bibavpn::protocol::{
     is_v3_mux_open, V3FirstChannelKind, OPEN_FLAG_STATUS,
 };
 use bibavpn::reality::{
-    extract_sni, server_handshake_reality, RealityReplayCache, RealityServerConfig,
+    extract_sni, reality_client_auth_mac, server_handshake_reality_with_auth, RealityReplayCache, RealityServerConfig,
 };
+use bibavpn::users::{UserRegistry, UserSession};
 use bibavpn::server_limits::{
     account_pre_hello_binary, AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget,
     PreHelloJunkTracker, ServerStats, MAX_PRE_HELLO_BYTES, MAX_PRE_HELLO_FRAMES,
@@ -42,6 +43,7 @@ use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
+use subtle::ConstantTimeEq;
 use std::str::FromStr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -63,6 +65,7 @@ struct ServerConnParams {
     mux_connect_timeout: Duration,
     mux_window_mib: bibavpn::tcp_mux::MuxWindow,
     udp_pool: Option<Arc<UdpSocketPool>>,
+    users: Option<UserRegistry>,
 }
 
 #[derive(Parser, Debug)]
@@ -74,8 +77,12 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8443")]
     listen: String,
 
-    #[arg(long, required_unless_present = "lab")]
+    #[arg(long, required_unless_present_any = ["lab", "users_file"], conflicts_with = "users_file")]
     token: Option<String>,
+
+    /// JSON user registry; changes take effect for new sessions without restart.
+    #[arg(long, conflicts_with_all = ["legacy_path_auth", "print_invite_uri"])]
+    users_file: Option<PathBuf>,
 
     /// Local demos only: allow missing `--token` (uses `change-me`), skip token denylist, relax PSK when REALITY is configured.
     #[arg(long, default_value_t = false)]
@@ -334,7 +341,8 @@ async fn main() -> anyhow::Result<()> {
     if args.lab {
         log_lab_mode_enabled();
     }
-    let token = resolve_cli_token(args.token.as_deref(), args.lab)?;
+    let users = args.users_file.as_ref().map(|path| UserRegistry::new(path.clone())).transpose()?;
+    let token = if users.is_some() { String::new() } else { resolve_cli_token(args.token.as_deref(), args.lab)? };
     let reality_configured = server_reality_configured(
         args.reality_target.as_deref(),
         args.reality_private_key.as_deref(),
@@ -773,6 +781,7 @@ async fn main() -> anyhow::Result<()> {
         let conn_sem = conn_sem.clone();
         let pre_auth = pre_auth.clone();
         let udp_pool = udp_pool.clone();
+        let users = users.clone();
         let handshake_timeout = handshake_timeout;
         let mux_connect_timeout = mux_connect_timeout;
         let session_id = rand::random::<u64>();
@@ -824,6 +833,7 @@ async fn main() -> anyhow::Result<()> {
                 mux_connect_timeout,
                 mux_window_mib,
                 udp_pool,
+                users,
             };
 
             if let Err(e) = handle_one(
@@ -939,9 +949,9 @@ where
     ));
     let auth_c = Arc::clone(auth);
     let wait =
-        async { server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer_ip, pre_auth).await };
+        async { server_wait_v3_auth(ws, &crypto, token, None, &auth_c, stats, peer_ip, pre_auth).await };
     match timeout(handshake_timeout, wait).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => {
             stats.inc_handshake_timeout();
@@ -1260,21 +1270,36 @@ async fn handle_one(
         // application frame is honoured — otherwise this is an open proxy.
         // Bounded like the other pre-tunnel phases, but with its own arms: this
         // one is an auth step, so it also feeds the per-IP rate limiter.
-        match timeout(
+        let (reality_token, _user_session) = match timeout(
             handshake_timeout,
-            server_handshake_reality(
+            server_handshake_reality_with_auth(
                 &mut ws,
                 reality_cfg,
-                &token,
                 tls_sni.as_deref(),
                 http_host.as_deref(),
                 reality_replay_cache.as_ref().expect("REALITY replay cache"),
+                |shared, client_pub, server_pub, timestamp, nonce, got| {
+                    let matches = |candidate: &str| {
+                        let expected = reality_client_auth_mac(shared, candidate, client_pub, server_pub, timestamp, nonce);
+                        bool::from(got[..].ct_eq(&expected[..]))
+                    };
+                    if let Some(users) = &params.users {
+                        let selected = users.find_token(matches)?;
+                        let session = users.acquire(&selected)?;
+                        Ok((selected, Some(session)))
+                    } else if matches(&token) {
+                        Ok((token.clone(), None))
+                    } else {
+                        anyhow::bail!("REALITY: client AUTH MAC invalid (unknown token)");
+                    }
+                },
             ),
         )
         .await
         {
-            Ok(Ok(_session_key)) => {
+            Ok(Ok((_session_key, identity))) => {
                 auth.record_success(peer_ip).await;
+                identity
             }
             Ok(Err(e)) => {
                 auth.record_failure(peer_ip).await;
@@ -1291,7 +1316,7 @@ async fn handle_one(
                 auth.record_failure(peer_ip).await;
                 anyhow::bail!("handshake timeout waiting for REALITY AUTH");
             }
-        }
+        };
 
         let domain_trim = proto_domain.trim();
         if domain_trim.is_empty() {
@@ -1343,7 +1368,7 @@ async fn handle_one(
             let crypto = server_handshake_v3_after_first_hello(
                 &mut ws,
                 next.as_ref(),
-                &token,
+                &reality_token,
                 secret,
                 decoy_max,
                 domain_trim,
@@ -1397,9 +1422,10 @@ async fn handle_one(
         anyhow::bail!("--proto-domain must not be empty");
     }
 
-    let crypto = server_handshake_v3(
+    let (crypto, _user_session) = server_handshake_v3(
         &mut ws,
         &token,
+        params.users.as_ref(),
         psk.as_deref(),
         decoy_max,
         domain_trim,
@@ -1560,6 +1586,7 @@ where
 async fn server_handshake_v3<S>(
     ws: &mut WebSocketStream<S>,
     token: &str,
+    users: Option<&UserRegistry>,
     psk: Option<&str>,
     decoy_max: u8,
     proto_domain: &str,
@@ -1568,7 +1595,7 @@ async fn server_handshake_v3<S>(
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
     handshake_timeout: Duration,
-) -> anyhow::Result<SharedCrypto>
+) -> anyhow::Result<(SharedCrypto, Option<UserSession>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1615,8 +1642,8 @@ where
                         decoy_max,
                     ));
                     let auth_c = Arc::clone(&auth_f);
-                    server_wait_v3_auth(ws, &crypto, token, &auth_c, stats, peer, pre_auth).await?;
-                    return Ok(crypto);
+                    let session = server_wait_v3_auth(ws, &crypto, token, users, &auth_c, stats, peer, pre_auth).await?;
+                    return Ok((crypto, session));
                 }
                 Message::Ping(p) => {
                     ws.send(Message::Pong(p)).await.context("pong")?;
@@ -1628,7 +1655,7 @@ where
         }
     };
     match timeout(handshake_timeout, fut).await {
-        Ok(Ok(crypto)) => Ok(crypto),
+        Ok(Ok(result)) => Ok(result),
         Ok(Err(e)) => Err(e),
         Err(_) => {
             stats.inc_handshake_timeout();
@@ -1642,11 +1669,12 @@ async fn server_wait_v3_auth<S>(
     ws: &mut WebSocketStream<S>,
     crypto: &SharedCrypto,
     expected_token: &str,
+    users: Option<&UserRegistry>,
     auth: &Arc<AuthRateLimiter>,
     stats: &Arc<ServerStats>,
     peer_ip: std::net::IpAddr,
     pre_auth: &PreAuthBudget,
-) -> anyhow::Result<()>
+) -> anyhow::Result<Option<UserSession>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1676,7 +1704,17 @@ where
                 };
                 let inner = read_padded_frame_into(raw).context("v3 auth frame")?;
                 let tok = decode_v3_auth(&inner).context("decode v3 auth")?;
-                if !crypto_layer::secret_eq(tok.as_str(), expected_token) {
+                let session = if let Some(users) = users {
+                    match users.acquire(&tok) {
+                        Ok(session) => Some(session),
+                        Err(_) => {
+                            auth.record_failure(peer_ip).await;
+                            anyhow::bail!("v3 auth token mismatch or user unavailable");
+                        }
+                    }
+                } else if crypto_layer::secret_eq(tok.as_str(), expected_token) {
+                    None
+                } else {
                     auth.record_failure(peer_ip).await;
                     warn!(
                         target: "bibavpn_security",
@@ -1684,10 +1722,10 @@ where
                         "v3 auth token mismatch"
                     );
                     anyhow::bail!("v3 auth token mismatch");
-                }
+                };
                 auth.record_success(peer_ip).await;
                 stats.inc_handshake_success();
-                return Ok(());
+                return Ok(session);
             }
             Message::Ping(p) => {
                 ws.send(Message::Pong(p)).await.context("pong")?;
@@ -1934,6 +1972,7 @@ mod first_channel_wait_tests {
         let err = match server_handshake_v3(
             &mut server,
             "tok",
+            None,
             Some("test-psk"),
             8,
             "test.domain",

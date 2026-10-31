@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
         udp_max_pad: None,
         udp_max_ws_binary: None,
         udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-        insecure: true,
+        insecure: std::env::var("BIBA_INVITE_INSECURE").map(|v| v != "false" && v != "0").unwrap_or(true),
         tls_profile: "default".into(),
         ws_path: Some(ws_path),
         pad_mode: Some("random".into()),
@@ -116,9 +116,9 @@ fn main() -> anyhow::Result<()> {
         ws_parallel: 1,
         idle_decoy_secs: None,
         tls_stack: "rustls".to_string(),
-        reality_target: None,
-        reality_public_key: None,
-        reality_short_id: None,
+        reality_target: std::env::var("INVITE_REALITY_TARGET").ok().filter(|s| !s.trim().is_empty()),
+        reality_public_key: std::env::var("INVITE_REALITY_PUBLIC_KEY").ok().filter(|s| !s.trim().is_empty()),
+        reality_short_id: std::env::var("INVITE_REALITY_SHORT_ID").ok().filter(|s| !s.trim().is_empty()),
         pin_cert_pem: None,
         server_ack_delay_min_ms: None,
         server_ack_delay_max_ms: None,
@@ -126,6 +126,11 @@ fn main() -> anyhow::Result<()> {
         ack_profile: None,
     };
 
+    if invite.reality_target.is_some() || invite.reality_public_key.is_some() || invite.reality_short_id.is_some() {
+        anyhow::ensure!(invite.reality_target.is_some() && invite.reality_public_key.is_some(), "REALITY invites require INVITE_REALITY_TARGET and INVITE_REALITY_PUBLIC_KEY");
+        invite.reality_public_key_parsed()?;
+        invite.reality_short_id_parsed()?;
+    }
     println!("{}", encode_invite_v1(&invite, &passphrase)?);
     Ok(())
 }

@@ -1,0 +1,37 @@
+[package]
+name = "bibavpn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+bibavpn = { path = "../bibavpn" }
+biba = { path = "../biba" }
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol"
+path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clienthello"
+path = "fuzz_targets/clienthello.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

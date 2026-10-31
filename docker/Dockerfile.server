@@ -7,7 +7,7 @@ COPY bibavpn ./bibavpn
 COPY apps/bibavpn-jni ./apps/bibavpn-jni
 COPY apps/bibavpn-ffi ./apps/bibavpn-ffi
 COPY apps/bibavpn-desktop ./apps/bibavpn-desktop
-RUN cargo build --release -p bibavpn --bin bibavpn-server
+RUN cargo build --release -p bibavpn --bin bibavpn-server --bin bibavpn-users --bin bibavpn-mint-invite
 
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/Eljaja/BibaVPN" \
@@ -16,6 +16,6 @@ LABEL org.opencontainers.image.source="https://github.com/Eljaja/BibaVPN" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=chef /app/target/release/bibavpn-server /usr/local/bin/bibavpn-server
+COPY --from=chef /app/target/release/bibavpn-server /app/target/release/bibavpn-users /app/target/release/bibavpn-mint-invite /usr/local/bin/
 EXPOSE 8443
 ENTRYPOINT ["/usr/local/bin/bibavpn-server"]

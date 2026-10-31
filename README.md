@@ -171,6 +171,38 @@ Import the printed `biba://` URI into the app, or pass it to the CLI with `--fro
 
 ## Using the tunnel
 
+### Manage multiple users
+
+One server can authenticate separate users without changing the tunnel protocol. Build all binaries with `cargo build --release -p bibavpn --bins`, then create a private registry and users on the server:
+
+```bash
+./target/release/bibavpn-users --users-file /secure/path/users.json add alice --max-concurrent 4
+./target/release/bibavpn-users --users-file /secure/path/users.json add bob
+./target/release/bibavpn-users --users-file /secure/path/users.json list
+```
+
+The server image built from `docker/Dockerfile.server` also includes both administration binaries under `/usr/local/bin`; mount the registry directory into the container. Images that contain only the server binary require the tools to be built separately.
+
+The registry contains secret tokens. Keep it in a directory accessible only to the server and administrator; the tool creates the file with mode `0600` on Unix. Start the server with `--users-file /secure/path/users.json` instead of `--token`, alongside the usual TLS and `--psk` settings. The registry is read on every new authentication, so changes apply without a server restart. An invalid or unreadable registry rejects new sessions. `--users-file` cannot be combined with `--token`, `--legacy-path-auth`, or server `--print-invite-uri`.
+
+Generate an encrypted invitation using the existing invite settings. `bibavpn-mint-invite` must be installed next to `bibavpn-users`. Send the passphrase separately and never share the registry:
+
+```bash
+export INVITE_PUBLIC="vpn.example.com:8443"
+export BIBA_VPN_PSK="your-server-psk"
+export BIBA_INVITE_PASSPHRASE="a-separate-invitation-passphrase"
+./target/release/bibavpn-users --users-file /secure/path/users.json mint alice
+```
+
+For REALITY invitations, also set `INVITE_REALITY_TARGET` and `INVITE_REALITY_PUBLIC_KEY`; optionally set `INVITE_REALITY_SHORT_ID`. New invitations from `bibavpn-users` require verified TLS. To disable or enable new sessions without disconnecting existing ones:
+
+```bash
+./target/release/bibavpn-users --users-file /secure/path/users.json disable alice
+./target/release/bibavpn-users --users-file /secure/path/users.json enable alice
+```
+
+The per-user limit counts outer tunnel sessions, not applications or mux streams: TCP parallel connections and the separate UDP session each consume a slot. Counters apply per server process and reset when it restarts. Users share the server PSK and REALITY keys; disabling a user revokes their token for new sessions but does not rotate shared secrets or terminate existing sessions.
+
 For the VPS example, the local SOCKS5 endpoint is `127.0.0.1:1080`. For the Docker lab, use port **`11080`** instead.
 
 | Application | Setup |

@@ -150,6 +150,9 @@ jobs:
       - name: Mux capacity and fallback session cleanup
         run: python3 bibavpn/tests/mux_capacity.py target/debug
 
+      - name: Multi-user authentication and live reload
+        run: python3 bibavpn/tests/users_e2e.py target/debug
+
   e2e:
     name: e2e (SOCKS tunnel smoke test)
     needs: changes
