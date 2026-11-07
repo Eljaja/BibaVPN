@@ -55,8 +55,12 @@ struct PendingConnect {
 /// which the dialing side sees as an instant "connection refused". A pool
 /// lets concurrent handshakes proceed in parallel; every established socket
 /// moves to the accept queue and is replaced with a fresh listener.
-/// Cost: each socket preallocates 2×64 KiB buffers (1 MiB per listener).
+/// Cost: each socket preallocates two TCP buffers (16 MiB per listener).
 const LISTEN_POOL: usize = 8;
+
+// Allow more in-flight data over higher-latency mesh paths while keeping the
+// memory used by each socket and the listener pool bounded.
+const TCP_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Reap a listen-pool socket whose handshake never completed after this long.
 const SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -178,9 +182,12 @@ impl NetstackState {
 
     /// Create a new TCP socket with standard buffers.
     fn new_tcp_socket(&mut self) -> SocketHandle {
-        let rx = tcp::SocketBuffer::new(vec![0u8; 65536]);
-        let tx = tcp::SocketBuffer::new(vec![0u8; 65536]);
-        self.sockets.add(tcp::Socket::new(rx, tx))
+        let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
+        let mut socket = tcp::Socket::new(rx, tx);
+        // Interactive tunneled requests should not wait for previous ACKs.
+        socket.set_nagle_enabled(false);
+        self.sockets.add(socket)
     }
 
     /// Create a new UDP socket with standard buffers.
@@ -790,6 +797,10 @@ impl AsyncRead for TcpStream {
                 Ok(0) => {}
                 Ok(n) => {
                     buf.advance(n);
+                    // Reading frees receive-window space; let the poller
+                    // advertise it promptly instead of waiting for a timer.
+                    drop(s);
+                    self.poll_wakeup.notify_one();
                     return Poll::Ready(Ok(()));
                 }
                 Err(e) => {
@@ -1102,9 +1113,10 @@ async fn join_with_grace(handle: &mut tokio::task::JoinHandle<()>) {
 
 /// Create a socket in LISTEN state on the given endpoint.
 fn new_listen_socket(sockets: &mut SocketSet, ep: IpListenEndpoint) -> SocketHandle {
-    let rx = tcp::SocketBuffer::new(vec![0u8; 65536]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; 65536]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
     let mut sock = tcp::Socket::new(rx, tx);
+    sock.set_nagle_enabled(false);
     let _ = sock.listen(ep);
     sockets.add(sock)
 }
@@ -1117,4 +1129,97 @@ fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Address, u8)> {
     let addr: std::net::Ipv4Addr = addr_str.trim().parse().ok()?;
     let prefix: u8 = prefix_str.trim().parse().ok()?;
     Some((Ipv4Address::from_bytes(&addr.octets()), prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use yggdrasil::core::Core;
+
+    async fn node() -> (Arc<Core>, Arc<YggNetstack>) {
+        let mut cfg = crate::config::generate();
+        cfg.peers.clear();
+        cfg.multicast_interfaces.clear();
+        let key = cfg.signing_key().unwrap();
+        let addr = crate::config::addr_for_key(&key.verifying_key().to_bytes());
+        let core = Core::new(key, cfg);
+        core.init_links().await;
+        core.start().await;
+        let mtu = core.mtu();
+        let rwc = ReadWriteCloser::new(core.clone(), mtu, None);
+        core.set_path_notify(rwc.clone());
+        let netstack = YggNetstack::new(
+            rwc,
+            addr,
+            mtu,
+            #[cfg(feature = "ckr")]
+            None,
+        );
+        (core, netstack)
+    }
+
+    #[tokio::test]
+    async fn interactive_tcp_sockets_do_not_delay_small_writes() {
+        let (core, netstack) = node().await;
+        let listener = netstack.listen_tcp(18184).unwrap();
+        let (outgoing_nagle, incoming_nagle) = {
+            let mut state = lock_state(&netstack.state);
+            let outgoing = state.new_tcp_socket();
+            let outgoing_nagle = state.sockets.get::<tcp::Socket>(outgoing).nagle_enabled();
+            state.sockets.remove(outgoing);
+            let incoming_nagle = state.listeners[0]
+                .listen_pool
+                .iter()
+                .any(|(handle, _)| state.sockets.get::<tcp::Socket>(*handle).nagle_enabled());
+            (outgoing_nagle, incoming_nagle)
+        };
+        drop(listener);
+        netstack.shutdown().await;
+        let _ = core.close().await;
+        assert!(!outgoing_nagle, "outgoing TCP delays small writes");
+        assert!(!incoming_nagle, "listening TCP delays small writes");
+    }
+
+    #[tokio::test]
+    async fn reading_received_data_wakes_network_poller() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = format!("tcp://{}", reservation.local_addr().unwrap());
+        drop(reservation);
+        let (server_core, server) = node().await;
+        server_core.listen(&peer).await.unwrap();
+        let listener = server.listen_tcp(18183).unwrap();
+        let (client_core, client) = node().await;
+        client_core.add_peer(&peer).await.unwrap();
+        let woke = tokio::time::timeout(Duration::from_secs(20), async {
+            while !client_core.get_peers().await.iter().any(|peer| peer.up) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let mut outgoing = client
+                .dial_tcp(SocketAddr::new(server.our_addr.into(), 18183))
+                .await
+                .unwrap();
+            let mut incoming = listener.accept().await.unwrap();
+            // Observe the receiver's wakeup independently of its poll task,
+            // which would otherwise consume the notification concurrently.
+            incoming.poll_wakeup = Arc::new(Notify::new());
+            outgoing.write_all(b"data").await.unwrap();
+            let mut bytes = [0; 4];
+            incoming.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"data");
+            tokio::time::timeout(Duration::from_millis(100), incoming.poll_wakeup.notified())
+                .await
+                .is_ok()
+        })
+        .await
+        .expect("mesh transfer timed out");
+        client.shutdown().await;
+        server.shutdown().await;
+        let _ = client_core.close().await;
+        let _ = server_core.close().await;
+        assert!(
+            woke,
+            "reading received data did not wake the network poller"
+        );
+    }
 }

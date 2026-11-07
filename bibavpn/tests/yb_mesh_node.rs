@@ -2,6 +2,38 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+async fn mesh_tcp_can_queue_a_large_burst_in_both_directions() {
+    let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_address = reserve.local_addr().unwrap();
+    drop(reserve);
+    let server = bibavpn::yb_mesh::MeshNode::start(vec![], vec![format!("tcp://{peer_address}")]).await.unwrap();
+    let listener = server.netstack.listen_tcp(18182).unwrap();
+    let client = bibavpn::yb_mesh::MeshNode::start(vec![format!("tcp://{peer_address}")], vec![]).await.unwrap();
+    let address = std::net::SocketAddr::new(server.netstack.our_addr.into(), 18182);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while client.connected_peers().await == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut outgoing = client.netstack.dial_tcp(address).await.unwrap();
+        let mut incoming = listener.accept().await.unwrap();
+        let payload = vec![0x5a; 768 * 1024];
+        let mut received = vec![0; payload.len()];
+
+        let n = outgoing.write(&payload).await.unwrap();
+        assert_eq!(n, payload.len(), "client could not queue a full burst before ACKs");
+        incoming.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+
+        let n = incoming.write(&payload).await.unwrap();
+        assert_eq!(n, payload.len(), "server could not queue a full burst before ACKs");
+        outgoing.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+    }).await.expect("mesh bulk transfer timed out");
+    client.shutdown().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn two_nodes_exchange_bytes_over_a_peer_link() {
     let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let peer_address = reserve.local_addr().unwrap();

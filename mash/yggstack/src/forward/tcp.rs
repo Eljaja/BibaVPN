@@ -181,14 +181,7 @@ async fn forward_remote_tcp(
     entry: Arc<ListenerStats>,
 ) -> std::io::Result<()> {
     let _guard = ConnGuard::new(entry.clone());
-    let local = tokio::time::timeout(
-        crate::netstack::CONNECT_TIMEOUT,
-        TcpStream::connect(target),
-    )
-    .await
-    .map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "local connect timed out")
-    })??;
+    let local = connect_local(target).await?;
     let (lr, mut lw) = local.into_split();
     let (mut yr, mut yw) = tokio::io::split(ygg_stream);
     tracing::debug!("rtcp conn: relaying from ygg (local={})", target);
@@ -200,4 +193,27 @@ async fn forward_remote_tcp(
         r = counting_copy(lr, &mut yw, entry, Dir::Tx) => { tracing::debug!("rtcp conn: local→ygg done {:?}", r); }
     }
     Ok(())
+}
+
+async fn connect_local(target: SocketAddr) -> std::io::Result<TcpStream> {
+    let local = tokio::time::timeout(crate::netstack::CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "local connect timed out")
+        })??;
+    // Avoid adding local TCP delayed-ACK stalls to interactive mesh traffic.
+    let _ = local.set_nodelay(true);
+    Ok(local)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_forward_does_not_delay_small_tcp_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = connect_local(listener.local_addr().unwrap()).await.unwrap();
+        assert!(local.nodelay().unwrap(), "forwarder delays small writes");
+    }
 }
