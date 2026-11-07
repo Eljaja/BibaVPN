@@ -7,6 +7,7 @@ impl Drop for Process { fn drop(&mut self) { let _ = self.0.kill(); let _ = self
 fn unused_port() -> u16 { StdListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
 
 async fn run_mesh_tunnel(no_mux: bool) {
+    assert!(!bibavpn::domain_route::should_bypass("127.1"));
     let peer_port = unused_port();
     let server_port = unused_port();
     let socks_port = unused_port();
@@ -56,7 +57,10 @@ async fn run_mesh_tunnel(no_mux: bool) {
         socks.write_all(&[5, 1, 0]).await.unwrap();
         let mut hello = [0; 2]; socks.read_exact(&mut hello).await.unwrap(); assert_eq!(hello, [5, 0]);
         let port = echo_port.to_be_bytes();
-        socks.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, port[0], port[1]]).await.unwrap();
+        // A literal loopback IP is intentionally bypassed by the client.
+        // The numeric hostname resolves locally on the server while still
+        // exercising the mesh tunnel rather than the direct-bypass path.
+        socks.write_all(&[5, 1, 0, 3, 5, b'1', b'2', b'7', b'.', b'1', port[0], port[1]]).await.unwrap();
         let mut reply = [0; 10]; socks.read_exact(&mut reply).await.unwrap(); assert_eq!(reply[1], 0);
         socks.write_all(b"mesh").await.unwrap();
         let mut result = [0; 4]; socks.read_exact(&mut result).await.unwrap(); assert_eq!(&result, b"mesh");
