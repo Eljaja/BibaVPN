@@ -53,8 +53,6 @@ Newly minted invitations use Argon2id (invite format v2). Update clients before 
 
 ### Set up your own server
 
-You need a fresh Debian or Ubuntu VPS with root access and `curl`, a public domain pointing to the VPS, and TCP ports **80 and 443** open in both the VPS and cloud firewall. Those ports must not already be in use. The installer installs Docker and Compose if needed.
-
 Connect to the VPS as root and run:
 
 ```bash
