@@ -24,7 +24,6 @@
 
 BibaVPN carries your apps' **SOCKS5 and HTTP CONNECT traffic over TLS + WebSocket** to a server you control. Bring one VPS, connect a client, and tune the tunnel for your network — with desktop and Android apps, encrypted invitations, and a Rust core you can inspect.
 
-> **Experimental, actively evolving.** The protocol is not frozen and has not had a third-party security audit. DPI resistance depends on your network and configuration; it is not a guarantee of undetectability. [Read the security notes](#security).
 
 ## Why BibaVPN?
 
@@ -49,9 +48,19 @@ Newly minted invitations use Argon2id (invite format v2). Update clients before 
 | Linux | [Choose a package](https://github.com/Eljaja/BibaVPN/releases/latest) | x86_64 AppImage or `.deb` |
 | Server / CLI | [Quick server setup](#quick-start) · [Build from source](#build-from-source) | Self-hosted Rust binaries |
 
-Windows may need the Microsoft Edge WebView2 Runtime. **iOS is unfinished:** the Packet Tunnel extension does not forward traffic yet. See [app development notes](apps/AGENTS.md) for build details and [release notes](https://github.com/Eljaja/BibaVPN/releases) for changes.
 
 ## Quick start
+
+### Set up your own server
+
+You need a fresh Debian or Ubuntu VPS with root access and `curl`, a public domain pointing to the VPS, and TCP ports **80 and 443** open in both the VPS and cloud firewall. Those ports must not already be in use. The installer installs Docker and Compose if needed.
+
+Connect to the VPS as root and run:
+
+```bash
+git clone https://github.com/eljaja/BibaVPN
+bash start.sh
+```
 
 ### Connect with an invitation
 
@@ -61,192 +70,14 @@ Windows may need the Microsoft Edge WebView2 Runtime. **iOS is unfinished:** the
 
 You need an invitation from a server administrator. To run your own server, follow the next section.
 
-### Set up your own server
-
-You need a fresh Debian or Ubuntu VPS with root access and `curl`, a public domain pointing to the VPS, and TCP ports **80 and 443** open in both the VPS and cloud firewall. Those ports must not already be in use. The installer installs Docker and Compose if needed.
-
-Connect to the VPS as root and run:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Eljaja/BibaVPN/main/scripts/quick-server-setup.sh -o bibavpn-install.sh && bash bibavpn-install.sh
-```
-
-Enter your domain when prompted. The installer starts the VPN and Caddy, obtains a trusted TLS certificate, and prints an invitation and passphrase. Caddy renews the certificate automatically while it is running. Keep the invitation and passphrase secret and send them to users through separate private channels.
-
-The server configuration and credentials are stored in `/opt/bibavpn-quick`, accessible only to root. Re-running the installer resumes an existing quick setup without replacing its credentials. For an existing website, custom certificates, or a different deployment, use [manual VPS setup](#self-host-on-a-vps).
-
-To inspect or stop the quick setup, run as root:
-
-```bash
-cd /opt/bibavpn-quick
-docker compose --env-file server.env -f compose.yaml logs
-docker compose --env-file server.env -f compose.yaml down
-```
-
-If the installer used standalone `docker-compose`, replace `docker compose` with `docker-compose` in these commands. Back up the installation directory securely; it contains the server credentials.
-
-### Try a local Docker lab
-
-Try the complete tunnel locally using prebuilt Docker images — no Rust build or VPS needed.
-
-**You need:** Linux or WSL, Git, Docker with Compose, OpenSSL, and curl. Keep these commands in the same terminal so Compose can read the generated secrets. Ports `8443`, `11080`, and `11880` must be free.
-
-```bash
-git clone https://github.com/Eljaja/BibaVPN.git
-cd BibaVPN
-
-export BIBA_VPN_TOKEN="$(openssl rand -hex 16)"
-export BIBA_VPN_PSK="$(openssl rand -hex 32)"
-
-docker compose -f docker-compose.hub.yml up -d
-```
-
-This starts **both the server and client**. Once they are ready, send a request through either local proxy:
-
-```bash
-# SOCKS5, including DNS resolution through the proxy
-curl --fail --socks5-hostname 127.0.0.1:11080 https://ifconfig.io
-
-# HTTP CONNECT
-curl --fail --proxy http://127.0.0.1:11880 https://ifconfig.io
-```
-
-Both commands should print the public IP used by the Docker host. In this local demo it can match your normal IP; with a remote server, it will be that server's exit IP. The proxy endpoints bind to localhost.
-
-> This Compose setup uses a self-signed certificate and `--insecure` for a local lab. For a remote server, use verified TLS or certificate pinning as described below.
-
-Stop and remove the lab containers when done:
-
-```bash
-docker compose -f docker-compose.hub.yml down
-```
-
-<details>
-<summary><strong>Prefer to build the Docker images locally?</strong></summary>
-
-From the repository root:
-
-```bash
-bash start.sh --build
-docker compose --env-file .biba-start.env -f docker-compose.yml up -d --build biba-client
-```
-
-`start.sh` generates secrets in `.biba-start.env`, starts the **server only**, and prints an invitation and passphrase. The second command starts the client for the same curl checks above. Unlike the prebuilt-image lab, this Compose file publishes the proxy ports on all host interfaces: use it on an isolated development host.
-
-Keep `.biba-start.env` private. Rerunning `start.sh` replaces its secrets; recreate the client afterwards. Stop this lab with:
-
-```bash
-docker compose --env-file .biba-start.env -f docker-compose.yml down
-```
-
-</details>
 
 ## How it works
 
 ```text
 Your apps → BibaVPN client ═══ TLS + WebSocket ═══ Your VPS → Internet
-             SOCKS5 /          encrypted tunnel    BibaVPN
+             SOCKS5 /          secure tunnel    BibaVPN
            HTTP CONNECT                            server
 ```
-
-The CLI exposes local proxy endpoints; route the apps you want through them. It does not automatically capture every connection on your device. Android integrates with the system VPN service.
-
-The default tunnel adds **ChaCha20-Poly1305 encryption, authenticated control frames and padding** inside TLS. TCP streams share outer WebSocket sessions; SOCKS5 UDP uses a separate one. For the exact handshake and framing, read [PROTOCOL.md](PROTOCOL.md).
-
-## Self-host on a VPS
-
-You need a reachable VPS, a hostname pointing to it, and a TLS certificate and private key for that hostname. The example below terminates TLS directly in BibaVPN on TCP port `8443`; allow that port in your firewall. Build the binaries first using [the source instructions](#build-from-source).
-
-**On the server**, generate credentials once and keep them private:
-
-```bash
-export BIBA_HOST="vpn.example.com"  # Replace with your hostname
-export BIBA_VPN_TOKEN="$(openssl rand -hex 16)"
-export BIBA_VPN_PSK="$(openssl rand -hex 32)"
-
-./target/release/bibavpn-server \
-  --listen 0.0.0.0:8443 \
-  --cert /path/to/fullchain.pem --key /path/to/privkey.pem \
-  --token "$BIBA_VPN_TOKEN" --psk "$BIBA_VPN_PSK"
-```
-
-Replace the certificate paths with readable PEM files. **On your client machine**, set `BIBA_HOST`, `BIBA_VPN_TOKEN`, and `BIBA_VPN_PSK` to the same values through a private channel, then run:
-
-```bash
-./target/release/bibavpn-client \
-  --server "$BIBA_HOST:8443" --sni "$BIBA_HOST" \
-  --token "$BIBA_VPN_TOKEN" --psk "$BIBA_VPN_PSK" \
-  --socks5 127.0.0.1:1080
-```
-
-TLS verification is enabled by default. For a self-signed certificate, securely copy the server's public leaf certificate to the client and add `--pin-cert /path/to/leaf.pem`; keep verification enabled.
-
-<details>
-<summary><strong>Invite another device without copying CLI settings</strong></summary>
-
-Generate a separate invitation passphrase on the server:
-
-```bash
-export BIBA_INVITE_PASSPHRASE="$(openssl rand -hex 24)"
-```
-
-Restart the server with these additional flags appended to its command:
-
-```bash
---print-invite-uri \
---invite-passphrase "$BIBA_INVITE_PASSPHRASE" \
---invite-public "$BIBA_HOST:8443" \
---invite-sni "$BIBA_HOST"
-```
-
-Import the printed `biba://` URI into the app, or pass it to the CLI with `--from-invite 'biba://…'` and `--invite-passphrase`. Send the passphrase through a separate private channel. [Invitation format and options](PROTOCOL.md#encrypted-invite-biba).
-
-</details>
-
-## Using the tunnel
-
-### Manage multiple users
-
-One server can authenticate separate users without changing the tunnel protocol. Build all binaries with `cargo build --release -p bibavpn --bins`, then create a private registry and users on the server:
-
-```bash
-./target/release/bibavpn-users --users-file /secure/path/users.json add alice --max-concurrent 4
-./target/release/bibavpn-users --users-file /secure/path/users.json add bob
-./target/release/bibavpn-users --users-file /secure/path/users.json list
-```
-
-The server image built from `docker/Dockerfile.server` also includes both administration binaries under `/usr/local/bin`; mount the registry directory into the container. Images that contain only the server binary require the tools to be built separately.
-
-The registry contains secret tokens. Keep it in a directory accessible only to the server and administrator; the tool creates the file with mode `0600` on Unix. Start the server with `--users-file /secure/path/users.json` instead of `--token`, alongside the usual TLS and `--psk` settings. The registry is read on every new authentication, so changes apply without a server restart. An invalid or unreadable registry rejects new sessions. `--users-file` cannot be combined with `--token`, `--legacy-path-auth`, or server `--print-invite-uri`.
-
-Generate an encrypted invitation using the existing invite settings. `bibavpn-mint-invite` must be installed next to `bibavpn-users`. Send the passphrase separately and never share the registry:
-
-```bash
-export INVITE_PUBLIC="vpn.example.com:8443"
-export BIBA_VPN_PSK="your-server-psk"
-export BIBA_INVITE_PASSPHRASE="a-separate-invitation-passphrase"
-./target/release/bibavpn-users --users-file /secure/path/users.json mint alice
-```
-
-For REALITY invitations, also set `INVITE_REALITY_TARGET` and `INVITE_REALITY_PUBLIC_KEY`; optionally set `INVITE_REALITY_SHORT_ID`. New invitations from `bibavpn-users` require verified TLS. To disable or enable new sessions without disconnecting existing ones:
-
-```bash
-./target/release/bibavpn-users --users-file /secure/path/users.json disable alice
-./target/release/bibavpn-users --users-file /secure/path/users.json enable alice
-```
-
-The per-user limit counts outer tunnel sessions, not applications or mux streams: TCP parallel connections and the separate UDP session each consume a slot. Counters apply per server process and reset when it restarts. Users share the server PSK and REALITY keys; disabling a user revokes their token for new sessions but does not rotate shared secrets or terminate existing sessions.
-
-For the VPS example, the local SOCKS5 endpoint is `127.0.0.1:1080`. For the Docker lab, use port **`11080`** instead.
-
-| Application | Setup |
-| --- | --- |
-| Firefox | Network Settings → Manual proxy → SOCKS Host `127.0.0.1`, port `1080`, SOCKS v5; enable **Proxy DNS when using SOCKS v5** |
-| Chrome / Chromium | Launch with `--proxy-server="socks5://127.0.0.1:1080"` |
-| curl | `curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.io` |
-| Proxy-aware CLI tools | Set `ALL_PROXY=socks5h://127.0.0.1:1080` where supported; this is not a system-wide VPN switch |
-
-Need HTTP CONNECT? Add `--http-proxy 127.0.0.1:8080` to the CLI client. The Docker lab already exposes it on `127.0.0.1:11880`.
 
 ## Configuration
 
@@ -264,9 +95,6 @@ Start with the defaults, then adjust only what your network needs. Run either bi
 
 The server and client must agree on token, PSK, WebSocket path and protocol domain (`--proto-domain`, default `default`). The default path is `/ws`; authentication credentials are carried inside the encrypted tunnel, not in the URL.
 
-Optional **REALITY mode** is BibaVPN's own WSS handshake, not Xray REALITY compatibility. See [protocol details](PROTOCOL.md#reality-wss-path). Browser-like profiles and desync controls have implementation limits; consult the [current capabilities and roadmap](AGENTS.md#stealth-dpi-and-roadmap) before relying on them.
-
-REALITY handshake v3 rejects repeated nonces and timestamps outside `--reality-max-time-diff-secs` (default 90 seconds). Update both client and server together: older REALITY peers cannot connect. Keep clocks synchronized. The nonce cache is held in memory per server process; it does not survive restarts or coordinate multiple server processes.
 
 ## Build from source
 
