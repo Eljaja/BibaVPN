@@ -21,6 +21,10 @@ use crate::{decode_invite_v1, InviteV1, PadMode};
 #[derive(Deserialize)]
 struct StartJson {
     #[serde(default)]
+    yb_mesh_enabled: bool,
+    #[serde(default)]
+    yb_mesh_endpoint: Option<String>,
+    #[serde(default)]
     server: String,
     /// Omitted or null: use invite token when `from_invite` is set; otherwise required.
     #[serde(default)]
@@ -236,6 +240,13 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         (None, None) => None,
         _ => anyhow::bail!("invite: set both from_invite and invite_passphrase, or neither"),
     };
+
+    let yb_mesh_endpoint = if j.yb_mesh_enabled {
+        let endpoint = j.yb_mesh_endpoint.clone().or_else(|| invite_pair.as_ref().and_then(|i| i.yb_mesh.as_ref().map(|m| m.endpoint.clone())))
+            .ok_or_else(|| anyhow::anyhow!("yb-mesh requires an invite with a mesh endpoint"))?;
+        crate::yb_mesh::parse_endpoint(&endpoint)?;
+        Some(endpoint)
+    } else { None };
 
     let stealth_for_merge: Option<StealthProfile> =
         (|| -> anyhow::Result<Option<StealthProfile>> {
@@ -755,6 +766,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     );
 
     Ok(LocalClientOptions {
+        yb_mesh_endpoint,
         server_host,
         server_port,
         sni,
@@ -842,6 +854,7 @@ mod merge_tests {
         let inv = InviteV1 {
             v: 1,
             server: "10.0.0.2:443".into(),
+            yb_mesh: None,
             sni: "vpn.example.com".into(),
             token: "tok".into(),
             proto: 3,
@@ -997,6 +1010,7 @@ mod merge_tests {
         let inv = InviteV1 {
             v: 1,
             server: "10.0.0.2:443".into(),
+            yb_mesh: None,
             sni: "vpn.example.com".into(),
             token: "tok".into(),
             proto: 3,

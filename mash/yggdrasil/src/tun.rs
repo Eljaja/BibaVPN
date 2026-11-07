@@ -1,0 +1,510 @@
+// TUN support is behind the "tun" feature (enabled by default).
+// Disable it with --no-default-features for library/VpnService builds.
+#![cfg(feature = "tun")]
+
+#[cfg(feature = "ckr")]
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::sync::OnceLock;
+
+use tun_rs::AsyncDevice;
+
+use crate::ipv6rwc::ReadWriteCloser;
+
+/// Fixed GUID we register the wintun adapter with. Reused to target the same
+/// interface when assigning DNS servers via `SetInterfaceDnsSettings`.
+#[cfg(windows)]
+const TUN_DEVICE_GUID: u128 = 0x8f59971a78724aa6b2eb061fc4e9d0a7;
+
+#[cfg(windows)]
+static SET_INTERFACE_DNS_PTR: OnceLock<
+    Option<
+        unsafe extern "system" fn(
+            windows::core::GUID,
+            *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+        ) -> windows::core::HRESULT,
+    >,
+> = OnceLock::new();
+
+/// TUN adapter: bridges a TUN network device with the IPv6 RWC.
+pub struct TunAdapter {
+    device: Arc<AsyncDevice>,
+    /// Interface name assigned by the OS, which may differ from the requested one.
+    name: String,
+    /// MTU the interface ended up with, which the OS may have clamped.
+    mtu: u16,
+    read_handle: tokio::task::JoinHandle<()>,
+    write_handle: tokio::task::JoinHandle<()>,
+}
+
+impl TunAdapter {
+    /// Create and start the TUN adapter.
+    /// `name`: interface name ("auto" for automatic, "none" to disable)
+    /// `rwc`: the IPv6 ReadWriteCloser bridge
+    /// `addr`: the Yggdrasil IPv6 address string
+    /// `subnet`: the /64 subnet string (for routing)
+    /// `mtu`: the MTU for the TUN interface
+    /// `dns_servers`: DNS server IPs to assign to the interface (Windows only)
+    /// `ckr_config`: optional CKR tunnel routing config (for route installation)
+    pub async fn new(
+        name: &str,
+        rwc: Arc<ReadWriteCloser>,
+        addr: &str,
+        _subnet: &str,
+        mtu: u16,
+        #[cfg(windows)] dns_servers: &[String],
+        #[cfg(feature = "ckr")] ckr_config: Option<&crate::config::TunnelRoutingConfig>,
+        #[cfg(feature = "ckr")] self_key: &[u8; 32],
+    ) -> Result<Self, String> {
+        if name == "none" {
+            return Err("TUN disabled".to_string());
+        }
+
+        let tun_name = if name == "auto" {
+            if cfg!(windows) {
+                "Yggdrasil"
+            } else {
+                "ygg0"
+            }
+        } else {
+            name
+        };
+
+        // Parse the address - strip any /prefix and get just the IP
+        let ip_str = addr.split('/').next().unwrap_or(addr);
+        let ip: Ipv6Addr = ip_str
+            .parse()
+            .map_err(|e| format!("invalid address '{}': {}", ip_str, e))?;
+
+        // Create TUN device using tun-rs DeviceBuilder
+        let mut builder = tun_rs::DeviceBuilder::new().ipv6(ip, 7u8).mtu(mtu);
+
+        // macOS only accepts utunN names and assigns the index itself, so
+        // "auto" cannot map to a fixed name there.
+        if !(cfg!(target_os = "macos") && name == "auto") {
+            builder = builder.name(tun_name);
+        }
+
+        // Assign IPv4 address to TUN if configured in CKR
+        #[cfg(feature = "ckr")]
+        if let Some(ckr_cfg) = ckr_config {
+            if ckr_cfg.enable && !ckr_cfg.ipv4_address.is_empty() && ckr_cfg.ip_addresses.iter().all(|s| s.is_empty()) {
+                let (v4_addr, v4_prefix) = parse_ipv4_cidr(&ckr_cfg.ipv4_address)?;
+                builder = builder.ipv4(v4_addr, v4_prefix, None);
+                tracing::info!("CKR: assigning IPv4 address {} to TUN", ckr_cfg.ipv4_address);
+            }
+        }
+
+        #[cfg(feature = "ckr")]
+        let mut ipv4_addrs: Vec<(Ipv4Addr, u8)> = Vec::new();
+
+        // Assign IP addresses to TUN if configured in CKR
+        #[cfg(feature = "ckr")]
+        if let Some(ckr_cfg) = ckr_config {
+            for cidr in &ckr_cfg.ip_addresses {
+                if ckr_cfg.enable && !cidr.is_empty() {
+                    if cidr.contains(':') {
+                        // IPv6 path - reuse the same split/parse pattern already present
+                        // in parse_ipv4_cidr and the existing Yggdrasil IPv6 handling above
+                        let parts: Vec<&str> = cidr.split('/').collect();
+                        if parts.len() == 1 || parts.len() == 2 {
+                            let ip_str = parts[0];
+                            let prefix: u8 = if parts.len() == 1 {
+                                128
+                            } else {
+                                parts[1].parse().map_err(|e| format!("invalid IPv6 prefix in ip_addresses '{}': {}", cidr, e))?
+                            };
+                            let ip: Ipv6Addr = ip_str.parse().map_err(|e| format!("invalid IPv6 in ip_addresses '{}': {}", cidr, e))?;
+                            builder = builder.ipv6(ip, prefix);
+                            tracing::info!("CKR: assigning IPv6 address {} to TUN", cidr);
+                        } else {
+                            return Err(format!("invalid IPv6 CIDR in ip_addresses '{}': expected addr or addr/prefix", cidr));
+                        }
+                    } else {
+                        // IPv4 path - reuse the exact existing parse_ipv4_cidr function
+                        let (v4_addr, v4_prefix) = parse_ipv4_cidr(cidr)?;
+                        ipv4_addrs.push((v4_addr, v4_prefix));
+                        tracing::info!("CKR: assigning IPv4 address {} to TUN", cidr);
+                    }
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // Only call device_guid on Windows
+            builder = builder.device_guid(TUN_DEVICE_GUID);
+        }
+
+        let device = builder
+            .build_async()
+            .map_err(|e| format!("failed to create TUN device: {}", e))?;
+
+        let device = Arc::new(device);
+
+        #[cfg(feature = "ckr")]
+        for (v4_addr, v4_prefix) in ipv4_addrs {
+            device
+                .add_address_v4(v4_addr, v4_prefix)
+                .map_err(|e| format!("failed to add IPv4 address to TUN: {}", e))?;
+        }
+
+        let actual_name = device.name().unwrap_or_else(|_| tun_name.to_string());
+        let actual_mtu = device.mtu().unwrap_or(mtu);
+        tracing::info!("TUN device '{}' created with address {} and MTU {}", actual_name, addr, actual_mtu);
+        // Overlay MTU must follow the kernel-clamped interface MTU.
+        // Otherwise inbound packets larger than tun(4) TUNMTU pass the
+        // RWC check, fail tunwrite (EIO on NetBSD) and never produce
+        // an ICMPv6 Packet Too Big for the sender.
+        rwc.set_mtu(actual_mtu as u64);
+
+        // Install CKR routes if configured
+        #[cfg(feature = "ckr")]
+        if let Some(ckr_cfg) = ckr_config {
+            if ckr_cfg.install_system_routes {
+                if let Err(e) = crate::ckr::install_routes(ckr_cfg, &actual_name, self_key) {
+                    tracing::error!("Failed to install CKR routes: {}", e);
+                }
+            }
+        }
+
+        // Assign DNS servers to the interface (Windows only). Non-fatal on error.
+        #[cfg(windows)]
+        if !dns_servers.is_empty() {
+            if is_set_interface_dns_settings_supported() {
+                match set_interface_dns(dns_servers) {
+                    Ok(()) => tracing::info!("Set DNS servers on TUN interface: {}", dns_servers.join(", ")),
+                    Err(e) => tracing::error!("Failed to set DNS servers on TUN interface: {}", e),
+                }
+            } else {
+                tracing::warn!(
+                    "This Windows version does not support per-interface DNS settings \
+                     (SetInterfaceDnsSettings not found in iphlpapi.dll), skipping"
+                );
+            }
+        }
+
+        // Task 1: TUN → network (read from TUN, write to RWC)
+        let device_read = device.clone();
+        let rwc_read = rwc.clone();
+        let read_handle = tokio::spawn(async move {
+            tun_read_loop(device_read, rwc_read).await;
+        });
+
+        // Task 2: network → TUN (read from RWC directly into TUN; no intermediate queue)
+        let device_write = device.clone();
+        let rwc_write = rwc.clone();
+        let write_handle = tokio::spawn(async move {
+            tun_write_loop(device_write, rwc_write).await;
+        });
+
+        Ok(Self {
+            device,
+            name: actual_name,
+            mtu: actual_mtu,
+            read_handle,
+            write_handle,
+        })
+    }
+
+    /// Interface name assigned by the OS.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// MTU the interface ended up with.
+    pub fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
+    /// Tear down the TUN adapter explicitly: abort the I/O tasks, wait for
+    /// them to drop their `Arc<AsyncDevice>` references, then drop the device
+    /// so the OS-level interface is removed before this function returns.
+    ///
+    /// On Windows this is critical when running as a service: the SCM may
+    /// terminate the process shortly after we report `ServiceState::Stopped`,
+    /// before tokio's runtime drop has a chance to abort the I/O tasks. If
+    /// the Wintun adapter isn't closed by then, it gets orphaned in the
+    /// device tree and the next startup can't recreate it.
+    pub async fn close(self) {
+        let TunAdapter { device, name: _, mtu: _, read_handle, write_handle } = self;
+        read_handle.abort();
+        write_handle.abort();
+        let _ = read_handle.await;
+        let _ = write_handle.await;
+        // Tasks have released their Arc clones; drop the last one so
+        // AsyncDevice::Drop runs WintunCloseAdapter (or platform equivalent).
+        drop(device);
+    }
+}
+
+/// Read packets from the TUN device and send them to the network via RWC.
+async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        match device.recv(&mut buf).await {
+            Ok(n) if n > 0 => {
+                if let Err(e) = rwc.write(&buf[..n]).await {
+                    tracing::trace!("Unable to send packet to network: {}", e);
+                }
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::error!("TUN read error: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// Returns true for transient TUN write failures caused by kernel buffer exhaustion
+/// (ENOBUFS / WouldBlock, and EQFULL on Apple). In these cases the packet should
+/// be dropped instead of tearing down the write path.
+#[cfg(unix)]
+fn is_tun_write_overflow(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    match err.raw_os_error() {
+        Some(code) if code == libc::ENOBUFS => true,
+        // macOS-only: the interface output queue is full.
+        #[cfg(target_vendor = "apple")]
+        Some(code) if code == libc::EQFULL => true,
+        _ => false,
+    }
+}
+
+/// Windows counterpart: wintun reports a full ring buffer as ERROR_BUFFER_OVERFLOW,
+/// which tun-rs translates into `ErrorKind::WouldBlock`. Its blocking send swallows
+/// that internally and retries with backoff for 5 seconds before giving up with
+/// `ErrorKind::TimedOut`, so in practice a full ring reaches us as the latter. A
+/// disabled adapter surfaces as a different error, so it still tears down the loop.
+#[cfg(not(unix))]
+fn is_tun_write_overflow(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Read packets from the network (RWC) and write them straight into the TUN device.
+async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
+    // One byte larger than the largest payload: the session frame is read in
+    // place, so it needs room for the leading session type byte too.
+    let mut buf = vec![0u8; 65536];
+    // Rate-limit overflow warnings so a sustained overload does not flood the log,
+    // but count the drops in between so the warning says how bad it actually is.
+    let mut last_overflow_log = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    let mut dropped_since_log: u64 = 0;
+    const OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+    loop {
+        match rwc.read(&mut buf).await {
+            Ok(packet) => {
+                tracing::debug!("TUN write {} bytes, version={:#x}", packet.len(), packet[0] >> 4);
+                if let Err(e) = device.send(packet).await {
+                    if is_tun_write_overflow(&e) {
+                        // Drop on overflow: better to lose some packets under load
+                        // than to stop delivering traffic entirely.
+                        dropped_since_log += 1;
+                        let now = Instant::now();
+                        if now.duration_since(last_overflow_log) >= OVERFLOW_LOG_INTERVAL {
+                            tracing::warn!(
+                                "TUN write overflow, dropped {} packet(s) since last report: {}",
+                                dropped_since_log,
+                                e
+                            );
+                            last_overflow_log = now;
+                            dropped_since_log = 0;
+                        }
+                        continue;
+                    }
+                    tracing::error!("TUN write error: {}", e);
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Exiting TUN write loop due to RWC read error: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// Parse an IPv4 CIDR string like "10.99.0.1/24" into (Ipv4Addr, prefix_len).
+#[cfg(feature = "ckr")]
+fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), String> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    let (addr_str, prefix_str) = if parts.len() == 1 {
+        (parts[0], "32")
+    } else if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        return Err(format!("invalid IPv4 CIDR '{}': expected addr or addr/prefix", cidr));
+    };
+    let addr: Ipv4Addr = addr_str
+        .parse()
+        .map_err(|e| format!("invalid IPv4 address '{}': {}", addr_str, e))?;
+    let prefix: u8 = prefix_str
+        .parse()
+        .map_err(|e| format!("invalid prefix length '{}': {}", prefix_str, e))?;
+    if prefix > 32 {
+        return Err(format!("prefix length {} exceeds 32", prefix));
+    }
+    Ok((addr, prefix))
+}
+
+#[cfg(windows)]
+fn get_set_interface_dns_settings_ptr() -> Option<
+    unsafe extern "system" fn(
+        windows::core::GUID,
+        *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+    ) -> windows::core::HRESULT,
+> {
+    *SET_INTERFACE_DNS_PTR.get_or_init(|| {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+        let dll_name: Vec<u16> = OsStr::new("iphlpapi.dll")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let hmod_result = unsafe { GetModuleHandleW(windows::core::PCWSTR(dll_name.as_ptr())) };
+        let hmod = match hmod_result {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        if hmod.is_invalid() {
+            return None;
+        }
+
+        let proc_name = b"SetInterfaceDnsSettings\0";
+        let proc = unsafe { GetProcAddress(hmod, windows::core::PCSTR(proc_name.as_ptr())) };
+        proc.map(|addr| unsafe { std::mem::transmute(addr) })
+    })
+}
+
+#[cfg(windows)]
+fn is_set_interface_dns_settings_supported() -> bool {
+    get_set_interface_dns_settings_ptr().is_some()
+}
+
+#[cfg(windows)]
+fn call_set_interface_dns_settings(
+    guid: windows::core::GUID,
+    settings: *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+) -> windows::core::Result<()> {
+    match get_set_interface_dns_settings_ptr() {
+        Some(func) => {
+            let hr = unsafe { func(guid, settings) };
+            if hr.is_ok() {
+                Ok(())
+            } else {
+                Err(windows::core::Error::from(hr))
+            }
+        }
+        None => Err(windows::core::Error::from(
+            windows::Win32::Foundation::ERROR_PROC_NOT_FOUND,
+        )),
+    }
+}
+
+/// Assign DNS servers to our TUN interface via `SetInterfaceDnsSettings`, and
+/// disable dynamic DNS registration for it. Targets the adapter by the fixed
+/// GUID we registered it with.
+#[cfg(windows)]
+fn set_interface_dns(servers: &[String]) -> Result<(), String> {
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    // Same GUID we registered the wintun adapter with. tun-rs converts the u128
+    // via GUID::from_u128, so this matches the interface GUID exactly.
+    let guid = windows::core::GUID::from_u128(TUN_DEVICE_GUID);
+
+    // SetInterfaceDnsSettings configures one address family per call, and IPv6
+    // nameservers require the DNS_SETTING_IPV6 flag — without it the addresses are
+    // parsed as IPv4 and the call fails with ERROR_INVALID_PARAMETER. Split by family.
+    let mut v4: Vec<&str> = Vec::new();
+    let mut v6: Vec<&str> = Vec::new();
+    for s in servers {
+        match IpAddr::from_str(s) {
+            Ok(IpAddr::V4(_)) => v4.push(s),
+            Ok(IpAddr::V6(_)) => v6.push(s),
+            Err(_) => tracing::warn!("Ignoring invalid DNS server address: {}", s),
+        }
+    }
+
+    apply_interface_dns(guid, &v4, false)?;
+    apply_interface_dns(guid, &v6, true)?;
+
+    // Disable dynamic DNS registration for the mesh interface: registering this
+    // interface's address with the mesh DNS servers is pointless and only produces
+    // repeated failing DDNS attempts.
+    set_interface_registration(guid, false)?;
+    Ok(())
+}
+
+/// Enable or disable dynamic DNS (DDNS) registration of the interface's addresses.
+#[cfg(windows)]
+fn set_interface_registration(guid: windows::core::GUID, enabled: bool) -> Result<(), String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+        DNS_SETTING_REGISTRATION_ENABLED,
+    };
+
+    let settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: DNS_SETTING_REGISTRATION_ENABLED as u64,
+        RegistrationEnabled: if enabled { 1 } else { 0 },
+        ..Default::default()
+    };
+
+    call_set_interface_dns_settings(guid, &settings as *const _)
+        .map_err(|e| format!("SetInterfaceDnsSettings (registration): {}", e))
+}
+
+/// Set the nameserver list for a single address family on the interface.
+/// `ipv6` selects the DNS_SETTING_IPV6 flag. No-op for an empty list.
+#[cfg(windows)]
+fn apply_interface_dns(guid: windows::core::GUID, addrs: &[&str], ipv6: bool) -> Result<(), String> {
+    use windows::core::PWSTR;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+        DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
+    };
+
+    if addrs.is_empty() {
+        return Ok(());
+    }
+
+    // Comma-separated, null-terminated UTF-16 nameserver list.
+    // Must stay alive for the duration of the call below.
+    let mut ns: Vec<u16> = addrs
+        .join(",")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut flags = DNS_SETTING_NAMESERVER as u64;
+    if ipv6 {
+        flags |= DNS_SETTING_IPV6 as u64;
+    }
+
+    let settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: flags,
+        NameServer: PWSTR(ns.as_mut_ptr()),
+        ..Default::default()
+    };
+
+    call_set_interface_dns_settings(guid, &settings as *const _)
+        .map_err(|e| format!("SetInterfaceDnsSettings (ipv6={}): {}", ipv6, e))
+}

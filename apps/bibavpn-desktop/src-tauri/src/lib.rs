@@ -1975,17 +1975,24 @@ async fn pick_installed_package_cmd() -> Result<Option<String>, String> {
 
 #[tauri::command]
 async fn measure_server_rtt_cmd(state: State<'_, AppState>) -> Result<Option<u32>, String> {
-    let target = {
+    let (mesh_endpoint, target) = {
         let g = lock_inner(&state.inner);
         let Some(p) = g.cfg.active_profile() else {
             return Ok(None);
         };
-        let server = p.server.trim();
-        if server.is_empty() {
-            return Ok(None);
+        if p.yb_mesh_enabled {
+            (Some(p.yb_mesh_endpoint.clone()), None)
+        } else {
+            let server = p.server.trim();
+            if server.is_empty() {
+                return Ok(None);
+            }
+            (None, parse_server_tcp_target(server))
         }
-        parse_server_tcp_target(server)
     };
+    if let Some(endpoint) = mesh_endpoint {
+        return Ok(bibavpn::yb_mesh::active_mesh_rtt(&endpoint).await);
+    }
     let Some((host, port)) = target else {
         return Ok(None);
     };

@@ -26,6 +26,7 @@ fn decoy_base_interval_secs(configured: u64) -> u64 {
 }
 
 pub struct DecoyConfig {
+    pub route: crate::yb_mesh::ServerRoute,
     pub server_host: String,
     pub server_port: u16,
     pub sni: String,
@@ -124,10 +125,7 @@ pub async fn run_decoy_gets_loop(
         );
 
         let run = async {
-            let tcp = crate::outbound_protect::tcp_connect_host_protected(
-                &cfg.server_host,
-                cfg.server_port,
-            )
+            let tcp = cfg.route.connect(&cfg.server_host, cfg.server_port)
             .await
             .context("decoy tcp")?;
             let mut tls = connector
@@ -203,10 +201,9 @@ pub async fn run_one_decoy_get(cfg: &DecoyConfig) {
         cfg.mode,
     );
     let run = async {
-        let tcp =
-            crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
-                .await
-                .context("idle decoy tcp")?;
+        let tcp = cfg.route.connect(&cfg.server_host, cfg.server_port)
+        .await
+        .context("idle decoy tcp")?;
         let mut tls = connector
             .connect(domain, tcp)
             .await

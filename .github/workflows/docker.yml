@@ -1,9 +1,10 @@
-# Builds multi-arch Docker images for bibavpn-server and bibavpn-client and
+# Builds multi-arch Docker images for the server, client, and mesh sidecar and
 # pushes them to Docker Hub.
 #
 # Images:
 #   docker.io/eljaja/bibavpn-server
 #   docker.io/eljaja/bibavpn-client
+#   docker.io/eljaja/bibavpn-yb-mesh
 #
 # Tagging:
 #   - push to main                 → :latest, :main, :sha-<short>
@@ -14,7 +15,7 @@
 #   DOCKERHUB_USERNAME  — e.g. eljaja
 #   DOCKERHUB_TOKEN     — a Docker Hub Personal Access Token with Read+Write
 #                         scope on the eljaja/bibavpn-server and
-#                         eljaja/bibavpn-client repositories.
+#                         eljaja/bibavpn-client and eljaja/bibavpn-yb-mesh repositories.
 #
 # Forks: this workflow only pushes when the event runs on the original
 # repository (i.e. where the secrets exist).
@@ -35,8 +36,11 @@ on:
       - "!bibavpn/**/*.md"
       - "biba/**"
       - "!biba/**/*.md"
+      - "mash/**"
       - "docker/Dockerfile.server"
       - "docker/Dockerfile.client"
+      - "docker/Dockerfile.yb-mesh"
+      - "docker/yb-mesh-entrypoint.sh"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -69,6 +73,7 @@ jobs:
         with:
           filters: |
             server:
+              - 'mash/**'
               - 'bibavpn/**'
               - '!bibavpn/**/*.md'
               - 'biba/**'
@@ -82,6 +87,7 @@ jobs:
               - 'docker-compose.bibavpn-check.yml'
               - '.github/workflows/docker.yml'
             client:
+              - 'mash/**'
               - 'bibavpn/**'
               - '!bibavpn/**/*.md'
               - 'biba/**'
@@ -94,26 +100,43 @@ jobs:
               - 'docker-compose.hub.yml'
               - 'docker-compose.bibavpn-check.yml'
               - '.github/workflows/docker.yml'
+            mesh:
+              - 'mash/**'
+              - 'bibavpn/**'
+              - '!bibavpn/**/*.md'
+              - 'biba/**'
+              - '!biba/**/*.md'
+              - 'docker/Dockerfile.yb-mesh'
+              - 'docker/yb-mesh-entrypoint.sh'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/docker.yml'
 
       - name: Plan matrix (which images to build)
         id: plan
         env:
           FILTER_SERVER: ${{ steps.filter.outputs.server }}
           FILTER_CLIENT: ${{ steps.filter.outputs.client }}
+          FILTER_MESH: ${{ steps.filter.outputs.mesh }}
         run: |
           set -euo pipefail
           build_server=false
           build_client=false
+          build_mesh=false
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             build_server=true
             build_client=true
+            build_mesh=true
           elif [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             build_server=true
             build_client=true
+            build_mesh=true
           else
             if [ "${FILTER_SERVER:-}" = "true" ]; then build_server=true; fi
             if [ "${FILTER_CLIENT:-}" = "true" ]; then build_client=true; fi
+            if [ "${FILTER_MESH:-}" = "true" ]; then build_mesh=true; fi
           fi
 
           matrix='[]'
@@ -122,6 +145,9 @@ jobs:
           fi
           if [ "$build_client" = true ]; then
             matrix=$(echo "$matrix" | jq -c '. + [{"name":"client","image":"eljaja/bibavpn-client","dockerfile":"docker/Dockerfile.client"}]')
+          fi
+          if [ "$build_mesh" = true ]; then
+            matrix=$(echo "$matrix" | jq -c '. + [{"name":"mesh","image":"eljaja/bibavpn-yb-mesh","dockerfile":"docker/Dockerfile.yb-mesh"}]')
           fi
 
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -173,6 +199,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=mesh,enable=${{ matrix.name == 'server' && github.ref == 'refs/heads/main' }}
             type=sha,format=short
             type=raw,value=manual-${{ github.run_id }},enable=${{ github.event_name == 'workflow_dispatch' }}
 

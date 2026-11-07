@@ -68,6 +68,12 @@ fn default_tls_stack_str() -> String {
     "rustls".to_string()
 }
 
+/// Optional route to the same server through Yggdrasil.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct YbMeshInvite {
+    pub endpoint: String,
+}
+
 /// Wire payload after decryption (JSON).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InviteV1 {
@@ -75,6 +81,8 @@ pub struct InviteV1 {
     pub v: u8,
     /// Client `--server host:port` (reachable address).
     pub server: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yb_mesh: Option<YbMeshInvite>,
     /// TLS SNI and default WS trust name.
     pub sni: String,
     pub token: String,
@@ -401,6 +409,7 @@ mod tests {
         InviteV1 {
             v: 1,
             server: "203.0.113.7:8443".into(),
+            yb_mesh: None,
             sni: "vpn.example.com".into(),
             token: "tok".into(),
             proto: 3,

@@ -39,6 +39,8 @@ function AppInner() {
   /** @type {[null | { controlPlaneHost: string, vpnHost: string, displayName: string, serverName: string }, (v: null | object) => void]} */
   const [pendingImport, setPendingImport] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
+  const [meshBusy, setMeshBusy] = useState(false);
+  const [meshError, setMeshError] = useState("");
   /** В черновике настроек есть несохранённые правки (уход с вкладки без правок не ходит в бэкенд). */
   const [draftDirty, setDraftDirty] = useState(false);
   /**
@@ -313,6 +315,30 @@ function AppInner() {
     }
   }
 
+  async function handleToggleMesh(enabled) {
+    if (busy || meshBusy || sessionPending) return;
+    setMeshBusy(true);
+    setMeshError("");
+    try {
+      const cfg = await getEditConfig();
+      const profile = cfg.profiles.find((p) => p.id === cfg.active_profile_id);
+      if (!profile) throw new Error("Profile not found");
+      if (snap.connected) await disconnect();
+      profile.yb_mesh_enabled = enabled;
+      await saveCfg(cfg);
+      if (snap.connected) {
+        setTunnelHandshake(true);
+        const state = await connect();
+        if (state?.connected) setTunnelHandshake(false);
+      }
+    } catch (e) {
+      setTunnelHandshake(false);
+      setMeshError(String(e));
+    } finally {
+      setMeshBusy(false);
+    }
+  }
+
   if (!snap) {
     return (
       <div style={{ padding: 24, fontFamily: "IBM Plex Mono", color: "#6a7c78" }}>…</div>
@@ -385,13 +411,16 @@ function AppInner() {
       <ConnectScreen
         snap={snap}
         connectPending={connectPhasePending}
-        busy={busy}
+        busy={busy || meshBusy}
         cancelable={sessionPending}
         reconnecting={sessionPending && !tunnelHandshake}
         refresh={refresh}
         getTunnelStatus={getTunnelStatus}
         onSettings={() => goTab("settings")}
         onToggleConnect={handleToggleConnect}
+        onToggleMesh={handleToggleMesh}
+        meshBusy={meshBusy}
+        meshError={meshError}
         onClearError={clearError}
       />
     );

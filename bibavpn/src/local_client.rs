@@ -25,7 +25,7 @@ use crate::transport_capabilities::log_client_transport_caps;
 use crate::activity::ActivityTracker;
 use crate::client_tls_stream::ClientTlsStream;
 use crate::crypto_layer::{self, SessionCrypto};
-use crate::decoy_traffic::{run_one_decoy_get, spawn_decoy_gets, DecoyConfig};
+use crate::decoy_traffic::{run_decoy_gets_loop, run_one_decoy_get, DecoyConfig};
 use crate::desync;
 use crate::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
 use crate::http_connect;
@@ -288,6 +288,7 @@ async fn tcp_mux_open_stream_with_retry(
 /// User-facing options (CLI, JSON over JNI, etc.).
 #[derive(Clone, Debug)]
 pub struct LocalClientOptions {
+    pub yb_mesh_endpoint: Option<String>,
     pub server_host: String,
     pub server_port: u16,
     pub sni: String,
@@ -368,6 +369,7 @@ pub struct LocalClientOptions {
 
 #[derive(Clone)]
 struct ClientCfg {
+    route: crate::yb_mesh::ServerRoute,
     server_host: String,
     server_port: u16,
     sni: String,
@@ -426,6 +428,7 @@ struct ClientCfg {
 impl ClientCfg {
     fn udp_mux_config(&self) -> UdpMuxConfig {
         UdpMuxConfig {
+            route: self.route.clone(),
             server_host: self.server_host.clone(),
             server_port: self.server_port,
             sni: self.sni.clone(),
@@ -513,8 +516,11 @@ type SharedCrypto = Arc<SessionCrypto>;
 
 type ClientWs = WebSocketStream<ClientTlsStream>;
 
-async fn upgrade_client_tls(cfg: &ClientCfg, tcp: TcpStream) -> anyhow::Result<ClientTlsStream> {
-    desync::after_tcp_connect(&tcp, cfg.desync_mode, cfg.tcp_fooling).await?;
+async fn upgrade_client_tls(cfg: &ClientCfg, tcp: crate::yb_mesh::ServerStream) -> anyhow::Result<ClientTlsStream> {
+    if let crate::yb_mesh::ServerStream::Direct(ref stream) = tcp {
+        let _ = stream.set_nodelay(true);
+        desync::after_tcp_connect(stream, cfg.desync_mode, cfg.tcp_fooling).await?;
+    }
     desync::note_tls_fragment_requested(cfg.tls_fragment);
 
     match cfg.tls_stack {
@@ -560,10 +566,9 @@ async fn upgrade_client_tls(cfg: &ClientCfg, tcp: TcpStream) -> anyhow::Result<C
 async fn dial_outer_wss(cfg: &ClientCfg, log_context: &str) -> anyhow::Result<ClientWs> {
     let path = cfg.ws_path.clone();
     let tcp =
-        crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
+        cfg.route.connect(&cfg.server_host, cfg.server_port)
             .await
             .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
-    let _ = tcp.set_nodelay(true);
     let tls = upgrade_client_tls(cfg, tcp).await?;
 
     let ws_host = cfg.ws_host.as_deref().or(if cfg.reality_target.is_some() {
@@ -1065,7 +1070,13 @@ pub async fn run_local_client(
         "local client starting"
     );
 
+    let route = if let Some(endpoint) = opts.yb_mesh_endpoint.as_deref() {
+        let node = Arc::new(crate::yb_mesh::MeshNode::start(crate::yb_mesh::bootstrap_peers(), vec![]).await?);
+        crate::yb_mesh::ServerRoute::mesh(node, endpoint)?
+    } else { crate::yb_mesh::ServerRoute::Direct };
+
     let cfg = Arc::new(ClientCfg {
+        route,
         server_host: opts.server_host.clone(),
         server_port: opts.server_port,
         sni: crate::reality::effective_tls_sni(&opts.sni, opts.reality_target.as_deref()),
@@ -1130,8 +1141,9 @@ pub async fn run_local_client(
             .ws_accept_language
             .clone()
             .unwrap_or_else(|| DEFAULT_ACCEPT_LANGUAGE.to_string());
-        spawn_decoy_gets(
+        session.push_task(tokio::spawn(run_decoy_gets_loop(
             DecoyConfig {
+                route: cfg.route.clone(),
                 server_host: cfg.server_host.clone(),
                 server_port: cfg.server_port,
                 sni: cfg.sni.clone(),
@@ -1145,7 +1157,7 @@ pub async fn run_local_client(
                 mode: cfg.decoy_mode,
             },
             shutdown.clone(),
-        );
+        )));
     }
 
     if let Some(ref act) = cfg.activity {
@@ -1160,6 +1172,7 @@ pub async fn run_local_client(
                 .clone()
                 .unwrap_or_else(|| DEFAULT_ACCEPT_LANGUAGE.to_string());
             let decoy = DecoyConfig {
+                route: cfg.route.clone(),
                 server_host: cfg.server_host.clone(),
                 server_port: cfg.server_port,
                 sni: cfg.sni.clone(),
@@ -1222,6 +1235,11 @@ pub async fn run_local_client(
                 }
             })?;
         info!(target: "bibavpn_client", "remote multiplexed WSS ready");
+    } else if opts.yb_mesh_endpoint.is_some() {
+        // Require the same remote handshake before announcing a non-mux mesh session.
+        timeout(Duration::from_secs(30), prepare_mux_connection(&cfg))
+            .await
+            .context("mesh startup handshake timed out")??;
     }
 
     let socks_listener = TcpListener::bind(&opts.socks_bind)
@@ -2230,6 +2248,7 @@ mod session_shutdown_tests {
         http_bind: SocketAddr,
     ) -> LocalClientOptions {
         LocalClientOptions {
+            yb_mesh_endpoint: None,
             server_host: "127.0.0.1".into(),
             server_port: 1,
             sni: "localhost".into(),
@@ -2528,6 +2547,7 @@ mod http_split_bypass_tests {
         })
         .expect("tls");
         Arc::new(ClientCfg {
+            route: crate::yb_mesh::ServerRoute::Direct,
             server_host: "127.0.0.1".into(),
             server_port: 1,
             sni: "localhost".into(),

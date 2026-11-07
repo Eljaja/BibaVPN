@@ -3,6 +3,8 @@
 /** @type {Record<Lang, Record<string, string>>} */
 const MESSAGES = {
   ru: {
+    mesh_toggle: "biba://mash",
+    mesh_missing_endpoint: "В ключе этого сервера нет адреса mesh",
     app_title: "BibaVPN",
     settings_aria: "Настройки",
     back_aria: "Назад",
@@ -159,6 +161,8 @@ const MESSAGES = {
     connect_stat_down: "вниз",
   },
   en: {
+    mesh_toggle: "biba://mash",
+    mesh_missing_endpoint: "This server's invite has no mesh address",
     app_title: "BibaVPN",
     settings_aria: "Settings",
     back_aria: "Back",

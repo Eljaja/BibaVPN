@@ -1,0 +1,125 @@
+# Yggdrasil configuration file
+#
+# This is a TOML configuration file for the Yggdrasil mesh network daemon.
+# Documentation: https://yggdrasil-network.github.io/
+
+# Your private key. DO NOT share this with anyone!
+# This is a hex-encoded Ed25519 keypair (64 bytes = 128 hex characters).
+# Delete this line and restart to generate a new identity.
+private_key = "{{PRIVATE_KEY}}"
+
+# List of connection strings for outbound peer connections in URI format.
+# Supported schemes: tcp://, tls://
+# You can find public peers at https://publicpeers.neilalexander.dev/
+#
+# Optional query parameters:
+#   key=HEX          - pin the remote peer's public key (connection fails if mismatch)
+#   password=SECRET  - shared password, must match the listener side (max 64 chars)
+#   priority=N       - connection priority 0-255, lower = preferred when multiple
+#                      connections exist to the same peer (default: 0)
+#   maxbackoff=DUR   - max reconnect wait if peer goes offline, e.g. 30s, 5m, 1h
+#                      (default: 4096s ≈ 68 min, minimum: 5s)
+#   sni=HOSTNAME     - override TLS SNI hostname, useful when connecting via IP
+#                      or through a reverse proxy (TLS only)
+#
+# Examples:
+#   "tcp://192.0.2.1:12345"
+#   "tls://peer.example.com:443?maxbackoff=30s&key=abcdef01..."
+#   "tls://203.0.113.5:2096?sni=peer.example.com&password=s3cr3t"
+peers = []
+
+# Listen addresses for inbound connections. You'll need to add port
+# forwarding for these ports if you are behind a NAT/firewall.
+# Supported schemes: tcp://, tls://
+#
+# Optional query parameters:
+#   password=SECRET  - require a shared password from connecting peers (max 64 chars)
+#
+# Examples:
+#   "tcp://[::]:12345"
+#   "tls://[::]:443?password=s3cr3t"
+listen = ["tcp://0.0.0.0:0"]
+
+# Listen address for the admin socket.
+# This is used by yggdrasil to query and control the node by default.
+# Uncomment the line below and set `admin_listen = ""` to disable the admin socket.
+# admin_listen = "tcp://localhost:9001"
+
+# Name of the TUN interface to use.
+# "auto" = automatically assign a name.
+# "none" = disable the TUN interface (useful for router-only nodes).
+if_name = "auto"
+
+# Maximum Transmission Unit (MTU) for the TUN interface.
+if_mtu = 65535
+
+# DNS servers to assign to the TUN interface (Windows only). Useful when you use
+# DNS servers inside the Yggdrasil network. Ignored on other platforms.
+# if_dns_servers = ["308:84:68:55::", "308:62:45:62::"]
+
+# Closed-network group password. When set, this node only establishes encrypted
+# sessions with peers that use the EXACT same password, turning the mesh into a
+# private closed network. Every member must share the same value;
+# empty = open network. This is independent of the per-peer/per-multicast
+# `password` above, which only authenticates direct links.
+# group_password = ""
+
+# Custom node info that is advertised to other nodes.
+# This can be any TOML table, e.g. { name = "my-node", location = "earth" }
+[node_info]
+
+# If true, your node_info will not be visible to other nodes.
+# node_info_privacy = false
+
+# List of allowed public keys (hex-encoded). If non-empty, only peers with
+# these public keys will be allowed to connect. Leave empty to allow all peers.
+# allowed_public_keys = []
+
+# Multicast peer discovery — automatically finds and connects to nearby nodes
+# on the local network without manual configuration.
+#
+# Each entry controls which network interfaces participate in discovery.
+# Multiple entries can be added to apply different settings per interface.
+#
+# filter   - glob pattern to match interface names, e.g. "eth*", "en*", "*" (default: "*")
+# beacon   - advertise this node's presence on matching interfaces (default: true)
+# listen   - connect to other nodes discovered on matching interfaces (default: true)
+# port     - TLS listener port for this interface, 0 = auto-assign (default: 0)
+# priority - connection priority for peers found on this interface (0-255, lower = preferred),
+#            used when the same peer is reachable via multiple connections
+# password - shared password for discovery; only nodes with the same password
+#            will discover each other on this interface (default: none)
+[[multicast_interfaces]]
+filter = "*"
+beacon = true
+listen = true
+# port = 0
+# priority = 0
+# password = ""
+
+# Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the Yggdrasil mesh.
+# Bare IPv4/IPv6 addresses without prefix are also accepted (/32 and /128 respectively;
+# applies to ~ and ! prefixed entries too)
+# ‘~’ prefix means CKR tunnels without system routes. "inetv4"/"~inetv4" and
+# "inetv6"/"~inetv6" expand to internet prefixes excluding internal networks.
+# "!" excludes range from CKR, (e.g., "!142.250.109.0/24") for both normal
+# and "~" prefixed includes. No "!inetv4" or "!inetv6" are supported.
+# [tunnel_routing]
+# enable = true
+# yggdrasil_routing = true
+# install_system_routes = true  # Automatically install system routing table entries for CKR.
+# ip_addresses = [ "10.99.0.1/24", "2005:8a:9:11::3/64" ]  # IPs for the TUN (VPN use)
+# [tunnel_routing.remote_subnets]
+# "peer_public_key_hex" = ["10.99.0.0/24", "fd03:1:2:3::/64", "~inetv4", "inetv6", "!172.16.0.0/12"]
+
+# Built-in stateful firewall. Default policy when enabled: drop inbound
+# from the mesh unless it's a reply to outbound traffic, comes from a
+# whitelisted source subnet, or hits an explicitly opened port. Outbound
+# is always allowed. Default off so servers reachable only via Yggdrasil
+# keep working after upgrade.
+[firewall]
+enable = false
+open_tcp = [22, 80, 443]
+open_udp = [53]
+# open_all_for = ["200:abcd:1234::/48"]   # trusted friend subnets
+allow_icmp_echo = true

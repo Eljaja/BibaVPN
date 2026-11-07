@@ -68,9 +68,20 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .or_else(|| Some("default".to_string()));
 
+    let pin_cert_pem = std::env::var_os("INVITE_PIN_CERT_FILE")
+        .map(|path| std::fs::read_to_string(path).context("read INVITE_PIN_CERT_FILE"))
+        .transpose()?;
+    if pin_cert_pem.as_ref().is_some_and(|pem| pem.trim().is_empty()) {
+        anyhow::bail!("INVITE_PIN_CERT_FILE is empty");
+    }
+
     let invite = InviteV1 {
         v: 1,
         server: public,
+        yb_mesh: std::env::var("BIBA_YB_MESH_ENDPOINT").ok().filter(|s| !s.trim().is_empty()).map(|endpoint| {
+            bibavpn::yb_mesh::parse_endpoint(&endpoint)?;
+            Ok::<_, anyhow::Error>(bibavpn::invite_uri::YbMeshInvite { endpoint })
+        }).transpose()?,
         sni,
         token,
         proto,
@@ -87,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         udp_max_pad: None,
         udp_max_ws_binary: None,
         udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-        insecure: std::env::var("BIBA_INVITE_INSECURE").map(|v| v != "false" && v != "0").unwrap_or(true),
+        insecure: pin_cert_pem.is_none() && std::env::var("BIBA_INVITE_INSECURE").map(|v| v != "false" && v != "0").unwrap_or(true),
         tls_profile: "default".into(),
         ws_path: Some(ws_path),
         pad_mode: Some("random".into()),
@@ -119,7 +130,7 @@ fn main() -> anyhow::Result<()> {
         reality_target: std::env::var("INVITE_REALITY_TARGET").ok().filter(|s| !s.trim().is_empty()),
         reality_public_key: std::env::var("INVITE_REALITY_PUBLIC_KEY").ok().filter(|s| !s.trim().is_empty()),
         reality_short_id: std::env::var("INVITE_REALITY_SHORT_ID").ok().filter(|s| !s.trim().is_empty()),
-        pin_cert_pem: None,
+        pin_cert_pem,
         server_ack_delay_min_ms: None,
         server_ack_delay_max_ms: None,
         rtt_mask_jitter_ms: None,

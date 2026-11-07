@@ -1,0 +1,114 @@
+[package]
+name = "yggdrasil"
+version = "0.3.2"
+edition = "2024"
+description = "Yggdrasil mesh networking service"
+license = "MPL-2.0"
+
+[[bin]]
+name = "yggdrasil"
+path = "src/main.rs"
+
+[lib]
+name = "yggdrasil"
+path = "src/lib.rs"
+
+[dependencies]
+ironwood = { path = "../ironwood" }
+# Used only for the startup crypto-backend log line. Resolves to the SIMD fork
+# (crates/salsa20-simd) via the workspace [patch.crates-io]; active_backend() is
+# a fork-only helper.
+salsa20 = "0.10"
+tokio = { version = "1", features = ["full"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+rand = "0.8"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake2 = "0.11.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+time = { version = "0.3", features = ["macros", "local-offset"] }
+getopts = "0.2"
+toml = "1"
+toml_edit = "0.25"
+hex = "0.4"
+url = "2"
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.14.7"
+glob-match = "0.2"
+x509-parser = "0.18"
+socket2 = "0.6.5"
+getifaddrs = "0.6"
+rustc-hash = "2.1.3"
+arc-swap = "1.9"
+
+# Terminal width detection for the control commands' table output, pulled in by
+# the `ctl` feature.
+terminal_size = { version = "0.4", optional = true }
+
+# WebSocket (ws:// / wss://) transport, pulled in by the `ws` feature.
+tokio-tungstenite = { version = "0.30.0", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# QUIC (quic://) transport, pulled in by the `quic` feature. Default features
+# are disabled to drop the unused platform certificate verifier (jni,
+# security-framework, webpki roots, ...) from the build graph.
+quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+
+[features]
+default = ["ctl", "tun", "systemd", "ckr", "ws", "quic"]
+ctl = ["dep:terminal_size"]
+tun = ["dep:tun-rs"]
+ckr = ["dep:route_manager"]
+systemd = ["dep:sd-notify"]
+# ws costs ~300 KiB of binary size, quic ~1.2 MiB; slim builds (e.g. OpenWrt)
+# can drop either via --no-default-features with a hand-picked feature list.
+ws = ["dep:tokio-tungstenite", "dep:futures-util"]
+quic = ["dep:quinn"]
+
+[dependencies.ipnet]
+version = "2"
+
+# route_manager doesn't build on Android; system routes there are handled by VpnService.
+[target.'cfg(not(target_os = "android"))'.dependencies.route_manager]
+version = "0.2"
+optional = true
+
+[dependencies.tun-rs]
+version = "2.8.7"
+features = ["async_tokio"]
+optional = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.0"
+windows = { version = "0.62.2", features = ["Win32_NetworkManagement_IpHelper", "Win32_System_LibraryLoader", "Win32_Foundation"] }
+
+# Used only for portable ENOBUFS / EQFULL constants in tun write overflow detection.
+# Already present transitively via socket2/tun-rs; declaring it does not grow the graph.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# systemd readiness notification (Type=notify). Linux-only; pulled in by the
+# default `systemd` feature. Drop it for OpenWRT/minimal builds via
+# `--no-default-features`.
+[target.'cfg(target_os = "linux")'.dependencies.sd-notify]
+version = "0.5.0"
+optional = true
+
+[package.metadata.deb]
+name = "yggdrasil-ng"
+maintainer = "Revertron"
+section = "net"
+priority = "optional"
+depends = "$auto, systemd"
+conflicts = "yggdrasil"
+conf-files = ["/etc/yggdrasil/yggdrasil.toml"]
+maintainer-scripts = "../../contrib/deb"
+assets = [
+    ["target/release/yggdrasil", "usr/bin/yggdrasil", "755"],
+    ["../../contrib/systemd/yggdrasil.service", "lib/systemd/system/yggdrasil.service", "644"],
+    ["../../contrib/systemd/yggdrasil.sysusers", "usr/lib/sysusers.d/yggdrasil.conf", "644"],
+]

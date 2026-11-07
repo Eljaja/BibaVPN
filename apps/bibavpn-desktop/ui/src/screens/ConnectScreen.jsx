@@ -5,7 +5,7 @@ import { SEMANTIC, MONO, SANS } from "../theme.js";
 import { StatusDot } from "../ui/primitives.jsx";
 import { t } from "../i18n.js";
 import { getActiveProfile } from "../profileUtils.js";
-import { isDocumentHidden } from "../visibility.js";
+import { startVisiblePolling } from "../visiblePolling.js";
 
 /** Длительность сессии с момента перехода в connected (локальные часы). */
 function formatSessionUptime(elapsedMs) {
@@ -56,66 +56,54 @@ function ConnectStats({ snap, getTunnelStatus, refresh }) {
   useEffect(() => {
     if (!connected || !backendUptime) return;
     let cancelled = false;
-    let inFlight = false;
     async function refreshUptime() {
-      if (cancelled || inFlight || isDocumentHidden()) return;
-      inFlight = true;
-      try {
-        const status = await getTunnelStatus();
-        if (cancelled) return;
-        if (status?.connected) {
-          if (typeof status.vpnSessionUptimeSecs === "number") {
-            setBackendUptimeSecs(status.vpnSessionUptimeSecs);
-          }
-        } else if (status && status.connected === false) {
-          // Туннель действительно упал — синхронизируем полный snapshot один раз.
-          // `null` означает ошибку IPC: не дёргаем `get_state` каждую секунду.
-          setBackendUptimeSecs(null);
-          await refresh();
+      const status = await getTunnelStatus();
+      if (cancelled) return;
+      if (status?.connected) {
+        if (typeof status.vpnSessionUptimeSecs === "number") {
+          setBackendUptimeSecs(status.vpnSessionUptimeSecs);
         }
-      } finally {
-        inFlight = false;
+      } else if (status && status.connected === false) {
+        setBackendUptimeSecs(null);
+        await refresh();
       }
     }
-    refreshUptime();
-    const id = window.setInterval(refreshUptime, 1000);
+    const stop = startVisiblePolling({ task: refreshUptime, intervalMs: 1000 });
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      stop();
     };
   }, [connected, backendUptime, refresh, getTunnelStatus]);
 
   useEffect(() => {
     if (!connected || sessionStartedAt == null) return;
-    const id = window.setInterval(() => {
-      // В фоне не тикаем: после возврата elapsed всё равно считается от Date.now().
-      if (isDocumentHidden()) return;
-      setTick((x) => x + 1);
-    }, 1000);
-    return () => window.clearInterval(id);
+    return startVisiblePolling({ task: () => setTick((x) => x + 1), intervalMs: 1000 });
   }, [connected, sessionStartedAt]);
+
+  useEffect(() => {
+    if (!connected || backendUptime) return;
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [connected, backendUptime, refresh]);
 
   useEffect(() => {
     if (!connected) return;
     let cancelled = false;
-    let inFlight = false;
     async function probe() {
-      if (cancelled || inFlight || isDocumentHidden()) return;
-      inFlight = true;
       try {
         const v = await invoke("measure_server_rtt_cmd");
         if (!cancelled) setRttMs(typeof v === "number" ? v : null);
       } catch {
         if (!cancelled) setRttMs(null);
-      } finally {
-        inFlight = false;
       }
     }
-    probe();
-    const id = window.setInterval(probe, 30000);
+    const stop = startVisiblePolling({ task: probe, intervalMs: 30000 });
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      stop();
     };
   }, [connected]);
 
@@ -202,6 +190,9 @@ export function ConnectScreen({
   getTunnelStatus,
   onSettings,
   onToggleConnect,
+  onToggleMesh,
+  meshBusy,
+  meshError,
   onClearError,
 }) {
   const { theme, accent } = useT();
@@ -217,6 +208,8 @@ export function ConnectScreen({
         : "idle";
 
   const profile = getActiveProfile(snap.cfg);
+  const meshEnabled = Boolean(profile?.yb_mesh_enabled);
+  const meshDisabled = busy || meshBusy || connectPending || (!profile?.yb_mesh_endpoint && !meshEnabled);
   const ringColor =
     cs === "connected"
       ? accent.hex
@@ -254,7 +247,8 @@ export function ConnectScreen({
   const canTap = snap.connected || cancelable || snap.canConnect;
   const tapDisabled = !canTap || busy;
 
-  const subtitle = snap.connected ? snap.displayHost : t("status_sub_disconnected");
+  const serverName = profile?.yb_mesh_enabled ? (profile.name || snap.displayHost) : snap.displayHost;
+  const subtitle = snap.connected ? serverName : t("status_sub_disconnected");
 
   const inviteMode = Boolean(profile?.has_invite);
   const serverMismatch =
@@ -460,6 +454,33 @@ export function ConnectScreen({
 
         <button
           type="button"
+          aria-pressed={meshEnabled}
+          disabled={meshDisabled}
+          onClick={() => onToggleMesh(!meshEnabled)}
+          style={{
+            alignSelf: "center",
+            minWidth: 112,
+            minHeight: 44,
+            padding: "10px 20px",
+            border: `1px solid ${meshEnabled ? theme.text : theme.line}`,
+            borderRadius: 4,
+            background: meshEnabled ? theme.text : theme.panel,
+            color: meshEnabled ? theme.panel : theme.textDim,
+            fontFamily: SANS,
+            fontSize: 14,
+            fontWeight: 500,
+            cursor: meshDisabled ? "not-allowed" : "pointer",
+            opacity: meshDisabled ? 0.55 : 1,
+            transition: "background 160ms ease, color 160ms ease, border-color 160ms ease",
+          }}
+        >
+          {t("mesh_toggle")}
+        </button>
+        {!profile?.yb_mesh_endpoint && <div style={{ alignSelf: "center", color: theme.textDim, fontFamily: SANS, fontSize: 12 }}>{t("mesh_missing_endpoint")}</div>}
+        {meshError && <div role="alert" style={{ alignSelf: "center", color: SEMANTIC.err, fontFamily: SANS, fontSize: 12 }}>{meshError}</div>}
+
+        <button
+          type="button"
           onClick={onSettings}
           style={{
             alignSelf: "center",
@@ -487,7 +508,7 @@ export function ConnectScreen({
             {t("server_label")}
           </div>
           <div style={{ fontFamily: SANS, fontSize: 16, fontWeight: 500 }}>
-            {snap.displayHost}
+            {serverName}
           </div>
           <div
             style={{

@@ -370,6 +370,7 @@ fn spawn_udp_mux_ping<S>(
 /// Config snapshot for opening a UDP-mux WebSocket (mirrors `local_client::ClientCfg` mux fields).
 #[derive(Clone)]
 pub struct UdpMuxConfig {
+    pub route: crate::yb_mesh::ServerRoute,
     pub server_host: String,
     pub server_port: u16,
     pub sni: String,
@@ -553,7 +554,7 @@ async fn connect_udp_mux_ws_resilient(
     cfg: &UdpMuxConfig,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<(
-    WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    WebSocketStream<tokio_rustls::client::TlsStream<crate::yb_mesh::ServerStream>>,
     SharedCrypto,
 )> {
     let mut streak = 0u32;
@@ -621,7 +622,7 @@ fn short_hash8(s: &str) -> String {
 async fn connect_udp_mux_ws(
     cfg: &UdpMuxConfig,
 ) -> anyhow::Result<(
-    WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    WebSocketStream<tokio_rustls::client::TlsStream<crate::yb_mesh::ServerStream>>,
     SharedCrypto,
 )> {
     anyhow::ensure!(
@@ -633,10 +634,9 @@ async fn connect_udp_mux_ws(
         "Biba v3 UDP mux requires --psk (or invite psk)"
     );
     let tcp =
-        crate::outbound_protect::tcp_connect_host_protected(&cfg.server_host, cfg.server_port)
+        cfg.route.connect(&cfg.server_host, cfg.server_port)
             .await
             .with_context(|| format!("connect server {}:{}", cfg.server_host, cfg.server_port))?;
-    let _ = tcp.set_nodelay(true);
     let domain = ServerName::try_from(cfg.sni.clone())?;
     let connector = tokio_rustls::TlsConnector::from(cfg.tls.clone());
     let tls = connector.connect(domain, tcp).await.context("tls")?;
@@ -1329,6 +1329,7 @@ mod tests {
 
     fn test_udp_mux_cfg(ws_ping_secs: u64) -> UdpMuxConfig {
         UdpMuxConfig {
+            route: crate::yb_mesh::ServerRoute::Direct,
             server_host: "127.0.0.1".into(),
             server_port: 1,
             sni: "localhost".into(),

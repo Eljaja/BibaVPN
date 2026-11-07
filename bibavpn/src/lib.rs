@@ -38,6 +38,7 @@ pub mod server_limits;
 pub mod server_metrics;
 pub mod transport_capabilities;
 pub mod udp_mux;
+pub mod yb_mesh;
 pub mod ws_auth;
 pub mod ws_bridge;
 

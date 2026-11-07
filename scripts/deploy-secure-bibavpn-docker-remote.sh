@@ -12,6 +12,8 @@ cd "$ROOT"
 
 DEPLOY_VPS_IP="${DEPLOY_VPS_IP:?set DEPLOY_VPS_IP}"
 DEPLOY_PORT="${DEPLOY_PORT:-19843}"
+BIBA_YB_MESH="${BIBA_YB_MESH:-0}"
+[[ "$BIBA_YB_MESH" == 0 || "$BIBA_YB_MESH" == 1 ]] || { echo 'BIBA_YB_MESH must be 0 or 1' >&2; exit 1; }
 
 # Prefer RSA; override with SSH_IDENTITY=/path/to/key
 if [[ -z "${SSH_IDENTITY:-}" ]]; then
@@ -51,13 +53,19 @@ fi
 export DOCKER_BUILDKIT=1
 echo "== [1/3] Building image (Rust release can take 5–15 min, output follows) =="
 docker build --progress=plain -f docker/Dockerfile.server -t bibavpn-server:secure "$ROOT"
+if [[ "$BIBA_YB_MESH" == 1 ]]; then
+  docker build --progress=plain -f docker/Dockerfile.yb-mesh -t bibavpn-yb-mesh "$ROOT"
+fi
 echo "== [2/3] Piping image to $DEPLOY_VPS_IP: docker save | ssh docker load (no huge local .tar) =="
 "${SCP[@]}" "$ROOT/scripts/install-bibavpn-docker-secure.sh" "root@${DEPLOY_VPS_IP}:/tmp/install-bibavpn-docker-secure.sh"
 docker save bibavpn-server:secure | "${SSH[@]}" "docker load"
+if [[ "$BIBA_YB_MESH" == 1 ]]; then
+  docker save bibavpn-yb-mesh | "${SSH[@]}" "docker load"
+fi
 
 echo "== [3/3] Running install on server =="
 "${SSH[@]}" "chmod +x /tmp/install-bibavpn-docker-secure.sh && \
-  DEPLOY_VPS_IP=${DEPLOY_VPS_IP} DEPLOY_PORT=${DEPLOY_PORT} BIBAVPN_IMAGE=bibavpn-server:secure \
+  DEPLOY_VPS_IP=${DEPLOY_VPS_IP} DEPLOY_PORT=${DEPLOY_PORT} BIBAVPN_IMAGE=bibavpn-server:secure BIBA_YB_MESH=${BIBA_YB_MESH} \
   bash /tmp/install-bibavpn-docker-secure.sh && rm -f /tmp/install-bibavpn-docker-secure.sh"
 
 echo "Done."
