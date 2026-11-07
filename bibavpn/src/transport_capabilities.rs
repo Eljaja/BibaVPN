@@ -221,6 +221,7 @@ mod tests {
         reality_public_key: Option<[u8; 32]>,
     ) -> LocalClientOptions {
         LocalClientOptions {
+            yb_mesh_endpoint: None,
             server_host: "example.com".into(),
             server_port: 8443,
             sni: "example.com".into(),

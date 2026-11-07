@@ -444,6 +444,10 @@ async fn main() -> anyhow::Result<()> {
         let invite = InviteV1 {
             v: 1,
             server: public.clone(),
+            yb_mesh: std::env::var("BIBA_YB_MESH_ENDPOINT").ok().filter(|s| !s.trim().is_empty()).map(|endpoint| {
+            bibavpn::yb_mesh::parse_endpoint(&endpoint)?;
+            Ok::<_, anyhow::Error>(bibavpn::invite_uri::YbMeshInvite { endpoint })
+        }).transpose()?,
             sni,
             token: token.clone(),
             proto: 3,

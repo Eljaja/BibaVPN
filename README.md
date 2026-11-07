@@ -69,6 +69,28 @@ bash start.sh
 You need an invitation from a server administrator. To run your own server, follow the next section.
 
 
+### Optional Yggdrasil mesh transport
+
+For a server without mesh, run `bash start.sh` to pull the prebuilt server image and print an invitation. The script saves its generated secrets in `.biba-start.env`; keep this file private. Each run replaces the server credentials.
+
+Pull and start the mesh-compatible server and mesh sidecar with a persistent Yggdrasil identity. The encrypted invitation includes its mesh address:
+
+```bash
+BIBA_INVITE_PUBLIC="your-server.example:8443" BIBA_INVITE_SNI="your-server.example" bash start.sh --mesh
+```
+
+`BIBA_YB_MESH=1 bash start.sh` is equivalent. Use `--no-mesh` to disable the sidecar. `BIBA_SERVER_IMAGE` and `BIBA_MESH_IMAGE` can override the image names. Mesh mode requires the published `eljaja/bibavpn-server:mesh` and `eljaja/bibavpn-yb-mesh:latest` images; these are published by the Docker workflow after the mesh changes reach the main branch.
+
+Import the new invitation into an updated client and enable **biba://mash** on the connection screen. The setting belongs to the selected profile and is off by default. The server's `yb-mesh-data` Docker volume contains its identity: keep that volume when updating, since replacing it changes the mesh address and requires a new invitation. The sidecar shares the server container's network namespace and forwards its mesh port to the existing TLS listener; it needs no TUN device or inbound Yggdrasil port.
+
+The client attempts several public TCP/TLS peers concurrently through Yggdrasil's reconnect logic. Available peers carry traffic and the mesh determines the route; this does not benchmark or guarantee the fastest route. There is no automatic fallback to the server's public address when mesh fails. For a custom client peer list, set `BIBA_YB_MESH_PEERS` to comma-separated TCP/TLS peer URLs in the client's environment. Public peers are third-party infrastructure, may disappear, and can observe the connection metadata of their direct links.
+
+For existing deployments that mint invitations separately, set `BIBA_YB_MESH_ENDPOINT` to the sidecar address and port (for example `[201:…]:8443`) when running `bibavpn-server --print-invite-uri` or `bibavpn-mint-invite`. This does not install or start the sidecar by itself.
+
+When minting an invitation with `bibavpn-mint-invite` for a self-signed server, set `INVITE_PIN_CERT_FILE` to the server certificate PEM to include the pin in the encrypted invitation. The sidecar forwards mesh port 8443 to port 8443 by default; set `BIBA_YB_MESH_FORWARD_PORT` on the sidecar if the existing server listens on a different port.
+
+The secure Docker installer also accepts `BIBA_YB_MESH=1`. When using `scripts/deploy-secure-bibavpn-docker-remote.sh`, this additionally builds and transfers the sidecar image; when running `scripts/install-bibavpn-docker-secure.sh` directly on the VPS, load the `bibavpn-yb-mesh` image first. As with the existing installer, rerunning it replaces server credentials and certificates.
+
 ## How it works
 
 ```text

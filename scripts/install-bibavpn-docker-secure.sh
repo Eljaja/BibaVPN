@@ -6,12 +6,19 @@ set -euo pipefail
 
 BIBAVPN_IMAGE="${BIBAVPN_IMAGE:-bibavpn-server:secure}"
 DEPLOY_PORT="${DEPLOY_PORT:-19843}"
+BIBA_YB_MESH="${BIBA_YB_MESH:-0}"
+if [[ "$BIBA_YB_MESH" == 1 ]]; then
+  docker image inspect bibavpn-yb-mesh >/dev/null
+  mesh_address="$(docker run --rm --network none -v bibavpn-yb-mesh-data:/data bibavpn-yb-mesh init)"
+  BIBA_YB_MESH_ENDPOINT="[${mesh_address}]:8443"
+fi
 if [[ -z "${DEPLOY_VPS_IP:-}" ]]; then
   DEPLOY_VPS_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 fi
 : "${DEPLOY_VPS_IP:?set DEPLOY_VPS_IP to this host public IP or name}"
 
 DIR="/opt/bibavpn"
+docker rm -f bibavpn-yb-mesh 2>/dev/null || true
 docker rm -f bibavpn bibavpn-temp 2>/dev/null || true
 mkdir -p "$DIR" && chmod 700 "$DIR"
 cd "$DIR"
@@ -38,6 +45,7 @@ fi
 run_invite_server() {
   exec docker run -i --name bibavpn-temp \
     -e RUST_LOG=off \
+    -e BIBA_YB_MESH_ENDPOINT="${BIBA_YB_MESH_ENDPOINT:-}" \
     -v "$DIR:/data:ro" \
     "$BIBAVPN_IMAGE" \
     --listen "0.0.0.0:8443" \
@@ -102,6 +110,10 @@ printf '%s' "$BIBA_INVITE_PASSPHRASE" >"$DIR/invite.pass"
 chmod 600 "$DIR/invite.biba" "$DIR/invite.pass" 2>/dev/null || true
 
 run_long_server
+if [[ "$BIBA_YB_MESH" == 1 ]]; then
+  docker run -d --name bibavpn-yb-mesh --restart unless-stopped \
+    --network container:bibavpn -v bibavpn-yb-mesh-data:/data bibavpn-yb-mesh >/dev/null
+fi
 sleep 2
 docker ps --filter "name=bibavpn" --format '{{.Status}}'
 

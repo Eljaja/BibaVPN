@@ -27,6 +27,8 @@ pub struct PublicTunnelProfile {
     pub id: String,
     pub name: String,
     pub server: String,
+    pub yb_mesh_enabled: bool,
+    pub yb_mesh_endpoint: String,
     pub sni: String,
     pub insecure: bool,
     pub max_pad: u8,
@@ -109,6 +111,8 @@ pub fn to_public_profile(p: &TunnelProfile) -> PublicTunnelProfile {
         id: p.id.clone(),
         name: p.name.clone(),
         server: p.server.clone(),
+        yb_mesh_enabled: p.yb_mesh_enabled,
+        yb_mesh_endpoint: p.yb_mesh_endpoint.clone(),
         sni: p.sni.clone(),
         insecure: p.insecure,
         max_pad: p.max_pad,
@@ -262,6 +266,10 @@ pub struct TunnelProfile {
     pub name: String,
     pub server: String,
     #[serde(default)]
+    pub yb_mesh_enabled: bool,
+    #[serde(default)]
+    pub yb_mesh_endpoint: String,
+    #[serde(default)]
     pub token: String,
     #[serde(default)]
     pub psk: String,
@@ -409,6 +417,7 @@ pub const ANDROID_DEFAULT_SOCKS_BIND: &str = "127.0.0.1:1080";
 /// Copy decoded invite fields into a saved profile (UI + tunnel JSON hints).
 pub fn apply_invite_fields(p: &mut TunnelProfile, inv: &InviteV1) {
     p.server = inv.server.clone();
+    p.yb_mesh_endpoint = inv.yb_mesh.as_ref().map(|m| m.endpoint.clone()).unwrap_or_default();
     p.sni = inv.sni.clone();
     p.token = inv.token.clone();
     p.psk = inv.psk.clone().unwrap_or_default();
@@ -531,6 +540,8 @@ impl Default for TunnelProfile {
             id: String::new(),
             name: "Profile".to_string(),
             server: String::new(),
+            yb_mesh_enabled: false,
+            yb_mesh_endpoint: String::new(),
             token: String::new(),
             psk: String::new(),
             sni: String::new(),
@@ -698,6 +709,10 @@ impl TunnelProfile {
         use serde_json::{json, Map, Value};
         let use_invite = !self.from_invite.trim().is_empty() && !self.invite_passphrase.is_empty();
         let mut o = Map::new();
+        o.insert("yb_mesh_enabled".to_string(), json!(self.yb_mesh_enabled));
+        if !self.yb_mesh_endpoint.trim().is_empty() {
+            o.insert("yb_mesh_endpoint".to_string(), json!(self.yb_mesh_endpoint.trim()));
+        }
         if use_invite {
             o.insert("from_invite".to_string(), json!(self.from_invite.trim()));
             o.insert(
@@ -1226,6 +1241,22 @@ mod split_bypass_json_tests {
             token: "t".to_string(),
             ..TunnelProfile::default()
         }
+    }
+
+    #[test]
+    fn mesh_is_opt_in_and_persists_per_profile() {
+        let mut p = profile();
+        let mut old = serde_json::to_value(&p).unwrap();
+        old.as_object_mut().unwrap().remove("yb_mesh_enabled");
+        old.as_object_mut().unwrap().remove("yb_mesh_endpoint");
+        let restored: TunnelProfile = serde_json::from_value(old).unwrap();
+        assert!(!restored.yb_mesh_enabled);
+        assert!(restored.yb_mesh_endpoint.is_empty());
+        p.yb_mesh_enabled = true;
+        p.yb_mesh_endpoint = "[201:db8::42]:8443".into();
+        let json: serde_json::Value = serde_json::from_str(&p.start_config_json().unwrap()).unwrap();
+        assert_eq!(json["yb_mesh_enabled"], true);
+        assert_eq!(json["yb_mesh_endpoint"], "[201:db8::42]:8443");
     }
 
     /// The tunnel client treats an absent `split_bypass_domains` as "domain split off", so the

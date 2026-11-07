@@ -1,9 +1,10 @@
 # Build from repo root: biba-vpn/biba-vpn (contains Cargo.toml workspace)
-FROM rust:1.89-bookworm AS chef
+FROM rust:1-bookworm AS chef
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY biba ./biba
 COPY bibavpn ./bibavpn
+COPY mash ./mash
 COPY apps/bibavpn-jni ./apps/bibavpn-jni
 COPY apps/bibavpn-ffi ./apps/bibavpn-ffi
 COPY apps/bibavpn-desktop ./apps/bibavpn-desktop
@@ -12,7 +13,7 @@ RUN cargo build --release -p bibavpn --bin bibavpn-server --bin bibavpn-users --
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/Eljaja/BibaVPN" \
       org.opencontainers.image.description="BibaVPN server — TLS+WebSocket tunnel terminator" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT AND MPL-2.0"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

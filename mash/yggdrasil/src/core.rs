@@ -1,0 +1,622 @@
+use std::collections::HashSet;
+use std::ops::Range;
+use std::sync::Arc;
+
+use ed25519_dalek::SigningKey;
+use ironwood::{Addr, Config as IwConfig, EncryptedPacketConn, PacketConn};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
+
+use crate::address::{addr_for_key, subnet_for_key, Address, Subnet};
+use crate::config::Config;
+use crate::ipv6rwc::ReadWriteCloser;
+use crate::links::{ActiveLinks, Links, LinkPeerInfo};
+use crate::multicast::{Multicast, NetworkInterface};
+use crate::proto::ProtoHandler;
+use crate::transport::tls;
+
+/// Session type byte prefixed to ironwood payloads.
+const TYPE_SESSION_TRAFFIC: u8 = 0x01;
+const TYPE_SESSION_PROTO: u8 = 0x02;
+
+/// Shared slot for path_notify callback target.
+/// Filled in after Core and RWC are both created.
+pub type PathNotifySlot = Arc<std::sync::Mutex<Option<Arc<ReadWriteCloser>>>>;
+
+/// Core wraps an ironwood EncryptedPacketConn with session type handling
+/// and TCP link management.
+pub struct Core {
+    pub(crate) inner: Arc<EncryptedPacketConn>,
+    pub(crate) links: Mutex<Links>,
+    pub(crate) active_links: ActiveLinks,
+    pub(crate) signing_key: SigningKey,
+    pub(crate) public_key: [u8; 32],
+    pub(crate) address: Address,
+    pub(crate) subnet: Subnet,
+    pub(crate) allowed_keys: HashSet<[u8; 32]>,
+    pub(crate) config: Config,
+    pub(crate) path_notify_slot: PathNotifySlot,
+    pub(crate) proto_handler: Arc<ProtoHandler>,
+    pub(crate) tls_server_config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+    pub(crate) tls_client_config: Arc<RwLock<Arc<rustls::ClientConfig>>>,
+    pub(crate) tls_cert_expiry: Arc<RwLock<time::OffsetDateTime>>,
+    proto_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    /// Queue of inbound protocol messages, drained by a dedicated task so that
+    /// handling them never blocks the traffic read path.
+    proto_in_tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
+    pub(crate) multicast: Mutex<Option<Arc<Multicast>>>,
+    /// Name and MTU of the TUN interface, as assigned by the OS. Filled in
+    /// after the adapter is created; `None` means there is no TUN.
+    tun_info: std::sync::Mutex<Option<(String, u64)>>,
+    external_ifaces_tx: watch::Sender<Vec<NetworkInterface>>,
+    external_ifaces_rx: watch::Receiver<Vec<NetworkInterface>>,
+}
+
+impl Core {
+    /// Create a new Core from a signing key and configuration.
+    /// Returns the Core and a PathNotifySlot that should be filled with
+    /// the ReadWriteCloser after creation (call `set_path_notify`).
+    pub fn new(signing_key: SigningKey, config: Config) -> Arc<Self> {
+        let public_key = signing_key.verifying_key().to_bytes();
+        let address = addr_for_key(&public_key);
+        let subnet = subnet_for_key(&public_key);
+
+        let allowed_keys: HashSet<[u8; 32]> = config.allowed_keys().into_iter().collect();
+
+        // Create a shared slot for the path_notify target
+        let path_notify_slot: PathNotifySlot = Arc::new(std::sync::Mutex::new(None));
+        let slot_clone = path_notify_slot.clone();
+
+        // Create ironwood config with bloom transform and path notify
+        let iw_config = IwConfig::default()
+            .with_bloom_transform(|key: [u8; 32]| -> [u8; 32] {
+                let subnet = subnet_for_key(&key);
+                subnet.get_key()
+            })
+            .with_peer_max_message_size(65535 * 2)
+            .with_group_password(config.group_password.clone().into_bytes())
+            .with_path_notify(move |key: [u8; 32]| {
+                let rwc = {
+                    let guard = slot_clone.lock().unwrap();
+                    guard.clone()
+                };
+                if let Some(rwc) = rwc {
+                    tokio::spawn(async move {
+                        rwc.update_key(key).await;
+                    });
+                }
+            });
+
+        let inner = ironwood::new_encrypted_packet_conn(signing_key.clone(), iw_config);
+
+        let active_links = ActiveLinks::new();
+
+        // Generate self-signed TLS certificate
+        let tls_material = tls::generate_self_signed_cert(&signing_key)
+            .expect("failed to generate TLS certificate");
+        let tls_server_config = tls::create_server_config(
+            tls_material.cert_chain(),
+            tls_material.private_key().expect("invalid private key"),
+        ).expect("failed to create TLS server config");
+        let tls_client_config = tls::create_client_config(
+            tls_material.cert_chain(),
+            tls_material.private_key().expect("invalid private key"),
+        ).expect("failed to create TLS client config");
+        let cert_expiry = tls_material.expiry;
+
+        let tls_server_config = Arc::new(RwLock::new(tls_server_config));
+        let tls_client_config = Arc::new(RwLock::new(tls_client_config));
+        let tls_cert_expiry = Arc::new(RwLock::new(cert_expiry));
+
+        // Create external interface watch channel (for Android multicast support)
+        let (external_ifaces_tx, external_ifaces_rx) = watch::channel(Vec::new());
+
+        // Create protocol message channel
+        let (proto_tx, mut proto_rx) = mpsc::channel::<(Addr, Vec<u8>)>(64);
+        let proto_handler = ProtoHandler::new(proto_tx.clone());
+
+        // Spawn proto sender task
+        let inner_clone = inner.clone();
+        tokio::spawn(async move {
+            while let Some((addr, msg)) = proto_rx.recv().await {
+                // Prepend TYPE_SESSION_PROTO byte
+                let mut full_msg = Vec::with_capacity(1 + msg.len());
+                full_msg.push(TYPE_SESSION_PROTO);
+                full_msg.extend_from_slice(&msg);
+                let _ = inner_clone.write_to(&full_msg, &addr).await;
+            }
+        });
+
+        // Create inbound protocol message channel
+        let (proto_in_tx, mut proto_in_rx) = mpsc::channel::<([u8; 32], Vec<u8>)>(64);
+
+        let core = Arc::new(Self {
+            inner,
+            links: Mutex::new(Links::new(active_links.clone())),
+            active_links,
+            signing_key: signing_key.clone(),
+            public_key,
+            address,
+            subnet,
+            allowed_keys,
+            config,
+            path_notify_slot,
+            proto_handler,
+            tls_server_config,
+            tls_client_config,
+            tls_cert_expiry,
+            proto_tx,
+            proto_in_tx,
+            multicast: Mutex::new(None),
+            tun_info: std::sync::Mutex::new(None),
+            external_ifaces_tx,
+            external_ifaces_rx,
+        });
+
+        // Spawn inbound proto handler task
+        let core_clone = core.clone();
+        tokio::spawn(async move {
+            while let Some((from_key, payload)) = proto_in_rx.recv().await {
+                core_clone.handle_inbound_proto(from_key, &payload).await;
+            }
+        });
+
+        // Spawn TLS certificate renewal task
+        let core_clone = core.clone();
+        tokio::spawn(async move {
+            core_clone.tls_renewal_task().await;
+        });
+
+        core
+    }
+
+    /// Wire up the path_notify callback to deliver to the given ReadWriteCloser.
+    /// Must be called after both Core and RWC are created.
+    pub fn set_path_notify(&self, rwc: Arc<ReadWriteCloser>) {
+        let mut slot = self.path_notify_slot.lock().unwrap();
+        *slot = Some(rwc);
+    }
+
+    /// Read a traffic packet from ironwood into `buf`, returning the range of
+    /// `buf` holding the payload (i.e. the frame minus the session type byte).
+    ///
+    /// The frame is read in place, so the largest payload this can deliver is
+    /// `buf.len() - 1`. A range is returned rather than a slice because the
+    /// caller loops over this and would otherwise hold a borrow of `buf`
+    /// across an iteration that reborrows it mutably.
+    pub async fn read_from(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(Range<usize>, Addr), ironwood::Error> {
+        loop {
+            let (n, addr) = self.inner.read_from(buf).await?;
+            if n == 0 {
+                continue;
+            }
+            tracing::debug!("Core read: {n} bytes with {} from {}", buf[0], &addr);
+            match buf[0] {
+                TYPE_SESSION_TRAFFIC => {
+                    return Ok((1..n, addr));
+                }
+                TYPE_SESSION_PROTO => {
+                    // Hand the message off to the proto task. This must never
+                    // block: proto handling talks to the router actor and can
+                    // wait on session setup, while this loop is the only source
+                    // of inbound traffic for the TUN. Dropping is safe, remote
+                    // queries time out on the requester side.
+                    if self
+                        .proto_in_tx
+                        .try_send((addr.0, buf[1..n].to_vec()))
+                        .is_err()
+                    {
+                        tracing::debug!("proto queue full, dropping message from {}", &addr);
+                    }
+
+                    // Continue reading, don't return proto messages to caller
+                    continue;
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Handle one inbound protocol message. Runs on the dedicated proto task,
+    /// off the traffic read path, so blocking here is harmless.
+    async fn handle_inbound_proto(&self, from_key: [u8; 32], payload: &[u8]) {
+        // Each query below is a round-trip to the single router actor task, so
+        // only ask for what this particular message will use.
+        let needs = crate::proto::proto_needs(payload);
+        let routing_entries = if needs.routing_entries {
+            self.routing_entries().await
+        } else {
+            0
+        };
+        let peer_keys = if needs.peer_keys {
+            self.get_peer_keys().await
+        } else {
+            Vec::new()
+        };
+        let tree_keys = if needs.tree_keys {
+            self.get_tree_keys().await
+        } else {
+            Vec::new()
+        };
+        let our_key = self.public_key;
+        let nodeinfo_json = self.config.node_info_json();
+
+        if let Some((target, response)) = self.proto_handler.handle_proto_message(
+            from_key,
+            payload,
+            &our_key,
+            routing_entries,
+            || peer_keys.clone(),
+            || tree_keys.clone(),
+            &nodeinfo_json,
+        ).await {
+            // Send response back through proto channel
+            let _ = self.proto_tx.send((target, response)).await;
+        }
+    }
+
+    /// Write a traffic packet to ironwood, prepending the session type byte.
+    pub async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize, ironwood::Error> {
+        let mut payload = Vec::with_capacity(1 + buf.len());
+        payload.push(TYPE_SESSION_TRAFFIC);
+        payload.extend_from_slice(buf);
+        let n = self.inner.write_to(&payload, addr).await?;
+        if n > 0 {
+            Ok(n - 1)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Send a key lookup via ironwood.
+    pub async fn send_lookup(&self, target: Addr) {
+        self.inner.send_lookup(target).await;
+    }
+
+    /// Get the MTU (ironwood MTU minus session type overhead, capped at 65535).
+    pub fn mtu(&self) -> u64 {
+        let m = self.inner.mtu().saturating_sub(1);
+        m.min(65535)
+    }
+
+    /// Get the local public key.
+    pub fn public_key(&self) -> &[u8; 32] {
+        &self.public_key
+    }
+
+    /// Get the local Yggdrasil IPv6 address.
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
+
+    /// Get the local Yggdrasil /64 subnet.
+    pub fn subnet(&self) -> &Subnet {
+        &self.subnet
+    }
+
+    /// Get the underlying encrypted packet connection.
+    ///
+    /// This allows integration with higher-level protocols like stream multiplexing
+    /// (e.g., ygg_stream) that need direct access to the ironwood PacketConn.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use yggdrasil::core::Core;
+    /// use ygg_stream::StreamManager;
+    ///
+    /// # async fn example(core: std::sync::Arc<Core>) {
+    /// let stream_manager = StreamManager::new(core.packet_conn());
+    /// # }
+    /// ```
+    pub fn packet_conn(&self) -> Arc<EncryptedPacketConn> {
+        self.inner.clone()
+    }
+
+    /// Check if a public key is allowed to connect.
+    pub fn is_key_allowed(&self, key: &[u8; 32]) -> bool {
+        if self.allowed_keys.is_empty() {
+            return true;
+        }
+        self.allowed_keys.contains(key)
+    }
+
+    /// Handle a new peer connection (delegate to ironwood).
+    pub async fn handle_conn(&self, key: [u8; 32], conn: Box<dyn ironwood::types::AsyncConn>, priority: u8) -> Result<(), ironwood::Error> {
+        self.inner.handle_conn(Addr(key), conn, priority).await
+    }
+
+    /// Initialize the links with a reference to this core.
+    pub async fn init_links(self: &Arc<Self>) {
+        let mut links = self.links.lock().await;
+        links.set_core(self.clone());
+    }
+
+    /// Close the core and all links.
+    pub async fn close(&self) -> Result<(), ironwood::Error> {
+        {
+            let mut links = self.links.lock().await;
+            links.close().await;
+        }
+        self.inner.close().await
+    }
+
+    /// Start listeners and connect to configured peers.
+    pub async fn start(self: &Arc<Self>) {
+        let config = self.config.clone();
+
+        for addr in &config.listen {
+            if let Err(e) = self.listen(addr).await {
+                tracing::error!("Failed to listen on {}: {}", addr, e);
+            }
+        }
+
+        // Connect to configured peers in the background. Per-peer DNS resolution (see Links::add_peer) has no timeout of its own,
+        // so doing it here synchronously stacks one resolver latency per domain-name peer and delays this function
+        // returning -- which in turn delays the Type=notify readiness signal sent by run_node(). Spawning keeps the node
+        // from being held up on startup while a peer resolves.
+        let core = self.clone();
+        tokio::spawn(async move {
+            for uri in &config.peers {
+                if let Err(e) = core.add_peer(uri).await {
+                    tracing::error!("Failed to add peer {}: {}", uri, e);
+                }
+            }
+        });
+    }
+
+    /// Start listening on the given address.
+    pub async fn listen(&self, addr: &str) -> Result<(), String> {
+        let mut links = self.links.lock().await;
+        links.listen(addr).await
+    }
+
+    /// Add a persistent peer.
+    pub async fn add_peer(&self, uri: &str) -> Result<(), String> {
+        let mut links = self.links.lock().await;
+        links.add_peer(uri).await
+    }
+
+    /// Remove a peer by URI.
+    pub async fn remove_peer(&self, uri: &str) -> Result<(), String> {
+        let mut links = self.links.lock().await;
+        links.remove_peer(uri).await
+    }
+
+    /// Wake all sleeping peer reconnect loops so they retry immediately.
+    pub async fn retry_peers_now(&self) {
+        self.links.lock().await.retry_peers_now();
+    }
+
+    /// External nudge to force an immediate router refresh / re-announce.
+    /// Used by mobile clients to keep the mesh view of us fresh during long
+    /// suspend windows (Android Doze) where in-process timers can't fire.
+    pub fn force_router_refresh(&self) {
+        self.inner.force_refresh();
+    }
+
+    /// Get link-level peer info merged with ironwood RTT/cost (for admin getPeers).
+    /// Returns all configured peers (with up=false if disconnected) plus active inbound peers.
+    pub async fn get_peers(&self) -> Vec<LinkPeerInfo> {
+        let mut peers = self.active_links.get_peers().await;
+        // Merge latency/cost from ironwood router
+        let iw_peers = self.inner.get_peers().await;
+        for p in &mut peers {
+            if let Some(iw) = iw_peers.iter().find(|ip| ip.key == p.key) {
+                p.latency_ms = iw.latency_ms;
+                p.cost = iw.cost;
+            }
+        }
+
+        // Add configured but currently disconnected peers
+        let configured = self.links.lock().await.get_configured_peers().await;
+        for (uri, last_error) in configured {
+            if !peers.iter().any(|p| p.uri == uri) {
+                peers.push(LinkPeerInfo {
+                    uri,
+                    up: false,
+                    inbound: false,
+                    key: [0u8; 32],
+                    priority: 0,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    rx_rate: 0,
+                    tx_rate: 0,
+                    uptime_secs: 0.0,
+                    latency_ms: 0.0,
+                    cost: 0,
+                    last_error,
+                });
+            }
+        }
+        peers.sort_by(|a, b| a.uri.cmp(&b.uri));
+        peers
+    }
+
+    /// Subscribe to peer connect/disconnect events.
+    pub fn subscribe_peer_events(&self) -> tokio::sync::broadcast::Receiver<crate::links::PeerEvent> {
+        self.active_links.subscribe()
+    }
+
+    /// Get spanning tree entries (from ironwood).
+    pub async fn get_tree(&self) -> Vec<ironwood::TreeEntry> {
+        self.inner.get_tree().await
+    }
+
+    /// Get the number of routing entries.
+    pub async fn routing_entries(&self) -> usize {
+        self.inner.routing_entries().await
+    }
+
+    /// Get our current tree coordinates (path from root).
+    pub async fn tree_coordinates(&self) -> Vec<u64> {
+        self.inner.tree_coordinates().await
+    }
+
+    /// Get all cached paths.
+    pub async fn get_paths(&self) -> Vec<ironwood::PathEntry> {
+        self.inner.get_paths().await
+    }
+
+    /// Get all active encrypted sessions.
+    pub async fn get_sessions(&self) -> Vec<ironwood::SessionEntry> {
+        self.inner.get_sessions().await
+    }
+
+    /// Get a diagnostic snapshot of internal routing state.
+    pub async fn get_debug_snapshot(&self) -> ironwood::DebugSnapshot {
+        self.inner.get_debug_snapshot().await
+    }
+
+    /// Count how many on-tree peers' bloom filters cover the given destination key.
+    /// Returns (xformed_key_hex, multicast_count).
+    pub async fn count_lookup_targets(&self, dest: [u8; 32]) -> ([u8; 32], usize) {
+        self.inner.count_lookup_targets(dest).await
+    }
+
+    /// Force a path lookup for the given destination, bypassing the rumor throttle.
+    /// Returns the number of peers the lookup was sent to.
+    pub async fn force_lookup(&self, dest: [u8; 32]) -> usize {
+        self.inner.force_lookup(dest).await
+    }
+
+    /// Record the name and MTU of the TUN interface. Called once the adapter
+    /// exists, since the OS may hand out different values than were requested.
+    pub fn set_tun_info(&self, name: &str, mtu: u64) {
+        let mut slot = self.tun_info.lock().unwrap();
+        *slot = Some((name.to_string(), mtu));
+    }
+
+    /// Get TUN adapter status: (enabled, name, mtu). Without a TUN — disabled
+    /// via `if_name = "none"`, or built without the `tun` feature — the name
+    /// is empty, the MTU is 0 and `enabled` is false.
+    pub fn get_tun_status(&self) -> (bool, String, u64) {
+        match self.tun_info.lock().unwrap().clone() {
+            Some((name, mtu)) => (true, name, mtu),
+            None => (false, String::new(), 0),
+        }
+    }
+
+    /// Set the multicast module reference (called after construction).
+    pub async fn set_multicast(&self, m: Arc<Multicast>) {
+        let mut slot = self.multicast.lock().await;
+        *slot = Some(m);
+    }
+
+    /// Start multicast peer discovery using the current config.
+    ///
+    /// If external interfaces have been provided via `update_network_interfaces()`,
+    /// they will be used instead of `getifaddrs()` (needed on Android).
+    pub async fn start_multicast(self: &Arc<Self>) -> Result<(), String> {
+        let config = self.config.multicast_interfaces.clone();
+        if config.is_empty() {
+            return Err("no multicast interfaces configured".to_string());
+        }
+
+        // If external interfaces have been set, pass the receiver to Multicast
+        let external_rx = if !self.external_ifaces_rx.borrow().is_empty() {
+            Some(self.external_ifaces_rx.clone())
+        } else {
+            None
+        };
+
+        let m = Multicast::new(self.clone(), config, external_rx).await?;
+        let m = Arc::new(m);
+        tracing::info!("Multicast peer discovery started");
+        self.set_multicast(m).await;
+        Ok(())
+    }
+
+    /// Provide network interface info from an external source (e.g. Android ConnectivityManager).
+    ///
+    /// When set, multicast discovery uses these interfaces instead of `getifaddrs()`.
+    /// Call with an empty vec to clear external interfaces.
+    pub fn update_network_interfaces(&self, ifaces: Vec<NetworkInterface>) {
+        let _ = self.external_ifaces_tx.send(ifaces);
+    }
+
+    /// Stop multicast peer discovery (if running).
+    pub async fn close_multicast(&self) {
+        let slot = self.multicast.lock().await;
+        if let Some(m) = slot.as_ref() {
+            m.close();
+        }
+    }
+
+    /// Get multicast interface info for admin API.
+    pub async fn get_multicast_interfaces(&self) -> Vec<crate::multicast::MulticastInterfaceInfo> {
+        let slot = self.multicast.lock().await;
+        if let Some(m) = slot.as_ref() {
+            m.get_interfaces().await
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get protocol handler (for admin debug commands).
+    pub fn proto_handler(&self) -> &Arc<ProtoHandler> {
+        &self.proto_handler
+    }
+
+    /// Get peer keys for protocol responses (returns routing peer keys).
+    pub async fn get_peer_keys(&self) -> Vec<[u8; 32]> {
+        self.inner.get_routing_peer_keys().await
+    }
+
+    /// Get tree keys for protocol responses.
+    pub async fn get_tree_keys(&self) -> Vec<[u8; 32]> {
+        let tree = self.get_tree().await;
+        tree.iter().map(|t| t.key).collect()
+    }
+
+    /// Background task to renew TLS certificate before expiry.
+    /// Checks every 12 hours and renews if certificate expires within 10 days.
+    async fn tls_renewal_task(self: Arc<Self>) {
+        loop {
+            // Check every 12 hours
+            tokio::time::sleep(std::time::Duration::from_secs(12 * 60 * 60)).await;
+
+            let expiry = *self.tls_cert_expiry.read().await;
+            let now = time::OffsetDateTime::now_utc();
+            let days_until_expiry = (expiry - now).whole_days();
+
+            if days_until_expiry <= 10 {
+                tracing::info!("TLS certificate expires in {} days, renewing...", days_until_expiry);
+
+                // Generate new certificate
+                match tls::generate_self_signed_cert(&self.signing_key) {
+                    Ok(material) => {
+                        let server_result = tls::create_server_config(
+                            material.cert_chain(),
+                            material.private_key().unwrap(),
+                        );
+                        let client_result = tls::create_client_config(
+                            material.cert_chain(),
+                            material.private_key().unwrap(),
+                        );
+                        match (server_result, client_result) {
+                            (Ok(server_config), Ok(client_config)) => {
+                                // Update configs
+                                *self.tls_server_config.write().await = server_config;
+                                *self.tls_client_config.write().await = client_config;
+                                *self.tls_cert_expiry.write().await = material.expiry;
+
+                                tracing::info!("TLS certificate renewed successfully");
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                tracing::error!("Failed to create TLS config during renewal: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to generate new TLS certificate: {}", e);
+                    }
+                }
+            }
+        }
+    }
+}

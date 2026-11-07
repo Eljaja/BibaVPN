@@ -26,11 +26,12 @@ impl BoringTlsParams {
 }
 
 /// TCP → TLS with SNI, verification mode from [`BoringTlsParams`].
-pub async fn upgrade_tcp_boring(
-    tcp: TcpStream,
+pub async fn upgrade_tcp_boring<S>(
+    tcp: S,
     sni: &str,
     params: &BoringTlsParams,
-) -> anyhow::Result<tokio_boring::SslStream<TcpStream>> {
+) -> anyhow::Result<tokio_boring::SslStream<S>>
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
     params.validate()?;
 
     use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
@@ -119,7 +120,7 @@ pub async fn upgrade_tcp_boring(
     let connect_cfg = connector.configure().context("boring configure")?;
     let stream = tokio_boring::connect(connect_cfg, sni, tcp)
         .await
-        .map_err(|e| anyhow::anyhow!("boring handshake: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("boring handshake: {e}"))?;
 
     if let Some(pins) = pin_ders {
         verify_peer_pin_der(&stream, &pins)?;
@@ -128,8 +129,8 @@ pub async fn upgrade_tcp_boring(
     Ok(stream)
 }
 
-fn verify_peer_pin_der(
-    stream: &tokio_boring::SslStream<TcpStream>,
+fn verify_peer_pin_der<S>(
+    stream: &tokio_boring::SslStream<S>,
     pins: &[Vec<u8>],
 ) -> anyhow::Result<()> {
     use foreign_types::ForeignTypeRef;

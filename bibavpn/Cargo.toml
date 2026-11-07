@@ -21,6 +21,8 @@ name = "bibavpn-users"
 path = "src/bin/users.rs"
 
 [dependencies]
+yggstack = { path = "../mash/yggstack" }
+yggdrasil = { path = "../mash/yggdrasil", default-features = false }
 anyhow = "1.0"
 argon2 = "0.5"
 base64 = "0.23"

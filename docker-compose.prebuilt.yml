@@ -1,0 +1,7 @@
+services:
+  biba-server:
+    image: ${BIBA_SERVER_IMAGE:-eljaja/bibavpn-server:latest}
+  yb-mesh-init:
+    image: ${BIBA_MESH_IMAGE:-eljaja/bibavpn-yb-mesh:latest}
+  yb-mesh:
+    image: ${BIBA_MESH_IMAGE:-eljaja/bibavpn-yb-mesh:latest}

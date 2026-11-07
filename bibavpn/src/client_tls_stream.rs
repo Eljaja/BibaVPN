@@ -5,14 +5,14 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use crate::yb_mesh::ServerStream;
 use tokio_rustls::client::TlsStream as RustlsTs;
 
 /// `AsyncRead` + `AsyncWrite` over the main VPN outer TLS (before WebSocket).
 pub enum ClientTlsStream {
-    Rustls(RustlsTs<TcpStream>),
+    Rustls(RustlsTs<ServerStream>),
     #[cfg(feature = "boring-tls")]
-    Boring(tokio_boring::SslStream<TcpStream>),
+    Boring(tokio_boring::SslStream<ServerStream>),
 }
 
 impl AsyncRead for ClientTlsStream {

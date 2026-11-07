@@ -34,6 +34,12 @@ use tracing::info;
     about = "SOCKS5 / HTTP CONNECT front for BibaVPN (v2.1: WS ping, MTU cap, custom WS headers)"
 )]
 struct Args {
+    /// Route the server connection through the mesh endpoint from the invite.
+    #[arg(long)]
+    yb_mesh: bool,
+    /// Explicit Yggdrasil IPv6 endpoint (for manual configuration).
+    #[arg(long)]
+    yb_mesh_endpoint: Option<String>,
     /// Encrypted `biba://...` invite (use with `--invite-passphrase`; mutually exclusive with `--server`).
     #[arg(long, conflicts_with = "server")]
     from_invite: Option<String>,
@@ -293,6 +299,13 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
     } else {
         None
     };
+
+    let yb_mesh_endpoint = if args.yb_mesh {
+        let endpoint = args.yb_mesh_endpoint.clone().or_else(|| inv_opt.as_ref().and_then(|i| i.yb_mesh.as_ref().map(|m| m.endpoint.clone())))
+            .ok_or_else(|| anyhow::anyhow!("yb-mesh requires an invite with a mesh endpoint"))?;
+        bibavpn::yb_mesh::parse_endpoint(&endpoint)?;
+        Some(endpoint)
+    } else { None };
 
     let (
         server_host,
@@ -812,6 +825,7 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
     let sni_owned = bibavpn::reality::effective_tls_sni(&sni_owned, reality_target.as_deref());
 
     Ok(LocalClientOptions {
+        yb_mesh_endpoint,
         server_host,
         server_port,
         sni: sni_owned,

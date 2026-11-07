@@ -18,6 +18,7 @@ static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 /// Install or clear the pre-connect hook (e.g. JNI → `VpnService.protect`).
 #[cfg(unix)]
 pub fn set_hook(hook: Option<Hook>) {
+    yggdrasil::socket_protect::set_hook(hook.clone());
     *HOOK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
 }
 

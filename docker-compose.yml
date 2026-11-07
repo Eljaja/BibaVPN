@@ -6,6 +6,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.server
+    environment:
+      BIBA_YB_MESH_ENDPOINT: "${BIBA_YB_MESH_ENDPOINT:-}"
     command:
       - --listen
       - 0.0.0.0:8443
@@ -34,6 +36,27 @@ services:
       - "8443:8443"
     networks:
       - bibanet
+
+  yb-mesh-init:
+    profiles: [yb-mesh]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.yb-mesh
+    image: bibavpn-yb-mesh
+    network_mode: none
+    volumes:
+      - yb-mesh-data:/data
+    command: [init]
+
+  yb-mesh:
+    profiles: [yb-mesh]
+    image: bibavpn-yb-mesh
+    network_mode: "service:biba-server"
+    depends_on:
+      - biba-server
+    volumes:
+      - yb-mesh-data:/data
+    restart: unless-stopped
 
   biba-client:
     build:
@@ -73,3 +96,6 @@ services:
 
 networks:
   bibanet:
+
+volumes:
+  yb-mesh-data:
