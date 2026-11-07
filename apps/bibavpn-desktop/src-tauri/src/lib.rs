@@ -195,6 +195,8 @@ struct ClientCapabilities {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StateSnapshot {
+    revision: u64,
+    phase: &'static str,
     cfg: PublicSavedConfig,
     connected: bool,
     display_host: String,
@@ -463,7 +465,25 @@ pub(crate) fn assemble_state_snapshot(
 
     let error = android_snapshot_error(&last_error, connected, jni_connect_error);
 
+    // Assigned while Inner is locked, so asynchronous delivery cannot reorder snapshots.
+    static SNAPSHOT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let phase = if current.recovery_pending {
+        "reconnecting"
+    } else if error.is_some() {
+        "error"
+    } else if connected {
+        "connected"
+    } else {
+        match current.phase {
+            VpnPhase::Connecting => "connecting",
+            VpnPhase::Disconnecting => "disconnecting",
+            VpnPhase::Connected if tunnel_server.is_some() => "reconnecting",
+            _ => "idle",
+        }
+    };
     StateSnapshot {
+        revision: SNAPSHOT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        phase,
         cfg: public_cfg,
         connected,
         display_host,
@@ -478,6 +498,24 @@ pub(crate) fn assemble_state_snapshot(
     }
 }
 
+#[cfg(any(test, target_os = "android"))]
+fn android_phase_after_probe(
+    phase: VpnPhase,
+    session_requested: bool,
+    connected: bool,
+    has_error: bool,
+) -> VpnPhase {
+    if phase != VpnPhase::Connecting || !session_requested {
+        phase
+    } else if connected {
+        VpnPhase::Connected
+    } else if has_error {
+        VpnPhase::Idle
+    } else {
+        phase
+    }
+}
+
 fn snapshot_with_probe<F>(state: &AppState, probe_fn: F, force_disconnected: bool) -> StateSnapshot
 where
     F: FnOnce() -> TunnelProbe,
@@ -487,8 +525,23 @@ where
         snapshot_copy_from_inner(&g)
     };
     let probe = probe_fn();
-    let g = lock_inner(&state.inner);
-    assemble_state_snapshot(&copy, &g, Some(probe), force_disconnected)
+    #[allow(unused_mut)]
+    let mut g = lock_inner(&state.inner);
+    let snapshot = assemble_state_snapshot(&copy, &g, Some(probe), force_disconnected);
+    #[cfg(target_os = "android")]
+    {
+        let phase = android_phase_after_probe(
+            g.phase,
+            g.tunnel_server.is_some(),
+            snapshot.connected,
+            snapshot.error.is_some(),
+        );
+        if phase != g.phase {
+            g.phase = phase;
+            bump_epoch(&mut g);
+        }
+    }
+    snapshot
 }
 
 fn snapshot_from_state(app: &AppHandle, state: &AppState) -> StateSnapshot {
@@ -1879,7 +1932,8 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         return Err("Подключение отменено: VPN отключён пользователем.".into());
     }
     g.tunnel_server = Some(remote_label);
-    g.phase = VpnPhase::Connected;
+    // Android only queued the service; the first active tunnel probe completes
+    // the Connecting -> Connected transition.
     bump_epoch(&mut g);
     phase_guard.disarm();
     Ok(())
@@ -2018,7 +2072,7 @@ async fn get_tunnel_status_cmd(
     {
         let _ = state;
         let status = tauri::async_runtime::spawn_blocking(move || {
-            let st = android_vpn::tunnel_status(&app).unwrap_or_default();
+            let st = android_vpn::tunnel_status(&app)?;
             let error = if st.active {
                 None
             } else {
@@ -2027,14 +2081,14 @@ async fn get_tunnel_status_cmd(
                     .map(map_android_jni_connect_error)
                     .filter(|s| !s.is_empty())
             };
-            TunnelStatus {
+            Ok::<_, String>(TunnelStatus {
                 connected: st.active,
                 vpn_session_uptime_secs: st.active.then_some(st.elapsed_ms / 1000),
                 error,
-            }
+            })
         })
         .await
-        .map_err(|e| format!("tunnel status task: {e}"))?;
+        .map_err(|e| format!("tunnel status task: {e}"))??;
         return Ok(status);
     }
 
@@ -2764,6 +2818,70 @@ mod snapshot_assemble_tests {
             pin_cert_pem: "-----BEGIN CERTIFICATE-----SECRET-----END CERTIFICATE-----".to_string(),
             ..TunnelProfile::default()
         }
+    }
+
+    #[test]
+    fn android_bootstrap_remains_pending_then_allows_retry_after_failure() {
+        use super::android_phase_after_probe;
+        assert_eq!(
+            android_phase_after_probe(VpnPhase::Connecting, true, false, false),
+            VpnPhase::Connecting
+        );
+        assert_eq!(
+            android_phase_after_probe(VpnPhase::Connecting, true, true, false),
+            VpnPhase::Connected
+        );
+        assert_eq!(
+            android_phase_after_probe(VpnPhase::Connecting, true, false, true),
+            VpnPhase::Idle
+        );
+        assert_eq!(
+            android_phase_after_probe(VpnPhase::Connecting, false, false, true),
+            VpnPhase::Connecting
+        );
+        assert_eq!(
+            android_phase_after_probe(VpnPhase::Idle, true, true, false),
+            VpnPhase::Idle
+        );
+    }
+
+    #[test]
+    fn snapshots_expose_ordered_connection_phases() {
+        let mut inner = Inner {
+            cfg: SavedConfig::default(),
+            proxy_backup: None,
+            vpn: None,
+            tunnel_server: None,
+            last_error: None,
+            phase: VpnPhase::Idle,
+            recovery_pending: false,
+            pending_import: None,
+            epoch: 0,
+            connect_token: 0,
+        };
+        let first = assemble_state_snapshot(&snapshot_copy_from_inner(&inner), &inner, None, false);
+        assert_eq!(first.phase, "idle");
+        inner.phase = VpnPhase::Connecting;
+        let next = assemble_state_snapshot(&snapshot_copy_from_inner(&inner), &inner, None, false);
+        assert_eq!(next.phase, "connecting");
+        assert!(next.revision > first.revision);
+        inner.phase = VpnPhase::Disconnecting;
+        assert_eq!(
+            assemble_state_snapshot(&snapshot_copy_from_inner(&inner), &inner, None, false).phase,
+            "disconnecting"
+        );
+        inner.phase = VpnPhase::Idle;
+        inner.recovery_pending = true;
+        assert_eq!(
+            assemble_state_snapshot(&snapshot_copy_from_inner(&inner), &inner, None, false).phase,
+            "reconnecting"
+        );
+        inner.recovery_pending = false;
+        inner.last_error = Some("failed".into());
+        assert_eq!(
+            assemble_state_snapshot(&snapshot_copy_from_inner(&inner), &inner, None, false).phase,
+            "error"
+        );
     }
 
     #[test]

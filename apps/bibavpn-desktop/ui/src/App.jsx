@@ -9,7 +9,6 @@ import { SettingsScreen } from "./screens/SettingsScreen.jsx";
 import { BottomNav } from "./components/BottomNav.jsx";
 import { Btn } from "./ui/primitives.jsx";
 import { t } from "./i18n.js";
-import { isDocumentHidden } from "./visibility.js";
 import { MONO, SANS } from "./theme.js";
 
 function cloneCfg(c) {
@@ -27,15 +26,12 @@ function AppInner() {
     refreshFromControlPlane,
     clearError,
     refresh,
-    getTunnelStatus,
     getEditConfig,
   } = useVpn();
   const { theme } = useT();
   const [tab, setTab] = useState("connect");
   /** @type {[import('./vpnTypes').SavedConfig | null, (c: import('./vpnTypes').SavedConfig | null) => void]} */
   const [draft, setDraft] = useState(null);
-  /** Ждём VPN после вызова connect (диалог разрешения Android и пока туннель не поднялся). */
-  const [tunnelHandshake, setTunnelHandshake] = useState(false);
   /** @type {[null | { controlPlaneHost: string, vpnHost: string, displayName: string, serverName: string }, (v: null | object) => void]} */
   const [pendingImport, setPendingImport] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
@@ -149,88 +145,6 @@ function AppInner() {
     setPendingImport(null);
   }, []);
 
-  useEffect(() => {
-    if (tab !== "connect") setTunnelHandshake(false);
-  }, [tab]);
-
-  /** Рукопожатие закончилось, когда туннель реально поднялся или появилась ошибка. */
-  useEffect(() => {
-    if (!tunnelHandshake || !snap) return;
-    if (snap.connected) setTunnelHandshake(false);
-    if (snap.error) setTunnelHandshake(false);
-  }, [snap?.connected, snap?.error, tunnelHandshake]);
-
-  /**
-   * Туннель на Android поднимается после JNI; опрашиваем только лёгкий статус, а полный snapshot
-   * берём один раз — когда туннель поднялся или сервис сообщил ошибку (провал bootstrap, отказ
-   * в разрешении VPN). Раньше ошибку здесь не видели, и кнопка висела заблокированной 2 минуты.
-   */
-  useEffect(() => {
-    if (!tunnelHandshake) return;
-    if (snap?.connected) return;
-    let cancelled = false;
-    let timer = 0;
-    async function pollTunnelStatus() {
-      // В фоне не дёргаем IPC: Android WebView всё равно троттлит таймеры.
-      if (isDocumentHidden()) {
-        timer = window.setTimeout(pollTunnelStatus, 1500);
-        return;
-      }
-      const status = await getTunnelStatus();
-      if (cancelled) return;
-      if (status?.connected || status?.error) {
-        await refresh();
-        if (!cancelled) setTunnelHandshake(false);
-        return;
-      }
-      timer = window.setTimeout(pollTunnelStatus, 900);
-    }
-    timer = window.setTimeout(pollTunnelStatus, 350);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [tunnelHandshake, snap?.connected, refresh, getTunnelStatus]);
-
-  /** Страховка: nativeStart (20 с) + tun2socks (25 с) ограничены, дальше за туннелем следит опрос ниже. */
-  useEffect(() => {
-    if (!tunnelHandshake) return;
-    const id = setTimeout(() => setTunnelHandshake(false), 60000);
-    return () => clearTimeout(id);
-  }, [tunnelHandshake]);
-
-  /**
-   * Сессия запрошена (`tunnelServer`), но туннель сейчас не поднят: Android пересобирает стек
-   * после разблокировки / смены сети (секунды), или ещё открыт диалог разрешения VPN. Раньше в
-   * этот момент оба опроса выключались и UI навсегда оставался на «Не подключено», хотя VPN
-   * через пару секунд снова работал, — а нажатие «Подключить» рвало живой туннель.
-   */
-  const sessionDown = Boolean(snap && !snap.connected && snap.tunnelServer);
-  const snapError = snap?.error ?? null;
-  useEffect(() => {
-    if (!sessionDown || tunnelHandshake || busy) return;
-    let cancelled = false;
-    let timer = 0;
-    async function pollRecovery() {
-      if (isDocumentHidden()) {
-        timer = window.setTimeout(pollRecovery, 2500);
-        return;
-      }
-      const status = await getTunnelStatus();
-      if (cancelled) return;
-      if (status?.connected || (status?.error && !snapError)) {
-        await refresh();
-        if (cancelled || status?.connected) return;
-      }
-      timer = window.setTimeout(pollRecovery, 2000);
-    }
-    timer = window.setTimeout(pollRecovery, 1500);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [sessionDown, snapError, tunnelHandshake, busy, refresh, getTunnelStatus]);
-
   const setCfg = useCallback((updater) => {
     draftRevRef.current += 1;
     setDraft((d) => {
@@ -282,41 +196,23 @@ function AppInner() {
     if (await saveDraft()) setTab("connect");
   }, [saveDraft]);
 
-  /**
-   * Сессия поднимается или пересобирается — кнопка работает как «Отменить/Отключить», а не
-   * заблокирована. Блокируем её только пока идёт сам invoke (`busy`).
-   */
-  const sessionPending = tunnelHandshake || Boolean(sessionDown && !snapError);
-  /** Показываем «рукопожатие»: пока invoke идёт (busy), или пока ждём появление туннеля после диалога VPN. */
+  const sessionPending = snap?.phase === "connecting" || snap?.phase === "reconnecting";
+  const transitionBusy = busy || snap?.phase === "disconnecting";
   const connectPhasePending = sessionPending || Boolean(busy && snap && !snap.connected);
 
   async function handleToggleConnect() {
-    if (!snap || busy) return;
-    if (snap.connected || sessionPending) {
-      setTunnelHandshake(false);
-      try {
-        await disconnect();
-      } catch (e) {
-        console.error(e);
-        // Бэкенд уже мог записать ошибку — подтягиваем её в баннер.
-        await refresh();
-      }
-      return;
-    }
-    setTunnelHandshake(true);
+    if (!snap || transitionBusy) return;
     try {
-      const s = await connect();
-      if (s?.connected) setTunnelHandshake(false);
+      if (snap.connected || sessionPending) await disconnect();
+      else await connect();
     } catch (e) {
       console.error(e);
-      setTunnelHandshake(false);
-      // Если событие `vpn-state` с ошибкой не успело прийти, забираем его из снимка.
       await refresh();
     }
   }
 
   async function handleToggleMesh(enabled) {
-    if (busy || meshBusy || sessionPending) return;
+    if (transitionBusy || meshBusy || sessionPending) return;
     setMeshBusy(true);
     setMeshError("");
     try {
@@ -327,12 +223,9 @@ function AppInner() {
       profile.yb_mesh_enabled = enabled;
       await saveCfg(cfg);
       if (snap.connected) {
-        setTunnelHandshake(true);
-        const state = await connect();
-        if (state?.connected) setTunnelHandshake(false);
+        await connect();
       }
     } catch (e) {
-      setTunnelHandshake(false);
       setMeshError(String(e));
     } finally {
       setMeshBusy(false);
@@ -411,11 +304,9 @@ function AppInner() {
       <ConnectScreen
         snap={snap}
         connectPending={connectPhasePending}
-        busy={busy || meshBusy}
+        busy={transitionBusy || meshBusy}
         cancelable={sessionPending}
-        reconnecting={sessionPending && !tunnelHandshake}
-        refresh={refresh}
-        getTunnelStatus={getTunnelStatus}
+        reconnecting={snap.phase === "reconnecting"}
         onSettings={() => goTab("settings")}
         onToggleConnect={handleToggleConnect}
         onToggleMesh={handleToggleMesh}
