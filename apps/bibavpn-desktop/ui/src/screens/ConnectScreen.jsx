@@ -23,71 +23,23 @@ function formatSessionUptime(elapsedMs) {
  * не должны перерисовывать весь экран подключения (на Android WebView это
  * заметно как «подвисание» интерфейса).
  */
-function ConnectStats({ snap, getTunnelStatus, refresh }) {
+function ConnectStats({ snap }) {
   const { theme } = useT();
-  const [backendUptimeSecs, setBackendUptimeSecs] = useState(
-    typeof snap?.vpnSessionUptimeSecs === "number" ? snap.vpnSessionUptimeSecs : null,
-  );
-  const [sessionStartedAt, setSessionStartedAt] = useState(null);
+  const sessionStartedAt = snap?.sessionStartedAt ?? null;
   /** Ререндер только этого компонента раз в секунду для локального аптайма. */
   const [, setTick] = useState(0);
   const [rttMs, setRttMs] = useState(null);
 
   const connected = Boolean(snap?.connected);
-  const backendUptime = typeof snap?.vpnSessionUptimeSecs === "number";
 
   useEffect(() => {
-    if (!connected) {
-      setBackendUptimeSecs(null);
-      setSessionStartedAt(null);
-      setRttMs(null);
-      return;
-    }
-    if (backendUptime) {
-      setSessionStartedAt(null);
-      setBackendUptimeSecs(snap.vpnSessionUptimeSecs);
-      return;
-    }
-    setBackendUptimeSecs(null);
-    setSessionStartedAt((prev) => (prev == null ? Date.now() : prev));
-  }, [connected, backendUptime, snap?.vpnSessionUptimeSecs]);
-
-  /** Android/iOS: обновляем только лёгкий статус туннеля, не весь snapshot с конфигом. */
-  useEffect(() => {
-    if (!connected || !backendUptime) return;
-    let cancelled = false;
-    async function refreshUptime() {
-      const status = await getTunnelStatus();
-      if (cancelled) return;
-      if (status?.connected) {
-        if (typeof status.vpnSessionUptimeSecs === "number") {
-          setBackendUptimeSecs(status.vpnSessionUptimeSecs);
-        }
-      } else if (status && status.connected === false) {
-        setBackendUptimeSecs(null);
-        await refresh();
-      }
-    }
-    const stop = startVisiblePolling({ task: refreshUptime, intervalMs: 1000 });
-    return () => {
-      cancelled = true;
-      stop();
-    };
-  }, [connected, backendUptime, refresh, getTunnelStatus]);
+    if (!connected) setRttMs(null);
+  }, [connected]);
 
   useEffect(() => {
     if (!connected || sessionStartedAt == null) return;
     return startVisiblePolling({ task: () => setTick((x) => x + 1), intervalMs: 1000 });
   }, [connected, sessionStartedAt]);
-
-  useEffect(() => {
-    if (!connected || backendUptime) return;
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") refresh();
-    };
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
-  }, [connected, backendUptime, refresh]);
 
   useEffect(() => {
     if (!connected) return;
@@ -107,19 +59,9 @@ function ConnectStats({ snap, getTunnelStatus, refresh }) {
     };
   }, [connected]);
 
-  const effectiveBackendUptimeSecs =
-    typeof backendUptimeSecs === "number"
-      ? backendUptimeSecs
-      : typeof snap?.vpnSessionUptimeSecs === "number"
-        ? snap.vpnSessionUptimeSecs
-        : null;
-
-  const uptimeStr =
-    connected && typeof effectiveBackendUptimeSecs === "number"
-      ? formatSessionUptime(effectiveBackendUptimeSecs * 1000)
-      : connected && sessionStartedAt != null
-        ? formatSessionUptime(Date.now() - sessionStartedAt)
-        : "—";
+  const uptimeStr = connected && sessionStartedAt != null
+    ? formatSessionUptime(Date.now() - sessionStartedAt)
+    : "—";
 
   return (
     <div
@@ -179,15 +121,13 @@ function ConnectStats({ snap, getTunnelStatus, refresh }) {
   );
 }
 
-/** @param {{ snap: import('../vpnTypes').StateSnapshot, connectPending: boolean, busy: boolean, cancelable: boolean, reconnecting: boolean, refresh: () => Promise<void>, getTunnelStatus: () => Promise<{ connected?: boolean, vpnSessionUptimeSecs?: number, error?: string } | null>, onSettings: () => void, onToggleConnect: () => void, onClearError: () => void }} props */
+/** @param {{ snap: import('../vpnTypes').StateSnapshot, connectPending: boolean, busy: boolean, cancelable: boolean, reconnecting: boolean, onSettings: () => void, onToggleConnect: () => void, onClearError: () => void }} props */
 export function ConnectScreen({
   snap,
   connectPending,
   busy,
   cancelable,
   reconnecting,
-  refresh,
-  getTunnelStatus,
   onSettings,
   onToggleConnect,
   onToggleMesh,
@@ -522,7 +462,7 @@ export function ConnectScreen({
           </div>
         </button>
 
-        <ConnectStats snap={snap} getTunnelStatus={getTunnelStatus} refresh={refresh} />
+        <ConnectStats snap={snap} />
 
         <p
           style={{

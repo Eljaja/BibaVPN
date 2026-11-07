@@ -38,6 +38,7 @@ object TauriVpnBridge {
     @JvmStatic
     fun requestDisconnect(context: android.content.Context) {
         val app = context.applicationContext
+        BibaVpnService.clearPendingConnectJson(app)
         if (Looper.myLooper() == Looper.getMainLooper()) {
             BibaVpnService.stop(app)
         } else {
@@ -154,16 +155,15 @@ object TauriVpnBridge {
                     activity,
                     prep,
                     onOk = {
-                        val j =
-                            BibaVpnService.takePendingConnectJson(activity)
-                                ?: BibaVpnService.getLastConfigJson(activity)
-                                ?: json
-                        BibaVpnService.clearPendingConnectJson(activity)
-                        BibaVpnService.startWithJson(activity, j)
+                        // A disconnect may have cancelled this permission request.
+                        BibaVpnService.takePendingConnectJson(activity)?.let { j ->
+                            BibaVpnService.startWithJson(activity, j)
+                        }
                     },
                     onDenied = {
-                        BibaVpnService.clearPendingConnectJson(activity)
-                        BibaVpnService.recordConnectError("vpn_permission_denied")
+                        if (BibaVpnService.takePendingConnectJson(activity) != null) {
+                            BibaVpnService.recordConnectError("vpn_permission_denied")
+                        }
                     },
                 )
             if (!started) {

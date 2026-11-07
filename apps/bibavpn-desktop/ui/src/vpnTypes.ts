@@ -102,6 +102,10 @@ export type ClientCapabilities = {
 };
 
 export type StateSnapshot = {
+  revision: number;
+  /** Локальная отметка для часов сессии, сохраняется при смене вкладок. */
+  sessionStartedAt?: number | null;
+  phase: "idle" | "connecting" | "connected" | "reconnecting" | "disconnecting" | "error";
   cfg: PublicSavedConfig;
   connected: boolean;
   displayHost: string;

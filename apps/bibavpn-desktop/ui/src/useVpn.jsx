@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { setLanguageFromCfg } from "./i18n.js";
+import { startVisiblePolling } from "./visiblePolling.js";
+import { acceptSnapshot, sessionStart, tunnelStatusChanged } from "./vpnState.js";
 
 /**
  * @typedef {import('./vpnTypes').StateSnapshot} StateSnapshot
@@ -12,13 +14,11 @@ export function useVpn() {
   /** @type {[StateSnapshot | null, (s: StateSnapshot | null) => void]} */
   const [snap, setSnap] = useState(null);
   const [busy, setBusy] = useState(false);
+  const snapshotRef = useRef(null);
   const mountedRef = useRef(true);
-  /** Каждая мутация увеличивает счётчик: старый `get_state` не должен затереть её результат. */
+  /** Отсекаем ответы более ранних команд. */
   const mutationSeqRef = useRef(0);
   const pendingOpsRef = useRef(0);
-  /** Сколько мутаций сейчас в полёте и сколько уже завершилось (для отсева устаревших refresh). */
-  const mutationInFlightRef = useRef(0);
-  const lastMutationDoneRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -29,24 +29,18 @@ export function useVpn() {
 
   const commitSnapshot = useCallback((/** @type {StateSnapshot} */ s) => {
     if (!mountedRef.current) return false;
-    setSnap(s);
+    if (acceptSnapshot(snapshotRef.current, s) !== s) return false;
+    const next = { ...s, sessionStartedAt: sessionStart(snapshotRef.current, s, Date.now()) };
+    snapshotRef.current = next;
+    setSnap(next);
     if (s?.cfg) setLanguageFromCfg(s.cfg);
     return true;
   }, []);
 
   const refresh = useCallback(async () => {
-    // Снимок, запрошенный во время connect/save, может прийти уже после неё
-    // и откатить UI назад. Если мутация была в полёте или завершилась за время
-    // запроса — не применяем устаревший снимок.
-    const doneAtStart = lastMutationDoneRef.current;
     try {
       const s = await invoke("get_state");
-      const stale =
-        mutationInFlightRef.current > 0 ||
-        lastMutationDoneRef.current !== doneAtStart;
-      if (mountedRef.current && !stale) {
-        commitSnapshot(/** @type {StateSnapshot} */ (s));
-      }
+      commitSnapshot(/** @type {StateSnapshot} */ (s));
       return /** @type {StateSnapshot} */ (s);
     } catch (e) {
       console.error(e);
@@ -67,7 +61,6 @@ export function useVpn() {
     let alive = true;
     let unlisten = () => {};
     (async () => {
-      await refresh();
       try {
         const un = await listen("vpn-state", (ev) => {
           const p = /** @type {StateSnapshot} */ (ev.payload);
@@ -80,12 +73,33 @@ export function useVpn() {
       } catch (e) {
         console.error(e);
       }
+      if (alive) await refresh();
     })();
     return () => {
       alive = false;
       unlisten();
     };
   }, [refresh, commitSnapshot]);
+
+  // A single observer owns tunnel reconciliation across all screens. It pauses in
+  // the background and rechecks immediately on return to the foreground.
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    const stop = startVisiblePolling({
+      intervalMs: 2000,
+      task: async () => {
+        const status = await getTunnelStatus();
+        if (tunnelStatusChanged(snapshotRef.current, status)) await refresh();
+      },
+    });
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stop();
+    };
+  }, [getTunnelStatus, refresh]);
 
   const getEditConfig = useCallback(async () => {
     const c = await invoke("get_edit_config");
@@ -97,7 +111,6 @@ export function useVpn() {
     async (/** @type {string} */ cmd) => {
       const seq = ++mutationSeqRef.current;
       pendingOpsRef.current += 1;
-      mutationInFlightRef.current += 1;
       if (mountedRef.current) setBusy(true);
       try {
         const s = await invoke(cmd);
@@ -106,8 +119,6 @@ export function useVpn() {
         }
         return /** @type {StateSnapshot} */ (s);
       } finally {
-        mutationInFlightRef.current = Math.max(0, mutationInFlightRef.current - 1);
-        lastMutationDoneRef.current += 1;
         pendingOpsRef.current = Math.max(0, pendingOpsRef.current - 1);
         if (mountedRef.current && pendingOpsRef.current === 0) setBusy(false);
       }
@@ -115,21 +126,15 @@ export function useVpn() {
     [commitSnapshot],
   );
 
-  /** Мутация без `busy` (сохранение/инвайт/ошибка); тоже не даёт старому refresh её затереть. */
+  /** Мутация без `busy` (сохранение/инвайт/ошибка). */
   const runSilent = useCallback(
     async (/** @type {string} */ cmd, /** @type {Record<string, unknown> | undefined} */ args) => {
       const seq = ++mutationSeqRef.current;
-      mutationInFlightRef.current += 1;
-      try {
-        const s = await invoke(cmd, args);
-        if (mountedRef.current && seq === mutationSeqRef.current) {
-          commitSnapshot(/** @type {StateSnapshot} */ (s));
-        }
-        return /** @type {StateSnapshot} */ (s);
-      } finally {
-        mutationInFlightRef.current = Math.max(0, mutationInFlightRef.current - 1);
-        lastMutationDoneRef.current += 1;
+      const s = await invoke(cmd, args);
+      if (mountedRef.current && seq === mutationSeqRef.current) {
+        commitSnapshot(/** @type {StateSnapshot} */ (s));
       }
+      return /** @type {StateSnapshot} */ (s);
     },
     [commitSnapshot],
   );
@@ -163,7 +168,6 @@ export function useVpn() {
     snap,
     busy,
     refresh,
-    getTunnelStatus,
     getEditConfig,
     saveCfg,
     connect,
