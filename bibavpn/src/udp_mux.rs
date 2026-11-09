@@ -2213,6 +2213,22 @@ mod tests {
         let _ = timeout(Duration::from_secs(2), server).await;
     }
 
+    async fn flood_server_udp_reqs_to(
+        client_ws: &mut WebSocketStream<DuplexStream>,
+        crypto: &SessionCrypto,
+        count: usize,
+        dest: std::net::SocketAddr,
+    ) {
+        for i in 0..count {
+            let inner = encode_udp_req(i as u64, "127.0.0.1", dest.port(), b"q").unwrap();
+            let sealed = seal_c2s(crypto, &inner);
+            client_ws
+                .send(Message::Binary(Bytes::from(sealed)))
+                .await
+                .unwrap();
+        }
+    }
+
     async fn flood_server_udp_reqs(
         client_ws: &mut WebSocketStream<DuplexStream>,
         crypto: &SessionCrypto,
@@ -2221,15 +2237,8 @@ mod tests {
         // Reserve the destination so a relay socket cannot bind the same port
         // and receive its own datagram. The caller keeps it alive during the test.
         let discard = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let port = discard.local_addr().unwrap().port();
-        for i in 0..count {
-            let inner = encode_udp_req(i as u64, "127.0.0.1", port, b"q").unwrap();
-            let sealed = seal_c2s(crypto, &inner);
-            client_ws
-                .send(Message::Binary(Bytes::from(sealed)))
-                .await
-                .unwrap();
-        }
+        let dest = discard.local_addr().unwrap();
+        flood_server_udp_reqs_to(client_ws, crypto, count, dest).await;
         discard
     }
 
@@ -2390,9 +2399,34 @@ mod tests {
             });
             let sem = wait_for_server_sem().await;
 
-            let _discard =
-                flood_server_udp_reqs(&mut client_ws, crypto.as_ref(), UDP_MUX_SERVER_MAX_INFLIGHT)
-                    .await;
+            // Drain the discard socket concurrently with the flood. Receiving all
+            // N datagrams proves every worker got a lease and completed send_to,
+            // so the later abort cancels recv (not a pre-send lease) and the
+            // idle-pool assertion is meaningful.
+            let discard = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let dest = discard.local_addr().unwrap();
+            let drain = tokio::spawn(async move {
+                let mut buf = [0u8; 16];
+                for i in 0..UDP_MUX_SERVER_MAX_INFLIGHT {
+                    let (n, _) = timeout(Duration::from_secs(5), discard.recv_from(&mut buf))
+                        .await
+                        .unwrap_or_else(|_| panic!("datagram {i} was not relayed"))
+                        .unwrap();
+                    assert_eq!(n, 1);
+                }
+            });
+            flood_server_udp_reqs_to(
+                &mut client_ws,
+                crypto.as_ref(),
+                UDP_MUX_SERVER_MAX_INFLIGHT,
+                dest,
+            )
+            .await;
+            timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("not every UDP request reached the discard socket")
+                .unwrap();
+
             wait_for_server_workers_inflight().await;
             wait_for_sem_available(&sem, 0).await;
             client_ws.close(None).await.ok();
