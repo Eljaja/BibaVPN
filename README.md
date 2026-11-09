@@ -79,7 +79,7 @@ Pull and start the mesh-compatible server and mesh sidecar with a persistent Ygg
 BIBA_INVITE_PUBLIC="your-server.example:8443" BIBA_INVITE_SNI="your-server.example" bash start.sh --mesh
 ```
 
-When mesh mode runs without `BIBA_INVITE_PUBLIC` / `BIBA_INVITE_SNI`, `start.sh` generates a name such as `biba-1a2b3c4d` and uses it as the certificate SAN, TLS SNI and the invitation's display address. Imported profiles therefore show that name instead of `127.0.0.1`; set either variable to choose your own.
+When mesh mode runs without `BIBA_INVITE_PUBLIC` / `BIBA_INVITE_SNI`, `start.sh` generates a name such as `biba-otter` and uses it as the certificate SAN, TLS SNI and the invitation's display address. Imported profiles therefore show that name instead of `127.0.0.1`; set either variable to choose your own.
 
 `BIBA_YB_MESH=1 bash start.sh` is equivalent. Use `--no-mesh` to disable the sidecar. `BIBA_SERVER_IMAGE` and `BIBA_MESH_IMAGE` can override the image names. Mesh mode requires the published `eljaja/bibavpn-server:mesh` and `eljaja/bibavpn-yb-mesh:latest` images; these are published by the Docker workflow after the mesh changes reach the main branch.
 
