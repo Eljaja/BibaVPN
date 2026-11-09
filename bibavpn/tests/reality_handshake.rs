@@ -61,11 +61,9 @@ async fn spawn_reality_server(
         let (tcp, _) = listener.accept().await.expect("accept");
         let tls = acceptor.accept(tcp).await.expect("tls accept");
         let tls_sni = tls.get_ref().1.server_name().map(str::to_string);
-        let (mut ws, _, http_host) = accept_websocket_or_camouflage(
+        let (mut ws, http_host) = accept_websocket_or_camouflage(
             tls,
             &ws_path,
-            false,
-            &token,
             CamouflageServeConfig::default(),
             None,
             bibavpn::frame::DEFAULT_MAX_WS_BINARY,
@@ -108,11 +106,9 @@ async fn spawn_reality_server_loop(
             let (tcp, _) = listener.accept().await.expect("accept");
             let tls = acceptor.accept(tcp).await.expect("tls accept");
             let tls_sni = tls.get_ref().1.server_name().map(str::to_string);
-            let (mut ws, _, http_host) = accept_websocket_or_camouflage(
+            let (mut ws, http_host) = accept_websocket_or_camouflage(
                 tls,
                 &ws_path,
-                false,
-                &token,
                 CamouflageServeConfig::default(),
                 None,
                 bibavpn::frame::DEFAULT_MAX_WS_BINARY,
@@ -428,16 +424,13 @@ async fn reality_handshake_rejects_forged_server() {
     let token = "test-token".to_string();
 
     let ws_path_s = ws_path.clone();
-    let token_s = token.clone();
     let echoed_pub = pub_key;
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.expect("accept");
         let tls = acceptor.accept(tcp).await.expect("tls accept");
-        let (mut ws, _, _http_host) = accept_websocket_or_camouflage(
+        let (mut ws, _http_host) = accept_websocket_or_camouflage(
             tls,
             &ws_path_s,
-            false,
-            &token_s,
             CamouflageServeConfig::default(),
             None,
             bibavpn::frame::DEFAULT_MAX_WS_BINARY,

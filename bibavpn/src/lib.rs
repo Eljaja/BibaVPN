@@ -2,6 +2,8 @@
 //! and browser-looking HTTP upgrade headers. Intended to run alongside zapret on Linux routers
 //! (see `scripts/zapret-sidecar.sh`); zapret is not linked into these binaries.
 
+#![recursion_limit = "256"]
+
 pub mod accept;
 pub mod activity;
 pub mod camouflage;
@@ -39,7 +41,6 @@ pub mod server_metrics;
 pub mod transport_capabilities;
 pub mod udp_mux;
 pub mod yb_mesh;
-pub mod ws_auth;
 pub mod ws_bridge;
 
 pub use crypto_layer::secret_eq;

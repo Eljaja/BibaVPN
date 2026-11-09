@@ -22,6 +22,24 @@ pub struct UsersFile {
 }
 
 pub fn load_users(path: &Path) -> anyhow::Result<UsersFile> {
+    // The registry holds bearer tokens. On Unix a file readable by group/other
+    // lets any local account mint sessions, so refuse it loudly instead of
+    // silently accepting a world-readable deployment.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .context("stat users file")?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "users file {:?} is accessible by group/other (mode {:04o}); restrict it with `chmod 600`",
+                path,
+                mode & 0o777
+            );
+        }
+    }
     let data = std::fs::read(path).context("read users file")?;
     if data.len() > 1024 * 1024 {
         bail!("users file exceeds 1 MiB");
@@ -137,7 +155,12 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("bibavpn-users-{}.json", rand::random::<u64>()));
         let write = |enabled| {
-            std::fs::write(&path, format!(r#"{{"users":[{{"label":"alice","token":"alice-secret","enabled":{enabled},"max_concurrent":1}}]}}"#)).unwrap()
+            std::fs::write(&path, format!(r#"{{"users":[{{"label":"alice","token":"alice-secret","enabled":{enabled},"max_concurrent":1}}]}}"#)).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
         };
         write(true);
         let registry = UserRegistry::new(path.clone()).unwrap();
@@ -158,6 +181,29 @@ mod tests {
         assert!(registry.acquire("alice-secret").is_err());
         std::fs::write(&path, b"broken").unwrap();
         assert!(registry.acquire("alice-secret").is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_group_or_other_readable_users_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("bibavpn-users-mode-{}.json", rand::random::<u64>()));
+        std::fs::write(&path, r#"{"users":[]}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = match load_users(&path) {
+            Ok(_) => panic!("world-readable users file must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("group/other"), "unexpected: {msg}");
+        assert!(msg.contains("0644"), "unexpected: {msg}");
+
+        // Owner-only is what the admin tool writes and what the server accepts.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load_users(&path).is_ok());
         std::fs::remove_file(path).unwrap();
     }
 }

@@ -13,13 +13,6 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::camouflage;
 
-/// Same meaning as server bin `WsAcceptKind`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WsHandshakeKind {
-    NewPath,
-    LegacyPath,
-}
-
 #[derive(Clone, Default)]
 pub struct CamouflageServeConfig {
     pub static_dir: Option<PathBuf>,
@@ -31,6 +24,9 @@ pub struct CamouflageServeConfig {
 
 /// Max bytes copied from the camouflage origin to the client (not configurable via CLI).
 const CAMOUFLAGE_ORIGIN_MAX_BYTES: usize = 1024 * 1024;
+/// Max size of a file served from `--camouflage-dir` (checked via metadata
+/// before reading, so an unauthenticated probe cannot make us allocate more).
+const CAMOUFLAGE_STATIC_MAX_BYTES: u64 = 1024 * 1024;
 /// Max time for camouflage origin connect + read (not configurable via CLI).
 const CAMOUFLAGE_ORIGIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Max rewritten request-target length sent upstream.
@@ -40,12 +36,10 @@ const CAMOUFLAGE_MAX_REQUEST_TARGET: usize = 2048;
 pub async fn accept_websocket_or_camouflage<S>(
     mut stream: S,
     ws_path: &str,
-    legacy_path_auth: bool,
-    token: &str,
     camo: CamouflageServeConfig,
     peer: Option<SocketAddr>,
     max_ws_binary_cap: usize,
-) -> anyhow::Result<Option<(WebSocketStream<S>, WsHandshakeKind, Option<String>)>>
+) -> anyhow::Result<Option<(WebSocketStream<S>, Option<String>)>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -68,20 +62,10 @@ where
     };
 
     if is_websocket_upgrade(&req) {
-        let kind = if path == ws_path {
-            WsHandshakeKind::NewPath
-        } else if legacy_path_auth {
-            let legacy = format!("/b/{token}");
-            if crate::crypto_layer::secret_eq(path, legacy.as_str()) {
-                WsHandshakeKind::LegacyPath
-            } else {
-                write_camouflage_status(&mut stream, 404).await?;
-                return Ok(None);
-            }
-        } else {
+        if path != ws_path {
             write_camouflage_status(&mut stream, 404).await?;
             return Ok(None);
-        };
+        }
 
         let key = header_line(&req, "Sec-WebSocket-Key").context("websocket: missing key")?;
         let http_host = header_line(&req, "Host");
@@ -129,7 +113,7 @@ Sec-WebSocket-Accept: {accept}\r\n\
         let ws =
             WebSocketStream::from_partially_read(stream, remainder, Role::Server, Some(ws_cfg))
                 .await;
-        return Ok(Some((ws, kind, http_host)));
+        return Ok(Some((ws, http_host)));
     }
 
     // Plain HTTP
@@ -336,9 +320,10 @@ async fn serve_camouflage_http<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     if let Some(dir) = camo.static_dir.as_deref() {
-        match serve_static_file(dir, req.path).await {
+        match serve_static_file(dir, req.path, !req.is_head()).await {
             Some(f) => {
-                write_file_response(stream, req, f.ctype, &f.body, f.meta).await?;
+                let body = if req.is_head() { None } else { Some(f.body.as_slice()) };
+                write_file_response(stream, req, f.ctype, body, f.meta).await?;
                 return Ok(());
             }
             None => {
@@ -423,17 +408,28 @@ struct StaticFile {
     meta: FileMeta,
 }
 
-async fn serve_static_file(dir: &Path, path: &str) -> Option<StaticFile> {
+async fn serve_static_file(dir: &Path, path: &str, read_body: bool) -> Option<StaticFile> {
     let fs_path = safe_static_path_under_base(dir, path)?;
     let md = tokio::fs::metadata(&fs_path).await.ok()?;
-    if !md.is_file() {
+    if !md.is_file() || md.len() > CAMOUFLAGE_STATIC_MAX_BYTES {
         return None;
     }
-    let data = tokio::fs::read(&fs_path).await.ok()?;
+    // `HEAD` only needs the metadata nginx would report; reading the body here
+    // would let a probe force a 1 MiB allocation for a response with no body.
+    let data = if read_body {
+        let data = tokio::fs::read(&fs_path).await.ok()?;
+        // The file can grow between metadata and read: never serve past the cap.
+        if data.len() as u64 > CAMOUFLAGE_STATIC_MAX_BYTES {
+            return None;
+        }
+        data
+    } else {
+        Vec::new()
+    };
     let ctype = guess_mime(fs_path.extension().and_then(|e| e.to_str()).unwrap_or(""));
     let meta = FileMeta {
         mtime_secs: mtime_secs(&md),
-        len: data.len() as u64,
+        len: md.len(),
     };
     Some(StaticFile {
         ctype,
@@ -559,21 +555,23 @@ async fn write_synthetic_response<S: AsyncWrite + Unpin>(
         mtime_secs: synthetic_mtime(),
         len: body.len() as u64,
     };
-    write_file_response(stream, req, ctype, body, meta).await
+    write_file_response(stream, req, ctype, Some(body), meta).await
 }
 
 /// 200 / 206 / 416 for a body backed by a file, in nginx's header order.
-/// `HEAD` gets byte-identical headers and no body.
+/// `HEAD` gets byte-identical headers and no body; `body` is `None` when the
+/// caller only has metadata (static `HEAD`) and must not read the file.
 async fn write_file_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     req: CamoRequest<'_>,
     ctype: &str,
-    body: &[u8],
+    body: Option<&[u8]>,
     meta: FileMeta,
 ) -> anyhow::Result<()> {
     let date = camouflage::http_date_now();
-    let total = body.len() as u64;
-    let (head, payload) = match parse_single_range(req.range, total) {
+    let total = meta.len;
+    let (head, payload): (NginxHead<'_>, Option<&[u8]>) = match parse_single_range(req.range, total)
+    {
         RangeOutcome::Whole => {
             let head = NginxHead {
                 status: 200,
@@ -587,18 +585,18 @@ async fn write_file_response<S: AsyncWrite + Unpin>(
             (head, body)
         }
         RangeOutcome::Partial { start, end } => {
-            let slice = &body[start as usize..=end as usize];
+            let payload = body.map(|b| &b[start as usize..=end as usize]);
             // nginx drops `Accept-Ranges` once it actually answers with a range.
             let head = NginxHead {
                 status: 206,
                 ctype: Some(ctype),
-                content_length: Some(slice.len() as u64),
+                content_length: Some(end - start + 1),
                 file: Some(meta),
                 content_range: Some(format!("bytes {start}-{end}/{total}")),
                 cache_control: true,
                 ..Default::default()
             };
-            (head, slice)
+            (head, payload)
         }
         RangeOutcome::Unsatisfiable => {
             let (_code, page) = camouflage::error_page(416);
@@ -609,12 +607,14 @@ async fn write_file_response<S: AsyncWrite + Unpin>(
                 content_range: Some(format!("bytes */{total}")),
                 ..Default::default()
             };
-            (head, page.as_bytes())
+            (head, Some(page.as_bytes()))
         }
     };
     stream.write_all(head.render(&date).as_bytes()).await?;
     if !req.is_head() {
-        stream.write_all(payload).await?;
+        if let Some(payload) = payload {
+            stream.write_all(payload).await?;
+        }
     }
     stream.flush().await?;
     Ok(())
@@ -935,8 +935,6 @@ mod tests {
             accept_websocket_or_camouflage(
                 server,
                 "/ws",
-                false,
-                "tok",
                 CamouflageServeConfig::default(),
                 None,
                 crate::frame::DEFAULT_MAX_WS_BINARY,
@@ -959,8 +957,6 @@ mod tests {
             accept_websocket_or_camouflage(
                 server,
                 "/ws",
-                false,
-                "tok",
                 CamouflageServeConfig::default(),
                 None,
                 crate::frame::DEFAULT_MAX_WS_BINARY,
@@ -1182,11 +1178,11 @@ mod tests {
             len: body.len() as u64,
         };
         let mut get_out: Vec<u8> = Vec::new();
-        write_file_response(&mut get_out, req("GET", None), "text/plain", body, meta)
+        write_file_response(&mut get_out, req("GET", None), "text/plain", Some(body), meta)
             .await
             .unwrap();
         let mut head_out: Vec<u8> = Vec::new();
-        write_file_response(&mut head_out, req("HEAD", None), "text/plain", body, meta)
+        write_file_response(&mut head_out, req("HEAD", None), "text/plain", Some(body), meta)
             .await
             .unwrap();
         let g = String::from_utf8(get_out).unwrap();
@@ -1212,7 +1208,7 @@ mod tests {
             &mut out,
             req("GET", Some("bytes=2-5")),
             "text/plain",
-            body,
+            Some(body),
             meta,
         )
         .await
@@ -1237,7 +1233,7 @@ mod tests {
             &mut out,
             req("GET", Some("bytes=50-60")),
             "text/plain",
-            body,
+            Some(body),
             meta,
         )
         .await
@@ -1306,7 +1302,7 @@ mod tests {
         fs::write(&outside, b"outside secret").unwrap();
         std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
         assert!(
-            serve_static_file(&base, "/escape").await.is_none(),
+            serve_static_file(&base, "/escape", true).await.is_none(),
             "symlink pointing outside camouflage dir must not be served"
         );
         let _ = fs::remove_file(&outside);
@@ -1320,14 +1316,58 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("index.html"), b"<html>hi</html>").unwrap();
         fs::create_dir_all(base.join("sub")).unwrap();
-        let f = serve_static_file(&base, "/").await.expect("index served");
+        let f = serve_static_file(&base, "/", true).await.expect("index served");
         assert_eq!(f.ctype, "text/html; charset=utf-8");
         assert_eq!(f.meta.len, 15);
         assert_eq!(f.body.len(), 15);
         assert!(f.meta.mtime_secs > 1_600_000_000, "{}", f.meta.mtime_secs);
+        // HEAD path: metadata only, no body read.
+        let head = serve_static_file(&base, "/", false)
+            .await
+            .expect("index metadata for HEAD");
+        assert_eq!(head.meta.len, 15);
+        assert!(head.body.is_empty());
         // Directories are not served.
-        assert!(serve_static_file(&base, "/sub").await.is_none());
-        assert!(serve_static_file(&base, "/missing.html").await.is_none());
+        assert!(serve_static_file(&base, "/sub", true).await.is_none());
+        assert!(serve_static_file(&base, "/missing.html", true).await.is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn oversized_static_file_is_not_served() {
+        let base = std::env::temp_dir().join(format!("bibavpn_static_big_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let big = base.join("big.bin");
+        let file = match fs::File::create(&big) {
+            Ok(f) => f,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&base);
+                return;
+            }
+        };
+        // Sparse file: metadata alone exceeds the cap, so nothing large is allocated.
+        if file
+            .set_len(CAMOUFLAGE_STATIC_MAX_BYTES.saturating_add(1))
+            .is_err()
+        {
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(
+            serve_static_file(&base, "/big.bin", true).await.is_none(),
+            "files over the camouflage cap must 404 rather than be buffered"
+        );
+
+        // Exactly at the cap is still servable, and HEAD reads only metadata.
+        let at_cap = base.join("at-cap.bin");
+        let f = fs::File::create(&at_cap).unwrap();
+        f.set_len(CAMOUFLAGE_STATIC_MAX_BYTES).unwrap();
+        let served = serve_static_file(&base, "/at-cap.bin", false)
+            .await
+            .expect("file at the cap is served");
+        assert_eq!(served.meta.len, CAMOUFLAGE_STATIC_MAX_BYTES);
+        assert!(served.body.is_empty());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1405,8 +1445,6 @@ mod tests {
             accept_websocket_or_camouflage(
                 server,
                 "/ws",
-                false,
-                "tok",
                 CamouflageServeConfig::default(),
                 None,
                 crate::frame::DEFAULT_MAX_WS_BINARY,
@@ -1444,8 +1482,6 @@ mod tests {
             accept_websocket_or_camouflage(
                 server,
                 "/ws",
-                false,
-                "tok",
                 CamouflageServeConfig::default(),
                 None,
                 crate::frame::DEFAULT_MAX_WS_BINARY,
@@ -1819,8 +1855,6 @@ mod tests {
             accept_websocket_or_camouflage(
                 server,
                 "/ws",
-                false,
-                "tok",
                 CamouflageServeConfig::default(),
                 None,
                 crate::frame::DEFAULT_MAX_WS_BINARY,
@@ -1859,8 +1893,6 @@ Sec-WebSocket-Version: 13\r\n\
             accept_websocket_or_camouflage(
                 server,
                 "/ws",
-                false,
-                "tok",
                 CamouflageServeConfig::default(),
                 None,
                 crate::frame::DEFAULT_MAX_WS_BINARY,
@@ -1902,7 +1934,7 @@ Sec-WebSocket-Version: 13\r\n\
         oversized_frame_header.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]); // mask key
         client.write_all(&oversized_frame_header).await.unwrap();
 
-        let (mut ws, _kind, _host) = tokio::time::timeout(Duration::from_secs(5), srv)
+        let (mut ws, _host) = tokio::time::timeout(Duration::from_secs(5), srv)
             .await
             .expect("accept must not hang")
             .expect("join")

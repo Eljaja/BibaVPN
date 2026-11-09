@@ -15,7 +15,9 @@ pub const OPEN_FLAG_STATUS: u8 = 0x01;
 /// Client → server: session token after WebSocket upgrade (auth outside URL path).
 pub const AUTH_MAGIC: &[u8] = b"BIBA\x01AUTH\x00";
 
-pub const MAX_UDP_PAYLOAD: usize = 60 * 1024;
+/// Largest UDP payload we relay: 65535 (max IP datagram) − 8 (UDP header) − 20 (IPv4 header).
+/// Responses in 61441..=65507 were previously dropped after receive.
+pub const MAX_UDP_PAYLOAD: usize = 65_507;
 
 // Biba v3 inner control (plaintext inside padded frame, then AEAD on the wire)
 pub const V3_CTRL_AUTH: u8 = 0x01;
@@ -159,6 +161,21 @@ pub fn decode_open_err(data: &[u8]) -> anyhow::Result<String> {
     Ok(std::str::from_utf8(&data[i + 2..i + 2 + ml])?.to_string())
 }
 
+/// Reject destinations a relay must never resolve. An ATYP=3 domain is attacker-controlled
+/// bytes; empty or control-laden values only come from malformed/hostile frames.
+pub(crate) fn validate_udp_dest_host(host: &str) -> anyhow::Result<()> {
+    if host.is_empty() {
+        anyhow::bail!("empty UDP destination host");
+    }
+    if host.len() > u8::MAX as usize {
+        anyhow::bail!("UDP destination host too long");
+    }
+    if host.chars().any(char::is_control) {
+        anyhow::bail!("control character in UDP destination host");
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_atyp_host_port(
     host: &str,
     port: u16,
@@ -171,10 +188,8 @@ pub(crate) fn encode_atyp_host_port(
         buf.push(4);
         buf.extend_from_slice(&ip.octets());
     } else {
+        validate_udp_dest_host(host)?;
         let b = host.as_bytes();
-        if b.len() > u8::MAX as usize {
-            anyhow::bail!("host too long");
-        }
         buf.push(3);
         buf.push(b.len() as u8);
         buf.extend_from_slice(b);
@@ -206,6 +221,7 @@ pub(crate) fn decode_atyp_host_port(data: &[u8]) -> anyhow::Result<(String, u16,
                 anyhow::bail!("short domain host");
             }
             let h = std::str::from_utf8(&data[2..2 + l])?.to_string();
+            validate_udp_dest_host(&h)?;
             (h, 2 + l)
         }
         4 => {
@@ -567,6 +583,44 @@ mod udp_tests {
         let big = vec![0u8; MAX_UDP_PAYLOAD + 1];
         assert!(encode_udp_req(1, "1.1.1.1", 53, &big).is_err());
         assert!(encode_udp_rep(1, "1.1.1.1", 53, &big).is_err());
+    }
+
+    #[test]
+    fn udp_payload_accepts_full_65507_datagram() {
+        assert_eq!(MAX_UDP_PAYLOAD, 65_507);
+        let max = vec![0xab; MAX_UDP_PAYLOAD];
+        let req = encode_udp_req(1, "1.1.1.1", 53, &max).unwrap();
+        let (_, _, _, pl) = decode_udp_req(&req).unwrap();
+        assert_eq!(pl.len(), MAX_UDP_PAYLOAD);
+        assert!(pl.iter().all(|&b| b == 0xab));
+
+        let rep = encode_udp_rep(2, "2001:db8::1", 9, &max).unwrap();
+        let (_, _, _, pl) = decode_udp_rep(&rep).unwrap();
+        assert_eq!(pl.len(), MAX_UDP_PAYLOAD);
+
+        assert!(encode_udp_req(1, "1.1.1.1", 53, &vec![0u8; MAX_UDP_PAYLOAD + 1]).is_err());
+    }
+
+    #[test]
+    fn udp_rejects_empty_and_control_domains() {
+        // Encode must not produce ATYP=3 with an empty domain.
+        assert!(encode_udp_req(1, "", 53, b"q").is_err());
+        assert!(encode_udp_rep(1, "", 53, b"q").is_err());
+        assert!(encode_udp_req(1, "a\nb", 53, b"q").is_err());
+
+        // ATYP=3, domain len 0, port 53.
+        let empty_req = [V3_CTRL_UDP_REQ, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 53];
+        assert!(decode_udp_req(&empty_req).is_err());
+        let empty_rep = [V3_CTRL_UDP_REP, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 53];
+        assert!(decode_udp_rep(&empty_rep).is_err());
+
+        // ATYP=3, domain "a\n", port 53.
+        let ctrl_req = [V3_CTRL_UDP_REQ, 0, 0, 0, 0, 0, 0, 0, 1, 3, 2, b'a', b'\n', 0, 53];
+        assert!(decode_udp_req(&ctrl_req).is_err());
+
+        // SOCKS5 framing (RSV RSV FRAG) uses the same ATYP decoder.
+        let empty_socks = [0, 0, 0, 3, 0, 0, 53];
+        assert!(parse_socks5_udp_datagram(&empty_socks).is_err());
     }
 
     #[test]
