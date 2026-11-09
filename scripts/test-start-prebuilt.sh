@@ -24,6 +24,8 @@ grep -q 'pull biba-server' "$DOCKER_CALLS"
 grep -q 'up -d --no-build --pull never biba-server' "$DOCKER_CALLS"
 grep -q 'stop yb-mesh' "$DOCKER_CALLS"
 grep -q '^BIBA_SERVER_IMAGE=eljaja/bibavpn-server:latest$' .biba-start.env
+grep -q '^BIBA_INVITE_PUBLIC=127.0.0.1:8443$' .biba-start.env
+grep -q '^BIBA_INVITE_SNI=biba-server$' .biba-start.env
 ! grep -q 'pull yb-mesh-init' "$DOCKER_CALLS"
 
 : > "$DOCKER_CALLS"
@@ -33,6 +35,12 @@ grep -q 'run --pull never --rm -T --quiet yb-mesh-init init' "$DOCKER_CALLS"
 grep -q 'up -d --no-build --pull never yb-mesh' "$DOCKER_CALLS"
 grep -q '^BIBA_YB_MESH_ENDPOINT=\[200:abcd::1\]:8443$' .biba-start.env
 grep -q '^BIBA_SERVER_IMAGE=eljaja/bibavpn-server:mesh$' .biba-start.env
+# Mesh mode must not leave 127.0.0.1 in the imported profile; the generated
+# name is used as SNI, certificate SAN and the invite's display address.
+mesh_name="$(sed -n 's/^BIBA_INVITE_SNI=biba-\([0-9a-f]\{8\}\)$/\1/p' .biba-start.env)"
+[[ -n "$mesh_name" ]]
+grep -q "^BIBA_INVITE_PUBLIC=biba-${mesh_name}:8443$" .biba-start.env
+! grep -q '^BIBA_INVITE_PUBLIC=127.0.0.1' .biba-start.env
 ! grep -q ' compose .* build ' "$DOCKER_CALLS"
 
 cp .biba-start.env saved-env

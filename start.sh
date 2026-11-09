@@ -27,8 +27,16 @@ BIBA_MESH_IMAGE="${BIBA_MESH_IMAGE:-eljaja/bibavpn-yb-mesh:latest}"
 export BIBA_SERVER_IMAGE BIBA_MESH_IMAGE
 compose=(docker compose -f docker-compose.yml -f docker-compose.prebuilt.yml)
 
-BIBA_INVITE_PUBLIC="${BIBA_INVITE_PUBLIC:-127.0.0.1:8443}"
-BIBA_INVITE_SNI="${BIBA_INVITE_SNI:-biba-server}"
+if [[ "$mesh" == 1 ]]; then
+  # Mesh transports ignore the public host/port, so use a stable-per-run DNS-like
+  # name for the certificate SAN, SNI and the invite's display address. This keeps
+  # the imported profile from showing 127.0.0.1 everywhere.
+  BIBA_INVITE_SNI="${BIBA_INVITE_SNI:-biba-$(openssl rand -hex 4)}"
+  BIBA_INVITE_PUBLIC="${BIBA_INVITE_PUBLIC:-${BIBA_INVITE_SNI}:8443}"
+else
+  BIBA_INVITE_PUBLIC="${BIBA_INVITE_PUBLIC:-127.0.0.1:8443}"
+  BIBA_INVITE_SNI="${BIBA_INVITE_SNI:-biba-server}"
+fi
 BIBA_MAX_WS_BINARY="${BIBA_MAX_WS_BINARY:-262144}"
 
 BIBA_TOKEN="$(openssl rand -hex 16)"

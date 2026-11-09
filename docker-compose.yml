@@ -12,7 +12,7 @@ services:
       - --listen
       - 0.0.0.0:8443
       - --self-signed-san
-      - biba-server
+      - "${BIBA_INVITE_SNI:-biba-server}"
       - --token
       - "${BIBA_TOKEN:?run bash start.sh or set BIBA_TOKEN}"
       - --psk
