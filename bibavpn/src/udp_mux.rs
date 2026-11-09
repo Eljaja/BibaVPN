@@ -154,6 +154,8 @@ struct UdpPoolInner {
 /// Reuse bound UDP sockets on the server to cut `bind(2)` churn (`--udp-socket-pool-size`).
 pub struct UdpSocketPool {
     inner: Arc<UdpPoolInner>,
+    /// Max concurrently leased sockets per session, derived from capacity.
+    session_quota: usize,
 }
 
 pub struct UdpLease {
@@ -167,6 +169,12 @@ pub struct UdpLease {
 
 impl UdpSocketPool {
     pub fn new(cap: usize) -> Arc<Self> {
+        Self::with_session_quota(cap, session_socket_quota(cap))
+    }
+
+    /// Build a pool with an explicit per-session quota (the quota may exceed the
+    /// pool capacity in tests to exercise queueing/abort paths).
+    fn with_session_quota(cap: usize, quota: usize) -> Arc<Self> {
         let cap = cap.max(1);
         Arc::new(Self {
             inner: Arc::new(UdpPoolInner {
@@ -175,12 +183,12 @@ impl UdpSocketPool {
                 v6_idle: Mutex::new(Vec::new()),
                 sem: Arc::new(Semaphore::new(cap)),
             }),
+            session_quota: quota.max(1),
         })
     }
 
-    /// Total sockets this pool can hand out across all sessions.
-    fn capacity(&self) -> usize {
-        self.inner.max_idle_per_family
+    fn session_quota(&self) -> usize {
+        self.session_quota
     }
 
     pub async fn lease(self: &Arc<Self>, v6: bool) -> anyhow::Result<UdpLease> {
@@ -1062,7 +1070,7 @@ where
     // `recv_timeout` each (the global pool defaults to 64 sockets, a session allows 512).
     let socket_quota_sem = udp_socket_pool
         .as_ref()
-        .map(|pool| Arc::new(Semaphore::new(session_socket_quota(pool.capacity()))));
+        .map(|pool| Arc::new(Semaphore::new(pool.session_quota())));
     let udp_adaptive = Arc::new(std::sync::Mutex::new(AdaptivePadState::default()));
     let ws_send_j = WsSendJitter {
         min_ms: ws_jitter_min_ms,
@@ -2360,9 +2368,12 @@ mod tests {
     async fn server_session_pool_abort_drains_and_preserves_idle_baseline() {
         let _guard = test_hooks::server_stress_lock().await;
         for _ in 0..2 {
-            // Size the pool so the per-session quota (cap/4) still permits all
-            // UDP_MUX_SERVER_MAX_INFLIGHT workers this test needs in flight.
-            let pool = UdpSocketPool::new(UDP_MUX_SERVER_MAX_INFLIGHT * 4);
+            // One socket per worker: the pool is fully leased while the session is
+            // inflight, so the idle baseline after abort must be zero.
+            let pool = UdpSocketPool::with_session_quota(
+                UDP_MUX_SERVER_MAX_INFLIGHT,
+                UDP_MUX_SERVER_MAX_INFLIGHT,
+            );
             let pool_srv = pool.clone();
             let (mut client_ws, server_ws) = ws_duplex_pair().await;
             let crypto = test_session_crypto();
