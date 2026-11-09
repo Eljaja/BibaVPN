@@ -787,16 +787,22 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
         extra.push(parse_ws_header(line)?);
     }
 
-    let socks_bind = inv_opt
-        .as_ref()
-        .and_then(|i| {
-            i.socks_bind
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| args.socks5.clone());
+    // An explicit `--socks5` wins over the invite, like every other flag in the
+    // merge table: an invitation must not move the local listener off loopback.
+    let socks_bind = if explicit("socks5") {
+        args.socks5.clone()
+    } else {
+        inv_opt
+            .as_ref()
+            .and_then(|i| {
+                i.socks_bind
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| args.socks5.clone())
+    };
     let http_proxy_bind: Option<String> = args
         .http_proxy
         .clone()
@@ -950,6 +956,44 @@ mod performance_precedence_tests {
         assert_eq!(o.use_tcp_mux, false);
         assert!(!o.insecure_tls);
         assert_eq!(o.decoy_gets_interval_secs, 30);
+    }
+
+    #[test]
+    fn explicit_socks_bind_wins_over_invite() {
+        let inv: bibavpn::InviteV1 = serde_json::from_value(serde_json::json!({
+            "v": 1, "server": "vpn.example:443", "sni": "vpn.example", "token": "strong-token",
+            "psk": "0123456789abcdef0123456789abcdef", "socks_bind": "0.0.0.0:1080",
+            "decoy_max": 0, "max_pad": 16, "max_ws_binary": 1400, "ws_ping_secs": 25, "insecure": false
+        }))
+        .unwrap();
+        let uri = bibavpn::invite_uri::encode_invite_v1(&inv, "benchmark-test").unwrap();
+
+        let matches = Args::command()
+            .try_get_matches_from([
+                "client",
+                "--from-invite",
+                &uri,
+                "--invite-passphrase",
+                "benchmark-test",
+                "--socks5",
+                "127.0.0.1:1234",
+            ])
+            .unwrap();
+        let o = options_from_args(Args::from_arg_matches(&matches).unwrap(), &matches).unwrap();
+        assert_eq!(o.socks_bind, "127.0.0.1:1234");
+
+        // Without an explicit flag the invite may choose the bind.
+        let matches = Args::command()
+            .try_get_matches_from([
+                "client",
+                "--from-invite",
+                &uri,
+                "--invite-passphrase",
+                "benchmark-test",
+            ])
+            .unwrap();
+        let o = options_from_args(Args::from_arg_matches(&matches).unwrap(), &matches).unwrap();
+        assert_eq!(o.socks_bind, "0.0.0.0:1080");
     }
 
     #[test]

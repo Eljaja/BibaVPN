@@ -1019,6 +1019,19 @@ pub async fn run_local_client(
             "HTTP local proxy has no auth handshake; SOCKS username/password applies only to the SOCKS port"
         );
     }
+    if opts.socks_auth.is_none() && !bind_is_loopback(&opts.socks_bind) {
+        warn!(
+            "SOCKS5 listener bound to {} without username/password: anything that can reach this address can use the tunnel",
+            opts.socks_bind
+        );
+    }
+    if let Some(bind) = opts.http_proxy_bind.as_deref() {
+        if !bind_is_loopback(bind) {
+            warn!(
+                "HTTP proxy bound to {bind} has no authentication: anything that can reach this address can use the tunnel"
+            );
+        }
+    }
 
     let ws_parallel = opts.ws_parallel.clamp(1, 4);
     log_client_transport_caps(&opts, ws_parallel);
@@ -1246,9 +1259,6 @@ pub async fn run_local_client(
         .await
         .with_context(|| format!("bind socks {}", opts.socks_bind))?;
     info!("SOCKS5 on {}", opts.socks_bind);
-    if let Some(tx) = socks_ready {
-        let _ = tx.send(());
-    }
 
     if let Some(ref http_bind) = opts.http_proxy_bind {
         let http_listener = TcpListener::bind(http_bind)
@@ -1291,6 +1301,11 @@ pub async fn run_local_client(
                 }
             }
         }));
+    }
+
+    // Report readiness only once every configured listener is bound.
+    if let Some(tx) = socks_ready {
+        let _ = tx.send(());
     }
 
     static SOCKS_ACCEPT_ERR_LOG: crate::log_ratelimit::LogEvery =
@@ -1350,6 +1365,15 @@ pub fn parse_host_port(s: &str) -> anyhow::Result<(String, u16)> {
         return Ok((h.to_string(), p));
     }
     anyhow::bail!("expected host:port, got {s}")
+}
+
+/// True when the listener bind host is loopback, or a hostname whose address we
+/// cannot prove is public (`localhost`). Used for unauthenticated-exposure warnings.
+fn bind_is_loopback(bind: &str) -> bool {
+    match parse_host_port(bind).ok().map(|(host, _)| host) {
+        Some(host) => host.parse::<IpAddr>().map_or(true, |ip| ip.is_loopback()),
+        None => true,
+    }
 }
 
 pub fn parse_ws_header(line: &str) -> anyhow::Result<(String, String)> {
@@ -1687,12 +1711,9 @@ async fn run_socks_udp_assoc(
     let udp = Arc::new(udp);
     let mut mbuf = vec![0u8; 65535];
     let mut ctrl_buf = [0u8; 64];
-    let reply_timeout_secs = if cfg.udp_mux_reply_timeout_secs == 0 {
-        DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS
-    } else {
-        cfg.udp_mux_reply_timeout_secs
-    };
-    let reply_timeout = Duration::from_secs(reply_timeout_secs);
+    // `0` means no client-side deadline (documented as unlimited).
+    let reply_timeout =
+        (cfg.udp_mux_reply_timeout_secs > 0).then(|| Duration::from_secs(cfg.udp_mux_reply_timeout_secs));
     // Latched on the first datagram accepted from the association owner.
     let mut client_port: Option<u16> = None;
 
@@ -1740,12 +1761,15 @@ async fn run_socks_udp_assoc(
                             let xid: u64 = rand::random();
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             handle.forward(xid, dst_host.clone(), dst_port, payload.clone(), tx)?;
-                            let reply = match timeout(reply_timeout, rx).await {
-                                Ok(inner) => inner,
-                                Err(_) => {
-                                    error!("udp mux: reply timeout for xid {xid}");
-                                    return Ok(());
-                                }
+                            let reply = match reply_timeout {
+                                Some(limit) => match timeout(limit, rx).await {
+                                    Ok(inner) => inner,
+                                    Err(_) => {
+                                        error!("udp mux: reply timeout for xid {xid}");
+                                        return Ok(());
+                                    }
+                                },
+                                None => rx.await,
                             };
                             match reply {
                                 Ok(Ok(socks_body)) => {

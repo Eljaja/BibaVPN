@@ -150,6 +150,38 @@ fn start_json_with_binds_overrides_and_clears_http_proxy() {
 }
 
 #[test]
+fn start_json_local_bind_wins_over_invite() {
+    let invite = invite_from_json(serde_json::json!({
+        "v": 1,
+        "server": "vpn.example:443",
+        "sni": "vpn.example",
+        "token": "invite-token",
+        "psk": PSK,
+        "socks_bind": "0.0.0.0:1080",
+        "decoy_max": 0,
+        "max_pad": 16,
+        "max_ws_binary": 1400,
+        "ws_ping_secs": 25,
+        "insecure": false,
+    }));
+    let uri = encode_invite_v1(&invite, "passphrase-test").unwrap();
+
+    // The host application's injected bind must survive an invite that asks for
+    // a LAN-visible listener.
+    let json = format!(
+        r#"{{"from_invite":"{uri}","invite_passphrase":"passphrase-test","socks_bind":"127.0.0.1:0"}}"#
+    );
+    let o = local_client_options_from_json_str_with_binds(&json, "127.0.0.1:7".to_string(), None)
+        .unwrap();
+    assert_eq!(o.socks_bind, "127.0.0.1:7");
+
+    // Without an override the JSON default still wins over the invite.
+    let json = format!(r#"{{"from_invite":"{uri}","invite_passphrase":"passphrase-test"}}"#);
+    let o = local_client_options_from_json_str(&json).unwrap();
+    assert_eq!(o.socks_bind, "127.0.0.1:1080");
+}
+
+#[test]
 fn start_json_with_binds_rejects_non_object_json() {
     assert!(
         local_client_options_from_json_str_with_binds("[]", "127.0.0.1:0".into(), None).is_err()

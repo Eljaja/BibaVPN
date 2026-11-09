@@ -201,7 +201,7 @@ length is **not** fixed). Server **ACK**: 32 B server random ∥ 16 B MAC ∥
 in the KDF (`bibavpn.v3.mac.psk`, `bibavpn.v3.c2s`, `bibavpn.v3.s2c`).
 - **Server:** `--proto-domain <label>` (default `default`; must not be empty
 after trim). **Client / invite:** `--proto-domain` or `proto_domain` in JSON;
-if empty, the effective domain is the **SNI** — it must match the server.
+if empty, the effective domain is `default` — it must match the server.
 - **Control plane** (`AUTH`, TCP `OPEN` / `OPEN_OK` / `OPEN_ERR`, `MUX_OPEN`,
 `UDP_MUX_OPEN`): inner **single-byte opcodes** + payloads, **inside AEAD**
 after the handshake (see `encode_v3_*` / `decode_v3_*` in `protocol.rs`).

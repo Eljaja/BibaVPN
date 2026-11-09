@@ -715,16 +715,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
 
     let sni = crate::reality::effective_tls_sni(&sni, reality_target.as_deref());
 
-    let socks_bind = invite_pair
-        .as_ref()
-        .and_then(|i| {
-            i.socks_bind
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .unwrap_or(j.socks_bind);
+    // The JSON always carries the host application's local bind (it has a serde
+    // default), so it wins over the invite: an invite must not move the listener.
+    let socks_bind = j.socks_bind;
 
     let http_proxy_bind = json_or_invite_str(
         j.http_proxy.clone(),

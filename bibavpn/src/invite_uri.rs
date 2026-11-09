@@ -89,7 +89,7 @@ pub struct InviteV1 {
     /// Wire protocol: only `3` (opaque PSK hello + sealed control).
     #[serde(default = "default_invite_proto")]
     pub proto: u8,
-    /// Domain label for v3 PSK KDF (omit to let client default to SNI).
+    /// Domain label for v3 PSK KDF (omit to use the client default `default`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proto_domain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
