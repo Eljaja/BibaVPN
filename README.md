@@ -144,7 +144,6 @@ BibaVPN is experimental software for people comfortable operating their own tunn
 - Use verified TLS or pin the server certificate. `--insecure` is for local tests only.
 - Keep tokens, PSKs, invitation passphrases and private keys out of Git and public reports. Rotate exposed credentials.
 - Your VPS is the exit point: its operator can observe destinations and traffic metadata. End-to-end HTTPS still protects application contents; plaintext application traffic remains visible at the exit.
-- `--legacy-path-auth` is a weaker compatibility mode; use the default authenticated tunnel instead.
 
 Report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 

@@ -80,14 +80,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.includedRoutes = [NEIPv4Route.default()]
 
         var excluded: [NEIPv4Route] = []
-        if let host = (root["server_host"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !host.isEmpty {
+        if let host = serverHost(from: root) {
             let ips = resolveIPv4Addresses(host: host)
             if ips.isEmpty {
-                NSLog("[BibaVPN] warning: server_host \"\(host)\" has no IPv4 for excludedRoutes — risk of routing loop to VPN server (use IP or fix DNS)")
+                NSLog("[BibaVPN] warning: tunnel server \"\(host)\" has no IPv4 for excludedRoutes — risk of routing loop to VPN server (use IP or fix DNS)")
             }
             for ip in ips {
                 excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
             }
+        } else {
+            NSLog("[BibaVPN] warning: session JSON has no usable `server` host — cannot exclude the tunnel server from the default route")
         }
         ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
@@ -108,6 +110,41 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return nil
         }
         return o
+    }
+
+    /// Rust writes the tunnel server as `server` (`config.rs` / `start_config_json`);
+    /// `server_host` is accepted for sessions produced by older builds.
+    private static func serverHost(from root: [String: Any]) -> String? {
+        let server = (root["server"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.nilIfEmpty }
+        let legacy = (root["server_host"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.nilIfEmpty }
+        guard let raw = server ?? legacy else { return nil }
+        let host = hostFromHostPort(raw)
+        return host.isEmpty ? nil : host
+    }
+
+    /// `host:port`, `[v6]:port`, bare host or bare IPv6 literal → host without brackets/port.
+    private static func hostFromHostPort(_ raw: String) -> String {
+        if raw.hasPrefix("[") {
+            guard let close = raw.firstIndex(of: "]") else {
+                return String(raw.dropFirst())
+            }
+            return String(raw[raw.index(after: raw.startIndex)..<close])
+        }
+        // An unbracketed IPv6 literal has several colons and no port suffix.
+        if raw.filter({ $0 == ":" }).count > 1 {
+            return raw
+        }
+        if let colon = raw.lastIndex(of: ":") {
+            let port = raw[raw.index(after: colon)...]
+            if !port.isEmpty, Int(port) != nil {
+                return String(raw[..<colon])
+            }
+        }
+        return raw
     }
 
     private static func tun2socksProxyURL(fromSessionJson json: String) -> String {

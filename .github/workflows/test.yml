@@ -24,6 +24,8 @@ on:
       - "!bibavpn/**/*.md"
       - "biba/**"
       - "!biba/**/*.md"
+      - "mash/**"
+      - "!mash/**/*.md"
       - "apps/bibavpn-desktop/**"
       - "!apps/bibavpn-desktop/**/*.md"
       - "apps/bibavpn-jni/**"
@@ -46,6 +48,8 @@ on:
       - "!bibavpn/**/*.md"
       - "biba/**"
       - "!biba/**/*.md"
+      - "mash/**"
+      - "!mash/**/*.md"
       - "apps/bibavpn-desktop/**"
       - "!apps/bibavpn-desktop/**/*.md"
       - "apps/bibavpn-jni/**"
@@ -91,16 +95,16 @@ jobs:
           predicate-quantifier: every
           filters: |
             core:
-              - '{bibavpn/**,biba/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '{bibavpn/**,biba/**,mash/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
               - '!**/*.md'
             desktop:
-              - '{apps/bibavpn-desktop/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '{apps/bibavpn-desktop/**,bibavpn/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
               - '!**/*.md'
             mobile:
-              - '{apps/bibavpn-jni/**,apps/bibavpn-ffi/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '{apps/bibavpn-jni/**,apps/bibavpn-ffi/**,bibavpn/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
               - '!**/*.md'
             e2e:
-              - '{bibavpn/**,biba/**,scripts/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
+              - '{bibavpn/**,biba/**,mash/**,scripts/**,Cargo.toml,Cargo.lock,rust-toolchain.toml,.github/workflows/test.yml}'
               - '!**/*.md'
 
       - name: Plan which test jobs to run
@@ -144,6 +148,12 @@ jobs:
       - name: cargo test -p bibavpn -p biba
         run: cargo test -p bibavpn -p biba --locked
 
+      # ironwood is pulled into the workspace by the yggdrasil path dependency
+      # (cargo metadata lists it), so `-p ironwood` resolves and is locked by
+      # the root Cargo.lock. Its tests are in-memory and need no network.
+      - name: cargo test -p ironwood (mesh)
+        run: cargo test -p ironwood --locked
+
       - name: Build local tunnel regression binaries
         run: cargo build -p bibavpn --bins --locked
 
@@ -152,6 +162,11 @@ jobs:
 
       - name: Multi-user authentication and live reload
         run: python3 bibavpn/tests/users_e2e.py target/debug
+
+      # Hermetic: start.sh is copied to a temp dir and exercises a fake docker
+      # binary, so this needs no daemon, network or root.
+      - name: Start prebuilt regression
+        run: bash scripts/test-start-prebuilt.sh
 
   e2e:
     name: e2e (SOCKS tunnel smoke test)

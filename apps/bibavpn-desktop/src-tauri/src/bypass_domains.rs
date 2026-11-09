@@ -193,9 +193,34 @@ pub fn validate_http_url(url_str: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// One DNS label: 1..=63 ASCII alphanumerics/hyphens, no leading/trailing hyphen.
+fn is_valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Plain hostname only (dots separate non-empty labels). IP literals pass too,
+/// since their dotted-quad form is a valid hostname.
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty() && host.len() <= 253 && host.split('.').all(is_valid_label)
+}
+
 /// Normalize one preset domain. Server-controlled data ends up in OS proxy
 /// settings (semicolon-separated on Windows, GVariant arrays on Linux), so
 /// reject separators/control characters instead of escaping each backend.
+///
+/// Accepts a plain hostname plus the wildcard spellings used by existing
+/// presets/API responses: `.domain` and `*.domain` (valid hostname suffix).
+/// A bare `*` (or any other wildcard shape) would become `ProxyOverride=*` /
+/// `NO_PROXY=*` and silently disable the system proxy for all traffic — a VPN
+/// fail-open — so it is rejected. The original wildcard spelling is preserved
+/// (`.domain` stays `.domain`), because backends such as the core bypass
+/// matcher understand the leading-dot form.
 pub(crate) fn normalize_domain(raw: &str) -> Option<String> {
     let t = raw.trim();
     if t.is_empty() || t.len() > MAX_DOMAIN_LEN {
@@ -210,7 +235,22 @@ pub(crate) fn normalize_domain(raw: &str) -> Option<String> {
     if t.is_empty() {
         return None;
     }
-    Some(t.to_ascii_lowercase())
+    // Only `*.` and `.` may precede the hostname; `foo*`, `*foo`, `a.*.b`, `*.*` are not wildcards.
+    let (prefix, host) = if let Some(rest) = t.strip_prefix("*.") {
+        ("*.", rest)
+    } else if let Some(rest) = t.strip_prefix('.') {
+        (".", rest)
+    } else {
+        if t.contains('*') {
+            return None;
+        }
+        ("", t)
+    };
+    if !is_valid_hostname(host) {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    Some(format!("{prefix}{host}"))
 }
 
 pub(crate) fn normalize_android_package(raw: &str) -> Option<String> {
@@ -841,6 +881,41 @@ mod tests {
             "a'b.com",
             "a\\b.com",
             "",
+        ] {
+            assert!(normalize_domain(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_domain_allows_plain_and_wildcard_hosts() {
+        assert_eq!(
+            normalize_domain("  *.Sberbank.RU.  ").unwrap(),
+            "*.sberbank.ru"
+        );
+        assert_eq!(normalize_domain(".Example.COM.").unwrap(), ".example.com");
+        assert_eq!(normalize_domain(".tinkoff.ru").unwrap(), ".tinkoff.ru");
+        assert_eq!(normalize_domain("sub.example.com").unwrap(), "sub.example.com");
+        assert_eq!(normalize_domain("10.0.0.1").unwrap(), "10.0.0.1");
+
+        // A bare `*` becomes `ProxyOverride=*` / `NO_PROXY=*` (proxy disabled for
+        // everything) — never accept it, nor partial/malformed wildcards.
+        for bad in [
+            "*",
+            "*.",
+            ".",
+            "*.*",
+            ".*.example.com",
+            "*.example..com",
+            ".example..com",
+            "*.exa_mple.com",
+            "*.example.com:443",
+            "foo*",
+            "*foo.com",
+            "*foo.*",
+            "foo.*.bar.com",
+            "a..b",
+            "-lead.com",
+            "trail-.com",
         ] {
             assert!(normalize_domain(bad).is_none(), "{bad:?}");
         }

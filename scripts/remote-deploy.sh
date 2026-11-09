@@ -36,6 +36,18 @@ WS_PING_SECS="${BIBA_WS_PING_SECS:-25}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Never ship local secrets/tokens to the VPS: env files written by start.sh,
+# the invite blob, and any private keys/certs lying around in the tree.
+TAR_EXCLUDES=(
+  --exclude=target
+  --exclude=.git
+  --exclude=.biba-start.env
+  --exclude='.env*'
+  --exclude=server.txt
+  --exclude='*.pem'
+  --exclude='*.key'
+)
+
 # Shell-quote values that are spliced into a remote command string. Without
 # this, a token/PSK containing whitespace or metacharacters breaks the deploy
 # (or is interpreted by the remote shell).
@@ -64,10 +76,10 @@ echo "Build Linux binary locally"
 echo "Sync $ROOT -> $BIBA_SSH_USER@$BIBA_HOST:$REM_DIR"
 run "rm -rf $(q "$REM_DIR") && install -d -m 0755 $(q "$REM_DIR")"
 if [[ -n "${SSHPASS:-}" ]]; then
-  tar cf - --exclude=target --exclude=.git -C "$ROOT" . \
+  tar cf - "${TAR_EXCLUDES[@]}" -C "$ROOT" . \
     | sshpass -e ssh -o StrictHostKeyChecking=accept-new -p "$BIBA_SSH_PORT" "$BIBA_SSH_USER@$BIBA_HOST" "tar xf - -C $(q "$REM_DIR")"
 else
-  tar cf - --exclude=target --exclude=.git -C "$ROOT" . \
+  tar cf - "${TAR_EXCLUDES[@]}" -C "$ROOT" . \
     | ssh -o StrictHostKeyChecking=accept-new -p "$BIBA_SSH_PORT" "$BIBA_SSH_USER@$BIBA_HOST" "tar xf - -C $(q "$REM_DIR")"
 fi
 

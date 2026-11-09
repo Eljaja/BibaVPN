@@ -442,7 +442,6 @@ These options shape TLS/WebSocket timing and framing; they apply on top of the t
 - `--tls-stack rustls|boring` (client) — build with `cargo build -p bibavpn --features boring-tls` for Boring
 - `--tls-fragment` — record-size hint where the TLS stack supports it (see `tls_util`)
 - `--ws-path` — WebSocket path; token via sealed **AUTH** (default `/ws`)
-- `--legacy-path-auth` (server) — accept old `/b/{token}` without sealed AUTH (less safe)
 - `--pad-mode adaptive|random|http-buckets`
 - `--stealth-profile default|balanced|aggressive` — fills padding/jitter/decoy/idle
   defaults when explicit CLI values are unset (see `stealth_v12`)

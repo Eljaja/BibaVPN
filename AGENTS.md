@@ -163,7 +163,6 @@ Full layout for `**apps/`** (desktop, Android, JNI crate, scripts): **[apps/AGEN
 | `bibavpn/src/crypto_layer.rs`                       | Proto-3 tunnel: BLAKE3 derive, opaque HELLO/ACK (variable trailing padding), MAC, domain-aware `SessionCrypto` (per-direction **AtomicU64** nonces; `Sync` seal/open), decoy |
 | `bibavpn/src/incoming.rs`                           | Read HTTP request on TLS; WebSocket 101 + `WebSocketStream::from_partially_read`; or serve camouflage GET/HEAD     |
 | `bibavpn/src/camouflage.rs`                         | Shared HTML / 404 bodies for rejects and static fallbacks                                                          |
-| `bibavpn/src/ws_auth.rs`                            | Server waits for sealed `AUTH` (timeout, pre-`AUTH` junk/decrypt budgets via `PreAuthBudget` in `server_limits.rs`)   |
 | `bibavpn/src/tcp_mux.rs`                            | Mux wire format, client handle, server bridge, optional idle dummy, multi-WSS pool + RR                            |
 | `bibavpn/src/tcp_mux_roadmap.rs`                    | **Historical** one-WSS mux sketch; **current** implementation is `tcp_mux.rs` (doc-only module)                    |
 | `bibavpn/src/reality.rs`                              | WSS REALITY: X25519 exchange, mandatory client AUTH MAC (`reality_client_auth_mac`), SpiderX, `effective_tls_sni`, invite fields                     |
@@ -238,11 +237,9 @@ is fully configured (server: `--reality-target` + `--reality-private-key`;
 client: `reality_target` + `reality_public_key` after invite merge) or **`--lab`**.
 REALITY without PSK still starts but logs WARN that v3 HELLO / UDP mux need PSK.
 - Client `--proto` (only `**3`** is supported) and `--proto-domain` (KDF label;
-empty → SNI)
+empty → `default`)
 - Server `--proto-domain` — KDF domain string for proto 3 (default `default`); must match
 clients using the same `--proto` / invite
-- Server `--legacy-path-auth` — accept the old `/b/{token}` URL without
-`AUTH` (**deprecated**: standard path + sealed tunnel `AUTH` only in production)
 - `--pad-mode adaptive|random|http-buckets` — padding distribution (invite may carry
 `pad_mode` string); `--stealth-profile` can choose defaults when explicit
 `pad_mode` / jitter / decoy args are unset
@@ -428,7 +425,7 @@ on the mux bridge instead of binding per datagram.
 **Обязательно после изменений в сервере или клиенте:** любые правки в
 `bibavpn-server`, `bibavpn-client`, или модулях туннеля (`crypto_layer.rs`,
 `protocol.rs`, `tcp_mux.rs`, `udp_mux.rs`, `local_client.rs`, `incoming.rs`,
-`ws_auth.rs`, `stealth*.rs`, `frame.rs`, …) должны сопровождаться прогоном
+`stealth*.rs`, `frame.rs`, …) должны сопровождаться прогоном
 тестов crate `bibavpn`:
 
 ```bash
