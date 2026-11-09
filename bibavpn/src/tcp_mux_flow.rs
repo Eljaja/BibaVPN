@@ -52,6 +52,21 @@ const MAX_QUEUED_RECORDS: usize = 8192;
 const NEGOTIATION_WAIT: Duration = Duration::from_millis(300);
 const MAX_PEER_WINDOW: u32 = 16 * 1024 * 1024;
 const CAP_MAGIC: &[u8; 4] = b"BFC1";
+// Same 512-byte threshold as the legacy `ws_bridge` small-chunk cut-off.
+const STEALTH_DATA_MAX: usize = 512;
+
+/// Jitter and server ACK/RTT masking cost one sleep per frame. Apply them to
+/// control frames and small DATA (interactive traffic) but never to bulk DATA,
+/// which would otherwise be throttled to one frame per delay interval.
+fn wants_stealth_timing(flags: u8, payload_len: usize) -> bool {
+    if flags == MUX_FLAG_WIN {
+        false
+    } else if flags == MUX_FLAG_DATA {
+        payload_len <= STEALTH_DATA_MAX
+    } else {
+        true
+    }
+}
 
 fn capability(kind: u8, local_window: u32) -> Vec<u8> {
     let mut bytes = CAP_MAGIC.to_vec();
@@ -790,13 +805,14 @@ impl Endpoint {
                         continue;
                     }
                     _ = tokio::time::sleep_until(dummy_at), if self.cfg.dummy_interval_secs > 0 => {
+                        // One send-jitter sleep per dummy frame; servers additionally
+                        // mask ACK/RTT. Never call the jitter helper twice.
                         if self.client {
-                            // Preserve the producer and writer jitter of client dummy frames.
                             maybe_ws_send_jitter(self.cfg.send_jitter()).await;
                         } else {
                             maybe_server_ack_and_rtt_mask(self.timing).await;
+                            maybe_ws_send_jitter(self.cfg.send_jitter()).await;
                         }
-                        maybe_ws_send_jitter(self.cfg.send_jitter()).await;
                         let blob = self.serialize(&[], &crypto, &mut adaptive)?;
                         if blob.len() <= self.cfg.max_ws_binary { sink.send(Message::Binary(blob)).await?; }
                         dummy_at = Instant::now() + self.dummy_period();
@@ -819,7 +835,7 @@ impl Endpoint {
                     match command {
                         Output::Pong(payload) => sink.feed(Message::Pong(payload)).await?,
                         Output::Record(command) => {
-                            if command.flags != MUX_FLAG_DATA && command.flags != MUX_FLAG_WIN {
+                            if wants_stealth_timing(command.flags, command.payload.len()) {
                                 if !self.client {
                                     maybe_server_ack_and_rtt_mask(self.timing).await;
                                 }
@@ -2050,6 +2066,20 @@ mod tests {
             "failed publication must not leave a live stream with unadvertised allowance"
         );
         assert!(flow.enqueue(vec![1], false).is_err());
+    }
+
+    #[test]
+    fn stealth_timing_covers_small_data_and_control_only() {
+        assert!(wants_stealth_timing(MUX_FLAG_DATA, 0));
+        assert!(wants_stealth_timing(MUX_FLAG_DATA, STEALTH_DATA_MAX));
+        assert!(!wants_stealth_timing(MUX_FLAG_DATA, STEALTH_DATA_MAX + 1));
+        assert!(!wants_stealth_timing(MUX_FLAG_DATA, 64 * 1024));
+        // WIN credit is frequent and must not be delayed.
+        assert!(!wants_stealth_timing(MUX_FLAG_WIN, 4));
+        // OPEN/CLOSE/RST keep the shaping they had before DATA was included.
+        assert!(wants_stealth_timing(MUX_FLAG_OPEN, 0));
+        assert!(wants_stealth_timing(MUX_FLAG_CLOSE, 0));
+        assert!(wants_stealth_timing(MUX_FLAG_DATA | MUX_FLAG_CLOSE, 4096));
     }
 
     #[tokio::test]
