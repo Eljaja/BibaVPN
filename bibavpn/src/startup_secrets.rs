@@ -79,14 +79,31 @@ pub fn client_reality_configured(
     non_empty_str(reality_target) && reality_public_key.is_some()
 }
 
-/// Require a non-empty PSK at process start unless REALITY is fully configured or `--lab`.
+/// Validate an explicitly supplied PSK: rejecting empty/whitespace and the same
+/// well-known placeholders as [`is_token_denylisted`] (an empty PSK would still be
+/// a valid AEAD key, so it must never reach the tunnel).
+pub fn validate_psk(psk: &str) -> anyhow::Result<()> {
+    if is_token_denylisted(psk) {
+        bail!(
+            "--psk must not be empty or a well-known placeholder (denylisted: change-me, changeme, test)"
+        );
+    }
+    Ok(())
+}
+
+/// Require a valid PSK at process start unless REALITY is fully configured or `--lab`.
+///
+/// An explicitly supplied `Some` PSK is always validated (even with REALITY/`--lab`);
+/// only `None` may be omitted under those conditions.
 pub fn require_psk(
     psk: Option<&str>,
     reality_fully_configured: bool,
     lab: bool,
 ) -> anyhow::Result<()> {
-    let psk_present = psk.map(str::trim).is_some_and(|s| !s.is_empty());
-    if psk_present || lab || reality_fully_configured {
+    if let Some(raw) = psk {
+        return validate_psk(raw);
+    }
+    if lab || reality_fully_configured {
         Ok(())
     } else {
         bail!("--psk is required unless REALITY is fully configured or --lab is set");
@@ -171,6 +188,23 @@ mod tests {
         require_psk(None, true, false).unwrap();
         require_psk(None, false, true).unwrap();
         require_psk(Some("secret"), false, false).unwrap();
+    }
+
+    #[test]
+    fn validate_psk_rejects_empty_and_denylisted() {
+        for p in ["", "   ", "change-me", "CHANGE-ME", "changeme", "test", " test "] {
+            assert!(validate_psk(p).is_err(), "expected denied: {p:?}");
+        }
+        for p in ["s", "secret", "test-psk", "e2e-local-psk", "wsl-lab-psk"] {
+            validate_psk(p).unwrap_or_else(|e| panic!("expected allowed {p:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn require_psk_rejects_invalid_some_even_with_reality_or_lab() {
+        assert!(require_psk(Some(""), true, false).is_err());
+        assert!(require_psk(Some("   "), false, true).is_err());
+        assert!(require_psk(Some("change-me"), true, true).is_err());
     }
 
     #[test]

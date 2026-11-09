@@ -308,10 +308,14 @@ fn decrypt_invite_json(
     nonce: &[u8],
     ct: &[u8],
 ) -> anyhow::Result<InviteV1> {
-    let plain = cipher
+    let mut plain = cipher
         .decrypt(Nonce::from_slice(nonce), ct)
         .map_err(|_| anyhow::anyhow!("invite: bad passphrase or corrupted blob"))?;
-    let invite: InviteV1 = serde_json::from_slice(&plain).context("invite: bad json")?;
+    let parsed: anyhow::Result<InviteV1> =
+        serde_json::from_slice(&plain).context("invite: bad json");
+    // The plaintext holds token/PSK/pin material; wipe it on every exit path.
+    plain.fill(0);
+    let invite = parsed?;
     if invite.v != INNER_JSON_VERSION {
         anyhow::bail!("invite: inner v mismatch");
     }
@@ -325,7 +329,12 @@ fn decode_wire_v1(wire: &[u8], passphrase: &str) -> anyhow::Result<InviteV1> {
     let nonce = &wire[1..1 + NONCE_LEN];
     let ct = &wire[1 + NONCE_LEN..];
     let cipher = cipher_from_passphrase_v1(passphrase.as_bytes());
-    decrypt_invite_json(&cipher, nonce, ct)
+    let invite = decrypt_invite_json(&cipher, nonce, ct)?;
+    tracing::warn!(
+        target: "bibavpn_security",
+        "invite: legacy v1 blob uses an unsalted BLAKE3 KDF; keep it only for compatibility and re-mint as v2"
+    );
+    Ok(invite)
 }
 
 fn decode_wire_v2(wire: &[u8], passphrase: &str) -> anyhow::Result<InviteV1> {
@@ -343,28 +352,31 @@ fn decode_wire_v2(wire: &[u8], passphrase: &str) -> anyhow::Result<InviteV1> {
     validate_v2_argon_params(m_kib, t_cost, p_cost)?;
     let nonce = &wire[1 + SALT_LEN + 12..V2_HEADER_LEN];
     let ct = &wire[V2_HEADER_LEN..];
-    let key = derive_argon2_key(passphrase.as_bytes(), salt, m_kib, t_cost, p_cost)?;
+    let mut key = derive_argon2_key(passphrase.as_bytes(), salt, m_kib, t_cost, p_cost)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20Poly1305 key length");
+    key.fill(0);
     decrypt_invite_json(&cipher, nonce, ct)
 }
 
 /// `biba://` + URL-safe base64 of outer blob v2 (`version || salt || params || nonce || ct`).
 pub fn encode_invite_v1(invite: &InviteV1, passphrase: &str) -> anyhow::Result<String> {
-    let plain = serde_json::to_vec(invite).context("invite json")?;
+    let mut plain = serde_json::to_vec(invite).context("invite json")?;
     let m_kib = DEFAULT_M_KIB;
     let t_cost = DEFAULT_T_COST;
     let p_cost = DEFAULT_P_COST;
 
     let mut salt = [0u8; SALT_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    let key = derive_argon2_key(passphrase.as_bytes(), &salt, m_kib, t_cost, p_cost)?;
+    let mut key = derive_argon2_key(passphrase.as_bytes(), &salt, m_kib, t_cost, p_cost)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("ChaCha20Poly1305 key length");
+    key.fill(0);
 
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
-        .map_err(|e| anyhow::anyhow!("encrypt invite: {e}"))?;
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce), plain.as_ref());
+    // The serialized invite holds token/PSK/pin material; wipe it before returning.
+    plain.fill(0);
+    let ct = ct.map_err(|e| anyhow::anyhow!("encrypt invite: {e}"))?;
 
     let mut wire = Vec::with_capacity(V2_HEADER_LEN + ct.len());
     wire.push(BLOB_VERSION_V2);
@@ -511,6 +523,15 @@ mod tests {
         let wire = encode_invite_v1_blob_v1(&i, "legacy");
         let uri = format!("{}{}", PREFIX, URL_SAFE_NO_PAD.encode(wire));
         let j = decode_invite_v1(&uri, "legacy").unwrap();
+        assert_eq!(i, j);
+    }
+
+    #[test]
+    fn v1_legacy_decode_warns_and_still_succeeds() {
+        let i = sample_invite();
+        let wire = encode_invite_v1_blob_v1(&i, "legacy");
+        // `decode_wire_v1` emits the one-shot legacy warning and keeps v1 compatible.
+        let j = decode_wire_v1(&wire, "legacy").unwrap();
         assert_eq!(i, j);
     }
 

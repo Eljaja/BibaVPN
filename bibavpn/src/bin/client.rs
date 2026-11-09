@@ -16,7 +16,7 @@ use bibavpn::local_client::{
 };
 use bibavpn::startup_secrets::{
     client_reality_configured, log_lab_mode_enabled, log_reality_without_psk, require_psk,
-    resolve_cli_token, validate_resolved_token,
+    resolve_cli_token, validate_psk, validate_resolved_token,
 };
 use bibavpn::stealth_v12::{
     apply_preset_ws_jitter, merge_idle_decoy_secs, preset, DecoyMode, DesyncMode, StealthProfile,
@@ -644,6 +644,11 @@ fn options_from_args(args: Args, matches: &clap::ArgMatches) -> anyhow::Result<L
     let reality_configured =
         client_reality_configured(reality_target.as_deref(), reality_public_key.as_ref());
     require_psk(psk.as_deref(), reality_configured, args.lab)?;
+    // `require_psk` validates a supplied key too; keep the resolved-secret check explicit at
+    // this boundary, where CLI and invite values are merged.
+    if let Some(resolved) = psk.as_deref() {
+        validate_psk(resolved).context("psk")?;
+    }
     if reality_configured && psk.as_deref().map(str::trim).is_none_or(str::is_empty) {
         log_reality_without_psk();
     }

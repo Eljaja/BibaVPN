@@ -270,8 +270,10 @@ pub fn client_tls_config(params: &ClientTlsParams) -> anyhow::Result<Arc<ClientC
     if params.insecure && params.pinned_certs_pem.is_some() {
         anyhow::bail!("TLS: --insecure cannot be combined with certificate pinning");
     }
+    // Keep the configured `--fingerprint`/`tls_profile` hints even with `--insecure`
+    // (the common self-signed case); only `Default` falls back to plain insecure TLS.
     if params.insecure {
-        return Ok(client_config_insecure());
+        return client_config_for_profile(true, params.profile);
     }
 
     let pins: Option<Vec<CertificateDer<'static>>> = match &params.pinned_certs_pem {
@@ -511,5 +513,38 @@ mod tests {
         let pem = format!("{first}{second}");
         assert_eq!(read_certs(pem.as_bytes()).unwrap().len(), 2);
         assert!(parse_pem_certificates(b"not a certificate").is_err());
+    }
+
+    #[test]
+    fn insecure_with_profile_keeps_profile_hints() {
+        install_ring_crypto();
+
+        let default = client_tls_config(&ClientTlsParams {
+            insecure: true,
+            profile: TlsClientProfile::Default,
+            pinned_certs_pem: None,
+        })
+        .unwrap();
+        assert!(
+            default.alpn_protocols.is_empty(),
+            "Default profile should fall back to plain insecure config"
+        );
+
+        let profile = TlsClientProfile::Chrome132;
+        let direct = client_config_for_profile(true, profile).unwrap();
+        assert!(
+            !direct.alpn_protocols.is_empty(),
+            "profile path must configure ALPN hints"
+        );
+        let via_params = client_tls_config(&ClientTlsParams {
+            insecure: true,
+            profile,
+            pinned_certs_pem: None,
+        })
+        .unwrap();
+        assert_eq!(
+            via_params.alpn_protocols, direct.alpn_protocols,
+            "insecure+profile must not fall back to plain insecure config"
+        );
     }
 }

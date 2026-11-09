@@ -10,6 +10,7 @@ use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
+use bibavpn::startup_secrets::{resolve_cli_token, validate_psk};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -32,6 +33,22 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Strict bool parsing for env flags: only `1`/`true` and `0`/`false`
+/// (ASCII case-insensitive, surrounding whitespace ignored). Anything else is `None`.
+fn parse_bool_strict(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// `BIBA_INVITE_INSECURE` is opt-in: only an explicit `1`/`true` disables TLS
+/// verification. Unset, empty, or malformed values keep verification enabled.
+fn invite_insecure_from_env(raw: Option<&str>) -> bool {
+    raw.and_then(parse_bool_strict).unwrap_or(false)
+}
+
 /// Default SNI for an invite: the host part of `host:port` (IPv6-safe), or the
 /// raw value when it cannot be parsed (the caller validates the public address).
 fn default_sni(public: &str) -> String {
@@ -49,9 +66,15 @@ fn main() -> anyhow::Result<()> {
     parse_host_port(public.trim()).context("INVITE_PUBLIC must be host:port")?;
     let sni = std::env::var("INVITE_SNI").unwrap_or_else(|_| default_sni(&public));
     let token = std::env::var("BIBA_VPN_TOKEN").context("set BIBA_VPN_TOKEN")?;
+    let token = resolve_cli_token(Some(token.as_str()), false).context("BIBA_VPN_TOKEN")?;
     let psk = std::env::var("BIBA_VPN_PSK").context("set BIBA_VPN_PSK")?;
+    validate_psk(&psk).context("BIBA_VPN_PSK")?;
     let passphrase =
         std::env::var("BIBA_INVITE_PASSPHRASE").context("set BIBA_INVITE_PASSPHRASE")?;
+    anyhow::ensure!(
+        passphrase.trim().chars().count() >= 8,
+        "BIBA_INVITE_PASSPHRASE must be at least 8 characters"
+    );
 
     let ws_path =
         normalize_ws_path(&std::env::var("WS_PATH").unwrap_or_else(|_| "/ws".to_string()));
@@ -98,7 +121,9 @@ fn main() -> anyhow::Result<()> {
         udp_max_pad: None,
         udp_max_ws_binary: None,
         udp_mux_reply_timeout_secs: DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
-        insecure: pin_cert_pem.is_none() && std::env::var("BIBA_INVITE_INSECURE").map(|v| v != "false" && v != "0").unwrap_or(true),
+        // Pinned invites verify the pin; only unpinned invites may opt into insecure TLS.
+        insecure: pin_cert_pem.is_none()
+            && invite_insecure_from_env(std::env::var("BIBA_INVITE_INSECURE").ok().as_deref()),
         tls_profile: "default".into(),
         ws_path: Some(ws_path),
         pad_mode: Some("random".into()),
@@ -156,5 +181,28 @@ mod tests {
         assert_eq!(default_sni("203.0.113.7:8443"), "203.0.113.7");
         assert_eq!(default_sni("[2001:db8::1]:8443"), "2001:db8::1");
         assert_eq!(default_sni("vpn.example"), "vpn.example");
+    }
+
+    #[test]
+    fn strict_bool_parse_only_accepts_explicit_values() {
+        assert_eq!(parse_bool_strict("1"), Some(true));
+        assert_eq!(parse_bool_strict("true"), Some(true));
+        assert_eq!(parse_bool_strict("TRUE"), Some(true));
+        assert_eq!(parse_bool_strict(" true "), Some(true));
+        assert_eq!(parse_bool_strict("0"), Some(false));
+        assert_eq!(parse_bool_strict("false"), Some(false));
+        for raw in ["", " ", "yes", "on", "2", "true-ish", "no"] {
+            assert_eq!(parse_bool_strict(raw), None, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn invite_insecure_is_fail_closed() {
+        assert!(!invite_insecure_from_env(None));
+        assert!(!invite_insecure_from_env(Some("")));
+        assert!(!invite_insecure_from_env(Some("false")));
+        assert!(!invite_insecure_from_env(Some("yes")));
+        assert!(invite_insecure_from_env(Some("1")));
+        assert!(invite_insecure_from_env(Some("true")));
     }
 }
