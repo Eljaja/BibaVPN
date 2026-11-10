@@ -156,7 +156,6 @@ pub struct MeshNode {
     core: Arc<Core>,
     pub netstack: Arc<YggNetstack>,
     peer_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    supervisor_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Generated mesh config with every implicit listener disabled.
@@ -197,11 +196,10 @@ impl MeshNode {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(3)
             .clamp(1, 32);
-        let take = max_peers.min(ranked.len());
-        let (selected, fallbacks) = ranked.split_at(take);
-        let selected = selected.to_vec();
-        let fallbacks = fallbacks.to_vec();
-        tracing::debug!(?selected, ?fallbacks, "mesh peer graph selected");
+        let selected = ranked.iter().take(max_peers).cloned().collect::<Vec<_>>();
+        let supervise = ranked.len() > selected.len()
+            && std::env::var("BIBA_YB_MESH_SUPERVISOR").ok().as_deref() != Some("0");
+        tracing::debug!(?selected, "mesh peer graph selected");
 
         let peer_core = core.clone();
         let peer_task = tokio::spawn(async move {
@@ -210,23 +208,14 @@ impl MeshNode {
                     tracing::warn!(%peer, %error, "could not register mesh peer");
                 }
             }
+            if supervise {
+                peer_supervisor(peer_core, ranked, max_peers).await;
+            }
         });
-        let supervisor_task =
-            if fallbacks.is_empty() || std::env::var("BIBA_YB_MESH_SUPERVISOR").ok().as_deref() == Some("0") {
-            None
-        } else {
-            let supervisor_core = core.clone();
-            Some(tokio::spawn(peer_supervisor(
-                supervisor_core,
-                fallbacks,
-                max_peers,
-            )))
-        };
         Ok(Self {
             core,
             netstack,
             peer_task: std::sync::Mutex::new(Some(peer_task)),
-            supervisor_task: std::sync::Mutex::new(supervisor_task),
         })
     }
 
@@ -293,98 +282,160 @@ impl MeshNode {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(task) = self.peer_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let task = self.peer_task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = task {
             task.abort();
-        }
-        if let Some(task) = self.supervisor_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            task.abort();
+            let _ = task.await;
         }
         self.netstack.shutdown().await;
         let _ = self.core.close().await;
     }
 }
 
-/// Keep the selected peer graph populated and replace a consistently slow live
-/// peer with the next ranked fallback. Replacement is deliberately damped:
-/// only after 2 minutes of uptime, a 2x+50 ms gap, and at most one switch per
-/// 5 minutes, so transient RTT samples cannot flap the Ironwood tree.
-async fn peer_supervisor(core: Arc<Core>, fallbacks: Vec<String>, max_peers: usize) {
-    let mut next_fallback = 0usize;
-    let mut last_switch = Instant::now()
-        .checked_sub(Duration::from_secs(300))
-        .unwrap_or_else(Instant::now);
-    loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        let peers = core.get_peers().await;
-        let mut up: Vec<_> = peers.iter().filter(|peer| peer.up).collect();
-        up.sort_by(|a, b| a.latency_ms.total_cmp(&b.latency_ms));
-        let up_count = up.len();
+/// One temporary registration while its Yggdrasil handshake is validated. The
+/// original remains registered until commit. Dropping a cancelled supervisor
+/// removes probation too; node teardown additionally closes the whole Core.
+struct PeerProbation {
+    core: Arc<Core>,
+    uri: String,
+    original: Option<String>,
+    deadline: tokio::time::Instant,
+    armed: bool,
+}
 
-        if up_count < max_peers && next_fallback < fallbacks.len() {
-            let uri = fallbacks[next_fallback].clone();
-            next_fallback += 1;
-            match core.add_peer(&uri).await {
-                Ok(()) => tracing::info!(%uri, up_count, "mesh supervisor added fallback peer"),
-                Err(error) => tracing::warn!(%uri, %error, "mesh supervisor fallback failed"),
+impl PeerProbation {
+    async fn discard(mut self) {
+        let _ = self.core.remove_peer(&self.uri).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for PeerProbation {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let core = self.core.clone();
+                let uri = self.uri.clone();
+                runtime.spawn(async move { let _ = core.remove_peer(&uri).await; });
             }
-        } else if up_count >= max_peers
-            && next_fallback < fallbacks.len()
-            && last_switch.elapsed() >= Duration::from_secs(300)
-        {
-            let (best, worst) = (up[0], up[up_count - 1]);
-            let best_latency = best.latency_ms;
-            let worst_latency = worst.latency_ms;
-            if best_latency > 0.0
-                && worst_latency > best_latency * 2.0 + 50.0
-                && worst.uptime_secs >= 120.0
-                && worst.uri != best.uri
-            {
-                let bad_uri = worst.uri.clone();
-                let fallback = fallbacks[next_fallback].clone();
-                if core.remove_peer(&bad_uri).await.is_ok() {
-                    next_fallback += 1;
-                    match core.add_peer(&fallback).await {
-                        Ok(()) => {
-                            last_switch = Instant::now();
-                            tracing::info!(
-                                removed = %bad_uri,
-                                added = %fallback,
-                                best_latency_ms = best_latency,
-                                worst_latency_ms = worst_latency,
-                                "mesh supervisor replaced a slow peer"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(%fallback, %error, "mesh supervisor replacement failed")
+        }
+    }
+}
+
+struct PeerSupervisor {
+    candidates: Vec<String>,
+    next_candidate: usize,
+    max_peers: usize,
+    pending: Option<PeerProbation>,
+    next_probe_at: tokio::time::Instant,
+}
+
+impl PeerSupervisor {
+    fn new(candidates: Vec<String>, max_peers: usize, now: tokio::time::Instant) -> Self {
+        Self { candidates, next_candidate: 0, max_peers, pending: None, next_probe_at: now }
+    }
+
+    async fn reconcile(&mut self, core: &Arc<Core>, now: tokio::time::Instant) {
+        let peers = core.get_peers().await;
+        self.reconcile_peers(core, &peers, now).await;
+    }
+
+    async fn reconcile_peers(
+        &mut self,
+        core: &Arc<Core>,
+        peers: &[yggdrasil::links::LinkPeerInfo],
+        now: tokio::time::Instant,
+    ) {
+        if let Some(mut pending) = self.pending.take() {
+            let original = pending.original.as_ref().and_then(|uri| peers.iter().find(|p| &p.uri == uri));
+            let candidate = peers.iter().find(|p| p.uri == pending.uri);
+            // Recovery wins even if both links completed handshakes together.
+            if original.is_some_and(|p| p.up) {
+                pending.discard().await;
+            } else if candidate.is_some_and(|p| p.up) {
+                if let Some(uri) = &pending.original {
+                    match core.promote_peer(uri, &pending.uri).await {
+                        Ok(true) => {}
+                        result => {
+                            if let Err(error) = result {
+                                tracing::warn!(%uri, %error, "mesh failover could not retire original");
+                            }
+                            pending.discard().await;
+                            self.next_probe_at = now + Duration::from_secs(30);
+                            return;
                         }
                     }
                 }
+                tracing::info!(uri = %pending.uri, "mesh supervisor validated fallback peer");
+                pending.armed = false;
+            } else if now >= pending.deadline || candidate.is_none_or(|p| p.last_error.is_some()) {
+                pending.discard().await;
+            } else {
+                self.pending = Some(pending);
+                return;
             }
+            self.next_probe_at = now + Duration::from_secs(30);
+            return;
         }
+        if now < self.next_probe_at || self.candidates.is_empty() {
+            return;
+        }
+        self.next_probe_at = now + Duration::from_secs(30);
+        let outbound_count = peers.iter().filter(|p| !p.inbound).count();
+        // Never retire an up peer based on link RTT: it may be the only route
+        // to the destination, which an unrelated fast peer cannot establish.
+        let original = if outbound_count >= self.max_peers {
+            if outbound_count > self.max_peers { return; }
+            let Some(down) = peers.iter().find(|p| !p.inbound && !p.up) else { return; };
+            Some(down.uri.clone())
+        } else {
+            None
+        };
+        for _ in 0..self.candidates.len() {
+            let index = self.next_candidate;
+            self.next_candidate = (index + 1) % self.candidates.len();
+            let uri = &self.candidates[index];
+            if peers.iter().any(|p| p.uri == *uri) { continue; }
+            match core.add_peer(uri).await {
+                Ok(()) => {
+                    self.pending = Some(PeerProbation {
+                        core: core.clone(), uri: uri.clone(), original,
+                        deadline: now + Duration::from_secs(30), armed: true,
+                    });
+                }
+                Err(error) => tracing::warn!(%uri, %error, "mesh supervisor fallback registration failed"),
+            }
+            break;
+        }
+    }
+}
 
-        if let Some(best) = up.first() {
-            tracing::debug!(
-                up = up_count,
-                best_uri = %best.uri,
-                best_latency_ms = best.latency_ms,
-                "mesh peer graph health"
-            );
+/// Steady-state outbound registrations stay at max_peers. One probation slot
+/// permits make-before-break failover; events promptly reconcile recovery.
+async fn peer_supervisor(core: Arc<Core>, candidates: Vec<String>, max_peers: usize) {
+    let mut events = core.subscribe_peer_events();
+    let mut supervisor = PeerSupervisor::new(candidates, max_peers, tokio::time::Instant::now() + Duration::from_secs(30));
+    loop {
+        let wake_at = supervisor.pending.as_ref().map(|p| p.deadline).unwrap_or(supervisor.next_probe_at);
+        tokio::select! {
+            _ = tokio::time::sleep_until(wake_at) => {},
+            _ = events.recv() => {},
         }
+        supervisor.reconcile(&core, tokio::time::Instant::now()).await;
     }
 }
 
 impl Drop for MeshNode {
     fn drop(&mut self) {
-        if let Some(task) = self.peer_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            task.abort();
-        }
-        if let Some(task) = self.supervisor_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let task = self.peer_task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(task) = &task {
             task.abort();
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let core = self.core.clone();
             let netstack = self.netstack.clone();
             runtime.spawn(async move {
+                if let Some(task) = task { let _ = task.await; }
                 netstack.shutdown().await;
                 let _ = core.close().await;
             });
@@ -497,5 +548,171 @@ mod tests {
         );
         assert_eq!(peer_uri_host_port("tls://missing-port"), None);
         assert_eq!(peer_uri_host_port("not-a-peer"), None);
+    }
+
+    async fn wait_peer(core: &Core, uri: &str, up: bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if core.get_peers().await.iter().any(|p| p.uri == uri && p.up == up) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("local peer did not reach expected state");
+    }
+
+    fn local_peer_uri() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("tcp://{}", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn supervisor_keeps_original_after_registration_and_handshake_failure() {
+        use tokio::io::AsyncWriteExt;
+        let node = MeshNode::start(vec![], vec![]).await.unwrap();
+        let original = local_peer_uri();
+        node.core.add_peer(&original).await.unwrap();
+        let bad = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_uri = format!("tcp://{}", bad.local_addr().unwrap());
+        let now = tokio::time::Instant::now();
+        let mut supervisor = PeerSupervisor::new(vec!["unsupported://127.0.0.1:1".into(), bad_uri.clone()], 1, now);
+        supervisor.reconcile(&node.core, now).await;
+        assert!(supervisor.pending.is_none(), "failed registration cannot start probation");
+        assert_eq!(node.core.get_peers().await.len(), 1);
+
+        supervisor.reconcile(&node.core, now + Duration::from_secs(30)).await;
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), bad.accept()).await.unwrap().unwrap();
+        stream.write_all(b"invalid metadata").await.unwrap();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !node.core.get_peers().await.iter().any(|p| p.uri == bad_uri && p.last_error.is_some()) {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        supervisor.reconcile(&node.core, now + Duration::from_secs(31)).await;
+        assert!(supervisor.pending.is_none());
+        let peers = node.core.get_peers().await;
+        assert_eq!(peers.len(), 1, "failed candidate registration must be removed");
+        assert_eq!(peers[0].uri, original, "original reconnect loop must survive");
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_recovery_discards_probation_and_keeps_maximum() {
+        let fallback = local_peer_uri();
+        let fallback_server = MeshNode::start(vec![], vec![fallback.clone()]).await.unwrap();
+        let original = local_peer_uri();
+        let node = MeshNode::start(vec![], vec![]).await.unwrap();
+        node.core.add_peer(&original).await.unwrap();
+        let now = tokio::time::Instant::now();
+        let mut supervisor = PeerSupervisor::new(vec![fallback.clone()], 1, now);
+        supervisor.reconcile(&node.core, now).await;
+        assert_eq!(node.core.get_peers().await.len(), 2, "one bounded probation slot");
+        wait_peer(&node.core, &fallback, true).await;
+        let stale = node.core.get_peers().await;
+        assert!(stale.iter().any(|peer| peer.uri == original && !peer.up));
+        let recovered = MeshNode::start(vec![], vec![original.clone()]).await.unwrap();
+        node.core.retry_peers_now().await;
+        wait_peer(&node.core, &original, true).await;
+        assert_eq!(node.connected_peers().await, 2, "simultaneous recovery is bounded probation");
+        // Force promotion through the stale-snapshot branch after recovery.
+        supervisor.reconcile_peers(&node.core, &stale, now + Duration::from_secs(1)).await;
+        let peers = node.core.get_peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].uri, original);
+        assert!(peers[0].up);
+
+        // A recovered live peer cannot be retired by an unrelated candidate RTT.
+        supervisor.reconcile(&node.core, now + Duration::from_secs(600)).await;
+        assert!(supervisor.pending.is_none());
+        assert_eq!(node.connected_peers().await, 1);
+        node.shutdown().await;
+        recovered.shutdown().await;
+        fallback_server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_promotes_validated_fallback_and_retires_original_reconnect() {
+        let original = local_peer_uri();
+        let fallback = local_peer_uri();
+        let server = MeshNode::start(vec![], vec![fallback.clone()]).await.unwrap();
+        let node = MeshNode::start(vec![], vec![]).await.unwrap();
+        node.core.add_peer(&original).await.unwrap();
+        let now = tokio::time::Instant::now();
+        let mut supervisor = PeerSupervisor::new(vec![fallback.clone()], 1, now);
+        supervisor.reconcile(&node.core, now).await;
+        wait_peer(&node.core, &fallback, true).await;
+        supervisor.reconcile(&node.core, now + Duration::from_secs(1)).await;
+        let peers = node.core.get_peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].uri, fallback);
+        assert!(peers[0].up);
+        let recovered = MeshNode::start(vec![], vec![original]).await.unwrap();
+        node.core.retry_peers_now().await;
+        supervisor.reconcile(&node.core, now + Duration::from_secs(60)).await;
+        assert_eq!(node.core.get_peers().await.len(), 1, "retired original cannot reconnect above max");
+        assert_eq!(node.connected_peers().await, 1);
+        node.shutdown().await;
+        server.shutdown().await;
+        recovered.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_timeout_and_cancellation_remove_probation() {
+        let node = MeshNode::start(vec![], vec![]).await.unwrap();
+        let original = local_peer_uri();
+        node.core.add_peer(&original).await.unwrap();
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback = format!("tcp://{}", stalled.local_addr().unwrap());
+        let now = tokio::time::Instant::now();
+        let mut supervisor = PeerSupervisor::new(vec![fallback.clone()], 1, now);
+        supervisor.reconcile(&node.core, now).await;
+        let (_silent_stream, _) = tokio::time::timeout(Duration::from_secs(5), stalled.accept()).await.unwrap().unwrap();
+        assert!(node.core.get_peers().await.iter().find(|p| p.uri == fallback).unwrap().last_error.is_none());
+        supervisor.reconcile(&node.core, now + Duration::from_secs(60)).await;
+        assert_eq!(node.core.get_peers().await.len(), 1, "expired probation releases registration");
+        supervisor.reconcile(&node.core, now + Duration::from_secs(90)).await;
+        assert!(supervisor.pending.is_some());
+        let task = tokio::spawn(async move {
+            let _supervisor = supervisor;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while node.core.get_peers().await.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("cancelled supervisor left probation registered");
+        assert_eq!(node.core.get_peers().await[0].uri, original);
+        node.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_never_rotates_live_routes_for_unrelated_link_latency() {
+        let first = local_peer_uri();
+        let first_server = MeshNode::start(vec![], vec![first.clone()]).await.unwrap();
+        let second = local_peer_uri();
+        let second_server = MeshNode::start(vec![], vec![second.clone()]).await.unwrap();
+        let node = MeshNode::start(vec![], vec![]).await.unwrap();
+        node.core.add_peer(&first).await.unwrap();
+        node.core.add_peer(&second).await.unwrap();
+        wait_peer(&node.core, &first, true).await;
+        wait_peer(&node.core, &second, true).await;
+        let mut peers = node.core.get_peers().await;
+        assert_eq!(peers.len(), 2);
+        peers[0].latency_ms = 1.0;
+        peers[1].latency_ms = 1000.0;
+        for peer in &mut peers { peer.uptime_secs = 600.0; }
+        let now = tokio::time::Instant::now();
+        let mut supervisor = PeerSupervisor::new(vec![local_peer_uri()], 2, now);
+        supervisor.reconcile_peers(&node.core, &peers, now + Duration::from_secs(600)).await;
+        assert!(supervisor.pending.is_none(), "peer RTT cannot justify retiring a destination route");
+        assert_eq!(node.connected_peers().await, 2);
+        assert_eq!(node.core.get_peers().await.len(), 2);
+        node.shutdown().await;
+        first_server.shutdown().await;
+        second_server.shutdown().await;
     }
 }

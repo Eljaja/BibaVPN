@@ -387,6 +387,13 @@ impl Core {
         links.remove_peer(uri).await
     }
 
+    /// Atomically retire a down original only if candidate remains registered
+    /// and up. Returns false without mutation if original recovered or candidate
+    /// went down. Cancellation before commit leaves both registrations intact.
+    pub async fn promote_peer(&self, original: &str, candidate: &str) -> Result<bool, String> {
+        self.links.lock().await.promote_peer(original, candidate).await
+    }
+
     /// Wake all sleeping peer reconnect loops so they retry immediately.
     pub async fn retry_peers_now(&self) {
         self.links.lock().await.retry_peers_now();

@@ -446,8 +446,13 @@ impl ActiveLinks {
         }
     }
 
-    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
+    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8, cancel: Option<&CancellationToken>) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
         let mut inner = self.inner.lock().await;
+        // Retirement cancels while holding this same lock. Even an already
+        // polling reconnect task must not register after its entry is retired.
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         // Reject duplicate: same key + same direction
         if inner.connections.values().any(|c| c.key == key && c.inbound == inbound) {
             return None;
@@ -966,7 +971,7 @@ impl Links {
                         peer_errors.lock().await.insert(uri_str.clone(), None);
 
                         let conn_start = Instant::now();
-                        let result = handle_connection(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str).await;
+                        let result = handle_connection_with_cancel(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str, Some(&cancel_clone)).await;
 
                         // Reset backoff on clean shutdown OR if the peering stayed
                         // up long enough that the disconnect was almost certainly a
@@ -1014,26 +1019,44 @@ impl Links {
         Ok(())
     }
 
-    /// Remove a peer by URI.
+    /// Remove a peer and its active/error/address bookkeeping atomically.
     pub async fn remove_peer(&mut self, uri: &str) -> Result<(), String> {
-        if let Some(entry) = self.peers.remove(uri) {
-            entry.cancel.cancel();
-            entry.handle.abort();
+        self.retire_peer(uri, None).await.map(|_| ())
+    }
 
-            // The reconnect task is cancelled at `handle_conn().await`, which means
-            // the `active.unregister(conn_id)` line after it never runs.  Clean up
-            // the active_links entry here so the peer disappears from get_peers_json.
-            self.active.unregister_by_uri(uri).await;
+    /// Retire original only while it is down and candidate is registered/up.
+    /// A recovered original wins against the supervisor's earlier snapshot.
+    pub async fn promote_peer(&mut self, original: &str, candidate: &str) -> Result<bool, String> {
+        self.retire_peer(original, Some(candidate)).await
+    }
 
-            // Also remove from peer_addrs map
-            self.peer_addrs.retain(|_, v| v != uri);
-            // Remove error tracking entry
-            self.peer_errors.lock().await.remove(uri);
-
-            Ok(())
-        } else {
-            Err("peer not found".to_string())
+    async fn retire_peer(&mut self, uri: &str, candidate: Option<&str>) -> Result<bool, String> {
+        // Lock order is Links -> peer_errors -> ActiveLinks. All waits happen
+        // before mutation; commit and the caller's probation disarm complete
+        // in one poll, so cancellation cannot delete both registrations.
+        let mut errors = self.peer_errors.lock().await;
+        let mut active = self.active.inner.lock().await;
+        if let Some(candidate) = candidate {
+            if !self.peers.contains_key(candidate) {
+                return Err("candidate peer not found".to_string());
+            }
+            if active.connections.values().any(|c| !c.inbound && c.uri == uri)
+                || !active.connections.values().any(|c| !c.inbound && c.uri == candidate)
+            {
+                return Ok(false);
+            }
         }
+        let entry = self.peers.remove(uri).ok_or("peer not found")?;
+        entry.cancel.cancel();
+        entry.handle.abort();
+        active.connections.retain(|_, connection| {
+            if connection.uri != uri { return true; }
+            let _ = self.active.peer_tx.send(PeerEvent::Disconnected { key: connection.key });
+            false
+        });
+        self.peer_addrs.retain(|_, registered_uri| registered_uri != uri);
+        errors.remove(uri);
+        Ok(true)
     }
 
     /// Stop all listeners and peers.
@@ -1057,10 +1080,22 @@ impl Links {
 pub(crate) async fn handle_connection(
     link_type: LinkType,
     options: LinkOptions,
+    stream: Stream,
+    core: &Arc<Core>,
+    active: &ActiveLinks,
+    uri: &str,
+) -> Result<(), String> {
+    handle_connection_with_cancel(link_type, options, stream, core, active, uri, None).await
+}
+
+async fn handle_connection_with_cancel(
+    link_type: LinkType,
+    options: LinkOptions,
     mut stream: Stream,
     core: &Arc<Core>,
     active: &ActiveLinks,
     uri: &str,
+    cancel: Option<&CancellationToken>,
 ) -> Result<(), String> {
     // Get peer IP address for ban checking
     let peer_ip = match stream.peer_addr() {
@@ -1234,7 +1269,7 @@ pub(crate) async fn handle_connection(
     // Register in active links (rejects duplicate key+direction)
     let inbound = link_type == LinkType::Incoming;
     let (conn_id, rx_counter, tx_counter) = match active
-        .register(uri.to_string(), inbound, remote_meta.public_key, priority)
+        .register(uri.to_string(), inbound, remote_meta.public_key, priority, cancel)
         .await
     {
         Some(r) => r,
@@ -1506,6 +1541,111 @@ fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+
+    async fn promotion_links() -> (Links, ActiveLinks) {
+        let active = ActiveLinks::new();
+        let mut links = Links::new(active.clone());
+        for uri in ["original", "candidate"] {
+            links.peers.insert(uri.into(), PeerEntry {
+                cancel: CancellationToken::new(),
+                handle: tokio::spawn(std::future::pending()),
+            });
+            links.peer_addrs.insert(format!("address-{uri}"), uri.into());
+            links.peer_errors.lock().await.insert(uri.into(), None);
+        }
+        active.register("candidate".into(), false, [2; 32], 0, None).await.unwrap();
+        (links, active)
+    }
+
+    #[tokio::test]
+    async fn promotion_preserves_original_recovering_while_retirement_waits() {
+        let (mut links, active) = promotion_links().await;
+        let errors = links.peer_errors.clone();
+        let held_errors = errors.lock().await;
+        let mut promotion = Box::pin(links.promote_peer("original", "candidate"));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(promotion.as_mut().poll(cx).is_pending())).await);
+        // Recovery occurs after the supervisor's snapshot, while promotion is
+        // waiting for its cleanup locks. The active registration must win.
+        active.register("original".into(), false, [1; 32], 0, None).await.unwrap();
+        drop(held_errors);
+        assert!(!promotion.await.unwrap());
+        assert!(links.peers.contains_key("original"));
+        assert!(!links.peers["original"].cancel.is_cancelled());
+        assert_eq!(active.get_peers().await.len(), 2);
+        links.remove_peer("candidate").await.unwrap();
+        assert_eq!(active.get_peers().await[0].uri, "original");
+        links.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_retirement_at_active_cleanup_preserves_original() {
+        let (mut links, active) = promotion_links().await;
+        let original_cancel = links.peers["original"].cancel.clone();
+        let held_active = active.inner.lock().await;
+        {
+            let mut promotion = Box::pin(links.promote_peer("original", "candidate"));
+            assert!(std::future::poll_fn(|cx| Poll::Ready(promotion.as_mut().poll(cx).is_pending())).await);
+            // Cancelling here used to leave the original removed and its
+            // reconnect task aborted before the probation guard ran.
+        }
+        drop(held_active);
+        assert!(!original_cancel.is_cancelled());
+        assert!(links.peers.contains_key("original"));
+        assert_eq!(links.peer_addrs.len(), 2);
+        assert_eq!(links.peer_errors.lock().await.len(), 2);
+        links.remove_peer("candidate").await.unwrap();
+        assert!(links.peers.contains_key("original"), "probation cleanup cannot delete both registrations");
+        links.close().await;
+    }
+
+    #[tokio::test]
+    async fn promotion_commits_registration_and_cleanup_without_late_registration() {
+        let (mut links, active) = promotion_links().await;
+        let original_cancel = links.peers["original"].cancel.clone();
+        assert!(links.promote_peer("original", "candidate").await.unwrap());
+        assert!(original_cancel.is_cancelled());
+        assert!(!links.peers.contains_key("original"));
+        assert!(links.peers.contains_key("candidate"));
+        assert!(!links.peer_addrs.values().any(|uri| uri == "original"));
+        assert!(!links.peer_errors.lock().await.contains_key("original"));
+        assert!(active.register("original".into(), false, [1; 32], 0, Some(&original_cancel)).await.is_none(),
+            "a task already polling register when aborted cannot resurrect a retired peer");
+        assert_eq!(active.get_peers().await[0].uri, "candidate");
+        links.close().await;
+    }
+
+    #[tokio::test]
+    async fn promotion_preserves_original_if_candidate_drops_while_waiting() {
+        let (mut links, active) = promotion_links().await;
+        let errors = links.peer_errors.clone();
+        let held_errors = errors.lock().await;
+        let mut promotion = Box::pin(links.promote_peer("original", "candidate"));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(promotion.as_mut().poll(cx).is_pending())).await);
+        active.unregister_by_uri("candidate").await;
+        drop(held_errors);
+        assert!(!promotion.await.unwrap());
+        assert!(links.peers.contains_key("original"));
+        assert!(!links.peers["original"].cancel.is_cancelled());
+        links.remove_peer("candidate").await.unwrap();
+        assert_eq!(links.peers.len(), 1);
+        links.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_registration_waiting_on_active_lock_cannot_resurrect_peer() {
+        let active = ActiveLinks::new();
+        let cancel = CancellationToken::new();
+        let held_active = active.inner.lock().await;
+        let mut registration = Box::pin(active.register("original".into(), false, [1; 32], 0, Some(&cancel)));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(registration.as_mut().poll(cx).is_pending())).await);
+        // Retirement cancels under this lock while an old reconnect is already
+        // polling register; eligibility must be checked after acquiring it.
+        cancel.cancel();
+        drop(held_active);
+        assert!(registration.await.is_none());
+        assert!(active.get_peers().await.is_empty());
+    }
 
     #[test]
     fn test_parse_duration_string_plain_seconds() {

@@ -327,6 +327,15 @@ logs a one-line summary via `transport_capabilities::log_server_listen_caps`):
   on failed tunnel `AUTH` (see `server_limits::AuthRateLimiter`). Counted per
   bucket, **IPv4 /32** and **IPv6 /64** (`server_limits::auth_limit_key`), so a
   routed IPv6 prefix cannot rotate source addresses to dodge the ban.
+  Raw TCP/TLS probe EOF and completed transport errors do not count as AUTH
+  failures. Repeated setup deadlines still count as one failure per three
+  stalls; actual AUTH mismatches and junk/decrypt limits retain their budgets.
+- **Concurrent setup:** at most eight TLS/HTTP setups per external IPv4 /32
+  or IPv6 /64, acquired before the global session semaphore. OS-verified
+  loopback sources, including IPv4-mapped loopback, use the global session
+  limit instead so a mesh sidecar can forward multiple clients. Forwarded
+  HTTP headers never affect this decision. Keep the global cap enabled for
+  local forwarders; their actual AUTH failures still share a source bucket.
 - **`--handshake-max-junk-bytes`** (+ internal frame/decrypt budgets) — bounds
   pre-`AUTH` noise before `AUTH` completes (`server_limits::PreAuthBudget`).
 - **`--udp-socket-pool-size`** — reuse up to N UDP sockets on the UDP mux path
