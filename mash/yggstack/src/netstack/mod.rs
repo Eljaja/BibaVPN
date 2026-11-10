@@ -6,12 +6,12 @@ use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
 use smoltcp::iface::{Config as SmolConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities};
 use smoltcp::socket::{icmp, tcp, udp, Socket};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
@@ -30,12 +30,8 @@ use self::frag::FragReassembler;
 // ── Time helper ───────────────────────────────────────────────────────────────
 
 fn smoltcp_now() -> SmolInstant {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64;
-    SmolInstant::from_micros(micros)
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    SmolInstant::from_micros(START.elapsed().as_micros() as i64)
 }
 
 // ── Pending connect command ───────────────────────────────────────────────────
@@ -92,6 +88,10 @@ const SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// this grace period instead of lingering in FIN-WAIT forever.
 const CLOSE_GRACE: Duration = Duration::from_secs(60);
 
+// Keep reachable idle tunnels alive; bound silence when an overlay peer disappears.
+const TCP_KEEP_ALIVE: Duration = Duration::from_secs(30);
+const TCP_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Tracks a listener's socket pool and its accept queue.
 struct TcpListenerEntry {
     listen_ep: IpListenEndpoint,
@@ -142,17 +142,22 @@ impl NetstackState {
     /// Run one smoltcp poll cycle and return any outgoing raw IPv6 packets.
     /// Also services listeners and drains wakers (caller must fire them after
     /// releasing the lock).
-    fn run_poll(&mut self) -> (Vec<Vec<u8>>, Vec<Waker>) {
+    fn run_poll(&mut self, now: SmolInstant) -> (Vec<Vec<u8>>, Vec<Waker>) {
         static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
-        let now = smoltcp_now();
         loop {
-            self.iface.poll(now, &mut self.device, &mut self.sockets);
+            // smoltcp drains its Device within one poll. Service listeners
+            // between packets so a SYN batch cannot exhaust the listen pool.
+            self.iface.poll(
+                now,
+                &mut SinglePacketDevice { device: &mut self.device, received: false },
+                &mut self.sockets,
+            );
+            self.service_listeners(now);
             if self.device.rx_queue.is_empty() {
                 break;
             }
         }
-        self.service_listeners();
-        self.reap_closing_sockets();
+        self.reap_closing_sockets(now);
         let tx: Vec<Vec<u8>> = self.device.tx_queue.drain(..).collect();
         let wakers: Vec<Waker> = std::mem::take(&mut self.wakers);
         // Periodic stats: every 500 polls (~5 sec)
@@ -209,6 +214,8 @@ impl NetstackState {
         let mut socket = tcp::Socket::new(rx, tx);
         // Interactive tunneled requests should not wait for previous ACKs.
         socket.set_nagle_enabled(false);
+        socket.set_keep_alive(Some(TCP_KEEP_ALIVE.into()));
+        socket.set_timeout(Some(TCP_TIMEOUT.into()));
         self.sockets.add(socket)
     }
 
@@ -227,8 +234,7 @@ impl NetstackState {
     /// Service all listeners: move sockets whose handshake completed to the
     /// accept queue, reap half-handshakes stuck in SYN-RECEIVED, and keep the
     /// pool topped up so a concurrent SYN always finds a LISTEN socket.
-    fn service_listeners(&mut self) {
-        let now = smoltcp_now();
+    fn service_listeners(&mut self, now: SmolInstant) {
         for entry in &mut self.listeners {
             // Move established sockets to the accept queue.
             let mut queued = false;
@@ -304,8 +310,7 @@ impl NetstackState {
     /// Remove sockets queued for closing once their FIN handshake completes
     /// (State::Closed), or force-abort them after CLOSE_GRACE so a peer that
     /// never answers the FIN cannot leak sockets.
-    fn reap_closing_sockets(&mut self) {
-        let now = smoltcp_now();
+    fn reap_closing_sockets(&mut self, now: SmolInstant) {
         let mut i = 0;
         while i < self.closing.len() {
             let (handle, since) = self.closing[i];
@@ -321,6 +326,32 @@ impl NetstackState {
                 i += 1;
             }
         }
+    }
+
+    /// Stop accepting work and release sockets without a live stream owner.
+    /// Live streams keep their handles until Drop, even across shutdown.
+    fn close(&mut self) -> Vec<Waker> {
+        self.closed = true;
+        self.pending_connects.clear();
+        let mut wakers = std::mem::take(&mut self.wakers);
+        for (_, socket) in self.sockets.iter_mut() {
+            if let Socket::Tcp(socket) = socket {
+                socket.abort();
+            }
+        }
+        for mut listener in self.listeners.drain(..) {
+            wakers.append(&mut listener.accept_wakers);
+            for (handle, _) in listener.listen_pool {
+                self.sockets.remove(handle);
+            }
+            for handle in listener.accept_queue {
+                self.sockets.remove(handle);
+            }
+        }
+        for (handle, _) in self.closing.drain(..) {
+            self.sockets.remove(handle);
+        }
+        wakers
     }
 }
 
@@ -483,7 +514,7 @@ impl YggNetstack {
                 let (tx_pkts, wakers) = {
                     let mut s = lock_state(&state);
                     s.process_connects();
-                    s.run_poll()
+                    s.run_poll(smoltcp_now())
                 };
 
                 // Fire wakers outside the lock.
@@ -496,6 +527,10 @@ impl YggNetstack {
                     let _ = rwc.write(&pkt).await;
                 }
             }
+            let wakers = lock_state(&state).close();
+            for waker in wakers {
+                waker.wake();
+            }
         });
 
         *self.tasks.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![reader, poller]);
@@ -506,33 +541,7 @@ impl YggNetstack {
     /// and the background tasks are joined. Idempotent; called from engine
     /// stop() so nothing from an old engine generation keeps running.
     pub async fn shutdown(&self) {
-        let wakers = {
-            let mut s = lock_state(&self.state);
-            s.closed = true;
-            // Fail queued connect commands: dropping the senders breaks the
-            // dialers' oneshot channels.
-            s.pending_connects.clear();
-            // Wake everything blocked on a socket event so blocked reads,
-            // writes and accepts re-poll instead of pending forever.
-            let mut wakers: Vec<Waker> = std::mem::take(&mut s.wakers);
-            for entry in &mut s.listeners {
-                wakers.append(&mut entry.accept_wakers);
-            }
-            // Abort every TCP socket: pending wait_connected()/poll_read see
-            // the Closed state and return an error.
-            let tcp_handles: Vec<SocketHandle> = s
-                .sockets
-                .iter()
-                .filter(|(_, sock)| matches!(sock, Socket::Tcp(_)))
-                .map(|(h, _)| h)
-                .collect();
-            for h in tcp_handles {
-                s.sockets.get_mut::<tcp::Socket>(h).abort();
-            }
-            s.listeners.clear();
-            s.closing.clear();
-            wakers
-        };
+        let wakers = lock_state(&self.state).close();
         for w in wakers {
             w.wake();
         }
@@ -574,23 +583,28 @@ impl YggNetstack {
         // Pick a random local ephemeral port.
         let local_port: u16 = rand::random::<u16>() % 16384 + 49152;
 
-        // Create TCP socket.
-        let handle = {
-            let mut s = lock_state(&self.state);
-            s.new_tcp_socket()
-        };
-
-        // Queue the connect command for the poll loop.
+        // Own the socket before the first await. Cancellation removes its
+        // queued command under the same lock before releasing the handle.
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        {
+        let mut stream = {
             let mut s = lock_state(&self.state);
+            if s.closed {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "netstack closed"));
+            }
+            let handle = s.new_tcp_socket();
             s.pending_connects.push(PendingConnect {
                 handle,
                 remote: remote_ep,
                 local_port,
                 result_tx,
             });
-        }
+            TcpStream {
+                handle,
+                state: self.state.clone(),
+                poll_wakeup: self.poll_wakeup.clone(),
+                graceful_close: false,
+            }
+        };
         self.poll_wakeup.notify_one();
 
         // Wait for the connect() call to be processed.
@@ -599,20 +613,17 @@ impl YggNetstack {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "netstack closed"))?
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
 
-        // Wait for ESTABLISHED state.
-        let stream = TcpStream {
-            handle,
-            state: self.state.clone(),
-            poll_wakeup: self.poll_wakeup.clone(),
-        };
-
         // Bound the handshake wait: with no working overlay route (e.g.
         // right after a node restart, before the first peer link is up) the
         // SYN would be retransmitted forever and callers would pile up
         // instead of failing fast and retrying once links are healthy.
         // Dropping the stream on timeout aborts and removes the socket.
         match tokio::time::timeout(CONNECT_TIMEOUT, stream.wait_connected()).await {
-            Ok(result) => result.map(|_| stream),
+            Ok(result) => {
+                result?;
+                stream.graceful_close = true;
+                Ok(stream)
+            }
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "netstack connect timed out",
@@ -644,13 +655,16 @@ impl YggNetstack {
 
         {
             let mut s = lock_state(&self.state);
+            if s.closed {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "netstack closed"));
+            }
             // Validate the endpoint on the first socket so listen() errors
             // surface as before, then fill out the pool.
             let first = s.new_tcp_socket();
-            s.sockets
-                .get_mut::<tcp::Socket>(first)
-                .listen(listen_ep)
-                .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("{:?}", e)))?;
+            if let Err(error) = s.sockets.get_mut::<tcp::Socket>(first).listen(listen_ep) {
+                s.sockets.remove(first);
+                return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("{:?}", error)));
+            }
             let mut listen_pool = vec![(first, None)];
             for _ in 1..LISTEN_POOL {
                 listen_pool.push((new_listen_socket(&mut s.sockets, listen_ep), None));
@@ -759,6 +773,8 @@ pub struct TcpStream {
     handle: SocketHandle,
     state: Arc<Mutex<NetstackState>>,
     poll_wakeup: Arc<Notify>,
+    /// Only streams handed to callers close gracefully; unfinished dials abort.
+    graceful_close: bool,
 }
 
 impl TcpStream {
@@ -766,6 +782,9 @@ impl TcpStream {
     async fn wait_connected(&self) -> io::Result<()> {
         std::future::poll_fn(|cx| {
             let mut s = lock_state(&self.state);
+            if s.closed {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "netstack closed")));
+            }
             let sock = s.sockets.get::<tcp::Socket>(self.handle);
             match sock.state() {
                 tcp::State::Established => Poll::Ready(Ok(())),
@@ -789,16 +808,18 @@ impl Drop for TcpStream {
     fn drop(&mut self) {
         {
             let mut s = lock_state(&self.state);
+            s.pending_connects.retain(|command| command.handle != self.handle);
             let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
             let state = sock.state();
-            // close() sends FIN after any queued data. abort() would send an
-            // RST that destroys data still in flight to the receiver —
-            // observed as intermittent empty responses under load, because
-            // relays drop their stream the moment one direction finishes and
-            // the RST could overtake the last data packets.
-            sock.close();
-            s.closing.push((self.handle, smoltcp_now()));
-            tracing::debug!("TcpStream dropped (state={:?}), queued for close", state);
+            if !self.graceful_close || s.closed || state == tcp::State::Closed {
+                s.sockets.get_mut::<tcp::Socket>(self.handle).abort();
+                s.sockets.remove(self.handle);
+            } else {
+                // Preserve queued data: FIN must follow it instead of an RST
+                // overtaking the last response when a relay drops its stream.
+                s.sockets.get_mut::<tcp::Socket>(self.handle).close();
+                s.closing.push((self.handle, smoltcp_now()));
+            }
         }
         self.poll_wakeup.notify_one();
     }
@@ -909,6 +930,9 @@ impl TcpListener {
         let poll_wakeup = self.poll_wakeup.clone();
         std::future::poll_fn(move |cx| {
             let mut s = lock_state(&state);
+            if s.closed {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "netstack closed")));
+            }
             let idx = s.listeners.iter().position(|e| e.listen_ep.port == port);
             if let Some(i) = idx {
                 if let Some(handle) = s.listeners[i].accept_queue.pop_front() {
@@ -916,10 +940,13 @@ impl TcpListener {
                         handle,
                         state: state.clone(),
                         poll_wakeup: poll_wakeup.clone(),
+                        graceful_close: true,
                     }));
                 }
                 // Register waker so service_listeners() can wake us.
                 s.listeners[i].accept_wakers.push(cx.waker().clone());
+            } else {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "listener closed")));
             }
             Poll::Pending
         })
@@ -1139,8 +1166,37 @@ fn new_listen_socket(sockets: &mut SocketSet, ep: IpListenEndpoint) -> SocketHan
     let tx = tcp::SocketBuffer::new(vec![0u8; tcp_buffer_size()]);
     let mut sock = tcp::Socket::new(rx, tx);
     sock.set_nagle_enabled(false);
+    sock.set_keep_alive(Some(TCP_KEEP_ALIVE.into()));
+    sock.set_timeout(Some(TCP_TIMEOUT.into()));
     let _ = sock.listen(ep);
     sockets.add(sock)
+}
+
+/// Limit smoltcp's ingress drain to one packet without moving or copying queues.
+struct SinglePacketDevice<'a> {
+    device: &'a mut YggDevice,
+    received: bool,
+}
+
+impl Device for SinglePacketDevice<'_> {
+    type RxToken<'a> = device::YggRxToken where Self: 'a;
+    type TxToken<'a> = device::YggTxToken<'a> where Self: 'a;
+
+    fn receive(&mut self, timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.received {
+            return None;
+        }
+        self.received = true;
+        self.device.receive(timestamp)
+    }
+
+    fn transmit(&mut self, timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        self.device.transmit(timestamp)
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.device.capabilities()
+    }
 }
 
 /// Parse an IPv4 CIDR string like "10.99.0.1/24" into a smoltcp address +
@@ -1156,8 +1212,275 @@ fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Address, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use yggdrasil::core::Core;
+
+    // No overlay tasks: each test controls exactly when commands and packets run.
+    fn isolated_netstack(host: u16) -> YggNetstack {
+        let our_addr = Ipv6Addr::new(0x200, 0, 0, 0, 0, 0, 0, host);
+        let mut device = YggDevice::new(1500);
+        let mut cfg = SmolConfig::new(HardwareAddress::Ip);
+        cfg.random_seed = u64::from(host);
+        let mut iface = Interface::new(cfg, &mut device, SmolInstant::from_millis(0));
+        let ip = Ipv6Address::from_bytes(&our_addr.octets());
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::Ipv6(Ipv6Cidr::new(ip, 128))).unwrap();
+        });
+        iface.routes_mut().add_default_ipv6_route(ip).unwrap();
+        YggNetstack {
+            state: Arc::new(Mutex::new(NetstackState {
+                iface,
+                device,
+                sockets: SocketSet::new(vec![]),
+                wakers: Vec::new(),
+                pending_connects: Vec::new(),
+                listeners: Vec::new(),
+                closing: Vec::new(),
+                closed: false,
+            })),
+            poll_wakeup: Arc::new(Notify::new()),
+            tasks: Mutex::new(None),
+            our_addr,
+            mtu: 1500,
+        }
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut TaskContext::from_waker(Waker::noop()))
+    }
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicU64);
+
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn packets_at(netstack: &YggNetstack, millis: i64) -> Vec<Vec<u8>> {
+        let (packets, wakers) = {
+            let mut state = lock_state(&netstack.state);
+            state.process_connects();
+            state.run_poll(SmolInstant::from_millis(millis))
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+        packets
+    }
+
+    fn exchange_at(client: &YggNetstack, server: &YggNetstack, millis: i64) -> usize {
+        let mut count = 0;
+        for _ in 0..4 {
+            let packets = packets_at(client, millis);
+            count += packets.len();
+            lock_state(&server.state).device.rx_queue.extend(packets);
+            let packets = packets_at(server, millis);
+            count += packets.len();
+            lock_state(&client.state).device.rx_queue.extend(packets);
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn cancelled_dial_releases_socket_at_every_handoff() {
+        for stage in 0..4 {
+            let client = isolated_netstack(1);
+            let server = isolated_netstack(2);
+            let _listener = server.listen_tcp(18185).unwrap();
+            let mut dial = Box::pin(client.dial_tcp(SocketAddr::new(server.our_addr.into(), 18185)));
+            assert!(poll_once(dial.as_mut()).is_pending());
+            assert_eq!(lock_state(&client.state).sockets.iter().count(), 1);
+            if stage >= 1 {
+                lock_state(&client.state).process_connects();
+            }
+            if stage >= 2 {
+                assert!(poll_once(dial.as_mut()).is_pending());
+            }
+            if stage >= 3 {
+                exchange_at(&client, &server, 0);
+                let state = lock_state(&client.state);
+                assert!(state.sockets.iter().any(|(_, socket)| {
+                    matches!(socket, Socket::Tcp(tcp) if tcp.state() == tcp::State::Established)
+                }));
+            }
+            drop(dial);
+            {
+                let state = lock_state(&client.state);
+                assert!(state.pending_connects.is_empty(), "cancelled command retained");
+                assert_eq!(state.sockets.iter().count(), 0, "cancelled socket retained at stage {stage}");
+                assert!(state.closing.is_empty());
+            }
+            // Reuse the vacant SocketHandle: stale commands must not connect it.
+            let mut state = lock_state(&client.state);
+            let replacement = state.new_tcp_socket();
+            state.process_connects();
+            assert_eq!(state.sockets.get::<tcp::Socket>(replacement).state(), tcp::State::Closed);
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_error_and_shutdown_release_dial_ownership() {
+        let client = isolated_netstack(1);
+        let remote = SocketAddr::new(isolated_netstack(2).our_addr.into(), 0);
+        let mut dial = Box::pin(client.dial_tcp(remote));
+        assert!(poll_once(dial.as_mut()).is_pending());
+        lock_state(&client.state).process_connects();
+        assert!(matches!(poll_once(dial.as_mut()), Poll::Ready(Err(_))));
+        drop(dial);
+        assert_eq!(lock_state(&client.state).sockets.iter().count(), 0);
+
+        for processed in [false, true] {
+            let client = isolated_netstack(1);
+            let remote = SocketAddr::new(isolated_netstack(2).our_addr.into(), 18185);
+            let mut dial = Box::pin(client.dial_tcp(remote));
+            assert!(poll_once(dial.as_mut()).is_pending());
+            if processed {
+                lock_state(&client.state).process_connects();
+                assert!(poll_once(dial.as_mut()).is_pending());
+            }
+            client.shutdown().await;
+            assert!(matches!(poll_once(dial.as_mut()), Poll::Ready(Err(_))));
+            drop(dial);
+            assert_eq!(lock_state(&client.state).sockets.iter().count(), 0);
+            let mut late_dial = Box::pin(client.dial_tcp(remote));
+            assert!(matches!(poll_once(late_dial.as_mut()), Poll::Ready(Err(_))));
+            assert_eq!(lock_state(&client.state).sockets.iter().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_connection_frees_socket_and_shutdown_preserves_live_handles() {
+        let client = isolated_netstack(1);
+        let server = isolated_netstack(2);
+        let remote = SocketAddr::new(server.our_addr.into(), 18185);
+        let mut refused = Box::pin(client.dial_tcp(remote));
+        assert!(poll_once(refused.as_mut()).is_pending());
+        exchange_at(&client, &server, 0);
+        assert!(matches!(poll_once(refused.as_mut()), Poll::Ready(Err(_))));
+        drop(refused);
+        assert_eq!(lock_state(&client.state).sockets.iter().count(), 0);
+
+        let listener = server.listen_tcp(18185).unwrap();
+        let mut dial = Box::pin(client.dial_tcp(remote));
+        assert!(poll_once(dial.as_mut()).is_pending());
+        exchange_at(&client, &server, 0);
+        let outgoing = match poll_once(dial.as_mut()) {
+            Poll::Ready(Ok(stream)) => stream,
+            _ => panic!("dial did not establish"),
+        };
+        let mut accept = Box::pin(listener.accept());
+        let incoming = match poll_once(accept.as_mut()) {
+            Poll::Ready(Ok(stream)) => stream,
+            _ => panic!("connection was not accepted"),
+        };
+        client.shutdown().await;
+        server.shutdown().await;
+        server.shutdown().await;
+        for stream in [&outgoing, &incoming] {
+            let state = lock_state(&stream.state);
+            assert_eq!(state.sockets.iter().count(), 1);
+            assert_eq!(state.sockets.get::<tcp::Socket>(stream.handle).state(), tcp::State::Closed);
+        }
+        drop(outgoing);
+        drop(incoming);
+        assert_eq!(lock_state(&client.state).sockets.iter().count(), 0);
+        assert_eq!(lock_state(&server.state).sockets.iter().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_accept_and_rejects_late_accept_and_listen() {
+        let server = isolated_netstack(2);
+        let listener = server.listen_tcp(18185).unwrap();
+        let mut accept = Box::pin(listener.accept());
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wakes.clone());
+        assert!(accept.as_mut().poll(&mut TaskContext::from_waker(&waker)).is_pending());
+        server.shutdown().await;
+        assert!(wakes.0.load(Ordering::Relaxed) > 0, "shutdown did not wake accept");
+        assert!(matches!(poll_once(accept.as_mut()), Poll::Ready(Err(_))));
+        let mut late_accept = Box::pin(listener.accept());
+        assert!(matches!(poll_once(late_accept.as_mut()), Poll::Ready(Err(_))));
+        assert!(server.listen_tcp(18186).is_err());
+        assert_eq!(lock_state(&server.state).sockets.iter().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn syn_batch_larger_than_listen_pool_completes_without_refusal() {
+        let client = isolated_netstack(1);
+        let server = isolated_netstack(2);
+        let listener = server.listen_tcp(18185).unwrap();
+        let remote = SocketAddr::new(server.our_addr.into(), 18185);
+        let mut dials: Vec<_> = (0..16).map(|_| Box::pin(client.dial_tcp(remote))).collect();
+        for (index, dial) in dials.iter_mut().enumerate() {
+            assert!(poll_once(dial.as_mut()).is_pending());
+            lock_state(&client.state).pending_connects.last_mut().unwrap().local_port = 49152 + index as u16;
+        }
+        let syns = packets_at(&client, 0);
+        assert_eq!(syns.len(), 16);
+        lock_state(&server.state).device.rx_queue.extend(syns);
+        exchange_at(&client, &server, 0);
+        let mut streams = Vec::new();
+        for mut dial in dials {
+            match poll_once(dial.as_mut()) {
+                Poll::Ready(Ok(stream)) => streams.push(stream),
+                _ => panic!("batched SYN failed to establish"),
+            }
+            let mut accept = Box::pin(listener.accept());
+            match poll_once(accept.as_mut()) {
+                Poll::Ready(Ok(stream)) => streams.push(stream),
+                _ => panic!("batched connection was not accepted"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_peers_survive_keepalives_and_silent_peers_expire() {
+        let client = isolated_netstack(1);
+        let server = isolated_netstack(2);
+        let listener = server.listen_tcp(18185).unwrap();
+        let mut streams = Vec::new();
+        // Two connections also exercise both listen-socket constructors.
+        for _ in 0..2 {
+            let mut dial = Box::pin(client.dial_tcp(SocketAddr::new(server.our_addr.into(), 18185)));
+            assert!(poll_once(dial.as_mut()).is_pending());
+            lock_state(&client.state).pending_connects.last_mut().unwrap().local_port = 49152 + streams.len() as u16;
+            exchange_at(&client, &server, 0);
+            match poll_once(dial.as_mut()) {
+                Poll::Ready(Ok(stream)) => streams.push(stream),
+                _ => panic!("dial did not establish"),
+            }
+            let mut accept = Box::pin(listener.accept());
+            match poll_once(accept.as_mut()) {
+                Poll::Ready(Ok(stream)) => streams.push(stream),
+                _ => panic!("connection was not accepted"),
+            }
+        }
+        let mut keepalive_packets = 0;
+        for millis in (1000..=300_000).step_by(1000) {
+            keepalive_packets += exchange_at(&client, &server, millis);
+        }
+        assert!(keepalive_packets > 0, "idle peers exchanged no probes");
+        for stream in &streams {
+            assert_eq!(lock_state(&stream.state).sockets.get::<tcp::Socket>(stream.handle).state(), tcp::State::Established);
+        }
+        // Drop every packet in both directions while advancing only network time.
+        for millis in (301_000..=421_000).step_by(1000) {
+            packets_at(&client, millis);
+            packets_at(&server, millis);
+        }
+        for mut stream in streams {
+            assert_eq!(lock_state(&stream.state).sockets.get::<tcp::Socket>(stream.handle).state(), tcp::State::Closed);
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+            assert!(stream.write_all(b"expired").await.is_err());
+            let state = stream.state.clone();
+            drop(stream);
+            assert!(lock_state(&state).closing.is_empty(), "expired socket retained until grace timeout");
+        }
+    }
 
     async fn node() -> (Arc<Core>, Arc<YggNetstack>) {
         let mut cfg = crate::config::generate();
@@ -1169,7 +1492,13 @@ mod tests {
         core.init_links().await;
         core.start().await;
         let mtu = core.mtu();
-        let rwc = ReadWriteCloser::new(core.clone(), mtu, None);
+        let rwc = ReadWriteCloser::new(
+            core.clone(),
+            mtu,
+            #[cfg(feature = "ckr")]
+            None,
+            None,
+        );
         core.set_path_notify(rwc.clone());
         let netstack = YggNetstack::new(
             rwc,
