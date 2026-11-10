@@ -85,6 +85,8 @@ Import the new invitation into an updated client and enable **biba://mash** on t
 
 The client attempts several public TCP/TLS peers concurrently through Yggdrasil's reconnect logic. Available peers carry traffic and the mesh determines the route; this does not benchmark or guarantee the fastest route. There is no automatic fallback to the server's public address when mesh fails. For a custom client peer list, set `BIBA_YB_MESH_PEERS` to comma-separated TCP/TLS peer URLs in the client's environment. Public peers are third-party infrastructure, may disappear, and can observe the connection metadata of their direct links.
 
+Mesh TCP connections send keepalive probes every 30 seconds and close after 120 seconds without a response, releasing forwarded server sessions when a client disappears. Reachable idle clients stay connected. Network timers use a monotonic clock, and cancelled connection attempts release their socket buffers. The listener replenishes handshake capacity between incoming packets so simultaneous client connections do not exhaust a fixed per-batch pool.
+
 For existing deployments that mint invitations separately, set `BIBA_YB_MESH_ENDPOINT` to the sidecar address and port (for example `[201:…]:8443`) when running `bibavpn-server --print-invite-uri` or `bibavpn-mint-invite`. This does not install or start the sidecar by itself.
 
 When minting an invitation with `bibavpn-mint-invite` for a self-signed server, set `INVITE_PIN_CERT_FILE` to the server certificate PEM to include the pin in the encrypted invitation. The sidecar forwards mesh port 8443 to port 8443 by default; set `BIBA_YB_MESH_FORWARD_PORT` on the sidecar if the existing server listens on a different port.
