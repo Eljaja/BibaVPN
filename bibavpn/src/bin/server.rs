@@ -67,9 +67,9 @@ struct ServerConnParams {
     mux_window_mib: bibavpn::tcp_mux::MuxWindow,
     udp_pool: Option<Arc<UdpSocketPool>>,
     users: Option<UserRegistry>,
-    /// In-flight pre-auth setup slot for this peer's bucket; held until the
-    /// HTTP head has been read (or the connection fails) so a silent socket
-    /// cannot hold a global session permit.
+    /// In-flight pre-auth setup slot, held until the HTTP head arrives or the
+    /// connection fails. External sources have a per-bucket setup cap; trusted
+    /// loopback forwarding shares the global session cap.
     preauth_guard: Option<PreAuthSetupPermit>,
     preauth_timeouts: Arc<PreAuthTimeoutTracker>,
 }
@@ -803,10 +803,9 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
 
-            // Per-source cap on pre-auth setup connections: a peer that connects and
-            // stays silent must not consume global permits with an unbounded number of
-            // sockets. This is a cheap in-memory reservation, so it is taken before the
-            // semaphore; it is released once the HTTP head has been read.
+            // Bound external source setup before taking a global permit. Loopback
+            // sidecars forward many clients under one OS-verified socket address;
+            // these share the global cap, without trusting forwarded HTTP headers.
             let Some(preauth_guard) = preauth_setup.try_acquire(peer.ip()) else {
                 debug!(
                     target: "bibavpn_server",
@@ -1166,9 +1165,9 @@ where
 /// up: a handful of silent sockets can exhaust `--max-concurrent-sessions`. Expiry is
 /// counted as a handshake timeout and returns an error, which releases both.
 ///
-/// Setup failures are soft-counted per source bucket; only every
-/// [`bibavpn::server_limits::PREAUTH_FAILURES_PER_AUTH_FAILURE`]th one feeds the real
-/// auth limiter, so a single dropped probe never bans a whole /64.
+/// Only elapsed deadlines are soft-counted per source bucket; every
+/// [`bibavpn::server_limits::PREAUTH_FAILURES_PER_AUTH_FAILURE`]th stall feeds the
+/// auth limiter. TCP probes and transport EOF/errors are not AUTH failures.
 async fn with_setup_timeout<T, F>(
     phase: &'static str,
     dur: Duration,
@@ -1184,10 +1183,7 @@ where
 {
     match timeout(dur, fut).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => {
-            note_pre_auth_setup_failure(auth, preauth_timeouts, peer).await;
-            Err(e)
-        }
+        Ok(Err(e)) => Err(e),
         Err(_) => {
             let secs = dur.as_secs();
             stats.inc_handshake_timeout();
@@ -1823,6 +1819,57 @@ mod first_channel_wait_tests {
             PreAuthBudget::default(),
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         )
+    }
+
+    #[tokio::test]
+    async fn repeated_raw_tcp_tls_probes_do_not_ban_but_bad_auth_does() {
+        install_ring_crypto();
+        let acceptor = TlsAcceptor::from(server_self_signed("localhost").unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stats, auth, pre_auth, ip) = wait_ctx();
+        let strikes = PreAuthTimeoutTracker::default();
+        for _ in 0..30 {
+            let probe = TcpStream::connect(address).await.unwrap();
+            let (tcp, peer) = listener.accept().await.unwrap();
+            drop(probe);
+            assert!(with_setup_timeout(
+                "tls accept", Duration::from_secs(1), &stats, &auth, &strikes, peer, 1,
+                async { acceptor.accept(tcp).await.context("tls accept") },
+            ).await.is_err());
+            auth.check_allowed(ip).await.expect("TCP EOF is not failed authentication");
+        }
+        assert_eq!(auth.auth_failures_total.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.handshake_timeouts_total.load(Ordering::Relaxed), 0);
+
+        for _ in 0..10 {
+            let (mut client, mut server) = ws_pair().await;
+            let crypto = test_crypto();
+            let bad_auth = bibavpn::protocol::encode_v3_auth("wrong-token").unwrap();
+            client.send(Message::Binary(Bytes::from(seal_client_frame(&crypto, &bad_auth)))).await.unwrap();
+            assert!(server_wait_v3_auth(
+                &mut server, &crypto, "correct-token", None, &auth, &stats, ip, &pre_auth,
+            ).await.is_err());
+        }
+        assert!(auth.check_allowed(ip).await.is_err(), "bad AUTH still bans the source");
+        assert_eq!(auth.auth_failures_total.load(Ordering::Relaxed), 10);
+        assert_eq!(auth.auth_bans_issued_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_setup_stalls_still_feed_the_auth_budget() {
+        let (stats, auth, _, ip) = wait_ctx();
+        let strikes = PreAuthTimeoutTracker::default();
+        let peer = SocketAddr::new(ip, 12345);
+        for _ in 0..30 {
+            assert!(with_setup_timeout(
+                "tls accept", Duration::ZERO, &stats, &auth, &strikes, peer, 1,
+                std::future::pending::<anyhow::Result<()>>(),
+            ).await.is_err());
+        }
+        assert!(auth.check_allowed(ip).await.is_err());
+        assert_eq!(stats.handshake_timeouts_total.load(Ordering::Relaxed), 30);
+        assert_eq!(auth.auth_failures_total.load(Ordering::Relaxed), 10);
     }
 
     #[tokio::test]

@@ -86,15 +86,13 @@ pub fn auth_limit_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Max concurrent pre-auth setup connections per [`auth_limit_key`] bucket.
-///
-/// A peer that opens a socket and stays silent holds no global session permit
-/// unless this cap lets it: the guard is taken before the global semaphore, so
-/// eight stalled sockets from one source can never starve other peers.
+/// Max concurrent external pre-auth setup connections per [`auth_limit_key`] bucket.
+/// OS-verified loopback forwarders share the global session limit instead, since
+/// many independent mesh clients arrive through the same local sidecar.
 pub const PREAUTH_SETUP_MAX_PER_BUCKET: usize = 8;
 
-/// Pre-auth setup timeouts/EOF tolerated before one real auth failure is
-/// recorded for the bucket. The first timeout alone must not ban anyone.
+/// Pre-auth setup stalls tolerated before one real auth failure is recorded.
+/// Transport EOF/errors are not authentication attempts and do not count.
 pub const PREAUTH_FAILURES_PER_AUTH_FAILURE: u32 = 3;
 
 /// Soft pre-auth strikes decay after this long without a new one.
@@ -103,8 +101,8 @@ const PREAUTH_STRIKE_WINDOW: Duration = Duration::from_secs(600);
 /// Per-bucket in-flight accounting for pre-auth setup (TLS + HTTP head).
 ///
 /// Acquired before the global concurrency permit and released once the HTTP
-/// head has been read or the connection is dropped, so silent sockets are
-/// bounded per source instead of by `--max-concurrent-sessions` alone.
+/// head has been read or the connection is dropped. External silent sockets
+/// are bounded per source; loopback forwarding shares the global cap.
 pub struct PreAuthSetupLimiter {
     max_per_bucket: usize,
     inner: StdMutex<HashMap<IpAddr, usize>>,
@@ -118,13 +116,13 @@ impl PreAuthSetupLimiter {
         })
     }
 
-    /// Reserve a setup slot for `ip`'s bucket, or `None` when it is already at
-    /// the per-bucket cap.
+    /// Reserve a setup slot, applying the per-bucket cap only to external peers.
+    /// Trust comes from the socket address, never caller-supplied HTTP headers.
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PreAuthSetupPermit> {
         let key = auth_limit_key(ip);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let in_flight = g.get(&key).copied().unwrap_or(0);
-        if in_flight >= self.max_per_bucket {
+        if !ip.is_loopback() && !key.is_loopback() && in_flight >= self.max_per_bucket {
             return None;
         }
         if in_flight == 0 && g.len() >= MAX_TRACKED_IPS {
@@ -161,12 +159,9 @@ struct PreAuthStrikeState {
     last: Instant,
 }
 
-/// Counts pre-auth setup timeouts/EOF per [`auth_limit_key`] bucket and turns
-/// every [`PREAUTH_FAILURES_PER_AUTH_FAILURE`] strikes into one auth failure.
-///
-/// A single stalled or aborted probe is normal internet noise, so banning on
-/// it would let one dropped packet blackhole a whole /64. Only a source that
-/// repeatedly fails setup is fed to the regular [`AuthRateLimiter`].
+/// Counts pre-auth setup timeouts per [`auth_limit_key`] bucket and turns every
+/// [`PREAUTH_FAILURES_PER_AUTH_FAILURE`] stalls into one auth failure. Completed
+/// transport errors/EOF release setup immediately and do not count as deadlines.
 pub struct PreAuthTimeoutTracker {
     threshold: u32,
     inner: StdMutex<HashMap<IpAddr, PreAuthStrikeState>>,
@@ -186,7 +181,7 @@ impl PreAuthTimeoutTracker {
         }
     }
 
-    /// Account one pre-auth timeout/EOF. Returns `true` when the bucket has
+    /// Account one pre-auth setup timeout. Returns `true` when the bucket has
     /// accumulated enough strikes that the caller should call
     /// `AuthRateLimiter::record_failure`; the counter then resets.
     pub fn note_timeout(&self, ip: IpAddr) -> bool {
@@ -216,8 +211,8 @@ impl PreAuthTimeoutTracker {
         }
     }
 
-    /// A peer completed HTTP setup: forget strikes accumulated by earlier
-    /// aborted attempts from the same bucket.
+    /// A peer completed HTTP setup: forget strikes accumulated by earlier stalls
+    /// from the same bucket.
     pub fn clear(&self, ip: IpAddr) {
         let key = auth_limit_key(ip);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -862,6 +857,25 @@ mod tests {
         // Dropping the guard releases the slot again.
         drop(permits);
         assert!(lim.try_acquire(a).is_some());
+    }
+
+    #[tokio::test]
+    async fn local_forwarders_share_global_capacity_without_external_source_cap() {
+        let lim = PreAuthSetupLimiter::new(8);
+        let global = Arc::new(tokio::sync::Semaphore::new(12));
+        for address in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            let ip = address.parse().unwrap();
+            let mut permits = Vec::new();
+            for _ in 0..12 {
+                let setup = lim.try_acquire(ip).expect("local forwarding permits ninth setup");
+                let session = global.clone().try_acquire_owned().unwrap();
+                permits.push((setup, session));
+            }
+            assert!(global.clone().try_acquire_owned().is_err(), "global cap still applies");
+            assert!(lim.try_acquire("203.0.113.9".parse().unwrap()).is_some());
+            drop(permits);
+            assert_eq!(global.available_permits(), 12);
+        }
     }
 
     #[test]
