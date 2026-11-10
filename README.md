@@ -87,6 +87,8 @@ Import the new invitation into an updated client and enable **biba://mash** on t
 
 The client attempts several public TCP/TLS peers concurrently through Yggdrasil's reconnect logic. Available peers carry traffic and the mesh determines the route; this does not benchmark or guarantee the fastest route. There is no automatic fallback to the server's public address when mesh fails. For a custom client peer list, set `BIBA_YB_MESH_PEERS` to comma-separated TCP/TLS peer URLs in the client's environment. Public peers are third-party infrastructure, may disappear, and can observe the connection metadata of their direct links.
 
+The client ranks those candidates by measured TCP reachability/latency before joining, keeps the best `BIBA_YB_MESH_MAX_PEERS` (default 3), and a lightweight supervisor adds the next ranked fallback if fewer are up. Disable ranking with `BIBA_YB_MESH_RANK=0` or the supervisor with `BIBA_YB_MESH_SUPERVISOR=0`. Inner mux window defaults to 4 MiB in the Docker profile (`BIBA_MUX_WINDOW_MIB`); `BIBA_YGG_TCP_BUFFER_KIB` is capped at 1024 because larger smoltcp buffers stall without pacing.
+
 For existing deployments that mint invitations separately, set `BIBA_YB_MESH_ENDPOINT` to the sidecar address and port (for example `[201:…]:8443`) when running `bibavpn-server --print-invite-uri` or `bibavpn-mint-invite`. This does not install or start the sidecar by itself.
 
 When minting an invitation with `bibavpn-mint-invite` for a self-signed server, set `INVITE_PIN_CERT_FILE` to the server certificate PEM to include the pin in the encrypted invitation. The sidecar forwards mesh port 8443 to port 8443 by default; set `BIBA_YB_MESH_FORWARD_PORT` on the sidecar if the existing server listens on a different port.

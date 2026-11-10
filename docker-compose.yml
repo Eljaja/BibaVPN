@@ -23,6 +23,8 @@ services:
       - "64"
       - --max-ws-binary
       - "${BIBA_MAX_WS_BINARY:-262144}"
+      - --mux-window-mib
+      - "${BIBA_MUX_WINDOW_MIB:-4}"
       - --ws-ping-secs
       - "25"
       - --print-invite-uri
@@ -56,6 +58,8 @@ services:
       - biba-server
     volumes:
       - yb-mesh-data:/data
+    environment:
+      BIBA_YGG_TCP_BUFFER_KIB: "${BIBA_YGG_TCP_BUFFER_KIB:-1024}"
     restart: unless-stopped
 
   biba-client:
@@ -64,6 +68,8 @@ services:
       dockerfile: docker/Dockerfile.client
     depends_on:
       - biba-server
+    environment:
+      BIBA_YGG_TCP_BUFFER_KIB: "${BIBA_YGG_TCP_BUFFER_KIB:-1024}"
     command:
       - --server
       - biba-server:8443
@@ -83,7 +89,9 @@ services:
       - --max-pad
       - "64"
       - --max-ws-binary
-      - "1400"
+      - "${BIBA_MAX_WS_BINARY:-262144}"
+      - --mux-window-mib
+      - "${BIBA_MUX_WINDOW_MIB:-4}"
       - --ws-ping-secs
       - "25"
       - --early-ws-frames

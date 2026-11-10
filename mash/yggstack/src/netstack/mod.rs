@@ -58,9 +58,31 @@ struct PendingConnect {
 /// Cost: each socket preallocates two TCP buffers (16 MiB per listener).
 const LISTEN_POOL: usize = 8;
 
-// Allow more in-flight data over higher-latency mesh paths while keeping the
-// memory used by each socket and the listener pool bounded.
-const TCP_BUFFER_SIZE: usize = 1024 * 1024;
+/// Default per-direction smoltcp TCP buffer. The old hard-coded 1 MiB caps a
+/// single overlay stream at ~`1 MiB / RTT`; high-latency mesh paths need more.
+const DEFAULT_TCP_BUFFER_SIZE: usize = 1024 * 1024;
+const MIN_TCP_BUFFER_SIZE: usize = 64 * 1024;
+// Above 1 MiB smoltcp has no cwnd/pacing; on loopback 2/4 MiB stalled after
+// 1.7-20 MiB. Keep the ceiling at the proven-safe value until pacing lands.
+const MAX_TCP_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Env override for BDP tuning: `BIBA_YGG_TCP_BUFFER_KIB` (64..1024, default 1024).
+/// Read once; tests and long-lived processes see a stable value.
+fn clamp_tcp_buffer_bytes(kib: Option<usize>) -> usize {
+    kib.map(|k| k.saturating_mul(1024))
+        .unwrap_or(DEFAULT_TCP_BUFFER_SIZE)
+        .clamp(MIN_TCP_BUFFER_SIZE, MAX_TCP_BUFFER_SIZE)
+}
+
+fn tcp_buffer_size() -> usize {
+    static SIZE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let kib = std::env::var("BIBA_YGG_TCP_BUFFER_KIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        clamp_tcp_buffer_bytes(kib)
+    });
+    *SIZE
+}
 
 /// Reap a listen-pool socket whose handshake never completed after this long.
 const SYN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -182,8 +204,8 @@ impl NetstackState {
 
     /// Create a new TCP socket with standard buffers.
     fn new_tcp_socket(&mut self) -> SocketHandle {
-        let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
-        let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
+        let rx = tcp::SocketBuffer::new(vec![0u8; tcp_buffer_size()]);
+        let tx = tcp::SocketBuffer::new(vec![0u8; tcp_buffer_size()]);
         let mut socket = tcp::Socket::new(rx, tx);
         // Interactive tunneled requests should not wait for previous ACKs.
         socket.set_nagle_enabled(false);
@@ -1113,8 +1135,8 @@ async fn join_with_grace(handle: &mut tokio::task::JoinHandle<()>) {
 
 /// Create a socket in LISTEN state on the given endpoint.
 fn new_listen_socket(sockets: &mut SocketSet, ep: IpListenEndpoint) -> SocketHandle {
-    let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
+    let rx = tcp::SocketBuffer::new(vec![0u8; tcp_buffer_size()]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; tcp_buffer_size()]);
     let mut sock = tcp::Socket::new(rx, tx);
     sock.set_nagle_enabled(false);
     let _ = sock.listen(ep);
@@ -1221,5 +1243,13 @@ mod tests {
             woke,
             "reading received data did not wake the network poller"
         );
+    }
+
+    #[test]
+    fn tcp_buffer_env_is_clamped() {
+        assert_eq!(clamp_tcp_buffer_bytes(None), 1024 * 1024);
+        assert_eq!(clamp_tcp_buffer_bytes(Some(512)), 512 * 1024);
+        assert_eq!(clamp_tcp_buffer_bytes(Some(1)), MIN_TCP_BUFFER_SIZE);
+        assert_eq!(clamp_tcp_buffer_bytes(Some(4096)), MAX_TCP_BUFFER_SIZE);
     }
 }
