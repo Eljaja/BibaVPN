@@ -54,6 +54,7 @@ class BibaVpnService : VpnService() {
 
     private val tunLock = Any()
     private var tun2socksThread: Thread? = null
+    private var tun2socksSession: Tun2socksLifecycle.Session? = null
     /** Java держит свой dup TUN fd; в Go отдаём отдельный dup, чтобы не спорить за ownership с fdsan. */
     private var tunParcelOrphan: ParcelFileDescriptor? = null
     private var tunnelWakeLock: PowerManager.WakeLock? = null
@@ -806,55 +807,41 @@ class BibaVpnService : VpnService() {
                 pfd.close()
                 return false
             }
+            val session = tun2socksLifecycle.newSession() ?: run {
+                Log.e(TAG, "tun2socks: previous native start/stop has not finished")
+                runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+                javaOwnedTun.close()
+                return false
+            }
+            tun2socksSession = session
             runCatching { tunParcelOrphan?.close() }
             tunParcelOrphan = javaOwnedTun
 
             val proxy = proxyUrl.trim()
             val startLatch = CountDownLatch(1)
             val startErr = AtomicReference<String?>(null)
-            val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
             tun2socksThread = Thread(
                 {
-                    // The raw fd was detached from a ParcelFileDescriptor and is owned by the
-                    // engine only once Engine.start() returns. If start fails first, close it here.
-                    var engineOwnsFd = false
                     try {
-                        val key = Key()
-                        key.setDevice("fd://$fd")
-                        key.setProxy(proxy)
-                        key.setMTU(tunMtu.toLong())
-                        // П последним setter'ом: в некоторых gomobile-биндингах поля сбрасываются при других set* .
-                        key.setLogLevel("info")
-                        Log.i(TAG, "tun2socks Key.logLevel=${key.logLevel}")
-                        Engine.insert(key)
-                        Engine.start()
-                        engineOwnsFd = true
-                        if (cancelled.get()) {
-                            Log.w(TAG, "tun2socks: start finished after timeout — stopping engine")
-                            runCatching { Engine.stop() }
-                            return@Thread
-                        }
-                        acquireTunnelWakeLock()
-                        setTunnelActive(true)
-                        allowScreenOnStackRestart = true
-                        mainHandler.post {
-                            refreshForegroundNotification()
-                            val cm = connectivityManager ?: return@post
-                            val und = physicalInternetNetwork(cm) ?: return@post
-                            applyUnderlyingNetworks(arrayOf(und))
-                            synchronized(networkTrackingLock) {
-                                lastPhysicalNetworkForRestart = und
-                            }
-                        }
-                        Log.i(TAG, "tun2socks Engine.start OK")
+                        val started = tun2socksLifecycle.start(
+                            session,
+                            startEngine = {
+                                val key = Key()
+                                key.setDevice("fd://$fd")
+                                key.setProxy(proxy)
+                                key.setMTU(tunMtu.toLong())
+                                // Последним setter'ом: некоторые gomobile-биндинги сбрасывают поля.
+                                key.setLogLevel("info")
+                                Log.i(TAG, "tun2socks Key.logLevel=${key.logLevel}")
+                                Engine.insert(key)
+                                Engine.start()
+                            },
+                            closeUnstarted = { ParcelFileDescriptor.adoptFd(fd).close() },
+                        )
+                        if (!started) startErr.set("tun2socks start cancelled")
                     } catch (e: Throwable) {
                         Log.e(TAG, "tun2socks", e)
                         startErr.set(e.message ?: e.javaClass.simpleName)
-                        if (!engineOwnsFd) {
-                            runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
-                                .onFailure { ce -> Log.w(TAG, "close unowned tun fd: ${ce.message}") }
-                        }
-                        mainHandler.post { abortVpnFromWorker(e.message) }
                     } finally {
                         startLatch.countDown()
                     }
@@ -872,13 +859,37 @@ class BibaVpnService : VpnService() {
                 }
             if (!ok) {
                 Log.e(TAG, "tun2socks: Engine.start timeout (${25}s) — останавливаем")
-                cancelled.set(true)
+                // Keep the native engine reserved until this worker finishes its cancelled start.
                 tun2socksThread?.interrupt()
                 stopTun2socksOnly()
                 return false
             }
             startErr.get()?.let { err ->
                 Log.e(TAG, "tun2socks failed: $err")
+                stopTun2socksOnly()
+                return false
+            }
+            if (stopRequested || !tun2socksLifecycle.isRunning(session)) {
+                stopTun2socksOnly()
+                return false
+            }
+            // Publish only from the waiting owner. A timed-out worker cannot revive a later tunnel.
+            try {
+                acquireTunnelWakeLock()
+                setTunnelActive(true)
+                allowScreenOnStackRestart = true
+                mainHandler.post {
+                    if (!tun2socksLifecycle.isRunning(session)) return@post
+                    refreshForegroundNotification()
+                    val cm = connectivityManager ?: return@post
+                    val und = physicalInternetNetwork(cm) ?: return@post
+                    applyUnderlyingNetworks(arrayOf(und))
+                    synchronized(networkTrackingLock) {
+                        lastPhysicalNetworkForRestart = und
+                    }
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "tun2socks activation", e)
                 stopTun2socksOnly()
                 return false
             }
@@ -966,24 +977,11 @@ class BibaVpnService : VpnService() {
         return out.toList()
     }
 
-    private fun abortVpnFromWorker(detail: String?) {
-        Handler(Looper.getMainLooper()).post {
-            val msg =
-                getString(
-                    R.string.vpn_error_prefix,
-                    detail?.takeIf { it.isNotBlank() } ?: getString(R.string.vpn_error_tun2socks),
-                )
-            android.widget.Toast.makeText(applicationContext, msg, android.widget.Toast.LENGTH_LONG)
-                .show()
-            enqueueTeardownWorker("abort") { stopServiceUnlessRestarted("abort") }
-        }
-    }
-
     /**
      * Завершение сервиса после разбора стека — только если за это время не пришёл новый старт.
      *
      * Разбор идёт секундами (join tun2socks, `nativeStop`). «Отключить → сразу подключить»
-     * (или `connect_inner` в Rust, который сам делает disconnect + 300 мс + connect) успевает
+     * успевает
      * прислать новый `onStartCommand`, и безусловный `stopSelf()` уничтожал сервис прямо под
      * новой сессией: `onDestroy` обнулял [VpnProtect.vpn], снималось FGS-уведомление, а
      * bootstrap-воркер продолжал на мёртвом сервисе. Новый старт сбрасывает [stopRequested];
@@ -1076,11 +1074,16 @@ class BibaVpnService : VpnService() {
         }
         allowScreenOnStackRestart = false
         releaseTunnelWakeLock()
-        runCatching { Engine.stop() }
+        tun2socksSession?.let { session ->
+            tun2socksSession = null
+            runCatching { tun2socksLifecycle.stop(session) }
+                .onFailure { e -> Log.e(TAG, "tun2socks stop", e) }
+        }
         tun2socksThread?.let { t ->
             try {
                 t.join(8000)
             } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
             }
         }
         tun2socksThread = null
@@ -1287,6 +1290,9 @@ class BibaVpnService : VpnService() {
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_SCREEN_OFF_BATTERY_SAVER, false)
 
     companion object {
+        // Go Engine is process-global, including across VpnService instances.
+        private val tun2socksLifecycle = Tun2socksLifecycle { Engine.stop() }
+
         /** true после успешного Engine.start() tun2socks; сбрасывается при остановке. */
         @Volatile
         var isTunnelActive: Boolean = false
