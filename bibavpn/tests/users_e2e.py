@@ -56,6 +56,7 @@ def main():
         ]}
         registry = root / "users.json"
         registry.write_text(json.dumps(users))
+        registry.chmod(0o600)
         server = stack.enter_context(process([
             str(binaries / "bibavpn-server"), "--listen", f"127.0.0.1:{server_port}",
             "--self-signed-san", "localhost", "--users-file", str(registry), "--psk", psk,
@@ -81,6 +82,7 @@ def main():
         # Match the administration tool's atomic replacement.
         replacement = root / "replacement.json"
         replacement.write_text(json.dumps(users))
+        replacement.chmod(0o600)
         replacement.replace(registry)
         assert rejected(alice_port, target), "disabled alice connected"
         held.sendall(b"alive")
@@ -89,6 +91,7 @@ def main():
         assert rejected(alice_port, target), "disabled alice reconnected after closing her session"
         users["users"][0]["enabled"] = True
         replacement.write_text(json.dumps(users))
+        replacement.chmod(0o600)
         replacement.replace(registry)
         deadline = time.monotonic() + 5
         while True:

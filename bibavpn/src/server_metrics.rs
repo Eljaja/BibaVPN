@@ -1,12 +1,15 @@
 //! Prometheus text exposition and optional HTTP listener for `bibavpn-server`.
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::server_limits::{AuthRateLimiter, ServerStats};
@@ -14,6 +17,25 @@ use crate::server_limits::{AuthRateLimiter, ServerStats};
 /// Upper bound for one metrics HTTP request (read + write). A client that opens
 /// the socket and never finishes the request line must not pin a task forever.
 const METRICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Concurrent metrics HTTP connections. Bounds the number of spawned tasks so a
+/// connection burst cannot exhaust file descriptors/memory.
+const METRICS_MAX_CONNECTIONS: usize = 32;
+
+/// Pause after a failed `accept(2)` (e.g. EMFILE) so the loop cannot spin hot.
+const METRICS_ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Failed Basic Auth attempts allowed per peer IP per window before delaying.
+const METRICS_AUTH_FAILURE_BUDGET: u32 = 1;
+
+/// Window over which [`METRICS_AUTH_FAILURE_BUDGET`] is counted.
+const METRICS_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Added latency on unauthorized responses once a peer exceeded its budget.
+const METRICS_AUTH_FAILURE_DELAY: Duration = Duration::from_secs(1);
+
+/// Cap on remembered peer IPs; the oldest window is evicted when full.
+const METRICS_AUTH_TRACKED_PEERS: usize = 256;
 
 /// Build the metrics listener auth from the CLI password flag.
 ///
@@ -159,6 +181,73 @@ bibavpn_process_start_time_seconds {process_start}
     )
 }
 
+/// Per-peer accounting of failed Basic Auth attempts on the metrics listener.
+///
+/// Deliberately separate from the tunnel's [`AuthRateLimiter`]: a scanner
+/// hammering the metrics port must never ban real tunnel clients.
+struct MetricsAuthThrottle {
+    peers: Mutex<HashMap<IpAddr, AuthFailureWindow>>,
+    budget: u32,
+    window: Duration,
+    max_peers: usize,
+}
+
+struct AuthFailureWindow {
+    failures: u32,
+    started: Instant,
+}
+
+impl MetricsAuthThrottle {
+    fn new() -> Self {
+        Self {
+            peers: Mutex::new(HashMap::new()),
+            budget: METRICS_AUTH_FAILURE_BUDGET,
+            window: METRICS_AUTH_FAILURE_WINDOW,
+            max_peers: METRICS_AUTH_TRACKED_PEERS,
+        }
+    }
+
+    /// Account a failed attempt and return how long the 401 response is stalled.
+    fn record_failure(&self, peer: IpAddr) -> Option<Duration> {
+        let now = Instant::now();
+        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        if peers.len() >= self.max_peers && !peers.contains_key(&peer) {
+            self.evict(&mut peers, now);
+        }
+        let window = peers.entry(peer).or_insert_with(|| AuthFailureWindow {
+            failures: 0,
+            started: now,
+        });
+        if now.duration_since(window.started) >= self.window {
+            *window = AuthFailureWindow {
+                failures: 0,
+                started: now,
+            };
+        }
+        window.failures = window.failures.saturating_add(1);
+        (window.failures > self.budget).then_some(METRICS_AUTH_FAILURE_DELAY)
+    }
+
+    /// Drop expired windows, then the oldest one, to make room for a new peer.
+    fn evict(&self, peers: &mut HashMap<IpAddr, AuthFailureWindow>, now: Instant) {
+        peers.retain(|_, w| now.duration_since(w.started) < self.window);
+        if peers.len() >= self.max_peers {
+            let oldest = peers
+                .iter()
+                .min_by_key(|(_, w)| w.started)
+                .map(|(ip, _)| *ip);
+            if let Some(ip) = oldest {
+                peers.remove(&ip);
+            }
+        }
+    }
+}
+
+/// Whether the bound metrics address is reachable from other hosts.
+fn is_off_host(addr: &std::net::SocketAddr) -> bool {
+    !addr.ip().is_loopback()
+}
+
 /// Spawn a background HTTP listener serving `GET /metrics` and `GET /healthz`.
 pub fn spawn_metrics_listener(
     listen: String,
@@ -179,6 +268,15 @@ pub fn spawn_metrics_listener(
             }
         };
         if metrics_auth.is_required() {
+            if let Ok(local) = listener.local_addr() {
+                if is_off_host(&local) {
+                    warn!(
+                        target: "bibavpn_security",
+                        %local,
+                        "metrics listener is reachable off-host with HTTP Basic Auth over plaintext; credentials are sent unencrypted — bind loopback or front it with TLS/SSH"
+                    );
+                }
+            }
             info!(
                 target: "bibavpn_server",
                 %listen,
@@ -186,7 +284,7 @@ pub fn spawn_metrics_listener(
             );
         } else {
             if let Ok(local) = listener.local_addr() {
-                if !local.ip().is_loopback() {
+                if is_off_host(&local) {
                     warn!(
                         target: "bibavpn_security",
                         %local,
@@ -200,19 +298,36 @@ pub fn spawn_metrics_listener(
                 "Prometheus metrics listening (GET /metrics, GET /healthz; no auth — use --metrics-password in production)"
             );
         }
+        let semaphore = Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS));
+        let throttle = Arc::new(MetricsAuthThrottle::new());
         loop {
-            let Ok((stream, peer)) = listener.accept().await else {
-                continue;
+            let (stream, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    debug!(
+                        target: "bibavpn_server",
+                        %listen,
+                        "metrics listener accept failed: {e:#}"
+                    );
+                    tokio::time::sleep(METRICS_ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                break;
             };
             let stats = Arc::clone(&stats);
             let auth = Arc::clone(&auth);
             let metrics_auth = metrics_auth.clone();
+            let throttle = Arc::clone(&throttle);
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = serve_one_with_timeout(
                     stream,
                     &stats,
                     &auth,
                     &metrics_auth,
+                    &throttle,
                     METRICS_REQUEST_TIMEOUT,
                 )
                 .await
@@ -233,9 +348,11 @@ async fn serve_one_with_timeout(
     stats: &ServerStats,
     auth: &AuthRateLimiter,
     metrics_auth: &MetricsAuth,
+    throttle: &MetricsAuthThrottle,
     dur: Duration,
 ) -> anyhow::Result<()> {
-    match tokio::time::timeout(dur, serve_one_http(stream, stats, auth, metrics_auth)).await {
+    let fut = serve_one_http(stream, stats, auth, metrics_auth, throttle);
+    match tokio::time::timeout(dur, fut).await {
         Ok(r) => r,
         Err(_) => anyhow::bail!("metrics HTTP request timed out"),
     }
@@ -246,7 +363,9 @@ async fn serve_one_http(
     stats: &ServerStats,
     auth: &AuthRateLimiter,
     metrics_auth: &MetricsAuth,
+    throttle: &MetricsAuthThrottle,
 ) -> anyhow::Result<()> {
+    let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
     let mut buf = [0u8; 2048];
     let n = stream.read(&mut buf).await?;
     if n == 0 {
@@ -273,6 +392,11 @@ async fn serve_one_http(
     }
 
     if !metrics_auth.authorize(&headers) {
+        if let Some(ip) = peer_ip {
+            if let Some(delay) = throttle.record_failure(ip) {
+                tokio::time::sleep(delay).await;
+            }
+        }
         write_http_response(
             &mut stream,
             401,
@@ -376,9 +500,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let stats_c = Arc::clone(&stats);
         let auth_c = Arc::clone(&auth);
+        let throttle = MetricsAuthThrottle::new();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_one_http(stream, &stats_c, &auth_c, &metrics_auth)
+            serve_one_http(stream, &stats_c, &auth_c, &metrics_auth, &throttle)
                 .await
                 .unwrap();
         });
@@ -414,9 +539,10 @@ mod tests {
         let stats_c = Arc::clone(&stats);
         let auth_c = Arc::clone(&auth);
         let metrics_auth_c = metrics_auth.clone();
+        let throttle = MetricsAuthThrottle::new();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_one_http(stream, &stats_c, &auth_c, &metrics_auth_c)
+            serve_one_http(stream, &stats_c, &auth_c, &metrics_auth_c, &throttle)
                 .await
                 .unwrap();
         });
@@ -444,9 +570,10 @@ mod tests {
         let stats_c = Arc::clone(&stats);
         let auth_c = Arc::clone(&auth);
         let metrics_auth_ok = MetricsAuth::basic("metrics", "s3cret");
+        let throttle = MetricsAuthThrottle::new();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_one_http(stream, &stats_c, &auth_c, &metrics_auth_ok)
+            serve_one_http(stream, &stats_c, &auth_c, &metrics_auth_ok, &throttle)
                 .await
                 .unwrap();
         });
@@ -496,6 +623,7 @@ mod tests {
                 &stats,
                 &auth,
                 &metrics_auth,
+                &MetricsAuthThrottle::new(),
                 std::time::Duration::from_millis(50),
             )
             .await
@@ -516,5 +644,57 @@ mod tests {
         let hdrs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert!(auth.authorize(&hdrs));
         assert!(!auth.authorize(&[("Authorization", "Basic wrong")]));
+    }
+
+    fn test_throttle(budget: u32, window: Duration, max_peers: usize) -> MetricsAuthThrottle {
+        MetricsAuthThrottle {
+            peers: Mutex::new(HashMap::new()),
+            budget,
+            window,
+            max_peers,
+        }
+    }
+
+    #[test]
+    fn metrics_listener_off_host_detection() {
+        let parse = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert!(!is_off_host(&parse("127.0.0.1:9100")));
+        assert!(!is_off_host(&parse("[::1]:9100")));
+        assert!(is_off_host(&parse("0.0.0.0:9100")));
+        assert!(is_off_host(&parse("[::]:9100")));
+    }
+
+    #[test]
+    fn metrics_auth_throttle_allows_budget_then_delays() {
+        let throttle = test_throttle(1, Duration::from_secs(60), 8);
+        let peer: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(throttle.record_failure(peer).is_none());
+        assert_eq!(
+            throttle.record_failure(peer),
+            Some(METRICS_AUTH_FAILURE_DELAY)
+        );
+        // Budgets are per peer: another source starts fresh.
+        let other: IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(throttle.record_failure(other).is_none());
+    }
+
+    #[tokio::test]
+    async fn metrics_auth_throttle_restores_budget_after_window() {
+        let throttle = test_throttle(1, Duration::from_millis(20), 8);
+        let peer: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(throttle.record_failure(peer).is_none());
+        assert!(throttle.record_failure(peer).is_some());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(throttle.record_failure(peer).is_none());
+    }
+
+    #[test]
+    fn metrics_auth_throttle_caps_tracked_peers() {
+        let throttle = test_throttle(1, Duration::from_secs(60), 3);
+        for last in 0..50u8 {
+            let _ = throttle.record_failure(IpAddr::from([203, 0, 113, last]));
+        }
+        let peers = throttle.peers.lock().unwrap();
+        assert!(peers.len() <= 3, "tracked {} peers", peers.len());
     }
 }

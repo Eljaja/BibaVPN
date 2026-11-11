@@ -1,6 +1,7 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -8,7 +9,7 @@ use base64::Engine;
 use bibavpn::accept::classify_accept_error;
 use bibavpn::crypto_layer::{self, SessionCrypto};
 use bibavpn::frame::{AdaptivePadState, PadMode, DEFAULT_MAX_WS_BINARY};
-use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig, WsHandshakeKind};
+use bibavpn::incoming::{accept_websocket_or_camouflage, CamouflageServeConfig};
 use bibavpn::invite_uri::{encode_invite_v1, InviteV1};
 use bibavpn::local_client::{
     normalize_ws_path, parse_host_port, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
@@ -25,7 +26,8 @@ use bibavpn::reality::{
 use bibavpn::users::{UserRegistry, UserSession};
 use bibavpn::server_limits::{
     account_pre_hello_binary, AuthRateLimiter, AuthRateLimiterConfig, PreAuthBudget,
-    PreHelloJunkTracker, ServerStats, MAX_PRE_HELLO_BYTES, MAX_PRE_HELLO_FRAMES,
+    PreAuthSetupLimiter, PreAuthSetupPermit, PreAuthTimeoutTracker, PreHelloJunkTracker,
+    ServerStats, MAX_PRE_HELLO_BYTES, MAX_PRE_HELLO_FRAMES, PREAUTH_SETUP_MAX_PER_BUCKET,
 };
 use bibavpn::server_metrics::{metrics_auth_from_password, spawn_metrics_listener};
 use bibavpn::startup_secrets::{
@@ -54,7 +56,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, error, info, warn};
 
-#[derive(Clone)]
 struct ServerConnParams {
     peer: SocketAddr,
     session_id: u64,
@@ -66,6 +67,11 @@ struct ServerConnParams {
     mux_window_mib: bibavpn::tcp_mux::MuxWindow,
     udp_pool: Option<Arc<UdpSocketPool>>,
     users: Option<UserRegistry>,
+    /// In-flight pre-auth setup slot for this peer's bucket; held until the
+    /// HTTP head has been read (or the connection fails) so a silent socket
+    /// cannot hold a global session permit.
+    preauth_guard: Option<PreAuthSetupPermit>,
+    preauth_timeouts: Arc<PreAuthTimeoutTracker>,
 }
 
 #[derive(Parser, Debug)]
@@ -81,7 +87,7 @@ struct Args {
     token: Option<String>,
 
     /// JSON user registry; changes take effect for new sessions without restart.
-    #[arg(long, conflicts_with_all = ["legacy_path_auth", "print_invite_uri"])]
+    #[arg(long, conflicts_with = "print_invite_uri")]
     users_file: Option<PathBuf>,
 
     /// Local demos only: allow missing `--token` (uses `change-me`), skip token denylist, relax PSK when REALITY is configured.
@@ -91,10 +97,6 @@ struct Args {
     /// WebSocket HTTP path (token is sent in AUTH frame). Default `/ws`.
     #[arg(long, default_value = "/ws")]
     ws_path: String,
-
-    /// Accept legacy clients that use URL `/b/{token}` without AUTH frame (less secure).
-    #[arg(long, default_value_t = false)]
-    legacy_path_auth: bool,
 
     #[arg(long)]
     cert: Option<PathBuf>,
@@ -555,7 +557,6 @@ async fn main() -> anyhow::Result<()> {
     let udp_mux_pad = args.udp_max_pad.unwrap_or(max_pad);
     let udp_mux_ws = args.udp_max_ws_binary.unwrap_or(max_ws_binary);
     let udp_mux_recv = Duration::from_secs(args.udp_mux_recv_timeout_secs.clamp(1, 600));
-    let legacy_path_auth = args.legacy_path_auth;
     let dummy_interval_secs = args.dummy_interval_secs;
     let camouflage_dir = args.camouflage_dir.clone();
     let camouflage_url = args.camouflage_url.clone();
@@ -641,13 +642,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    if args.legacy_path_auth {
-        warn!(
-            target: "bibavpn_security",
-            "--legacy-path-auth is deprecated; use standard ws path + AUTH frame only; not recommended for production"
-        );
-    }
-
     let auth_cfg = AuthRateLimiterConfig {
         enabled: !args.no_auth_rate_limit,
         max_failures: args.auth_max_failures.max(1),
@@ -656,6 +650,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let auth = AuthRateLimiter::new(auth_cfg);
     let stats = ServerStats::new();
+    let preauth_setup = PreAuthSetupLimiter::new(PREAUTH_SETUP_MAX_PER_BUCKET);
+    let preauth_timeouts = Arc::new(PreAuthTimeoutTracker::default());
     let conn_sem = if args.max_concurrent_sessions > 0 {
         Some(Arc::new(Semaphore::new(args.max_concurrent_sessions)))
     } else {
@@ -681,7 +677,6 @@ async fn main() -> anyhow::Result<()> {
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
     log_server_listen_caps(
-        args.legacy_path_auth,
         !args.no_auth_rate_limit,
         args.max_concurrent_sessions,
         args.udp_socket_pool_size,
@@ -784,6 +779,8 @@ async fn main() -> anyhow::Result<()> {
         let stats = Arc::clone(&stats);
         let conn_sem = conn_sem.clone();
         let pre_auth = pre_auth.clone();
+        let preauth_setup = Arc::clone(&preauth_setup);
+        let preauth_timeouts = Arc::clone(&preauth_timeouts);
         let udp_pool = udp_pool.clone();
         let users = users.clone();
         let handshake_timeout = handshake_timeout;
@@ -805,6 +802,20 @@ async fn main() -> anyhow::Result<()> {
                 );
                 return;
             }
+
+            // Per-source cap on pre-auth setup connections: a peer that connects and
+            // stays silent must not consume global permits with an unbounded number of
+            // sockets. This is a cheap in-memory reservation, so it is taken before the
+            // semaphore; it is released once the HTTP head has been read.
+            let Some(preauth_guard) = preauth_setup.try_acquire(peer.ip()) else {
+                debug!(
+                    target: "bibavpn_server",
+                    %peer,
+                    session_id,
+                    "dropped: too many concurrent pre-auth connections from this source"
+                );
+                return;
+            };
 
             let permit = match &conn_sem {
                 Some(sem) => {
@@ -838,6 +849,8 @@ async fn main() -> anyhow::Result<()> {
                 mux_window_mib,
                 udp_pool,
                 users,
+                preauth_guard: Some(preauth_guard),
+                preauth_timeouts,
             };
 
             if let Err(e) = handle_one(
@@ -845,7 +858,6 @@ async fn main() -> anyhow::Result<()> {
                 acceptor,
                 token,
                 ws_path,
-                legacy_path_auth,
                 max_pad,
                 psk_conn,
                 decoy_max,
@@ -870,12 +882,17 @@ async fn main() -> anyhow::Result<()> {
             .await
             {
                 stats.inc_session_error();
-                error!(
-                    target: "bibavpn_server",
-                    %peer,
-                    session_id,
-                    "session error: {e:#}"
-                );
+                // Pre-auth parse/TLS failures are attacker-controlled; log them at the
+                // same rate as accept failures so a scanner cannot flood the log.
+                static SESSION_ERR_LOG: LogEvery = LogEvery::new(8, 256);
+                if SESSION_ERR_LOG.should_emit() {
+                    error!(
+                        target: "bibavpn_server",
+                        %peer,
+                        session_id,
+                        "session error: {e:#}"
+                    );
+                }
             }
             drop(permit);
         });
@@ -1148,23 +1165,33 @@ where
 /// peer that opens a socket and then stalls would otherwise hold a slot until it gives
 /// up: a handful of silent sockets can exhaust `--max-concurrent-sessions`. Expiry is
 /// counted as a handshake timeout and returns an error, which releases both.
-/// No `auth.record_failure`: a peer that never spoke has not failed authentication.
+///
+/// Setup failures are soft-counted per source bucket; only every
+/// [`bibavpn::server_limits::PREAUTH_FAILURES_PER_AUTH_FAILURE`]th one feeds the real
+/// auth limiter, so a single dropped probe never bans a whole /64.
 async fn with_setup_timeout<T, F>(
     phase: &'static str,
     dur: Duration,
     stats: &Arc<ServerStats>,
+    auth: &Arc<AuthRateLimiter>,
+    preauth_timeouts: &PreAuthTimeoutTracker,
     peer: SocketAddr,
     session_id: u64,
     fut: F,
 ) -> anyhow::Result<T>
 where
-    F: std::future::Future<Output = anyhow::Result<T>>,
+    F: Future<Output = anyhow::Result<T>>,
 {
     match timeout(dur, fut).await {
-        Ok(r) => r,
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => {
+            note_pre_auth_setup_failure(auth, preauth_timeouts, peer).await;
+            Err(e)
+        }
         Err(_) => {
             let secs = dur.as_secs();
             stats.inc_handshake_timeout();
+            note_pre_auth_setup_failure(auth, preauth_timeouts, peer).await;
             debug!(
                 target: "bibavpn_server",
                 %peer,
@@ -1176,12 +1203,21 @@ where
     }
 }
 
+async fn note_pre_auth_setup_failure(
+    auth: &Arc<AuthRateLimiter>,
+    preauth_timeouts: &PreAuthTimeoutTracker,
+    peer: SocketAddr,
+) {
+    if preauth_timeouts.note_timeout(peer.ip()) {
+        auth.record_failure(peer.ip()).await;
+    }
+}
+
 async fn handle_one(
     tcp: TcpStream,
     acceptor: TlsAcceptor,
     token: String,
     ws_path: String,
-    legacy_path_auth: bool,
     max_pad: u8,
     psk: Option<String>,
     decoy_max: u8,
@@ -1215,6 +1251,8 @@ async fn handle_one(
         "tls accept",
         params.handshake_timeout,
         &params.stats,
+        &params.auth,
+        &params.preauth_timeouts,
         params.peer,
         params.session_id,
         async move { acceptor.accept(tcp).await.context("tls accept") },
@@ -1225,39 +1263,32 @@ async fn handle_one(
 
     // Covers the HTTP head read (`incoming::read_http_head` has no deadline of its own)
     // plus writing the camouflage answer; a real probe is served long before it expires.
-    let Some((mut ws, ws_kind, http_host)) = with_setup_timeout(
+    let ws_phase = with_setup_timeout(
         "websocket upgrade / camouflage http",
         params.handshake_timeout,
         &params.stats,
+        &params.auth,
+        &params.preauth_timeouts,
         params.peer,
         params.session_id,
         accept_websocket_or_camouflage(
             tls,
             &ws_path,
-            legacy_path_auth,
-            &token,
             camo,
             Some(params.peer),
             max_ws_binary.max(udp_mux_max_ws_binary),
         ),
     )
-    .await?
-    else {
+    .await;
+    // The head arrived (a 404/405 camouflage answer counts too): this peer is not a
+    // silent socket, so release the per-source setup slot and forget soft failures.
+    if ws_phase.is_ok() {
+        params.preauth_timeouts.clear(params.peer.ip());
+    }
+    drop(params.preauth_guard);
+    let Some((mut ws, http_host)) = ws_phase? else {
         return Ok(());
     };
-
-    static LEGACY_CONN_LOG: AtomicU64 = AtomicU64::new(0);
-    if matches!(ws_kind, WsHandshakeKind::LegacyPath) {
-        let n = LEGACY_CONN_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 8 || n % 64 == 0 {
-            warn!(
-                target: "bibavpn_security",
-                peer_ip = %params.peer.ip(),
-                session_id = params.session_id,
-                "legacy path WebSocket auth in use (deprecated)"
-            );
-        }
-    }
 
     let peer_ip = params.peer.ip();
     let auth = &params.auth;
@@ -1331,6 +1362,8 @@ async fn handle_one(
             "first frame after REALITY",
             handshake_timeout,
             &params.stats,
+            &params.auth,
+            &params.preauth_timeouts,
             params.peer,
             params.session_id,
             async {

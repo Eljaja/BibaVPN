@@ -18,7 +18,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::crypto_layer::SessionCrypto;
 use crate::frame::{AdaptivePadState, PadMode};
-use crate::protocol::{decode_open_err, decode_v3_open_err, is_open_ok, is_v3_open_ok};
+use crate::protocol::{decode_open_err, is_open_ok};
 use crate::retry::{
     maybe_server_ack_and_rtt_mask, maybe_ws_send_jitter, ws_ping_period_duration,
     ServerWsOutTiming, WsSendJitter,
@@ -36,15 +36,14 @@ pub enum WsBridgePrefetch {
     OpenedPayload(Vec<u8>),
 }
 
-/// After client-side AEAD open + unpad: drop v3 `OPEN_OK`, fail on v3 `OPEN_ERR`.
-fn filter_client_downlink(inner: &[u8]) -> anyhow::Result<Option<&[u8]>> {
-    if is_v3_open_ok(inner) {
-        return Ok(None);
-    }
-    if let Ok(err) = decode_v3_open_err(inner) {
-        anyhow::bail!("remote OPEN failed: {err}");
-    }
-    Ok(Some(inner))
+/// Client downlink after AEAD open: unpad only. The v3 `OPEN_OK`/`OPEN_ERR`
+/// status is consumed by `wait_open_status_or_payload` before the bridge runs,
+/// so later payload merely *looking* like a status byte is ordinary tunnel data.
+fn open_client_downlink(crypto: &SessionCrypto, blob: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let raw = crypto
+        .open_server_to_client(blob)
+        .context("v2 open s2c")?;
+    read_padded_frame_into(raw).context("padded frame")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -242,12 +241,9 @@ where
                     }
                     match (&crypto_up, end) {
                         (Some(c), TunnelEnd::Client) => {
-                            let raw = c.open_server_to_client(b.as_ref()).context("v2 open s2c")?;
-                            let payload = read_padded_frame_into(raw).context("padded frame")?;
-                            if let Some(tcp_payload) = filter_client_downlink(&payload)? {
-                                if !tcp_payload.is_empty() {
-                                    tcp_write.write_all(tcp_payload).await?;
-                                }
+                            let payload = open_client_downlink(c, b.as_ref())?;
+                            if !payload.is_empty() {
+                                tcp_write.write_all(&payload).await?;
                             }
                         }
                         (Some(c), TunnelEnd::Server) => {
@@ -421,7 +417,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::encode_v3_open_ok;
+    use crate::crypto_layer::{build_ack, build_hello_v3};
+    use crate::frame::write_padded_frame;
     use tokio::net::TcpListener;
     use tokio::time::timeout;
     use tokio_tungstenite::tungstenite::protocol::Role;
@@ -530,23 +527,32 @@ mod tests {
         assert!(result.is_err(), "missing close reply must report a timeout");
     }
 
-    #[test]
-    fn late_v3_open_ok_filtered_from_client_downlink() {
-        let inner = encode_v3_open_ok();
-        assert!(filter_client_downlink(&inner).unwrap().is_none());
+    fn session() -> SessionCrypto {
+        let (c, _hello) = build_hello_v3();
+        let psk = "ws-bridge-downlink-psk";
+        let dom = "ws.bridge.downlink";
+        let (_ack, s) = build_ack(psk, dom, &c).unwrap();
+        SessionCrypto::new(psk, dom, &c, &s, 8)
+    }
+
+    fn sealed_downlink(crypto: &SessionCrypto, inner: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        write_padded_frame(&mut wire, inner, 0).unwrap();
+        crypto.seal_server_to_client(&wire).unwrap()
     }
 
     #[test]
-    fn v3_open_err_on_client_downlink_fails() {
-        use crate::protocol::encode_v3_open_err;
-        let inner = encode_v3_open_err("late fail").unwrap();
-        let err = filter_client_downlink(&inner).unwrap_err();
-        assert!(err.to_string().contains("late fail"));
-    }
-
-    #[test]
-    fn payload_passes_client_downlink_filter() {
-        let data = b"hello";
-        assert_eq!(filter_client_downlink(data).unwrap(), Some(data.as_slice()));
+    fn open_status_shaped_payload_passes_client_downlink() {
+        let crypto = session();
+        // The opening status was consumed before the bridge; a later payload that
+        // happens to start with OPEN_OK/OPEN_ERR bytes must reach TCP unchanged.
+        for payload in [
+            &[0x10u8][..],
+            &[0x11, 0, 2, b'n', b'o'][..],
+            &[0x11][..],
+        ] {
+            let sealed = sealed_downlink(&crypto, payload);
+            assert_eq!(open_client_downlink(&crypto, &sealed).unwrap(), payload);
+        }
     }
 }

@@ -41,7 +41,7 @@ In scope:
 
 Out of scope:
 
-- Misuse of `--insecure`, `--legacy-path-auth`, or committing secrets from
+- Misuse of `--insecure`, or committing secrets from
   `.env` / `server.txt` to a fork. Those are documented footguns.
 - Reverse-engineering the wire format from outside observation: the protocol
   is published in [PROTOCOL.md](PROTOCOL.md). Fingerprinting reports are

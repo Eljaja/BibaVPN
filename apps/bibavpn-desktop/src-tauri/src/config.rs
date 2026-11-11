@@ -1078,12 +1078,68 @@ pub fn load_config_from_path(path: &Path) -> SavedConfig {
     }
 }
 
+/// Write the config without ever exposing secrets (token/PSK/invite passphrase)
+/// to other local users: on Unix the file is created `0600` and atomically
+/// renamed into place.
+#[cfg(unix)]
+fn write_config_file(path: &Path, data: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id(),
+        nonce
+    );
+    let tmp = path.with_file_name(tmp_name);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = f.write_all(data.as_bytes()).and_then(|_| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    drop(f);
+    // `rename` replaces the target atomically and keeps the temp file's 0600 mode,
+    // so a pre-existing 0644 config is tightened without a readable window.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_config_file(path: &Path, data: &str) -> Result<(), String> {
+    std::fs::write(path, data).map_err(|e| e.to_string())
+}
+
 pub fn save_config_to_path(cfg: &SavedConfig, path: &Path) -> Result<(), String> {
+    let s = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The config directory holds only this app's secrets; keep it private.
+            // Skip root/empty parents so an unusual caller path cannot chmod `/`.
+            if parent.file_name().is_some() {
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
-    let s = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(path, s).map_err(|e| e.to_string())
+    write_config_file(path, &s)
 }
 
 pub fn load_config_disk() -> SavedConfig {
@@ -1297,7 +1353,9 @@ mod split_bypass_json_tests {
         p.split_tunnel_preset_ids = vec!["banks".into()];
         let json = p.start_config_json().expect("build start json");
         assert!(
-            json.contains("split_bypass_domains") && json.contains("sberbank.ru"),
+            json.contains("split_bypass_domains")
+                && json.contains("sberbank.ru")
+                && json.contains(".tinkoff.ru"),
             "got: {json}"
         );
     }
@@ -1577,5 +1635,47 @@ mod merge_and_normalize_tests {
         cfg.active_profile_id = "does-not-exist".into();
         normalize_loaded(&mut cfg);
         assert_eq!(cfg.active_profile_id, "kept");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod config_file_permissions_tests {
+    use super::{save_config_to_path, SavedConfig};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn saved_config_and_parent_dir_are_private() {
+        let base = std::env::temp_dir().join(format!(
+            "bibavpn-config-perms-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dir = base.join("BibaVPN");
+        let path = dir.join("config.json");
+
+        save_config_to_path(&SavedConfig::default(), &path).expect("save config");
+
+        assert_eq!(mode(&path), 0o600, "config.json must not be world-readable");
+        assert_eq!(mode(&dir), 0o700, "config dir must be private");
+        // A successful write must not leave the temp file behind.
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("read dir").count(),
+            1,
+            "only config.json must remain"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

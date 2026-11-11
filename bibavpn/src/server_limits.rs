@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -83,6 +83,145 @@ pub fn auth_limit_key(ip: IpAddr) -> IpAddr {
             Some(v4) => IpAddr::V4(v4),
             None => IpAddr::V6(mask_ipv6(v6, IPV6_AUTH_PREFIX_BITS)),
         },
+    }
+}
+
+/// Max concurrent pre-auth setup connections per [`auth_limit_key`] bucket.
+///
+/// A peer that opens a socket and stays silent holds no global session permit
+/// unless this cap lets it: the guard is taken before the global semaphore, so
+/// eight stalled sockets from one source can never starve other peers.
+pub const PREAUTH_SETUP_MAX_PER_BUCKET: usize = 8;
+
+/// Pre-auth setup timeouts/EOF tolerated before one real auth failure is
+/// recorded for the bucket. The first timeout alone must not ban anyone.
+pub const PREAUTH_FAILURES_PER_AUTH_FAILURE: u32 = 3;
+
+/// Soft pre-auth strikes decay after this long without a new one.
+const PREAUTH_STRIKE_WINDOW: Duration = Duration::from_secs(600);
+
+/// Per-bucket in-flight accounting for pre-auth setup (TLS + HTTP head).
+///
+/// Acquired before the global concurrency permit and released once the HTTP
+/// head has been read or the connection is dropped, so silent sockets are
+/// bounded per source instead of by `--max-concurrent-sessions` alone.
+pub struct PreAuthSetupLimiter {
+    max_per_bucket: usize,
+    inner: StdMutex<HashMap<IpAddr, usize>>,
+}
+
+impl PreAuthSetupLimiter {
+    pub fn new(max_per_bucket: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_per_bucket: max_per_bucket.max(1),
+            inner: StdMutex::new(HashMap::new()),
+        })
+    }
+
+    /// Reserve a setup slot for `ip`'s bucket, or `None` when it is already at
+    /// the per-bucket cap.
+    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PreAuthSetupPermit> {
+        let key = auth_limit_key(ip);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let in_flight = g.get(&key).copied().unwrap_or(0);
+        if in_flight >= self.max_per_bucket {
+            return None;
+        }
+        if in_flight == 0 && g.len() >= MAX_TRACKED_IPS {
+            return None;
+        }
+        g.insert(key, in_flight + 1);
+        Some(PreAuthSetupPermit {
+            limiter: Arc::clone(self),
+            key,
+        })
+    }
+}
+
+/// One in-flight pre-auth setup slot; releases its bucket on drop.
+pub struct PreAuthSetupPermit {
+    limiter: Arc<PreAuthSetupLimiter>,
+    key: IpAddr,
+}
+
+impl Drop for PreAuthSetupPermit {
+    fn drop(&mut self) {
+        let mut g = self.limiter.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = g.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(&self.key);
+            }
+        }
+    }
+}
+
+struct PreAuthStrikeState {
+    strikes: u32,
+    last: Instant,
+}
+
+/// Counts pre-auth setup timeouts/EOF per [`auth_limit_key`] bucket and turns
+/// every [`PREAUTH_FAILURES_PER_AUTH_FAILURE`] strikes into one auth failure.
+///
+/// A single stalled or aborted probe is normal internet noise, so banning on
+/// it would let one dropped packet blackhole a whole /64. Only a source that
+/// repeatedly fails setup is fed to the regular [`AuthRateLimiter`].
+pub struct PreAuthTimeoutTracker {
+    threshold: u32,
+    inner: StdMutex<HashMap<IpAddr, PreAuthStrikeState>>,
+}
+
+impl Default for PreAuthTimeoutTracker {
+    fn default() -> Self {
+        Self::new(PREAUTH_FAILURES_PER_AUTH_FAILURE)
+    }
+}
+
+impl PreAuthTimeoutTracker {
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            inner: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Account one pre-auth timeout/EOF. Returns `true` when the bucket has
+    /// accumulated enough strikes that the caller should call
+    /// `AuthRateLimiter::record_failure`; the counter then resets.
+    pub fn note_timeout(&self, ip: IpAddr) -> bool {
+        let key = auth_limit_key(ip);
+        let now = Instant::now();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.contains_key(&key) && g.len() >= MAX_TRACKED_IPS {
+            g.retain(|_, st| now.duration_since(st.last) <= PREAUTH_STRIKE_WINDOW);
+            if g.len() >= MAX_TRACKED_IPS {
+                return false;
+            }
+        }
+        let st = g.entry(key).or_insert(PreAuthStrikeState {
+            strikes: 0,
+            last: now,
+        });
+        if now.duration_since(st.last) > PREAUTH_STRIKE_WINDOW {
+            st.strikes = 0;
+        }
+        st.last = now;
+        st.strikes = st.strikes.saturating_add(1);
+        if st.strikes >= self.threshold {
+            st.strikes = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A peer completed HTTP setup: forget strikes accumulated by earlier
+    /// aborted attempts from the same bucket.
+    pub fn clear(&self, ip: IpAddr) {
+        let key = auth_limit_key(ip);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.remove(&key);
     }
 }
 
@@ -702,5 +841,86 @@ mod tests {
         assert!(got.is_none());
         assert_eq!(tracker.junk_frames, 2);
         assert_eq!(tracker.junk_bytes, 2);
+    }
+
+    #[test]
+    fn preauth_setup_guard_caps_each_bucket() {
+        let lim = PreAuthSetupLimiter::new(PREAUTH_SETUP_MAX_PER_BUCKET);
+        let a: IpAddr = "203.0.113.20".parse().unwrap();
+        let permits: Vec<_> = (0..PREAUTH_SETUP_MAX_PER_BUCKET)
+            .map(|_| lim.try_acquire(a).expect("slot under the cap"))
+            .collect();
+        assert!(
+            lim.try_acquire(a).is_none(),
+            "the ninth concurrent setup from one /32 must be refused"
+        );
+
+        // A different bucket is unaffected.
+        let b: IpAddr = "203.0.113.21".parse().unwrap();
+        assert!(lim.try_acquire(b).is_some());
+
+        // Dropping the guard releases the slot again.
+        drop(permits);
+        assert!(lim.try_acquire(a).is_some());
+    }
+
+    #[test]
+    fn preauth_setup_guard_uses_ipv6_64_buckets() {
+        let lim = PreAuthSetupLimiter::new(2);
+        let first: IpAddr = "2001:db8:9:9::1".parse().unwrap();
+        let same_64: IpAddr = "2001:db8:9:9:ffff::2".parse().unwrap();
+        let other_64: IpAddr = "2001:db8:9:a::1".parse().unwrap();
+        let _p1 = lim.try_acquire(first).expect("first slot");
+        let _p2 = lim.try_acquire(first).expect("second slot");
+        assert!(
+            lim.try_acquire(same_64).is_none(),
+            "addresses in one /64 share the setup cap"
+        );
+        assert!(
+            lim.try_acquire(other_64).is_some(),
+            "a different /64 has its own cap"
+        );
+    }
+
+    #[test]
+    fn preauth_timeouts_do_not_fail_on_the_first_strike() {
+        let tracker = PreAuthTimeoutTracker::default();
+        let ip: IpAddr = "198.51.100.7".parse().unwrap();
+        for _ in 0..(PREAUTH_FAILURES_PER_AUTH_FAILURE - 1) {
+            assert!(
+                !tracker.note_timeout(ip),
+                "a single pre-auth timeout must not record an auth failure"
+            );
+        }
+        assert!(
+            tracker.note_timeout(ip),
+            "the threshold-th strike must feed the auth limiter"
+        );
+        assert!(
+            !tracker.note_timeout(ip),
+            "the counter resets after reporting a failure"
+        );
+    }
+
+    #[test]
+    fn preauth_timeouts_are_per_bucket_and_clearable() {
+        let tracker = PreAuthTimeoutTracker::new(2);
+        let a: IpAddr = "198.51.100.8".parse().unwrap();
+        let b: IpAddr = "198.51.100.9".parse().unwrap();
+
+        assert!(!tracker.note_timeout(a));
+        assert!(
+            !tracker.note_timeout(b),
+            "another bucket does not share the strike"
+        );
+        tracker.clear(a);
+        assert!(
+            !tracker.note_timeout(a),
+            "a completed setup clears earlier strikes"
+        );
+        assert!(
+            tracker.note_timeout(a),
+            "two fresh strikes cross the threshold"
+        );
     }
 }

@@ -12,7 +12,7 @@ services:
       - --listen
       - 0.0.0.0:8443
       - --self-signed-san
-      - biba-server
+      - "${BIBA_INVITE_SNI:-biba-server}"
       - --token
       - "${BIBA_TOKEN:?run bash start.sh or set BIBA_TOKEN}"
       - --psk
@@ -89,8 +89,8 @@ services:
       - --early-ws-frames
       - "1"
     ports:
-      - "11080:11080"
-      - "11880:18080"
+      - "127.0.0.1:11080:11080"
+      - "127.0.0.1:11880:18080"
     networks:
       - bibanet
 

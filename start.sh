@@ -27,8 +27,29 @@ BIBA_MESH_IMAGE="${BIBA_MESH_IMAGE:-eljaja/bibavpn-yb-mesh:latest}"
 export BIBA_SERVER_IMAGE BIBA_MESH_IMAGE
 compose=(docker compose -f docker-compose.yml -f docker-compose.prebuilt.yml)
 
-BIBA_INVITE_PUBLIC="${BIBA_INVITE_PUBLIC:-127.0.0.1:8443}"
-BIBA_INVITE_SNI="${BIBA_INVITE_SNI:-biba-server}"
+if [[ "$mesh" == 1 ]]; then
+  # Mesh transports ignore the public host/port, so use a memorable DNS-like name
+  # for the certificate SAN, SNI and the invite's display address. A random word
+  # is easier to recognize in the imported profile than a hex suffix.
+  mesh_words=(
+    amber anchor arrow aspen badger bamboo beacon birch bison bloom brook cedar
+    cliff cloud comet coral crane creek dawn delta drift eagle ember falcon fern
+    field finch fjord flint forest fox frost garnet glacier grove harbor hawk
+    hazel heron hill island ivy jade juniper kite lake larch lark lotus maple
+    meadow mesa mist moon moss oak ocean olive orchid otter peak pine quail
+    quartz rain raven reef ridge river robin rose sage sand shore sky snow
+    sparrow spring spruce star stone storm stream sun swift thistle tide timber
+    trail valley vine wave willow wind wolf wren
+  )
+  if [[ -z "${BIBA_INVITE_SNI:-}" ]]; then
+    mesh_count=${#mesh_words[@]}
+    BIBA_INVITE_SNI="biba-${mesh_words[RANDOM % mesh_count]}"
+  fi
+  BIBA_INVITE_PUBLIC="${BIBA_INVITE_PUBLIC:-${BIBA_INVITE_SNI}:8443}"
+else
+  BIBA_INVITE_PUBLIC="${BIBA_INVITE_PUBLIC:-127.0.0.1:8443}"
+  BIBA_INVITE_SNI="${BIBA_INVITE_SNI:-biba-server}"
+fi
 BIBA_MAX_WS_BINARY="${BIBA_MAX_WS_BINARY:-262144}"
 
 BIBA_TOKEN="$(openssl rand -hex 16)"

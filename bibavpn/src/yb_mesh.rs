@@ -56,11 +56,23 @@ pub struct MeshNode {
     peer_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Generated mesh config with every implicit listener disabled.
+///
+/// The Yggdrasil template listens on all interfaces and enables an admin
+/// socket; an outbound-only mesh client must not do either. Only URIs passed
+/// explicitly to [`MeshNode::start`] are bound afterwards.
+fn mesh_config() -> config::Config {
+    let mut cfg = config::generate();
+    cfg.peers.clear();
+    cfg.multicast_interfaces.clear();
+    cfg.listen.clear();
+    cfg.admin_listen = "none".to_string();
+    cfg
+}
+
 impl MeshNode {
     pub async fn start(peers: Vec<String>, listen: Vec<String>) -> anyhow::Result<Self> {
-        let mut cfg = config::generate();
-        cfg.peers.clear();
-        cfg.multicast_interfaces.clear();
+        let cfg = mesh_config();
         let signing_key = cfg.signing_key().map_err(anyhow::Error::msg)?;
         let address = config::addr_for_key(&signing_key.verifying_key().to_bytes());
         let core = Core::new(signing_key, cfg);
@@ -166,5 +178,19 @@ impl AsyncWrite for ServerStream {
             Self::Direct(s) => Pin::new(s).poll_shutdown(cx),
             Self::Mesh(s) => Pin::new(s).poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_mesh_config_has_no_default_listeners() {
+        let cfg = mesh_config();
+        assert!(cfg.listen.is_empty(), "mesh client must not bind implicit listeners: {:?}", cfg.listen);
+        assert_eq!(cfg.admin_listen, "none", "mesh client must not expose an admin socket");
+        assert!(cfg.peers.is_empty());
+        assert!(cfg.multicast_interfaces.is_empty());
     }
 }

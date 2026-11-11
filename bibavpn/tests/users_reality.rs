@@ -24,7 +24,12 @@ async fn reality_registry_enforces_live_users_and_session_limits() {
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("users.json");
     let write = |enabled| {
-        std::fs::write(&path, format!(r#"{{"users":[{{"label":"alice","token":"alice-secret","enabled":{enabled},"max_concurrent":1}}]}}"#)).unwrap()
+        std::fs::write(&path, format!(r#"{{"users":[{{"label":"alice","token":"alice-secret","enabled":{enabled},"max_concurrent":1}}]}}"#)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     };
     write(true);
     let (private, public) = RealityServerConfig::generate_keys();

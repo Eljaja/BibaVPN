@@ -22,6 +22,7 @@ async fn socks5_negotiate_method(
     }
     let nmethods = buf[1] as usize;
     if nmethods == 0 {
+        let _ = local.write_all(&[5u8, 0xFF]).await;
         bail!("socks nmethods=0");
     }
     let mut methods = vec![0u8; nmethods];
@@ -139,7 +140,11 @@ async fn socks5_read_connect_request(local: &mut TcpStream) -> anyhow::Result<So
             local.read_exact(&mut a).await?;
             IpAddr::V6(Ipv6Addr::from(a)).to_string()
         }
-        _ => bail!("unsupported ATYP {}", atyp),
+        _ => {
+            // RFC 1928: report the address type before closing.
+            socks5_reply_code(local, 8).await?;
+            bail!("unsupported ATYP {}", atyp)
+        }
     };
 
     let mut p = [0u8; 2];
@@ -149,7 +154,11 @@ async fn socks5_read_connect_request(local: &mut TcpStream) -> anyhow::Result<So
     match cmd {
         1 => Ok(SocksCommand::Connect { host, port }),
         3 => Ok(SocksCommand::UdpAssociate { host, port }),
-        _ => bail!("unsupported SOCKS cmd {cmd}"),
+        _ => {
+            // RFC 1928: `command not supported` instead of a bare connection close.
+            socks5_reply_code(local, 7).await?;
+            bail!("unsupported SOCKS cmd {cmd}")
+        }
     }
 }
 
@@ -228,8 +237,13 @@ pub async fn socks5_reply_udp_associate(
 }
 
 pub async fn socks5_reply_err(local: &mut TcpStream) -> anyhow::Result<()> {
-    const REPLY: &[u8] = &[5, 1, 0, 1, 0, 0, 0, 0, 0, 0];
-    let _ = local.write_all(REPLY).await;
+    socks5_reply_code(local, 1).await
+}
+
+/// SOCKS5 reply with an explicit REP code and an empty IPv4 bind address.
+async fn socks5_reply_code(local: &mut TcpStream, rep: u8) -> anyhow::Result<()> {
+    let reply = [5u8, rep, 0, 1, 0, 0, 0, 0, 0, 0];
+    let _ = local.write_all(&reply).await;
     Ok(())
 }
 
@@ -287,6 +301,40 @@ mod tests {
         assert!(format!("{err:#}").contains("empty domain"));
         drop(server);
         client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_command_gets_a_reply_before_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0u8; 2];
+            s.read_exact(&mut method).await.unwrap();
+            // BIND (cmd 2) is not implemented.
+            s.write_all(&[5, 2, 0, 1, 127, 0, 0, 1, 0x1f, 0x90])
+                .await
+                .unwrap();
+            let mut reply = [0u8; 10];
+            s.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            socks5_read_command(&mut server, None),
+        )
+        .await
+        .expect("must not block")
+        .expect_err("BIND must be rejected");
+        assert!(format!("{err:#}").contains("unsupported SOCKS cmd"));
+        let reply = client.await.unwrap();
+        assert_eq!(reply[0], 5);
+        assert_eq!(reply[1], 7, "REP must be command-not-supported");
     }
 
     #[test]

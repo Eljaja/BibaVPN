@@ -100,7 +100,7 @@ pub async fn http_proxy_handshake(stream: &mut TcpStream) -> anyhow::Result<Http
     if !scheme.eq_ignore_ascii_case("http") {
         bail!("unsupported proxy URI scheme ({scheme}); use CONNECT for HTTPS targets");
     }
-    let host = uri.host().context("URI missing host")?.to_string();
+    let host = unbracket_host(uri.host().context("URI missing host")?).to_string();
     let port = uri.port_u16().unwrap_or(80);
     let path_query = uri
         .path_and_query()
@@ -229,6 +229,14 @@ fn parse_authority(auth: &str) -> anyhow::Result<(String, u16)> {
     Ok((auth.to_string(), 443))
 }
 
+/// `http::Uri::host()` keeps the brackets around IPv6 literals (`[::1]`), while the
+/// tunnel encodes hosts with `encode_atyp_host_port`, which expects a bare literal.
+fn unbracket_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 pub async fn reply_connect_ok(stream: &mut TcpStream) -> anyhow::Result<()> {
     stream
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -252,7 +260,7 @@ pub async fn reply_connect_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_authority, read_header_block, read_header_lines_into};
+    use super::{parse_authority, read_header_block, read_header_lines_into, unbracket_host};
     use http::Uri;
     use std::time::Duration;
     use tokio::io::{AsyncWriteExt, BufReader};
@@ -305,6 +313,13 @@ mod tests {
         assert_eq!(uri.host(), Some("192.168.50.2"));
         assert_eq!(uri.port_u16(), Some(8080));
         assert!(uri.path_and_query().unwrap().as_str().starts_with('/'));
+    }
+
+    #[test]
+    fn http_uri_ipv6_for_forward_is_unbracketed() {
+        let uri: Uri = "http://[2001:db8::1]:8080/x".parse().unwrap();
+        assert_eq!(uri.host(), Some("[2001:db8::1]"));
+        assert_eq!(unbracket_host(uri.host().unwrap()), "2001:db8::1");
     }
 
     #[test]

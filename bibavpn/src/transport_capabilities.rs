@@ -94,7 +94,6 @@ const EFFECTIVE_CONFIG_NOTE: &str =
 /// One-line summary when the entry server starts accepting connections.
 #[allow(clippy::too_many_arguments)]
 pub fn log_server_listen_caps(
-    legacy_path_auth: bool,
     auth_rate_limit_enabled: bool,
     max_concurrent_sessions: usize,
     udp_socket_pool_size: usize,
@@ -112,7 +111,6 @@ pub fn log_server_listen_caps(
     };
     tracing::info!(
         target: "bibavpn_server",
-        legacy_path_auth,
         auth_rate_limit = auth_rate_limit_enabled,
         max_concurrent_sessions = %cap,
         udp_socket_pool_size,
@@ -137,12 +135,6 @@ pub fn log_server_listen_caps(
         version = snap.version,
         "{EFFECTIVE_CONFIG_NOTE}"
     );
-    if legacy_path_auth {
-        warn!(
-            target: "bibavpn_security",
-            "legacy path auth is enabled; use AUTH frame + standard path for production"
-        );
-    }
 }
 
 fn tls_stack_str(stack: TlsStack) -> &'static str {

@@ -81,6 +81,8 @@ Pull and start the mesh-compatible server and mesh sidecar with a persistent Ygg
 BIBA_INVITE_PUBLIC="your-server.example:8443" BIBA_INVITE_SNI="your-server.example" bash start.sh --mesh
 ```
 
+When mesh mode runs without `BIBA_INVITE_PUBLIC` / `BIBA_INVITE_SNI`, `start.sh` generates a name such as `biba-otter` and uses it as the certificate SAN, TLS SNI and the invitation's display address. Imported profiles therefore show that name instead of `127.0.0.1`; set either variable to choose your own.
+
 `BIBA_YB_MESH=1 bash start.sh` is equivalent. Use `--no-mesh` to disable the sidecar. `BIBA_SERVER_IMAGE` and `BIBA_MESH_IMAGE` can override the image names. Mesh mode requires the published `eljaja/bibavpn-server:mesh` and `eljaja/bibavpn-yb-mesh:latest` images; these are published by the Docker workflow after the mesh changes reach the main branch.
 
 Import the new invitation into an updated client and enable **biba://mash** on the connection screen. The setting belongs to the selected profile and is off by default. The server's `yb-mesh-data` Docker volume contains its identity: keep that volume when updating, since replacing it changes the mesh address and requires a new invitation. The sidecar shares the server container's network namespace and forwards its mesh port to the existing TLS listener; it needs no TUN device or inbound Yggdrasil port.
@@ -148,7 +150,6 @@ BibaVPN is experimental software for people comfortable operating their own tunn
 - Use verified TLS or pin the server certificate. `--insecure` is for local tests only.
 - Keep tokens, PSKs, invitation passphrases and private keys out of Git and public reports. Rotate exposed credentials.
 - Your VPS is the exit point: its operator can observe destinations and traffic metadata. End-to-end HTTPS still protects application contents; plaintext application traffic remains visible at the exit.
-- `--legacy-path-auth` is a weaker compatibility mode; use the default authenticated tunnel instead.
 
 Report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 

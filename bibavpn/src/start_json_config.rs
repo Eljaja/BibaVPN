@@ -13,7 +13,9 @@ use crate::local_client::{
     DEFAULT_CLIENT_MAX_WS_BINARY, DEFAULT_UDP_MUX_REPLY_TIMEOUT_SECS,
 };
 use crate::logging::{self, LogConfig, LogFormat};
-use crate::startup_secrets::{client_reality_configured, require_psk, validate_resolved_token};
+use crate::startup_secrets::{
+    client_reality_configured, require_psk, validate_psk, validate_resolved_token,
+};
 use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
 use crate::tls_util::{TlsClientProfile, TlsStack};
 use crate::{decode_invite_v1, InviteV1, PadMode};
@@ -111,8 +113,9 @@ struct StartJson {
     #[serde(default)]
     tcp_fooling: Option<String>,
     /// Request TLS record / frame fragmentation (not fully implemented for rustls).
+    /// `Option` so that JSON can override an invite (`false` is a real value).
     #[serde(default)]
-    tls_fragment: bool,
+    tls_fragment: Option<bool>,
     /// Parallel WSS for TCP mux (1–4 when set; matches `bibavpn-client --ws-parallel`).
     #[serde(default)]
     ws_parallel: Option<u8>,
@@ -125,6 +128,18 @@ struct StartJson {
     /// `rustls` (default) or `boring` (Boring build + feature on client).
     #[serde(default)]
     tls_stack: Option<String>,
+    /// REALITY mode: front domain for SNI (e.g. `vk.com`); must match server target.
+    /// JSON takes precedence over the invite.
+    #[serde(default)]
+    reality_target: Option<String>,
+    /// REALITY mode: server public key (standard base64, 32-byte X25519).
+    /// JSON takes precedence over the invite.
+    #[serde(default)]
+    reality_public_key: Option<String>,
+    /// REALITY mode: short id (16 hex digits = 8 bytes); omit for random.
+    /// JSON takes precedence over the invite.
+    #[serde(default)]
+    reality_short_id: Option<String>,
     /// Same as client `--fingerprint` (e.g. `chrome-132`); takes precedence over `tls_profile` and invite.
     #[serde(default)]
     fingerprint: Option<String>,
@@ -177,6 +192,38 @@ fn json_or_invite_str(json_field: Option<String>, invite_field: Option<String>) 
 fn short_hash8(s: &str) -> String {
     let hex = blake3::hash(s.as_bytes()).to_hex().to_string();
     hex[..8].to_string()
+}
+
+/// Empty/whitespace JSON values count as unset so the invite value survives.
+fn reality_public_key_from_json(s: Option<&str>) -> anyhow::Result<Option<[u8; 32]>> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let Some(s) = s.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let bytes = STANDARD
+        .decode(s)
+        .context("reality_public_key: invalid base64")?;
+    if bytes.len() != 32 {
+        anyhow::bail!("reality_public_key: expected 32 bytes, got {}", bytes.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(Some(out))
+}
+
+/// Empty/whitespace JSON values count as unset so the invite value survives.
+fn reality_short_id_from_json(s: Option<&str>) -> anyhow::Result<Option<[u8; 8]>> {
+    let Some(s) = s.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(s).context("reality_short_id: invalid hex")?;
+    if bytes.len() != 8 {
+        anyhow::bail!("reality_short_id: need 8 bytes (16 hex digits)");
+    }
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&bytes);
+    Ok(Some(out))
 }
 
 /// Разбор JSON так же, как в Android `BibaNative.nativeStart`.
@@ -626,11 +673,12 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         Ok(TlsStack::Rustls)
     })()?;
 
-    let tls_fragment = if let Some(ref inv) = invite_pair {
-        inv.tls_fragment
-    } else {
-        j.tls_fragment
-    };
+    // JSON must be able to override the invite in both directions: with a plain `bool`,
+    // an explicit JSON `false` was indistinguishable from an omitted field.
+    let tls_fragment = j
+        .tls_fragment
+        .or(invite_pair.as_ref().map(|i| i.tls_fragment))
+        .unwrap_or(false);
     // JSON (Android `nativeStart`, CLI `--config`) must override invite: invite often embeds ws_parallel>1,
     // but the outer JSON may cap it for UDP mux / connection limits.
     let ws_parallel = match j.ws_parallel {
@@ -684,19 +732,28 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         }
     };
 
-    let reality_target: Option<String> =
-        invite_pair.as_ref().and_then(|i| i.reality_target.clone());
-    let reality_public_key: Option<[u8; 32]> = if let Some(ref inv) = invite_pair {
-        inv.reality_public_key_parsed()
-            .context("invite reality_public_key")?
-    } else {
-        None
+    // REALITY: the desktop app sends these in JSON; JSON wins over the invite field by field.
+    let reality_target = json_or_invite_str(
+        j.reality_target.clone(),
+        invite_pair.as_ref().and_then(|i| i.reality_target.clone()),
+    );
+    let reality_public_key = match reality_public_key_from_json(j.reality_public_key.as_deref())? {
+        Some(k) => Some(k),
+        None => match invite_pair.as_ref() {
+            Some(inv) => inv
+                .reality_public_key_parsed()
+                .context("invite reality_public_key")?,
+            None => None,
+        },
     };
-    let reality_short_id: Option<[u8; 8]> = if let Some(ref inv) = invite_pair {
-        inv.reality_short_id_parsed()
-            .context("invite reality_short_id")?
-    } else {
-        None
+    let reality_short_id = match reality_short_id_from_json(j.reality_short_id.as_deref())? {
+        Some(id) => Some(id),
+        None => match invite_pair.as_ref() {
+            Some(inv) => inv
+                .reality_short_id_parsed()
+                .context("invite reality_short_id")?,
+            None => None,
+        },
     };
     {
         let r_any =
@@ -704,7 +761,7 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
         if r_any {
             anyhow::ensure!(
                 reality_target.is_some() && reality_public_key.is_some(),
-                "REALITY mode requires both target and public key in invite (or in JSON, when added)"
+                "REALITY mode requires both target and public key (JSON or invite)"
             );
         }
     }
@@ -712,19 +769,17 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
     let reality_configured =
         client_reality_configured(reality_target.as_deref(), reality_public_key.as_ref());
     require_psk(psk.as_deref(), reality_configured, false)?;
+    // `require_psk` validates a supplied key too; keep the resolved-secret check explicit at
+    // this boundary, where a blank/placeholder PSK can arrive from JSON or the invite.
+    if let Some(resolved) = psk.as_deref() {
+        validate_psk(resolved).context("psk")?;
+    }
 
     let sni = crate::reality::effective_tls_sni(&sni, reality_target.as_deref());
 
-    let socks_bind = invite_pair
-        .as_ref()
-        .and_then(|i| {
-            i.socks_bind
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .unwrap_or(j.socks_bind);
+    // The JSON always carries the host application's local bind (it has a serde
+    // default), so it wins over the invite: an invite must not move the listener.
+    let socks_bind = j.socks_bind;
 
     let http_proxy_bind = json_or_invite_str(
         j.http_proxy.clone(),
@@ -823,8 +878,9 @@ fn start_json_into_options(j: StartJson) -> anyhow::Result<LocalClientOptions> {
 #[cfg(test)]
 mod merge_tests {
     use super::local_client_options_from_json_str;
-    use crate::stealth_v12::StealthProfile;
-    use crate::tls_util::TlsClientProfile;
+    use crate::frame::PadMode;
+    use crate::stealth_v12::{DecoyMode, DesyncMode, StealthProfile, TcpFooling};
+    use crate::tls_util::{TlsClientProfile, TlsStack};
 
     const BASE: &str =
         r#"{"server":"127.0.0.1:8443","token":"t","psk":"0123456789abcdef0123456789abcdef"}"#;
@@ -839,6 +895,17 @@ mod merge_tests {
     fn json_denylisted_token_fails() {
         let j = r#"{"server":"127.0.0.1:8443","token":"change-me","psk":"0123456789abcdef0123456789abcdef"}"#;
         assert!(local_client_options_from_json_str(j).is_err());
+    }
+
+    #[test]
+    fn json_denylisted_or_blank_psk_fails() {
+        for psk in ["change-me", "changeme", "test", "   "] {
+            let j = format!(r#"{{"server":"127.0.0.1:8443","token":"t","psk":"{psk}"}}"#);
+            assert!(
+                local_client_options_from_json_str(&j).is_err(),
+                "accepted PSK {psk:?}"
+            );
+        }
     }
 
     #[test]
@@ -1073,6 +1140,241 @@ mod merge_tests {
         assert_eq!(o.sni, "vpn.example.com");
         assert_eq!(o.server_host, "10.0.0.2");
         assert_eq!(o.server_port, 443);
+    }
+
+    const REALITY_KEY_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const REALITY_KEY_HEX: &str =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    fn invite_uri_with(extra: serde_json::Value) -> String {
+        let mut base = serde_json::json!({
+            "v": 1,
+            "server": "vpn.example:443",
+            "sni": "vpn.example",
+            "token": "strong-token",
+            "psk": "0123456789abcdef0123456789abcdef",
+            "decoy_max": 0,
+            "max_pad": 0,
+            "max_ws_binary": 65536,
+            "ws_ping_secs": 25,
+            "insecure": true,
+        });
+        let obj = base.as_object_mut().unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            obj.insert(key.clone(), value.clone());
+        }
+        let inv: crate::InviteV1 = serde_json::from_value(base).unwrap();
+        crate::invite_uri::encode_invite_v1(&inv, "pass").unwrap()
+    }
+
+    #[test]
+    fn json_reality_without_invite_does_not_require_psk() {
+        let o = local_client_options_from_json_str(
+            r#"{"server":"127.0.0.1:8443","token":"t","reality_target":"vk.com","reality_public_key":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","reality_short_id":"0001020304050607"}"#,
+        )
+        .unwrap();
+        assert!(o.psk.is_none(), "REALITY replaces PSK");
+        assert_eq!(o.reality_target.as_deref(), Some("vk.com"));
+        assert_eq!(hex::encode(o.reality_public_key.expect("public key")), REALITY_KEY_HEX);
+        assert_eq!(o.reality_short_id, Some([0, 1, 2, 3, 4, 5, 6, 7]));
+        assert_eq!(o.sni, "vk.com");
+    }
+
+    #[test]
+    fn json_reality_rejects_incomplete_or_malformed_values() {
+        // Target without public key.
+        let j = r#"{"server":"127.0.0.1:8443","token":"t","psk":"0123456789abcdef0123456789abcdef","reality_target":"vk.com"}"#;
+        assert!(local_client_options_from_json_str(j).is_err());
+
+        // Invalid base64.
+        let j = r#"{"server":"127.0.0.1:8443","token":"t","reality_target":"vk.com","reality_public_key":"not base64!","reality_short_id":"0001020304050607"}"#;
+        assert!(local_client_options_from_json_str(j).is_err());
+
+        // Public key must be 32 bytes.
+        let j = r#"{"server":"127.0.0.1:8443","token":"t","reality_target":"vk.com","reality_public_key":"AAAAAAAAAAA="}"#;
+        assert!(local_client_options_from_json_str(j).is_err());
+
+        // Short id must be 8 bytes (16 hex digits).
+        let j = format!(
+            r#"{{"server":"127.0.0.1:8443","token":"t","reality_target":"vk.com","reality_public_key":"{REALITY_KEY_B64}","reality_short_id":"0001"}}"#
+        );
+        assert!(local_client_options_from_json_str(&j).is_err());
+    }
+
+    #[test]
+    fn json_reality_overrides_invite_and_falls_back_per_field() {
+        let uri = invite_uri_with(serde_json::json!({
+            "reality_target": "old.example",
+            "reality_public_key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+            "reality_short_id": "ffffffffffffffff",
+        }));
+        let j = serde_json::json!({
+            "from_invite": uri,
+            "invite_passphrase": "pass",
+            "reality_target": "new.example",
+            "reality_public_key": REALITY_KEY_B64,
+            "reality_short_id": "0001020304050607",
+        });
+        let o = local_client_options_from_json_str(&j.to_string()).unwrap();
+        assert_eq!(o.reality_target.as_deref(), Some("new.example"));
+        assert_eq!(hex::encode(o.reality_public_key.expect("public key")), REALITY_KEY_HEX);
+        assert_eq!(o.reality_short_id, Some([0, 1, 2, 3, 4, 5, 6, 7]));
+        assert_eq!(o.sni, "new.example");
+
+        // Only the target is overridden; key and short id still come from the invite.
+        let uri = invite_uri_with(serde_json::json!({
+            "reality_target": "old.example",
+            "reality_public_key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+            "reality_short_id": "ffffffffffffffff",
+        }));
+        let j = serde_json::json!({
+            "from_invite": uri,
+            "invite_passphrase": "pass",
+            "reality_target": "new.example",
+        });
+        let o = local_client_options_from_json_str(&j.to_string()).unwrap();
+        assert_eq!(o.reality_target.as_deref(), Some("new.example"));
+        assert_eq!(hex::encode(o.reality_public_key.expect("public key")), "07".repeat(32));
+        assert_eq!(o.reality_short_id, Some([0xff; 8]));
+    }
+
+    #[test]
+    fn json_tls_fragment_overrides_invite_in_both_directions() {
+        // Invite true, JSON false: JSON wins.
+        let uri = invite_uri_with(serde_json::json!({ "tls_fragment": true }));
+        let j = serde_json::json!({
+            "from_invite": uri,
+            "invite_passphrase": "pass",
+            "tls_fragment": false,
+        });
+        assert!(!local_client_options_from_json_str(&j.to_string()).unwrap().tls_fragment);
+
+        // Invite false, JSON true: JSON wins.
+        let uri = invite_uri_with(serde_json::json!({ "tls_fragment": false }));
+        let j = serde_json::json!({
+            "from_invite": uri,
+            "invite_passphrase": "pass",
+            "tls_fragment": true,
+        });
+        assert!(local_client_options_from_json_str(&j.to_string()).unwrap().tls_fragment);
+
+        // Omitted JSON field keeps the invite value.
+        let uri = invite_uri_with(serde_json::json!({ "tls_fragment": true }));
+        let j = serde_json::json!({ "from_invite": uri, "invite_passphrase": "pass" });
+        assert!(local_client_options_from_json_str(&j.to_string()).unwrap().tls_fragment);
+
+        // No invite and no JSON field: off.
+        assert!(!local_client_options_from_json_str(BASE)
+            .unwrap()
+            .tls_fragment);
+    }
+
+    #[test]
+    fn desktop_start_config_json_keys_are_accepted() {
+        let j = serde_json::json!({
+            "yb_mesh_enabled": false,
+            "server": "vpn.example:443",
+            "token": "strong-token",
+            "sni": "vpn.example",
+            "socks_bind": "127.0.0.1:0",
+            "insecure": true,
+            "max_pad": 48,
+            "decoy_max": 12,
+            "junk_frames": 3,
+            "early_ws_frames": 2,
+            "max_ws_binary": 1600,
+            "ws_ping_secs": 20,
+            "use_tcp_mux": false,
+            "ws_path": "/tunnel",
+            "pad_mode": "random",
+            "ws_ping_jitter_percent": 10,
+            "ws_binary_send_jitter_ms": 4,
+            "ws_jitter_min_ms": 2,
+            "ws_jitter_max_ms": 6,
+            "udp_max_pad": 16,
+            "udp_max_ws_binary": 1300,
+            "udp_mux_reply_timeout_secs": 45,
+            "dummy_interval_secs": 12,
+            "decoy_gets": true,
+            "decoy_gets_interval_secs": 40,
+            "decoy_gets_paths": "/a,/b",
+            "pin_cert_pem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----",
+            "psk": "0123456789abcdef0123456789abcdef",
+            "ws_headers": ["X-Test: 1"],
+            "proto": 3,
+            "proto_domain": "lab",
+            "stealth_profile": "balanced",
+            "decoy_mode": "browser",
+            "desync_mode": "split2",
+            "tcp_fooling": "md5sig",
+            "tls_fragment": true,
+            "ws_parallel": 2,
+            "idle_decoy_secs": 15,
+            "tls_stack": "rustls",
+            "tls_profile": "firefox-136",
+            "fingerprint": "chrome-132",
+            "reality_target": "vk.com",
+            "reality_public_key": REALITY_KEY_B64,
+            "reality_short_id": "0001020304050607",
+            "ws_host": "cdn.example",
+            "ws_origin": "https://cdn.example",
+            "ws_user_agent": "Mozilla/5.0",
+            "ws_accept_language": "en-US",
+            "split_bypass_domains": ["example.com", "example.org"],
+        });
+        let o = local_client_options_from_json_str(&j.to_string()).unwrap();
+        assert_eq!(o.server_host, "vpn.example");
+        assert_eq!(o.server_port, 443);
+        assert_eq!(o.token, "strong-token");
+        assert_eq!(o.socks_bind, "127.0.0.1:0");
+        assert!(o.insecure_tls);
+        assert_eq!(o.max_pad, 48);
+        assert_eq!(o.decoy_max, 12);
+        assert_eq!(o.junk_frames, 3);
+        assert_eq!(o.early_ws_frames, 2);
+        assert_eq!(o.max_ws_binary, 1600);
+        assert_eq!(o.ws_ping_secs, 20);
+        assert!(!o.use_tcp_mux);
+        assert_eq!(o.ws_path, "/tunnel");
+        assert_eq!(o.pad_mode, PadMode::Random);
+        assert_eq!(o.ws_ping_jitter_percent, 10);
+        assert_eq!(o.ws_binary_send_jitter_ms, 4);
+        assert_eq!((o.ws_jitter_min_ms, o.ws_jitter_max_ms), (2, 6));
+        assert_eq!(o.udp_max_pad, Some(16));
+        assert_eq!(o.udp_max_ws_binary, Some(1300));
+        assert_eq!(o.udp_mux_reply_timeout_secs, 45);
+        assert_eq!(o.dummy_interval_secs, 12);
+        assert!(o.decoy_gets);
+        assert_eq!(o.decoy_gets_interval_secs, 40);
+        assert_eq!(o.decoy_gets_paths.len(), 2);
+        assert_eq!(o.decoy_gets_paths[0], "/a");
+        assert_eq!(o.decoy_gets_paths[1], "/b");
+        assert!(o
+            .pinned_certs_pem
+            .as_deref()
+            .is_some_and(|pem| pem.windows(5).any(|w| w == b"BEGIN")));
+        assert_eq!(o.ws_extra_headers.len(), 1);
+        assert_eq!(o.proto, 3);
+        assert_eq!(o.proto_domain, "lab");
+        assert_eq!(o.stealth_profile, Some(StealthProfile::Balanced));
+        assert_eq!(o.decoy_mode, DecoyMode::Browser);
+        assert_eq!(o.desync_mode, DesyncMode::Split2);
+        assert_eq!(o.tcp_fooling, TcpFooling::Md5Sig);
+        assert!(o.tls_fragment);
+        assert_eq!(o.ws_parallel, 2);
+        assert_eq!(o.idle_decoy_secs, 15);
+        assert_eq!(o.tls_stack, TlsStack::Rustls);
+        // `fingerprint` wins over `tls_profile`.
+        assert_eq!(o.tls_profile, TlsClientProfile::Chrome132);
+        assert_eq!(o.reality_target.as_deref(), Some("vk.com"));
+        assert_eq!(hex::encode(o.reality_public_key.expect("public key")), REALITY_KEY_HEX);
+        assert_eq!(o.reality_short_id, Some([0, 1, 2, 3, 4, 5, 6, 7]));
+        // REALITY front domain replaces SNI.
+        assert_eq!(o.sni, "vk.com");
+        assert_eq!(o.ws_host.as_deref(), Some("cdn.example"));
+        assert_eq!(o.ws_origin.as_deref(), Some("https://cdn.example"));
+        assert_eq!(o.ws_user_agent.as_deref(), Some("Mozilla/5.0"));
+        assert_eq!(o.ws_accept_language.as_deref(), Some("en-US"));
     }
 }
 

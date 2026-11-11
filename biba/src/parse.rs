@@ -3,7 +3,7 @@
 use crate::constants::*;
 use crate::error::{Error, Result};
 use crate::extensions::{parse_extension_block, Extension};
-use crate::grease::ungrease_u16;
+use crate::grease::{is_grease_u16, ungrease_u16};
 use crate::spec::ClientHelloSpec;
 
 /// Parse full TLS record (as in uTLS `ClientHelloSpec.FromRaw`).
@@ -95,10 +95,19 @@ fn parse_client_hello_handshake(data: &[u8], blunt: bool) -> Result<ClientHelloS
         let mut exts = parse_extension_block(ext_block, blunt)?;
         for e in &mut exts {
             if let Extension::SupportedVersions { versions } = e {
-                tls_min = 0;
+                tls_min = u16::MAX;
                 tls_max = 0;
                 for v in versions.iter_mut() {
+                    if !is_grease_u16(*v) {
+                        tls_min = tls_min.min(*v);
+                        tls_max = tls_max.max(*v);
+                    }
                     *v = ungrease_u16(*v);
+                }
+                if tls_min > tls_max {
+                    // Empty or GREASE-only list: fall back to the legacy version.
+                    tls_min = legacy_ver;
+                    tls_max = legacy_ver;
                 }
             }
             if let Extension::SupportedCurves { curves } = e {
@@ -122,4 +131,56 @@ fn parse_client_hello_handshake(data: &[u8], blunt: bool) -> Result<ClientHelloS
         tls_vers_min: tls_min,
         tls_vers_max: tls_max,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::{GREASE_PLACEHOLDER, VERSION_TLS12};
+    use crate::marshal::{marshal_tls_client_hello_record, MarshalParams};
+
+    fn tls12_spec(versions: Vec<u16>) -> ClientHelloSpec {
+        ClientHelloSpec {
+            cipher_suites: vec![0xC02F, 0x009C],
+            compression_methods: vec![0],
+            extensions: vec![Extension::SupportedVersions { versions }],
+            tls_vers_min: VERSION_TLS12,
+            tls_vers_max: VERSION_TLS12,
+        }
+    }
+
+    #[test]
+    fn tls12_versions_survive_roundtrip() {
+        let record =
+            marshal_tls_client_hello_record(&tls12_spec(vec![VERSION_TLS12]), &MarshalParams::default())
+                .expect("marshal");
+        // record header (5) + handshake header (4) precede legacy_version.
+        assert_eq!(u16::from_be_bytes([record[9], record[10]]), VERSION_TLS12);
+
+        let parsed = client_hello_spec_from_tls_record(&record, false, false).expect("parse");
+        assert_eq!(parsed.tls_vers_min, VERSION_TLS12);
+        assert_eq!(parsed.tls_vers_max, VERSION_TLS12);
+
+        let again =
+            marshal_tls_client_hello_record(&parsed, &MarshalParams::default()).expect("marshal");
+        assert_eq!(again, record, "TLS version bounds must round-trip");
+    }
+
+    #[test]
+    fn grease_versions_are_ignored_for_bounds() {
+        let record = marshal_tls_client_hello_record(
+            &tls12_spec(vec![GREASE_PLACEHOLDER, VERSION_TLS12]),
+            &MarshalParams::default(),
+        )
+        .expect("marshal");
+
+        let parsed = client_hello_spec_from_tls_record(&record, false, false).expect("parse");
+        assert_eq!(parsed.tls_vers_min, VERSION_TLS12);
+        assert_eq!(parsed.tls_vers_max, VERSION_TLS12);
+        assert!(
+            matches!(parsed.extensions.as_slice(), [Extension::SupportedVersions { versions }]
+                if versions.as_slice() == [GREASE_PLACEHOLDER, VERSION_TLS12].as_slice()),
+            "GREASE version should be ungreased, not counted"
+        );
+    }
 }

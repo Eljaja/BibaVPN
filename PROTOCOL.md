@@ -315,7 +315,7 @@ The server can print a **single-line encrypted config** after it binds: JSON (`I
 
 New invites from `encode_invite_v1` always write outer **`version = 2`**. Clients that only support outer v1 cannot read these new invites: update clients before distributing v2 invites. Updated clients retain v1 decoding. Default Argon2id params: **`m_kib = 19456`** (19 MiB), **`t_cost = 2`**, **`p_cost = 1`**, 32-byte output — recorded in the blob so future encoders can change them without a new outer version. Decoders reject crafted v2 blobs with `m_kib > 65536`, `t_cost > 8`, `p_cost > 4`, or any of those fields zero. Wrong passphrase or corrupt ciphertext → `invite: bad passphrase or corrupted blob`; unknown outer version → `invite: unsupported blob version`.
 
-Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`proto_domain`** (omit to let the client default the KDF label to **SNI** — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, optional **`tls_stack`** (`rustls` | `boring`), optional **`pin_cert_pem`**, optional REALITY fields (`reality_target`, `reality_public_key`, `reality_short_id`), and other tunnel fields. **`--print-invite-uri`** on the server embeds the same defaults as hand-written JSON. **`bibavpn-mint-invite`** uses environment variables (`INVITE_PROTO`, `INVITE_PROTO_DOMAIN`, …) with the same defaults. **Do not** paste real invites or passphrases into tickets or public logs.
+Invite JSON (`InviteV1`) includes **`proto`** (default **`3`**), optional **`proto_domain`** (omit to use the client default `default` — must match server `--proto-domain` in effect), plus **`ws_path`**, **`pad_mode`**, **`dummy_interval_secs`**, optional **`tls_stack`** (`rustls` | `boring`), optional **`pin_cert_pem`**, optional REALITY fields (`reality_target`, `reality_public_key`, `reality_short_id`), and other tunnel fields. **`--print-invite-uri`** on the server embeds the same defaults as hand-written JSON. **`bibavpn-mint-invite`** uses environment variables (`INVITE_PROTO`, `INVITE_PROTO_DOMAIN`, …) with the same defaults. **Do not** paste real invites or passphrases into tickets or public logs.
 
 **Server** (stdout = only the URI; passphrase must stay secret — share out-of-band):
 
@@ -442,7 +442,6 @@ These options shape TLS/WebSocket timing and framing; they apply on top of the t
 - `--tls-stack rustls|boring` (client) — build with `cargo build -p bibavpn --features boring-tls` for Boring
 - `--tls-fragment` — record-size hint where the TLS stack supports it (see `tls_util`)
 - `--ws-path` — WebSocket path; token via sealed **AUTH** (default `/ws`)
-- `--legacy-path-auth` (server) — accept old `/b/{token}` without sealed AUTH (less safe)
 - `--pad-mode adaptive|random|http-buckets`
 - `--stealth-profile default|balanced|aggressive` — fills padding/jitter/decoy/idle
   defaults when explicit CLI values are unset (see `stealth_v12`)

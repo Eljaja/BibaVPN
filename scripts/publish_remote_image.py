@@ -10,10 +10,20 @@ import paramiko
 
 
 EXCLUDE_PARTS = {".git", "target", "__pycache__", "node_modules", ".venv"}
+EXCLUDE_NAMES = {".biba-start.env", "server.txt"}
+EXCLUDE_NAME_PREFIXES = (".env",)
+EXCLUDE_SUFFIXES = (".pem", ".key")
 
 
 def should_include(path: Path) -> bool:
-    return not any(part in EXCLUDE_PARTS for part in path.parts)
+    if any(part in EXCLUDE_PARTS for part in path.parts):
+        return False
+    name = path.name
+    if name in EXCLUDE_NAMES:
+        return False
+    if name.startswith(EXCLUDE_NAME_PREFIXES) or name.endswith(EXCLUDE_SUFFIXES):
+        return False
+    return True
 
 
 def exec_checked(
