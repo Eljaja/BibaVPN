@@ -423,6 +423,7 @@ pub(crate) fn assemble_state_snapshot(
             )
         };
 
+    #[cfg(not(target_os = "android"))]
     let (mut connected, mut vpn_session_uptime_secs) = if tunnel_server.is_none() {
         (false, None)
     } else if stale {
@@ -447,6 +448,20 @@ pub(crate) fn assemble_state_snapshot(
                 p.and_then(|p| p.vpn_session_uptime_secs),
             )
         }
+    };
+    #[cfg(target_os = "android")]
+    let (mut connected, mut vpn_session_uptime_secs) = if stale
+        || current.phase == VpnPhase::Disconnecting
+        || (current.phase == VpnPhase::Connecting && tunnel_server.is_none())
+    {
+        (false, None)
+    } else {
+        // START_STICKY can restore the service before Rust has a session label.
+        let p = probe.as_ref();
+        (
+            p.is_some_and(|p| p.connected),
+            p.and_then(|p| p.vpn_session_uptime_secs),
+        )
     };
 
     if force_disconnected {
@@ -505,14 +520,12 @@ fn android_phase_after_probe(
     connected: bool,
     has_error: bool,
 ) -> VpnPhase {
-    if phase != VpnPhase::Connecting || !session_requested {
-        phase
-    } else if connected {
-        VpnPhase::Connected
-    } else if has_error {
-        VpnPhase::Idle
-    } else {
-        phase
+    match phase {
+        VpnPhase::Disconnecting if !connected => VpnPhase::Idle,
+        VpnPhase::Idle if connected => VpnPhase::Connected,
+        VpnPhase::Connecting if session_requested && connected => VpnPhase::Connected,
+        VpnPhase::Connecting if session_requested && has_error => VpnPhase::Idle,
+        _ => phase,
     }
 }
 
@@ -520,28 +533,31 @@ fn snapshot_with_probe<F>(state: &AppState, probe_fn: F, force_disconnected: boo
 where
     F: FnOnce() -> TunnelProbe,
 {
-    let copy = {
+    #[allow(unused_mut)]
+    let mut copy = {
         let g = lock_inner(&state.inner);
         snapshot_copy_from_inner(&g)
     };
     let probe = probe_fn();
     #[allow(unused_mut)]
     let mut g = lock_inner(&state.inner);
-    let snapshot = assemble_state_snapshot(&copy, &g, Some(probe), force_disconnected);
     #[cfg(target_os = "android")]
-    {
+    if copy.epoch == g.epoch {
         let phase = android_phase_after_probe(
             g.phase,
             g.tunnel_server.is_some(),
-            snapshot.connected,
-            snapshot.error.is_some(),
+            probe.connected,
+            g.last_error.is_some()
+                || probe.jni_connect_error.as_ref().is_some_and(|e| !e.trim().is_empty()),
         );
         if phase != g.phase {
             g.phase = phase;
             bump_epoch(&mut g);
+            // Only the phase changed under this lock; this probe is still current.
+            copy.epoch = g.epoch;
         }
     }
-    snapshot
+    assemble_state_snapshot(&copy, &g, Some(probe), force_disconnected)
 }
 
 fn snapshot_from_state(app: &AppHandle, state: &AppState) -> StateSnapshot {
@@ -1148,9 +1164,9 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             info!(target: "bibavpn_desktop", "отключение VPN");
             g.last_error = None;
             g.tunnel_server = None;
-            g.phase = VpnPhase::Idle;
-            // A slow connect may still be in flight after this point: leave the phase
-            // Idle and let its install check abort instead of reviving the tunnel.
+            g.phase = VpnPhase::Disconnecting;
+            // A late connect cannot install while shutdown is pending. A fresh
+            // inactive native probe completes the Disconnecting -> Idle transition.
             bump_epoch(&mut g);
         }
 
@@ -1164,6 +1180,7 @@ fn disconnect_inner(state: &AppState, app: &AppHandle, restore_system_proxy: boo
             warn!(target: "bibavpn_desktop", "android VPN stop: {e}");
             let mut g = lock_inner(&state.inner);
             g.last_error = Some(e.clone());
+            g.phase = VpnPhase::Idle;
             bump_epoch(&mut g);
         }
         // Остановка сервиса асинхронна — tunnel_is_active ещё может быть true в snapshot().
@@ -1848,8 +1865,12 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
 #[cfg(target_os = "android")]
 fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
     if android_vpn::tunnel_is_active(app).unwrap_or(false) {
-        disconnect_inner(state, app, true);
-        std::thread::sleep(Duration::from_millis(300));
+        match lock_inner(&state.inner).phase {
+            VpnPhase::Connecting => return Err("Подключение уже выполняется.".into()),
+            // A new connect may queue behind the already requested native stop.
+            VpnPhase::Disconnecting => {}
+            _ => return Ok(()),
+        }
     }
 
     // Вне мьютекса: JNI-вызов в Kotlin.
@@ -1864,9 +1885,6 @@ fn connect_inner(state: &AppState, app: &AppHandle) -> Result<(), String> {
         match g.phase {
             VpnPhase::Connecting => {
                 return Err("Подключение уже выполняется.".into());
-            }
-            VpnPhase::Disconnecting => {
-                return Err("Дождитесь завершения отключения.".into());
             }
             _ => {}
         }
@@ -2839,8 +2857,24 @@ mod snapshot_assemble_tests {
             android_phase_after_probe(VpnPhase::Connecting, false, false, true),
             VpnPhase::Connecting
         );
+    }
+
+    #[test]
+    fn android_adopts_active_tunnel_after_process_restart() {
         assert_eq!(
-            android_phase_after_probe(VpnPhase::Idle, true, true, false),
+            super::android_phase_after_probe(VpnPhase::Idle, false, true, false),
+            VpnPhase::Connected
+        );
+    }
+
+    #[test]
+    fn android_disconnect_waits_for_native_tunnel_to_stop() {
+        assert_eq!(
+            super::android_phase_after_probe(VpnPhase::Disconnecting, false, true, false),
+            VpnPhase::Disconnecting
+        );
+        assert_eq!(
+            super::android_phase_after_probe(VpnPhase::Disconnecting, false, false, false),
             VpnPhase::Idle
         );
     }

@@ -5,7 +5,8 @@ export function acceptSnapshot(current, next) {
 
 export function tunnelStatusChanged(snapshot, status) {
   if (!snapshot || !status) return false;
-  return status.connected !== snapshot.connected ||
+  return snapshot.phase === "connecting" || snapshot.phase === "disconnecting" ||
+    snapshot.phase === "reconnecting" || status.connected !== snapshot.connected ||
     Boolean(status.error && status.error !== snapshot.error);
 }
 
