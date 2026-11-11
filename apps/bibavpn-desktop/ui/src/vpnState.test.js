@@ -16,6 +16,13 @@ test('one status observer requests a full snapshot for connection and error tran
   assert.equal(tunnelStatusChanged(snapshot, null), false);
 });
 
+test('pending phases keep refreshing until native shutdown or bootstrap settles', () => {
+  for (const phase of ['connecting', 'disconnecting', 'reconnecting']) {
+    assert.equal(tunnelStatusChanged({ connected: false, phase }, { connected: false }), true);
+  }
+  assert.equal(tunnelStatusChanged({ connected: false, phase: 'idle' }, { connected: false }), false);
+});
+
 test('session clock survives tab changes and resumes from native uptime', async () => {
   const { sessionStart } = await import('./vpnState.js');
   assert.equal(sessionStart(null, { connected: true, vpnSessionUptimeSecs: 8 }, 100000), 92000);

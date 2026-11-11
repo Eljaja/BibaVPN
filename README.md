@@ -68,6 +68,8 @@ bash start.sh
 
 You need an invitation from a server administrator. To run your own server, follow the next section.
 
+On Android, the VPN can remain active while the app is in the background. Reopening the app shows the running tunnel's status and uptime. Use **Disconnect** to stop it; switching between Wi-Fi and mobile data reconnects the tunnel automatically.
+
 
 ### Optional Yggdrasil mesh transport
 
